@@ -9,7 +9,11 @@ use ostool::{build::config::Cargo, run::qemu::QemuConfig};
 
 use super::{
     AXVISOR_NORMAL_GROUP, AxvisorQemuCase,
-    assets::axvisor_case_asset_config,
+    assets::{
+        arceos_ivc_guest_requests, arceos_x86_64_guest_request, axvisor_case_asset_config,
+        build_group_needs_arceos_x86_64_guest, case_needs_arceos_x86_64_guest,
+        inject_arceos_x86_64_guest_image,
+    },
     discover_qemu_cases,
     discovery::{
         discover_test_group_names, qemu_list_error_is_ignorable, test_suite_dir, test_suite_root,
@@ -19,7 +23,7 @@ use super::{
 };
 use crate::{
     axvisor::{ArgsTestQemu, Axvisor, build, rootfs},
-    context::{AxvisorCliArgs, ResolvedAxvisorRequest, SnapshotPersistence},
+    context::{AxvisorCliArgs, ResolvedAxvisorRequest, ResolvedBuildRequest, SnapshotPersistence},
     test::{case as test_case, qemu as test_qemu},
 };
 
@@ -122,7 +126,34 @@ impl Axvisor {
         for build_group in &mut build_groups {
             rootfs::ensure_qemu_rootfs_ready(&build_group.request, self.app.workspace_root(), None)
                 .await?;
+            rootfs::prepare_loongarch_linux_vmconfigs(
+                &mut build_group.request,
+                self.app.workspace_root(),
+                None,
+            )?;
             build_group.cargo = build::load_cargo_config(&build_group.request)?;
+            for guest_request in arceos_ivc_guest_requests(&build_group.request)? {
+                let package = guest_request.package.clone();
+                self.build_arceos_direct_guest_image(guest_request)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to build ArceOS guest image `{package}` for Axvisor qemu \
+                             build group `{}`",
+                            build_group.group.build_group
+                        )
+                    })?;
+            }
+            if build_group_needs_arceos_x86_64_guest(&build_group.request) {
+                self.build_arceos_x86_64_guest_image()
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to build ArceOS guest image for Axvisor qemu build group `{}`",
+                            build_group.group.build_group
+                        )
+                    })?;
+            }
             self.app
                 .build(
                     build_group.cargo.clone(),
@@ -187,7 +218,7 @@ impl Axvisor {
                 &case.build_config_path,
                 &mut cargo_by_build_config,
             )?;
-            let qemu = self
+            let mut qemu = self
                 .app
                 .read_qemu_config_from_path_for_cargo(&cargo, &case.case.qemu_config_path)
                 .await
@@ -197,6 +228,7 @@ impl Axvisor {
                         case.case.display_name
                     )
                 })?;
+            test_qemu::apply_dynamic_platform_qemu_boot(&mut qemu, &cargo);
             test_qemu::validate_grouped_qemu_commands(&qemu, &case.case, "Axvisor")?;
             prepared.push(PreparedAxvisorQemuCase { case, qemu });
         }
@@ -253,7 +285,7 @@ impl Axvisor {
         test_qemu::apply_timeout_scale(&mut qemu);
 
         let rootfs_path = rootfs::qemu_rootfs_path(request, self.app.workspace_root(), None)?;
-        let prepared_assets = test_case::prepare_case_assets(
+        let mut prepared_assets = test_case::prepare_case_assets(
             self.app.workspace_root(),
             &request.arch,
             &request.target,
@@ -262,6 +294,20 @@ impl Axvisor {
             asset_config.clone(),
         )
         .await?;
+        if case_needs_arceos_x86_64_guest(request, case) {
+            inject_arceos_x86_64_guest_image(
+                self.app.workspace_root(),
+                request,
+                case,
+                &mut prepared_assets,
+            )
+            .with_context(|| {
+                format!(
+                    "failed to prepare ArceOS guest image for Axvisor qemu case `{}`",
+                    case.case.case.name
+                )
+            })?;
+        }
         rootfs::patch_qemu_rootfs_path(&mut qemu, &prepared_assets.rootfs_path);
         qemu.args.extend(prepared_assets.extra_qemu_args.clone());
         // UEFI needs a writable ESP for firmware variables. Keep the explicit
@@ -270,6 +316,8 @@ impl Axvisor {
         if qemu.uefi {
             test_qemu::apply_drive_snapshot_without_global_snapshot(&mut qemu);
         }
+        let cargo = build::load_cargo_config(request)?;
+        test_qemu::apply_dynamic_platform_qemu_boot(&mut qemu, &cargo);
         Ok((qemu, prepared_assets))
     }
 
@@ -297,6 +345,42 @@ impl Axvisor {
             },
         )
         .await
+    }
+
+    async fn build_arceos_x86_64_guest_image(&mut self) -> anyhow::Result<PathBuf> {
+        let request = arceos_x86_64_guest_request()?;
+        self.build_arceos_guest_image(request, crate::arceos::build::load_cargo_config)
+            .await
+    }
+
+    async fn build_arceos_direct_guest_image(
+        &mut self,
+        request: ResolvedBuildRequest,
+    ) -> anyhow::Result<PathBuf> {
+        self.build_arceos_guest_image(
+            request,
+            crate::arceos::build::load_direct_guest_cargo_config,
+        )
+        .await
+    }
+
+    async fn build_arceos_guest_image(
+        &mut self,
+        request: ResolvedBuildRequest,
+        load_cargo_config: fn(&ResolvedBuildRequest) -> anyhow::Result<Cargo>,
+    ) -> anyhow::Result<PathBuf> {
+        let cargo = load_cargo_config(&request)?;
+        let output = self
+            .app
+            .build(cargo.clone(), request.build_info_path.clone())
+            .await?;
+
+        let elf_path = output.elf_path().to_path_buf();
+        self.app
+            .prepare_elf_artifact(elf_path.clone(), true)
+            .await?;
+
+        Ok(elf_path.with_extension("bin"))
     }
 }
 
