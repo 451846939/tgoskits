@@ -789,10 +789,18 @@ impl RISCVVCpu {
             }
             Trap::Exception(Exception::VirtualInstruction) => self.handle_virtual_instruction(),
             Trap::Interrupt(Interrupt::SupervisorTimer) => {
-                // Forward host timer exits to VS without disabling HS timer;
-                // the host runtime owns its timer enable state.
-                unsafe {
-                    hvip::set_vstip();
+                // Nested environments may not deliver SSTC directly to VS.
+                // Reflect the host polling tick only after the guest's own
+                // comparator has expired, rather than on every host tick.
+                #[cfg(feature = "sstc")]
+                let guest_timer_expired =
+                    riscv::register::time::read64() >= self.regs.vs_csrs.vstimecmp as u64;
+                #[cfg(not(feature = "sstc"))]
+                let guest_timer_expired = true;
+                if guest_timer_expired {
+                    unsafe {
+                        hvip::set_vstip();
+                    }
                 }
                 Ok(AxVCpuExitReason::PreemptionTimer)
             }

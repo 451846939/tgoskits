@@ -262,6 +262,7 @@ fn wait_for_halted_vcpu_wakeup(
             set_current_vcpu_halted(control_file, false)?;
             return Err(AxErrorKind::Interrupted.into());
         }
+        crate::vmm::timer::check_events();
         if current_vcpu_has_pending_interrupt(control_file)? {
             set_current_vcpu_halted(control_file, false)?;
             return Ok(());
