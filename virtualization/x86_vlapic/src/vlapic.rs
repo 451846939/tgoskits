@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use core::ptr::NonNull;
+use core::{
+    ptr::NonNull,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use ax_errno::{AxError, AxResult, ax_err_type};
 use axaddrspace::{HostPhysAddr, device::AccessWidth};
@@ -54,6 +57,8 @@ const APIC_BASE_X2APIC_ENABLE: u64 = 1 << 10;
 const APIC_BASE_BSP: u64 = 1 << 8;
 const APIC_VERSION_INTEGRATED: u32 = 0x14;
 const APIC_VERSION_MAX_LVT_ENTRIES: u32 = 6 << 16;
+const IPI_DIAG_LIMIT: usize = 128;
+static IPI_ROUTE_DIAG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Virtual-APIC Registers.
 pub struct VirtualApicRegs {
@@ -557,6 +562,17 @@ impl VirtualApicRegs {
                 vec
             );
             let dmask = self.calculate_dest(shorthand, is_broadcast, dest, is_phys, false)?;
+            if mode == APICDeliveryMode::Fixed
+                && vec >= 0xf0
+                && IPI_ROUTE_DIAG_COUNT.fetch_add(1, Ordering::Relaxed) < IPI_DIAG_LIMIT
+            {
+                warn!(
+                    "[ipi-diag] route src={} vec={vec:#x} dest={dest:#x} shorthand={shorthand:?} \
+                     physical={is_phys} active={:#x} targets={dmask:#x}",
+                    self.vapic_id,
+                    self.active_vcpu_mask()
+                );
+            }
 
             for i in 0..u64::BITS {
                 if dmask & (1 << i) != 0 {

@@ -3,6 +3,7 @@ use core::{
     arch::asm,
     fmt::{Debug, Formatter, Result as FmtResult},
     mem::size_of,
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
 use ax_errno::{AxResult, ax_err, ax_err_type};
@@ -48,6 +49,8 @@ const X86_LOCAL_APIC_BASE: usize = 0xfee0_0000;
 const X86_LOCAL_APIC_SIZE: usize = 0x1000;
 const X86_LOCAL_APIC_EOI_OFFSET: usize = 0xb0;
 const APIC_BASE_MSR: u32 = 0x1b;
+const IPI_DIAG_LIMIT: usize = 128;
+static IPI_SVM_DIAG_COUNT: AtomicUsize = AtomicUsize::new(0);
 const IA32_UMWAIT_CONTROL: u32 = 0xe1;
 const AMD64_DE_CFG: u32 = 0xc001_1029;
 
@@ -538,9 +541,11 @@ impl SvmVcpu {
         level_triggered: bool,
     ) {
         if self.has_pending_external_event(vector) {
+            self.log_ipi_diag("coalesce", vector);
             return;
         }
 
+        self.log_ipi_diag("enqueue", vector);
         self.pending_events.push_back(PendingEvent {
             vector,
             err_code,
@@ -949,6 +954,7 @@ impl SvmVcpu {
     }
 
     fn arm_virtual_interrupt(&mut self, event: PendingEvent) {
+        self.log_ipi_diag("arm", event.vector);
         let vmcb = unsafe { self.vmcb.as_vmcb() };
         let priority = ((event.vector >> 4) as u32) << SVM_INT_CTL_V_INTR_PRIO_SHIFT;
         let int_control = (vmcb.control.int_control.get() & !SVM_INT_CTL_V_INTR_PRIO_MASK)
@@ -971,6 +977,7 @@ impl SvmVcpu {
 
         self.vlapic
             .accept_interrupt(event.vector, event.level_triggered);
+        self.log_ipi_diag("accept", event.vector);
         self.pending_events.pop_front();
     }
 
@@ -998,6 +1005,17 @@ impl SvmVcpu {
         vmcb.control.event_inj.set(0);
         vmcb.control.event_inj_err.set(0);
         vmcb.control.clean_bits.set(0);
+    }
+
+    fn log_ipi_diag(&self, stage: &str, vector: u8) {
+        if vector >= 0xf0 && IPI_SVM_DIAG_COUNT.fetch_add(1, Ordering::Relaxed) < IPI_DIAG_LIMIT {
+            warn!(
+                "[ipi-diag] svm {stage} vcpu={} vector={vector:#x} armed={:?} queued={}",
+                self.vcpu_id,
+                self.virtual_interrupt_vector(),
+                self.pending_events.len()
+            );
+        }
     }
 
     fn reinject_interrupted_event(&mut self) {

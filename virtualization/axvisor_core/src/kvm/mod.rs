@@ -25,7 +25,7 @@ mod vcpu;
 mod vm;
 
 use alloc::{collections::BTreeMap, vec::Vec};
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 pub use abi::public::*;
 use abi::*;
@@ -46,6 +46,9 @@ use crate::vmm::interrupt::{InterruptRoute, VirtualInterrupt};
 
 static REGISTERED: AtomicBool = AtomicBool::new(false);
 static NEXT_CONTROL_FILE_ID: AtomicU64 = AtomicU64::new(1);
+const IPI_DIAG_LIMIT: usize = 128;
+static IPI_QUEUE_DIAG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static IPI_DRAIN_DIAG_COUNT: AtomicUsize = AtomicUsize::new(0);
 pub(in crate::kvm) static CONTROL_FILES: Mutex<
     BTreeMap<api_control::ControlFileId, ControlFileState>,
 > = Mutex::new(BTreeMap::new());
@@ -136,6 +139,17 @@ pub(crate) fn queue_control_vcpu_interrupt(route: InterruptRoute) -> AxResult {
     let Some(ControlFileState::Vcpu(vcpu)) = control_files.get_mut(&vcpu_file) else {
         return Err(AxError::NotFound);
     };
+    if route.interrupt.vector >= 0xf0
+        && IPI_QUEUE_DIAG_COUNT.fetch_add(1, Ordering::Relaxed) < IPI_DIAG_LIMIT
+    {
+        warn!(
+            "[ipi-diag] queue vm={} vcpu={} vector={:#x} pending_before={}",
+            route.vm_id,
+            route.vcpu_id,
+            route.interrupt.vector,
+            vcpu.pending_interrupts.len()
+        );
+    }
     vcpu.halted = false;
     vcpu.pending_interrupts.push_back(route.interrupt);
     Ok(())
@@ -234,7 +248,18 @@ pub(in crate::kvm) fn take_control_vcpu_interrupts(
     if !vcpu.pending_interrupts.is_empty() {
         vcpu.halted = false;
     }
-    vcpu.pending_interrupts.drain(..).collect()
+    let pending: Vec<_> = vcpu.pending_interrupts.drain(..).collect();
+    for interrupt in &pending {
+        if interrupt.vector >= 0xf0
+            && IPI_DRAIN_DIAG_COUNT.fetch_add(1, Ordering::Relaxed) < IPI_DIAG_LIMIT
+        {
+            warn!(
+                "[ipi-diag] drain vcpu={} vector={:#x}",
+                vcpu.vcpu_id, interrupt.vector
+            );
+        }
+    }
+    pending
 }
 
 fn next_control_file_id() -> AxResult<api_control::ControlFileId> {
