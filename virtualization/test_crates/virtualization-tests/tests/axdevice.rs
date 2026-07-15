@@ -325,14 +325,32 @@ fn device_config(
     base_gpa: usize,
     length: usize,
 ) -> EmulatedDeviceConfig {
+    device_config_with_args(name, emu_type, base_gpa, length, vec![])
+}
+
+fn device_config_with_args(
+    name: &str,
+    emu_type: EmulatedDeviceType,
+    base_gpa: usize,
+    length: usize,
+    cfg_list: Vec<usize>,
+) -> EmulatedDeviceConfig {
     EmulatedDeviceConfig {
         name: String::from(name),
         base_gpa,
         length,
         irq_id: 0,
         emu_type,
-        cfg_list: vec![],
+        cfg_list,
     }
+}
+
+fn build_ivc_devices(config: EmulatedDeviceConfig) -> DeviceRuntime {
+    let mut factories = DeviceFactoryRegistry::new();
+    register_builtin_factories(&mut factories).unwrap();
+    let resolver = RejectingIrqResolver;
+    let context = DeviceBuildContext::new(&resolver);
+    DeviceRuntime::build_with_factories(&[config], &factories, &context).unwrap()
 }
 
 struct RejectingIrqResolver;
@@ -920,6 +938,31 @@ fn test_build_with_factories_accepts_ivc_config() {
     .unwrap();
 
     assert_eq!(devices.devices().count(), 0);
+}
+
+#[test]
+fn test_ivc_notify_irq_is_optional() {
+    let devices = build_ivc_devices(device_config(
+        "ivc",
+        EmulatedDeviceType::IVCChannel,
+        0x4_0000,
+        0x2000,
+    ));
+
+    assert_eq!(devices.ivc_notify_irq(), None);
+}
+
+#[test]
+fn test_ivc_notify_irq_uses_first_config_arg() {
+    let devices = build_ivc_devices(device_config_with_args(
+        "ivc",
+        EmulatedDeviceType::IVCChannel,
+        0x4_0000,
+        0x2000,
+        vec![33],
+    ));
+
+    assert_eq!(devices.ivc_notify_irq(), Some(33));
 }
 
 #[test]

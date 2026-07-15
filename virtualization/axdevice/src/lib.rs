@@ -62,7 +62,7 @@ pub use loongarch_pch_pic::{
     LoongArchPchPic, LoongArchPchPicFactory, PchPicOutputEvent, PchPicOutputPort,
     PchPicOutputPortKey,
 };
-pub use range_alloc::{GuestRangeAllocator, GuestRangeAllocatorKey};
+pub use range_alloc::{GuestRangeAllocator, GuestRangeAllocatorKey, IvcNotifyIrqKey};
 pub use registration::{DeviceBundle, DeviceLifecycle, DeviceRegistration, PollableDeviceOps};
 pub use service::{DeviceServices, ServiceCardinality, ServiceKey};
 #[cfg(target_arch = "x86_64")]

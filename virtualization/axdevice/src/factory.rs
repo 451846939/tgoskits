@@ -20,7 +20,7 @@ use axdevice_base::{InterruptTriggerMode, IrqLine};
 use axvm_types::{EmulatedDeviceConfig, EmulatedDeviceType};
 
 use crate::{
-    DeviceBundle, DeviceManagerError, DeviceManagerResult, GuestRangeAllocatorKey,
+    DeviceBundle, DeviceManagerError, DeviceManagerResult, GuestRangeAllocatorKey, IvcNotifyIrqKey,
     range_alloc::IvcGuestRangeAllocator,
 };
 
@@ -154,7 +154,11 @@ impl DeviceFactory for IvcChannelFactory {
         _context: &DeviceBuildContext<'_>,
     ) -> DeviceManagerResult<DeviceBundle> {
         let allocator = IvcGuestRangeAllocator::new(config.base_gpa, config.length)?.into_service();
-        DeviceBundle::new().with_service::<GuestRangeAllocatorKey>(allocator)
+        let mut bundle = DeviceBundle::new().with_service::<GuestRangeAllocatorKey>(allocator)?;
+        if let Some(notify_irq) = config.cfg_list.first().copied() {
+            bundle.provide_service::<IvcNotifyIrqKey>(Arc::new(notify_irq))?;
+        }
+        Ok(bundle)
     }
 }
 

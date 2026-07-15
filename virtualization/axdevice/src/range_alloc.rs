@@ -26,6 +26,16 @@ impl ServiceKey for GuestRangeAllocatorKey {
     const CARDINALITY: ServiceCardinality = ServiceCardinality::Single;
 }
 
+/// Type key for the optional VM-local IRQ used by IVC peer notification.
+pub struct IvcNotifyIrqKey;
+
+impl ServiceKey for IvcNotifyIrqKey {
+    type Service = usize;
+
+    const NAME: &'static str = "ivc-notify-irq";
+    const CARDINALITY: ServiceCardinality = ServiceCardinality::Single;
+}
+
 /// IVC's allocator over the guest range reserved during VM preparation.
 pub(crate) struct IvcGuestRangeAllocator {
     ranges: Mutex<RangeAllocator>,

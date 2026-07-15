@@ -23,7 +23,8 @@ use axvm_types::{EmulatedDeviceConfig, GuestPhysAddr};
 
 use crate::{
     DeviceBuildContext, DeviceBundle, DeviceFactoryRegistry, DeviceLifecycle, DeviceManagerError,
-    DeviceManagerResult, DeviceServices, GuestRangeAllocatorKey, PollableDeviceOps,
+    DeviceManagerResult, DeviceServices, GuestRangeAllocatorKey, IvcNotifyIrqKey,
+    PollableDeviceOps,
 };
 
 /// Runtime backend for access-scoped virtual timer requests.
@@ -380,6 +381,14 @@ impl DeviceRuntime {
         self.services
             .require::<GuestRangeAllocatorKey>()?
             .allocate(size)
+    }
+
+    /// Returns the optional VM-local IRQ line used by IVC notify.
+    pub fn ivc_notify_irq(&self) -> Option<usize> {
+        self.services
+            .require::<IvcNotifyIrqKey>()
+            .ok()
+            .map(|irq| *irq)
     }
 
     /// Releases an IVC channel at the specified address and size.
