@@ -372,15 +372,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "arceos-loongarch-unaligned-fixup"
-version = "0.1.0"
-dependencies = [
- "ax-cpu",
- "ax-hal",
- "ax-std",
-]
-
-[[package]]
 name = "arceos-ivc-publisher"
 version = "0.1.0"
 dependencies = [
@@ -398,6 +389,15 @@ dependencies = [
  "ax-std",
  "axhvc",
  "axivc",
+]
+
+[[package]]
+name = "arceos-loongarch-unaligned-fixup"
+version = "0.1.0"
+dependencies = [
+ "ax-cpu",
+ "ax-hal",
+ "ax-std",
 ]
 
 [[package]]
