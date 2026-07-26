@@ -185,8 +185,7 @@ fn supported_cpuid_entries_x86_64() -> Vec<KvmCpuidEntry2> {
         }
     }
     if max_basic >= 0xd {
-        push_host_cpuid(&mut entries, 0xd, 0, abi::KVM_CPUID_FLAG_SIGNIFICANT_INDEX);
-        push_host_cpuid(&mut entries, 0xd, 1, abi::KVM_CPUID_FLAG_SIGNIFICANT_INDEX);
+        push_xsave_cpuid(&mut entries);
     }
     if max_basic >= 0x15 {
         push_host_cpuid(&mut entries, 0x15, 0, 0);
@@ -226,6 +225,56 @@ fn push_host_cpuid(entries: &mut Vec<KvmCpuidEntry2>, function: u32, index: u32,
 }
 
 #[cfg(target_arch = "x86_64")]
+fn push_xsave_cpuid(entries: &mut Vec<KvmCpuidEntry2>) {
+    const LEGACY_XSAVE_AREA_SIZE: u32 = 576;
+    const AMX_TILECFG: u64 = 1 << 17;
+    const AMX_TILEDATA: u64 = 1 << 18;
+
+    let leaf0 = host_cpuid(0xd, 0);
+    let mut supported = u64::from(leaf0.eax) | (u64::from(leaf0.edx) << 32);
+    supported &= !(AMX_TILECFG | AMX_TILEDATA);
+
+    let mut components = Vec::new();
+    let mut max_size = LEGACY_XSAVE_AREA_SIZE;
+    for index in 2..64 {
+        if supported & (1u64 << index) == 0 {
+            continue;
+        }
+        let mut component = host_cpuid(0xd, index);
+        let Some(end) = component.ebx.checked_add(component.eax) else {
+            supported &= !(1u64 << index);
+            continue;
+        };
+        if component.eax == 0 || end > abi::KVM_X86_XSAVE_SIZE {
+            supported &= !(1u64 << index);
+            continue;
+        }
+        max_size = max_size.max(end);
+        component.flags = abi::KVM_CPUID_FLAG_SIGNIFICANT_INDEX;
+        components.push(component);
+    }
+
+    entries.push(KvmCpuidEntry2 {
+        function: 0xd,
+        index: 0,
+        flags: abi::KVM_CPUID_FLAG_SIGNIFICANT_INDEX,
+        eax: supported as u32,
+        ebx: max_size,
+        ecx: max_size,
+        edx: (supported >> 32) as u32,
+    });
+
+    let mut leaf1 = host_cpuid(0xd, 1);
+    leaf1.flags = abi::KVM_CPUID_FLAG_SIGNIFICANT_INDEX;
+    leaf1.eax &= 1; // XSAVEOPT does not add supervisor-state components.
+    leaf1.ebx = 0;
+    leaf1.ecx = 0;
+    leaf1.edx = 0;
+    entries.push(leaf1);
+    entries.extend(components);
+}
+
+#[cfg(target_arch = "x86_64")]
 fn host_tsc_frequency_mhz() -> u32 {
     const FALLBACK_TSC_FREQUENCY_MHZ: u32 = 3_000;
     axvisor_api::arch::host_tsc_frequency_mhz().unwrap_or(FALLBACK_TSC_FREQUENCY_MHZ)
@@ -251,11 +300,22 @@ fn host_cpuid(function: u32, index: u32) -> KvmCpuidEntry2 {
 
     match function {
         1 => {
+            const CPUID_MCE: u32 = 1 << 7;
+            const CPUID_MTRR: u32 = 1 << 12;
+            const CPUID_MCA: u32 = 1 << 14;
             entry.ecx |= 1 << 31; // hypervisor present
             entry.ecx &= !(1 << 5); // VMX
+            entry.edx &= !(CPUID_MCE | CPUID_MTRR | CPUID_MCA);
         }
         0x8000_0001 => {
             entry.ecx &= !(1 << 2); // SVM
+        }
+        7 => {
+            const AMX_FEATURES: u32 = (1 << 22) | (1 << 24) | (1 << 25);
+            entry.edx &= !AMX_FEATURES;
+            if index == 1 {
+                entry.eax &= !(1 << 21); // AMX-FP16
+            }
         }
         _ => {}
     }

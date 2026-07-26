@@ -130,6 +130,26 @@ pub enum AxVCpuExitReason {
         width: AccessWidth,
     },
 
+    /// The guest performed one element of a string port-I/O read.
+    IoStringRead {
+        /// I/O port number being read from.
+        port: Port,
+        /// Width of one string-I/O element.
+        width: AccessWidth,
+        /// Guest physical destination address for this element.
+        addr: GuestPhysAddr,
+        /// Whether the instruction has a REP prefix.
+        repeat: bool,
+        /// Number of elements remaining before this element completes.
+        remaining: u64,
+        /// RIP following the string-I/O instruction.
+        next_rip: u64,
+        /// Effective address size in bits.
+        address_size: u8,
+        /// Whether RFLAGS.DF requests decrementing the index.
+        decrement: bool,
+    },
+
     /// The guest performed a port-based I/O write operation.
     ///
     /// **Architecture**: x86-specific (other architectures don't have port I/O)

@@ -88,6 +88,10 @@ impl IOPm {
             self.set_intercept(port, intercept)
         }
     }
+
+    pub fn set_intercept_all(&mut self) {
+        self.frames.fill(u8::MAX);
+    }
 }
 
 /// SVM MSR permissions map. Each MSR has separate read/write intercept bits.

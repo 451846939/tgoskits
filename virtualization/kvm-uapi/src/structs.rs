@@ -65,6 +65,23 @@ pub struct KvmIrqFd {
     pub resamplefd: u32,
 }
 
+/// Payload for `KVM_IRQ_LINE`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KvmIrqLevel {
+    pub irq: u32,
+    pub level: u32,
+}
+
+/// Payload for `KVM_SIGNAL_MSI`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KvmMsi {
+    pub address_lo: u32,
+    pub address_hi: u32,
+    pub data: u32,
+    pub flags: u32,
+    pub devid: u32,
+}
+
 /// Payload for `KVM_ENABLE_CAP`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KvmEnableCap {

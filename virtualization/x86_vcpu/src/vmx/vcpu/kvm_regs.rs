@@ -17,7 +17,8 @@ use ax_errno::AxResult;
 use super::VmxVcpu;
 use crate::{
     kvm::{
-        KVM_REGS_SIZE, KVM_SREGS_SIZE, KvmDtable, KvmRegs, KvmSegment, KvmSregs, map_kvm_uapi_error,
+        KVM_DEBUGREGS_SIZE, KVM_REGS_SIZE, KVM_SREGS_SIZE, KvmDebugregs, KvmDtable, KvmRegs,
+        KvmSegment, KvmSregs, map_kvm_uapi_error,
     },
     vmx::{
         vmcs,
@@ -26,16 +27,35 @@ use crate::{
 };
 
 impl VmxVcpu {
+    pub(super) fn encode_kvm_debugregs(&self, buf: &mut [u8]) -> AxResult {
+        if buf.len() != KVM_DEBUGREGS_SIZE {
+            return ax_errno::ax_err!(InvalidInput);
+        }
+        KvmDebugregs {
+            db: self.debugregs.guest_db,
+            dr6: self.guest_dr6,
+            dr7: VmcsGuestNW::DR7.read()? as u64,
+            flags: 0,
+            reserved: [0; 9],
+        }
+        .encode(buf)
+        .map_err(map_kvm_uapi_error)
+    }
+
+    pub(super) fn decode_kvm_debugregs(&mut self, buf: &[u8]) -> AxResult {
+        let regs = KvmDebugregs::decode(buf).map_err(map_kvm_uapi_error)?;
+        if regs.flags != 0 || regs.reserved.iter().any(|value| *value != 0) {
+            return ax_errno::ax_err!(InvalidInput);
+        }
+        self.debugregs.guest_db = regs.db;
+        self.guest_dr6 = regs.dr6;
+        VmcsGuestNW::DR7.write(regs.dr7 as usize)
+    }
+
     pub(super) fn encode_kvm_regs(&self, buf: &mut [u8]) -> AxResult {
         if buf.len() != KVM_REGS_SIZE {
             return ax_errno::ax_err!(InvalidInput);
         }
-        self.bind_to_current_processor()?;
-        let result = self.encode_kvm_regs_loaded(buf);
-        finish_vmcs_access(self, result)
-    }
-
-    fn encode_kvm_regs_loaded(&self, buf: &mut [u8]) -> AxResult {
         let regs = self.regs();
         KvmRegs {
             rax: regs.rax,
@@ -62,12 +82,6 @@ impl VmxVcpu {
     }
 
     pub(super) fn decode_kvm_regs(&mut self, buf: &[u8]) -> AxResult {
-        self.bind_to_current_processor()?;
-        let result = self.decode_kvm_regs_loaded(buf);
-        finish_vmcs_access(self, result)
-    }
-
-    fn decode_kvm_regs_loaded(&mut self, buf: &[u8]) -> AxResult {
         let kvm_regs = KvmRegs::decode(buf).map_err(map_kvm_uapi_error)?;
         let regs = self.regs_mut();
         regs.rax = kvm_regs.rax;
@@ -95,12 +109,6 @@ impl VmxVcpu {
         if buf.len() != KVM_SREGS_SIZE {
             return ax_errno::ax_err!(InvalidInput);
         }
-        self.bind_to_current_processor()?;
-        let result = self.encode_kvm_sregs_loaded(buf);
-        finish_vmcs_access(self, result)
-    }
-
-    fn encode_kvm_sregs_loaded(&self, buf: &mut [u8]) -> AxResult {
         KvmSregs {
             cs: read_segment(
                 VmcsGuest16::CS_SELECTOR,
@@ -172,12 +180,6 @@ impl VmxVcpu {
     }
 
     pub(super) fn decode_kvm_sregs(&mut self, buf: &[u8]) -> AxResult {
-        self.bind_to_current_processor()?;
-        let result = self.decode_kvm_sregs_loaded(buf);
-        finish_vmcs_access(self, result)
-    }
-
-    fn decode_kvm_sregs_loaded(&mut self, buf: &[u8]) -> AxResult {
         let sregs = KvmSregs::decode(buf).map_err(map_kvm_uapi_error)?;
         write_segment(
             VmcsGuest16::CS_SELECTOR,
@@ -245,17 +247,6 @@ impl VmxVcpu {
         VmcsGuest64::IA32_EFER.write(sregs.efer)?;
         vmcs::update_efer()?;
         Ok(())
-    }
-}
-
-fn finish_vmcs_access(vcpu: &VmxVcpu, result: AxResult) -> AxResult {
-    let unbind_result = vcpu.unbind_from_current_processor();
-    match result {
-        Ok(()) => unbind_result,
-        Err(err) => {
-            let _ = unbind_result;
-            Err(err)
-        }
     }
 }
 

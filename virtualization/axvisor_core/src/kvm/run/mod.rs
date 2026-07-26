@@ -15,6 +15,8 @@
 use ax_errno::{AxErrorKind, AxResult, ax_err};
 use axvcpu::AxVCpuExitReason;
 use axvisor_api::control as api_control;
+#[cfg(target_arch = "x86_64")]
+use kvm_uapi::x86::KvmRegs;
 
 mod exit;
 #[cfg(target_arch = "riscv64")]
@@ -25,8 +27,11 @@ use exit::{complete_io_read, complete_mmio_read, kvm_exit_reason, prepare_usersp
 #[cfg(target_arch = "riscv64")]
 use riscv::{handle_cpu_up, handle_send_ipi};
 #[cfg(target_arch = "x86_64")]
+pub(in crate::kvm) use x86::apply_kvm_pv_msr_write;
+#[cfg(target_arch = "x86_64")]
 use x86::{
-    handle_cpu_up, handle_in_kernel_device_exit, handle_kvm_msr_write, inject_in_kernel_device_irqs,
+    handle_control_ioapic_eoi, handle_cpu_up, handle_in_kernel_device_exit, handle_kvm_msr_write,
+    inject_in_kernel_device_irqs,
 };
 use x86::{update_vcpu_run_interrupt_state, vcpu_run_irq_window_open};
 
@@ -50,6 +55,7 @@ pub(in crate::kvm) fn run_vcpu_file(control_file: api_control::ControlFileId) ->
         pending_io_read,
         irqchip_created,
         pit2_created,
+        first_run,
     ) = {
         let mut control_files = CONTROL_FILES.lock();
         let Some(ControlFileState::Vcpu(vcpu)) = control_files.get(&control_file) else {
@@ -69,6 +75,8 @@ pub(in crate::kvm) fn run_vcpu_file(control_file: api_control::ControlFileId) ->
         else {
             return ax_err!(NotFound);
         };
+        let first_run = !vcpu_file_state.run_diagnostic_started;
+        vcpu_file_state.run_diagnostic_started = true;
         vcpu_file_state.pending_mmio_read = None;
         vcpu_file_state.pending_io_read = None;
         let Some(vcpu) = vm.vcpu(vcpu_id) else {
@@ -83,14 +91,20 @@ pub(in crate::kvm) fn run_vcpu_file(control_file: api_control::ControlFileId) ->
             pending_io_read,
             irqchip_created,
             pit2_created,
+            first_run,
         )
     };
     #[cfg(not(target_arch = "x86_64"))]
-    let _ = (irqchip_created, pit2_created);
+    let _ = (irqchip_created, pit2_created, first_run);
 
     let _context_guard = crate::context::bind_current_vcpu_context(vm.id(), vcpu_id);
 
-    if mp_state == abi::KVM_MP_STATE_STOPPED {
+    #[cfg(target_arch = "x86_64")]
+    if first_run {
+        crate::println!("KVM_RUN enter: vCPU {vcpu_id}, MP state {mp_state}");
+    }
+
+    if mp_state != abi::KVM_MP_STATE_RUNNABLE {
         wait_until_vcpu_runnable(control_file)?;
     }
 
@@ -102,7 +116,7 @@ pub(in crate::kvm) fn run_vcpu_file(control_file: api_control::ControlFileId) ->
         complete_mmio_read(control_file, &vcpu, pending)?;
     }
     if let Some(pending) = pending_io_read {
-        complete_io_read(control_file, &vcpu, pending)?;
+        complete_io_read(control_file, &vm, &vcpu, pending)?;
     }
 
     update_vcpu_run_interrupt_state(control_file, &vcpu)?;
@@ -110,6 +124,8 @@ pub(in crate::kvm) fn run_vcpu_file(control_file: api_control::ControlFileId) ->
         return Err(AxErrorKind::Interrupted.into());
     }
 
+    #[cfg(target_arch = "x86_64")]
+    let mut internal_exit_count = 0u64;
     let exit_reason = loop {
         for interrupt in take_control_vcpu_interrupts(control_file) {
             inject_virtual_interrupt(interrupt, &vcpu)?;
@@ -137,6 +153,14 @@ pub(in crate::kvm) fn run_vcpu_file(control_file: api_control::ControlFileId) ->
         };
 
         #[cfg(target_arch = "x86_64")]
+        if mark_first_exit_logged(control_file)? {
+            crate::println!(
+                "KVM_RUN first exit: vCPU {vcpu_id}, RIP {:#x}, {exit_reason:?}",
+                kvm_vcpu_rip(&vcpu).unwrap_or(u64::MAX)
+            );
+        }
+
+        #[cfg(target_arch = "x86_64")]
         if handle_in_kernel_device_exit(&vm, &vcpu, irqchip_created, pit2_created, &exit_reason)? {
             continue;
         }
@@ -147,6 +171,24 @@ pub(in crate::kvm) fn run_vcpu_file(control_file: api_control::ControlFileId) ->
             | AxVCpuExitReason::ExternalInterrupt { .. }
             | AxVCpuExitReason::InterruptEnd { .. } => {
                 crate::vmm::vcpus::handle_internal_exit(&vm, &vcpu, &exit_reason);
+                #[cfg(target_arch = "x86_64")]
+                {
+                    if let AxVCpuExitReason::InterruptEnd { vector } = exit_reason {
+                        handle_control_ioapic_eoi(&vm, &vcpu, irqchip_created, vector);
+                    }
+                    inject_in_kernel_device_irqs(&vm, &vcpu, irqchip_created, pit2_created);
+                }
+                #[cfg(target_arch = "x86_64")]
+                {
+                    internal_exit_count += 1;
+                    if matches!(internal_exit_count, 1024 | 65_536) {
+                        crate::println!(
+                            "KVM_RUN internal exits: vCPU {vcpu_id}, count {internal_exit_count}, \
+                             RIP {:#x}, {exit_reason:?}",
+                            kvm_vcpu_rip(&vcpu).unwrap_or(u64::MAX)
+                        );
+                    }
+                }
                 axvisor_api::task::yield_now();
             }
             #[cfg(target_arch = "x86_64")]
@@ -177,6 +219,7 @@ pub(in crate::kvm) fn run_vcpu_file(control_file: api_control::ControlFileId) ->
             AxVCpuExitReason::SysRegWrite { addr, value }
                 if handle_kvm_msr_write(&vm, addr.addr(), value)? =>
             {
+                super::set_emulated_msr(control_file, addr.addr() as u32, value)?;
                 axvisor_api::task::yield_now();
             }
             #[cfg(target_arch = "x86_64")]
@@ -242,12 +285,30 @@ pub(in crate::kvm) fn run_vcpu_file(control_file: api_control::ControlFileId) ->
     Ok(0)
 }
 
+#[cfg(target_arch = "x86_64")]
+fn kvm_vcpu_rip(vcpu: &axvm::AxVCpuRef) -> Option<u64> {
+    let mut bytes = [0u8; abi::KVM_X86_REGS_SIZE as usize];
+    vcpu.get_kvm_regs(&mut bytes).ok()?;
+    KvmRegs::decode(&bytes).ok().map(|regs| regs.rip)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn mark_first_exit_logged(control_file: api_control::ControlFileId) -> AxResult<bool> {
+    let mut control_files = CONTROL_FILES.lock();
+    let Some(ControlFileState::Vcpu(vcpu)) = control_files.get_mut(&control_file) else {
+        return ax_err!(NotFound);
+    };
+    let first_exit = !vcpu.exit_diagnostic_logged;
+    vcpu.exit_diagnostic_logged = true;
+    Ok(first_exit)
+}
+
 fn wait_until_vcpu_runnable(control_file: api_control::ControlFileId) -> AxResult {
     loop {
         if read_vcpu_run_u8(control_file, abi::KVM_RUN_IMMEDIATE_EXIT_OFFSET)? != 0 {
             return Err(AxErrorKind::Interrupted.into());
         }
-        if current_vcpu_mp_state(control_file)? != abi::KVM_MP_STATE_STOPPED {
+        if current_vcpu_mp_state(control_file)? == abi::KVM_MP_STATE_RUNNABLE {
             return Ok(());
         }
         axvisor_api::task::yield_now();

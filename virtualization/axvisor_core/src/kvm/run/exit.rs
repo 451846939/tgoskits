@@ -13,8 +13,12 @@
 // limitations under the License.
 
 use ax_errno::{AxResult, ax_err};
+#[cfg(target_arch = "x86_64")]
+use axaddrspace::device::AccessWidth;
 use axvcpu::AxVCpuExitReason;
 use axvisor_api::control as api_control;
+#[cfg(target_arch = "x86_64")]
+use kvm_uapi::x86::KvmRegs;
 
 use super::super::{CONTROL_FILES, ControlFileState};
 use crate::kvm::{
@@ -29,7 +33,9 @@ use crate::kvm::{
 pub(super) fn kvm_exit_reason(exit_reason: &AxVCpuExitReason) -> u32 {
     match exit_reason {
         AxVCpuExitReason::Halt => abi::KVM_EXIT_HLT,
-        AxVCpuExitReason::IoRead { .. } | AxVCpuExitReason::IoWrite { .. } => abi::KVM_EXIT_IO,
+        AxVCpuExitReason::IoRead { .. }
+        | AxVCpuExitReason::IoStringRead { .. }
+        | AxVCpuExitReason::IoWrite { .. } => abi::KVM_EXIT_IO,
         AxVCpuExitReason::MmioRead { .. } | AxVCpuExitReason::MmioWrite { .. } => {
             abi::KVM_EXIT_MMIO
         }
@@ -120,7 +126,49 @@ pub(super) fn prepare_userspace_exit(
             let Some(ControlFileState::Vcpu(vcpu)) = control_files.get_mut(&control_file) else {
                 return ax_err!(NotFound);
             };
-            vcpu.pending_io_read = Some(PendingIoRead { width: *width });
+            vcpu.pending_io_read = Some(PendingIoRead::Accumulator { width: *width });
+        }
+        AxVCpuExitReason::IoStringRead {
+            port,
+            width,
+            addr,
+            repeat,
+            remaining,
+            next_rip,
+            address_size,
+            decrement,
+        } => {
+            write_vcpu_run_u8(
+                control_file,
+                abi::KVM_RUN_IO_DIRECTION_OFFSET,
+                abi::KVM_EXIT_IO_IN,
+            )?;
+            write_vcpu_run_u8(
+                control_file,
+                abi::KVM_RUN_IO_SIZE_OFFSET,
+                access_width_bytes(*width) as u8,
+            )?;
+            write_vcpu_run_u16(control_file, abi::KVM_RUN_IO_PORT_OFFSET, port.number())?;
+            write_vcpu_run_u32(control_file, abi::KVM_RUN_IO_COUNT_OFFSET, 1)?;
+            write_vcpu_run_u64(
+                control_file,
+                abi::KVM_RUN_IO_DATA_OFFSET_OFFSET,
+                abi::KVM_RUN_IO_DATA_OFFSET as u64,
+            )?;
+
+            let mut control_files = CONTROL_FILES.lock();
+            let Some(ControlFileState::Vcpu(vcpu)) = control_files.get_mut(&control_file) else {
+                return ax_err!(NotFound);
+            };
+            vcpu.pending_io_read = Some(PendingIoRead::String {
+                width: *width,
+                addr: *addr,
+                repeat: *repeat,
+                remaining: *remaining,
+                next_rip: *next_rip,
+                address_size: *address_size,
+                decrement: *decrement,
+            });
         }
         AxVCpuExitReason::IoWrite { port, width, data } => {
             let mmap_area = control_file_mmap_area(control_file)?;
@@ -173,14 +221,92 @@ pub(super) fn complete_mmio_read(
 
 pub(super) fn complete_io_read(
     control_file: api_control::ControlFileId,
+    _vm: &axvm::AxVMRef,
     vcpu: &axvm::AxVCpuRef,
     pending: PendingIoRead,
 ) -> AxResult {
     let mmap_area = control_file_mmap_area(control_file)?;
     let mut bytes = [0u8; 8];
-    let len = access_width_bytes(pending.width) as usize;
+    let width = match pending {
+        PendingIoRead::Accumulator { width } | PendingIoRead::String { width, .. } => width,
+    };
+    let len = access_width_bytes(width) as usize;
     api_control::read_mmap_area(mmap_area, abi::KVM_RUN_IO_DATA_OFFSET, &mut bytes[..len])?;
-    let value = u64::from_ne_bytes(bytes) as usize & access_width_mask(pending.width);
-    vcpu.set_gpr(abi::X86_RAX_REG_INDEX, value);
+    match pending {
+        PendingIoRead::Accumulator { width } => {
+            let value = u64::from_ne_bytes(bytes) as usize & access_width_mask(width);
+            vcpu.set_gpr(abi::X86_RAX_REG_INDEX, value);
+        }
+        PendingIoRead::String {
+            width,
+            addr,
+            repeat,
+            remaining,
+            next_rip,
+            address_size,
+            decrement,
+        } => {
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                let _ = (
+                    width,
+                    addr,
+                    repeat,
+                    remaining,
+                    next_rip,
+                    address_size,
+                    decrement,
+                );
+                return ax_err!(Unsupported);
+            }
+            #[cfg(target_arch = "x86_64")]
+            {
+                match width {
+                    AccessWidth::Byte => _vm.write_to_guest_of(addr, &bytes[0])?,
+                    AccessWidth::Word => {
+                        _vm.write_to_guest_of(addr, &u16::from_ne_bytes([bytes[0], bytes[1]]))?
+                    }
+                    AccessWidth::Dword => _vm.write_to_guest_of(
+                        addr,
+                        &u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+                    )?,
+                    AccessWidth::Qword => return ax_err!(InvalidInput),
+                }
+                let mut regs_bytes = [0; abi::KVM_X86_REGS_SIZE as usize];
+                vcpu.get_kvm_regs(&mut regs_bytes)?;
+                let mut regs =
+                    KvmRegs::decode(&regs_bytes).map_err(|_| ax_errno::AxError::InvalidData)?;
+                let delta = u64::from(access_width_bytes(width));
+                regs.rdi = update_string_register(regs.rdi, delta, address_size, decrement);
+                let completed = !repeat || remaining <= 1;
+                if repeat {
+                    regs.rcx = update_string_register(regs.rcx, 1, address_size, true);
+                }
+                if completed {
+                    regs.rip = next_rip;
+                }
+                regs.encode(&mut regs_bytes)
+                    .map_err(|_| ax_errno::AxError::InvalidData)?;
+                vcpu.set_kvm_regs(&regs_bytes)?;
+            }
+        }
+    }
     Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
+fn update_string_register(value: u64, delta: u64, address_size: u8, decrement: bool) -> u64 {
+    let update = |value: u64, mask: u64| {
+        let next = if decrement {
+            value.wrapping_sub(delta)
+        } else {
+            value.wrapping_add(delta)
+        };
+        next & mask
+    };
+    match address_size {
+        16 => (value & !0xffff) | update(value, 0xffff),
+        32 => update(value, 0xffff_ffff),
+        _ => update(value, u64::MAX),
+    }
 }

@@ -321,24 +321,63 @@ impl<A: AxArchVCpu> AxVCpu<A> {
         self.get_arch_vcpu().set_arch_reg(reg_id, value)
     }
 
+    /// Returns an x86 KVM MSR value while the target vCPU is bound.
+    pub fn get_kvm_msr(&self, index: u32) -> AxResult<u64> {
+        self.with_bound_arch_vcpu(|vcpu| vcpu.get_kvm_msr(index))
+    }
+
+    /// Applies an x86 KVM MSR value while the target vCPU is bound.
+    pub fn set_kvm_msr(&self, index: u32, value: u64) -> AxResult {
+        self.with_bound_arch_vcpu(|vcpu| vcpu.set_kvm_msr(index, value))
+    }
+
+    /// Writes the x86 KVM debug-register state while the target vCPU is bound.
+    pub fn get_kvm_debugregs(&self, buf: &mut [u8]) -> AxResult {
+        self.with_bound_arch_vcpu(|vcpu| vcpu.get_kvm_debugregs(buf))
+    }
+
+    /// Reads the x86 KVM debug-register state while the target vCPU is bound.
+    pub fn set_kvm_debugregs(&self, buf: &[u8]) -> AxResult {
+        self.with_bound_arch_vcpu(|vcpu| vcpu.set_kvm_debugregs(buf))
+    }
+
     /// Writes the KVM-compatible general register state into `buf`.
     pub fn get_kvm_regs(&self, buf: &mut [u8]) -> AxResult {
-        self.get_arch_vcpu().get_kvm_regs(buf)
+        self.with_bound_arch_vcpu(|vcpu| vcpu.get_kvm_regs(buf))
     }
 
     /// Reads the KVM-compatible general register state from `buf`.
     pub fn set_kvm_regs(&self, buf: &[u8]) -> AxResult {
-        self.get_arch_vcpu().set_kvm_regs(buf)
+        self.with_bound_arch_vcpu(|vcpu| vcpu.set_kvm_regs(buf))
     }
 
     /// Writes the KVM-compatible special register state into `buf`.
     pub fn get_kvm_sregs(&self, buf: &mut [u8]) -> AxResult {
-        self.get_arch_vcpu().get_kvm_sregs(buf)
+        self.with_bound_arch_vcpu(|vcpu| vcpu.get_kvm_sregs(buf))
     }
 
     /// Reads the KVM-compatible special register state from `buf`.
     pub fn set_kvm_sregs(&self, buf: &[u8]) -> AxResult {
-        self.get_arch_vcpu().set_kvm_sregs(buf)
+        self.with_bound_arch_vcpu(|vcpu| vcpu.set_kvm_sregs(buf))
+    }
+
+    fn with_bound_arch_vcpu<F, T>(&self, operation: F) -> AxResult<T>
+    where
+        F: FnOnce(&mut A) -> AxResult<T>,
+    {
+        self.bind()?;
+        let result = self.with_current_cpu_set(|| operation(self.get_arch_vcpu()));
+        let unbind_result = self.unbind();
+        match result {
+            Ok(value) => {
+                unbind_result?;
+                Ok(value)
+            }
+            Err(err) => {
+                let _ = unbind_result;
+                Err(err)
+            }
+        }
     }
 
     /// Inject an interrupt to the VCpu.

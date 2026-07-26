@@ -42,8 +42,16 @@ pub mod public {
     pub const KVM_SET_USER_MEMORY_REGION: u32 = iow(KVMIO, 0x46, KVM_USERSPACE_MEMORY_REGION_SIZE);
     /// Sets the x86 TSS address.
     pub const KVM_SET_TSS_ADDR: u32 = ioc(KVMIO, 0x47);
+    /// Sets the x86 identity-map address used by the in-kernel IRQ chip.
+    pub const KVM_SET_IDENTITY_MAP_ADDR: u32 = iow(KVMIO, 0x48, KVM_IDENTITY_MAP_ADDR_SIZE);
     /// Creates an in-kernel x86 IRQ chip.
     pub const KVM_CREATE_IRQCHIP: u32 = ioc(KVMIO, 0x60);
+    /// Sets the level of an x86 GSI input line.
+    pub const KVM_IRQ_LINE: u32 = iow(KVMIO, 0x61, KVM_IRQ_LEVEL_SIZE);
+    /// Gets the state of an x86 in-kernel interrupt controller.
+    pub const KVM_GET_IRQCHIP: u32 = iowr(KVMIO, 0x62, KVM_IRQCHIP_SIZE);
+    /// Sets the state of an x86 in-kernel interrupt controller.
+    pub const KVM_SET_IRQCHIP: u32 = ior(KVMIO, 0x63, KVM_IRQCHIP_SIZE);
     /// Sets x86 GSI routing.
     pub const KVM_SET_GSI_ROUTING: u32 = iow(KVMIO, 0x6a, KVM_IRQ_ROUTING_SIZE);
     /// Registers or unregisters an eventfd as an x86 interrupt source.
@@ -86,10 +94,14 @@ pub mod public {
     pub const KVM_SET_CPUID2: u32 = iow(KVMIO, 0x90, KVM_CPUID2_SIZE);
     /// Gets x86 CPUID entries configured on this vCPU.
     pub const KVM_GET_CPUID2: u32 = iowr(KVMIO, 0x91, KVM_CPUID2_SIZE);
+    /// Sets the guest physical address of the x86 virtual-APIC page.
+    pub const KVM_SET_VAPIC_ADDR: u32 = iow(KVMIO, 0x93, KVM_VAPIC_ADDR_SIZE);
     /// Returns the vCPU MP state.
     pub const KVM_GET_MP_STATE: u32 = ior(KVMIO, 0x98, KVM_MP_STATE_SIZE);
     /// Sets the vCPU MP state.
     pub const KVM_SET_MP_STATE: u32 = iow(KVMIO, 0x99, KVM_MP_STATE_SIZE);
+    /// Returns the x86 machine-check capabilities available to guests.
+    pub const KVM_X86_GET_MCE_CAP_SUPPORTED: u32 = ior(KVMIO, 0x9d, KVM_X86_MCE_CAP_SIZE);
     /// Gets x86 PIT state.
     pub const KVM_GET_PIT2: u32 = ior(KVMIO, 0x9f, KVM_PIT_STATE2_SIZE);
     /// Gets x86 vCPU event state.
@@ -112,6 +124,8 @@ pub mod public {
     pub const KVM_GET_XSAVE: u32 = ior(KVMIO, 0xa4, KVM_X86_XSAVE_SIZE);
     /// Sets x86 XSAVE state.
     pub const KVM_SET_XSAVE: u32 = iow(KVMIO, 0xa5, KVM_X86_XSAVE_SIZE);
+    /// Injects an x86 MSI into a VM.
+    pub const KVM_SIGNAL_MSI: u32 = iow(KVMIO, 0xa5, KVM_MSI_SIZE);
     /// Gets x86 XCR state.
     pub const KVM_GET_XCRS: u32 = ior(KVMIO, 0xa6, KVM_X86_XCRS_SIZE);
     /// Sets x86 XCR state.
@@ -135,19 +149,24 @@ pub mod public {
     pub const KVM_CAP_NR_MEMSLOTS: usize = 10;
     pub const KVM_CAP_MP_STATE: usize = 14;
     pub const KVM_CAP_DESTROY_MEMORY_REGION_WORKS: usize = 21;
+    pub const KVM_CAP_IRQ_ROUTING: usize = 25;
     pub const KVM_CAP_JOIN_MEMORY_REGIONS_WORKS: usize = 30;
+    pub const KVM_CAP_MCE: usize = 31;
     pub const KVM_CAP_IRQFD: usize = 32;
     pub const KVM_CAP_PIT2: usize = 33;
     pub const KVM_CAP_PIT_STATE2: usize = 35;
     pub const KVM_CAP_IOEVENTFD: usize = 36;
+    pub const KVM_CAP_SET_IDENTITY_MAP_ADDR: usize = 37;
     pub const KVM_CAP_ADJUST_CLOCK: usize = 39;
     pub const KVM_CAP_INTERNAL_ERROR_DATA: usize = 40;
     pub const KVM_CAP_VCPU_EVENTS: usize = 41;
     pub const KVM_CAP_DEBUGREGS: usize = 50;
+    pub const KVM_CAP_X86_ROBUST_SINGLESTEP: usize = 51;
     pub const KVM_CAP_XSAVE: usize = 55;
     pub const KVM_CAP_XCRS: usize = 56;
     pub const KVM_CAP_MAX_VCPUS: usize = 66;
     pub const KVM_CAP_ONE_REG: usize = 70;
+    pub const KVM_CAP_SIGNAL_MSI: usize = 77;
     pub const KVM_CAP_IOEVENTFD_ANY_LENGTH: usize = 122;
     pub const KVM_CAP_IMMEDIATE_EXIT: usize = 136;
     pub const KVM_CAP_XSAVE2: usize = 208;
@@ -170,14 +189,26 @@ pub const KVM_CPUID_ENTRY2_SIZE: usize = 40;
 pub const KVM_MSRS_SIZE: u32 = 8;
 pub const KVM_MSR_ENTRY_SIZE: usize = 16;
 pub const KVM_USERSPACE_MEMORY_REGION_SIZE: u32 = 32;
+pub const KVM_IDENTITY_MAP_ADDR_SIZE: u32 = 8;
 pub const KVM_IOEVENTFD_SIZE: u32 = 64;
 pub const KVM_CLOCK_DATA_SIZE: u32 = 48;
 pub const KVM_IRQ_ROUTING_SIZE: u32 = 8;
+pub const KVM_IRQ_LEVEL_SIZE: u32 = 8;
+pub const KVM_IRQCHIP_SIZE: u32 = 520;
+pub const KVM_IRQCHIP_STATE_SIZE: usize = 512;
+pub const KVM_NR_IRQCHIPS: usize = 3;
+pub const KVM_IRQCHIP_IOAPIC: u32 = 2;
+pub const KVM_IOAPIC_IOREGSEL_OFFSET: usize = 16;
+pub const KVM_IOAPIC_ID_OFFSET: usize = 20;
+pub const KVM_IOAPIC_IRR_OFFSET: usize = 24;
+pub const KVM_IOAPIC_REDIRENT_OFFSET: usize = 32;
 pub const KVM_IRQ_ROUTING_ENTRY_SIZE: usize = 48;
 pub const KVM_MAX_IRQ_ROUTES: usize = 4096;
+pub const KVM_X86_IOAPIC_NUM_PINS: u32 = 24;
 pub const KVM_IRQ_ROUTING_IRQCHIP: u32 = 1;
 pub const KVM_IRQ_ROUTING_MSI: u32 = 2;
 pub const KVM_IRQFD_SIZE: u32 = 32;
+pub const KVM_MSI_SIZE: u32 = 32;
 pub const KVM_IRQFD_FLAG_DEASSIGN: u32 = 1 << 0;
 pub const KVM_IRQFD_FLAG_RESAMPLE: u32 = 1 << 1;
 pub const KVM_IRQFD_VALID_FLAGS: u32 = KVM_IRQFD_FLAG_DEASSIGN | KVM_IRQFD_FLAG_RESAMPLE;
@@ -197,12 +228,23 @@ pub const KVM_X86_REGS_RFLAGS_OFFSET: usize = 17 * 8;
 pub const KVM_X86_SREGS_SIZE: u32 = 312;
 pub const KVM_X86_FPU_SIZE: u32 = 416;
 pub const KVM_X86_VCPU_EVENTS_SIZE: u32 = 64;
+pub const KVM_X86_MCE_CAP_SIZE: u32 = 8;
 pub const KVM_X86_DEBUGREGS_SIZE: u32 = 128;
 pub const KVM_X86_XSAVE_SIZE: u32 = 4096;
 pub const KVM_X86_XCRS_SIZE: u32 = 392;
 pub const KVM_X86_LAPIC_STATE_SIZE: u32 = 1024;
+pub const KVM_VAPIC_ADDR_SIZE: u32 = 8;
 pub const KVM_MP_STATE_RUNNABLE: u32 = 0;
+pub const KVM_MP_STATE_UNINITIALIZED: u32 = 1;
+pub const KVM_MP_STATE_INIT_RECEIVED: u32 = 2;
+pub const KVM_MP_STATE_HALTED: u32 = 3;
+pub const KVM_MP_STATE_SIPI_RECEIVED: u32 = 4;
 pub const KVM_MP_STATE_STOPPED: u32 = 5;
+pub const KVM_MP_STATE_CHECK_STOP: u32 = 6;
+pub const KVM_MP_STATE_OPERATING: u32 = 7;
+pub const KVM_MP_STATE_LOAD: u32 = 8;
+pub const KVM_MP_STATE_AP_RESET_HOLD: u32 = 9;
+pub const KVM_MP_STATE_SUSPENDED: u32 = 10;
 pub const KVM_MEM_ALLOWED_FLAGS: u32 = 0;
 #[cfg(target_arch = "x86_64")]
 pub const X86_RFLAGS_IF: u64 = 1 << 9;
@@ -213,6 +255,10 @@ pub const KVM_IOEVENTFD_VALID_FLAGS: u32 =
     KVM_IOEVENTFD_FLAG_DATAMATCH | KVM_IOEVENTFD_FLAG_PIO | KVM_IOEVENTFD_FLAG_DEASSIGN;
 pub const KVM_INTERRUPT_SET: u32 = u32::MAX;
 pub const KVM_INTERRUPT_UNSET: u32 = u32::MAX - 1;
+#[cfg(target_arch = "x86_64")]
+pub const MSR_KVM_WALL_CLOCK: usize = 0x11;
+#[cfg(target_arch = "x86_64")]
+pub const MSR_KVM_SYSTEM_TIME: usize = 0x12;
 #[cfg(target_arch = "x86_64")]
 pub const MSR_KVM_WALL_CLOCK_NEW: usize = 0x4b56_4d00;
 #[cfg(target_arch = "x86_64")]
@@ -269,11 +315,43 @@ pub const PAGE_SIZE_USIZE: usize = PAGE_SIZE as usize;
 pub const X86_RAX_REG_INDEX: usize = 0;
 pub const SUPPORTED_X86_MSRS: &[u32] = &[
     0x0000_0010, // IA32_TSC
+    0x0000_0011, // MSR_KVM_WALL_CLOCK
+    0x0000_0012, // MSR_KVM_SYSTEM_TIME
+    0x0000_001b, // IA32_APIC_BASE
+    0x0000_003b, // IA32_TSC_ADJUST
     0x0000_0174, // IA32_SYSENTER_CS
     0x0000_0175, // IA32_SYSENTER_ESP
     0x0000_0176, // IA32_SYSENTER_EIP
     0x0000_01a0, // IA32_MISC_ENABLE
-    0x0000_02ff, // MTRRdefType
+    0x0000_0200, // MTRR_PHYS_BASE_0
+    0x0000_0201, // MTRR_PHYS_MASK_0
+    0x0000_0202, // MTRR_PHYS_BASE_1
+    0x0000_0203, // MTRR_PHYS_MASK_1
+    0x0000_0204, // MTRR_PHYS_BASE_2
+    0x0000_0205, // MTRR_PHYS_MASK_2
+    0x0000_0206, // MTRR_PHYS_BASE_3
+    0x0000_0207, // MTRR_PHYS_MASK_3
+    0x0000_0208, // MTRR_PHYS_BASE_4
+    0x0000_0209, // MTRR_PHYS_MASK_4
+    0x0000_020a, // MTRR_PHYS_BASE_5
+    0x0000_020b, // MTRR_PHYS_MASK_5
+    0x0000_020c, // MTRR_PHYS_BASE_6
+    0x0000_020d, // MTRR_PHYS_MASK_6
+    0x0000_020e, // MTRR_PHYS_BASE_7
+    0x0000_020f, // MTRR_PHYS_MASK_7
+    0x0000_0250, // MTRR_FIX_64K_00000
+    0x0000_0258, // MTRR_FIX_16K_80000
+    0x0000_0259, // MTRR_FIX_16K_A0000
+    0x0000_0268, // MTRR_FIX_4K_C0000
+    0x0000_0269, // MTRR_FIX_4K_C8000
+    0x0000_026a, // MTRR_FIX_4K_D0000
+    0x0000_026b, // MTRR_FIX_4K_D8000
+    0x0000_026c, // MTRR_FIX_4K_E0000
+    0x0000_026d, // MTRR_FIX_4K_E8000
+    0x0000_026e, // MTRR_FIX_4K_F0000
+    0x0000_026f, // MTRR_FIX_4K_F8000
+    0x0000_0277, // IA32_PAT
+    0x0000_02ff, // MTRR_DEF_TYPE
     0xc000_0080, // EFER
     0xc000_0081, // STAR
     0xc000_0082, // LSTAR
@@ -282,6 +360,8 @@ pub const SUPPORTED_X86_MSRS: &[u32] = &[
     0xc000_0100, // FS_BASE
     0xc000_0101, // GS_BASE
     0xc000_0102, // KERNEL_GS_BASE
+    0x4b56_4d00, // MSR_KVM_WALL_CLOCK_NEW
+    0x4b56_4d01, // MSR_KVM_SYSTEM_TIME_NEW
 ];
 
 pub const fn ioc(type_: u32, nr: u32) -> u32 {

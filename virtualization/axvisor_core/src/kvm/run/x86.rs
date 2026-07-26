@@ -36,7 +36,6 @@ use crate::kvm::{
         access_width_mask, read_vcpu_run_u8, sign_extend_value, write_vcpu_run_u8,
         write_vcpu_run_u16,
     },
-    vcpu_file_mp_state_by_id,
 };
 #[cfg(target_arch = "x86_64")]
 use crate::vmm::vcpus::guest_cpu_id_to_vcpu_id;
@@ -44,11 +43,13 @@ use crate::vmm::vcpus::guest_cpu_id_to_vcpu_id;
 #[cfg(target_arch = "x86_64")]
 pub(super) fn handle_kvm_msr_write(vm: &AxVMRef, msr: usize, value: u64) -> AxResult<bool> {
     match msr {
-        abi::MSR_KVM_WALL_CLOCK_NEW => {
-            write_kvm_wall_clock(vm, GuestPhysAddr::from(value as usize))?;
+        abi::MSR_KVM_WALL_CLOCK | abi::MSR_KVM_WALL_CLOCK_NEW => {
+            if value != 0 {
+                write_kvm_wall_clock(vm, GuestPhysAddr::from(value as usize))?;
+            }
             Ok(true)
         }
-        abi::MSR_KVM_SYSTEM_TIME_NEW => {
+        abi::MSR_KVM_SYSTEM_TIME | abi::MSR_KVM_SYSTEM_TIME_NEW => {
             if value & abi::KVM_SYSTEM_TIME_ENABLE != 0 {
                 let gpa = GuestPhysAddr::from((value & !abi::KVM_SYSTEM_TIME_ENABLE) as usize);
                 write_kvm_system_time(vm, gpa)?;
@@ -60,6 +61,15 @@ pub(super) fn handle_kvm_msr_write(vm: &AxVMRef, msr: usize, value: u64) -> AxRe
 }
 
 #[cfg(target_arch = "x86_64")]
+pub(in crate::kvm) fn apply_kvm_pv_msr_write(
+    vm: &AxVMRef,
+    msr: usize,
+    value: u64,
+) -> AxResult<bool> {
+    handle_kvm_msr_write(vm, msr, value)
+}
+
+#[cfg(target_arch = "x86_64")]
 pub(super) fn handle_cpu_up(
     control_file: api_control::ControlFileId,
     vm: &AxVMRef,
@@ -67,10 +77,6 @@ pub(super) fn handle_cpu_up(
     entry_point: GuestPhysAddr,
 ) -> AxResult {
     let target_vcpu_id = guest_cpu_id_to_vcpu_id(vm, target_cpu).ok_or(AxError::InvalidInput)?;
-    if vcpu_file_mp_state_by_id(control_file, target_vcpu_id)? != abi::KVM_MP_STATE_STOPPED {
-        return Ok(());
-    }
-
     let target_vcpu = vm.vcpu(target_vcpu_id).ok_or(AxError::InvalidInput)?;
     target_vcpu.set_entry(entry_point)?;
     set_vcpu_file_mp_state_by_id(control_file, target_vcpu_id, abi::KVM_MP_STATE_RUNNABLE)
@@ -137,10 +143,22 @@ pub(super) fn inject_in_kernel_device_irqs(
     }
     let mut injected = false;
     if pit2_created {
-        injected |= crate::vmm::devices::x86::inject_due_pit_irq0(vm, vcpu);
+        injected |= crate::vmm::devices::x86::inject_due_pit_irq0_for_control(vm, vcpu);
     }
-    injected |= crate::vmm::devices::x86::inject_pending_serial_irq(vm, vcpu);
+    injected |= crate::vmm::devices::x86::inject_pending_serial_irq_for_control(vm, vcpu);
     injected
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(super) fn handle_control_ioapic_eoi(
+    vm: &AxVMRef,
+    vcpu: &axvm::AxVCpuRef,
+    irqchip_created: bool,
+    vector: Option<u8>,
+) {
+    if irqchip_created && let Some(vector) = vector {
+        crate::vmm::devices::x86::inject_pending_ioapic_irq_after_eoi_for_control(vm, vcpu, vector);
+    }
 }
 
 #[cfg(target_arch = "x86_64")]

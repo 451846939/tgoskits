@@ -73,19 +73,17 @@ where
         deadline,
         TimeValue::from_nanos(deadline)
     );
-    // SAFETY: Called from a vCPU task pinned to a physical CPU. TIMER_LIST is
-    // initialised per-CPU in init_percpu() before any timer operation is invoked.
+    // SAFETY: The current CPU's timer list is initialized during AxVisor bring-up.
     // The token is only an identifier used for cancellation and does not
     // publish any timer data, so relaxed ordering is sufficient.
     let token = TOKEN.fetch_add(1, Ordering::Relaxed);
-    let next_deadline = {
-        let timer_list = unsafe { TIMER_LIST.current_ref_mut_raw() };
+    {
+        let timer_list = unsafe { TIMER_LIST.current_ref_raw() };
         let mut timers = timer_list.lock();
         let event = VmmTimerEvent::new(token, handler);
         timers.set(TimeValue::from_nanos(deadline), event);
-        timers.next_deadline()
-    };
-    rearm_host_timer(next_deadline);
+    }
+    rearm_host_timer(global_next_deadline());
     token
 }
 
@@ -94,34 +92,44 @@ where
 /// # Parameters
 /// - `token`: The unique token of the timer to cancel.
 pub fn cancel_timer(token: usize) {
-    // SAFETY: Called from a vCPU task pinned to a physical CPU. TIMER_LIST is
-    // initialised per-CPU in init_percpu() before any timer operation is invoked.
-    let next_deadline = {
-        let timer_list = unsafe { TIMER_LIST.current_ref_mut_raw() };
+    for cpu_id in 0..axvisor_api::host::get_host_cpu_num() {
+        // SAFETY: Every host CPU initializes its timer list before VM execution starts.
+        let timer_list = unsafe { TIMER_LIST.remote_ref_raw(cpu_id) };
         let mut timers = timer_list.lock();
         timers.cancel(|event| event.token == token);
-        timers.next_deadline()
-    };
-    rearm_host_timer(next_deadline);
+    }
+    rearm_host_timer(global_next_deadline());
 }
 
 /// Check and process any pending timer events
 pub fn check_events() {
-    // SAFETY: Called from a vCPU task pinned to a physical CPU. TIMER_LIST is
-    // initialised per-CPU in init_percpu() before any timer operation is invoked.
-    let timer_list = unsafe { TIMER_LIST.current_ref_mut_raw() };
-    loop {
-        let now = axvisor_api::time::current_time();
-        let event = timer_list.lock().expire_one(now);
-        if let Some((_deadline, event)) = event {
-            trace!("pick one {_deadline:#?} to handle!!!");
-            event.callback(now);
-        } else {
-            let next_deadline = timer_list.lock().next_deadline();
-            rearm_host_timer(next_deadline);
-            break;
+    for cpu_id in 0..axvisor_api::host::get_host_cpu_num() {
+        // SAFETY: Every host CPU initializes its timer list before VM execution starts.
+        let timer_list = unsafe { TIMER_LIST.remote_ref_raw(cpu_id) };
+        loop {
+            let now = axvisor_api::time::current_time();
+            let event = timer_list.lock().expire_one(now);
+            if let Some((_deadline, event)) = event {
+                trace!("pick one {_deadline:#?} to handle!!!");
+                event.callback(now);
+            } else {
+                break;
+            }
         }
     }
+    rearm_host_timer(global_next_deadline());
+}
+
+fn global_next_deadline() -> Option<TimeValue> {
+    let mut next = None;
+    for cpu_id in 0..axvisor_api::host::get_host_cpu_num() {
+        // SAFETY: Every host CPU initializes its timer list before VM execution starts.
+        let timer_list = unsafe { TIMER_LIST.remote_ref_raw(cpu_id) };
+        if let Some(deadline) = timer_list.lock().next_deadline() {
+            next = Some(next.map_or(deadline, |current: TimeValue| current.min(deadline)));
+        }
+    }
+    next
 }
 
 fn rearm_host_timer(next_deadline: Option<TimeValue>) {

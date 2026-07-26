@@ -29,7 +29,7 @@ use super::{
 use crate::kvm::{
     abi::raw as abi,
     util::read_u32_user,
-    vcpu::{default_debugregs, default_fpu, default_xcrs},
+    vcpu::{default_fpu, default_xcrs},
 };
 
 pub(in crate::kvm) fn create_vm_file() -> AxResult<api_control::ControlFileId> {
@@ -52,8 +52,15 @@ pub(in crate::kvm) fn create_vm_file() -> AxResult<api_control::ControlFileId> {
             vcpu_files: BTreeMap::new(),
             clock: vec![0; abi::KVM_CLOCK_DATA_SIZE as usize],
             pit2: vec![0; abi::KVM_PIT_STATE2_SIZE as usize],
+            #[cfg(target_arch = "x86_64")]
+            irqchips: core::array::from_fn(|chip_id| {
+                let mut state = vec![0; abi::KVM_IRQCHIP_SIZE as usize];
+                state[..4].copy_from_slice(&(chip_id as u32).to_ne_bytes());
+                state
+            }),
             tsc_khz: 0,
             tss_addr: None,
+            identity_map_addr: None,
             irqchip_created: false,
             pit2_created: false,
             gsi_routing_count: 0,
@@ -95,18 +102,20 @@ pub(in crate::kvm) fn create_vcpu_file(
                     abi::KVM_MP_STATE_STOPPED
                 },
                 halted: false,
+                run_diagnostic_started: false,
+                exit_diagnostic_logged: false,
                 pending_interrupts: VecDeque::new(),
                 pending_mmio_read: None,
                 pending_io_read: None,
                 cpuid: Vec::new(),
-                msrs: BTreeMap::new(),
+                emulated_msrs: BTreeMap::new(),
                 fpu: default_fpu(),
                 vcpu_events: vec![0; abi::KVM_X86_VCPU_EVENTS_SIZE as usize],
-                debugregs: default_debugregs(),
                 xsave: vec![0; abi::KVM_X86_XSAVE_SIZE as usize],
                 xcrs: default_xcrs(),
                 signal_mask: Vec::new(),
                 lapic: vec![0; abi::KVM_X86_LAPIC_STATE_SIZE as usize],
+                vapic_addr: None,
             }),
         );
         vcpu_file
@@ -133,6 +142,28 @@ pub(in crate::kvm) fn set_tss_addr(
     Ok(0)
 }
 
+pub(in crate::kvm) fn set_identity_map_addr(
+    control_file: api_control::ControlFileId,
+    arg: usize,
+) -> AxResult<isize> {
+    if !cfg!(target_arch = "x86_64") {
+        return ax_err!(Unsupported);
+    }
+    let mut bytes = [0u8; core::mem::size_of::<u64>()];
+    api_control::copy_from_user(arg, &mut bytes)?;
+    let addr = u64::from_ne_bytes(bytes);
+    if addr & 0xfff != 0 {
+        return ax_err!(InvalidInput);
+    }
+
+    let mut control_files = CONTROL_FILES.lock();
+    let Some(ControlFileState::Vm(vm)) = control_files.get_mut(&control_file) else {
+        return ax_err!(NotFound);
+    };
+    vm.identity_map_addr = Some(addr);
+    Ok(0)
+}
+
 pub(in crate::kvm) fn create_irqchip(control_file: api_control::ControlFileId) -> AxResult<isize> {
     let mut control_files = CONTROL_FILES.lock();
     let Some(ControlFileState::Vm(vm)) = control_files.get_mut(&control_file) else {
@@ -140,6 +171,87 @@ pub(in crate::kvm) fn create_irqchip(control_file: api_control::ControlFileId) -
     };
     vm.irqchip_created = true;
     Ok(0)
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(in crate::kvm) fn get_irqchip(
+    control_file: api_control::ControlFileId,
+    arg: usize,
+) -> AxResult<isize> {
+    let chip_id = read_u32_user(arg)? as usize;
+    let control_files = CONTROL_FILES.lock();
+    let Some(ControlFileState::Vm(vm)) = control_files.get(&control_file) else {
+        return ax_err!(NotFound);
+    };
+    if !vm.irqchip_created {
+        return ax_err!(InvalidInput);
+    }
+    let state = vm.irqchips.get(chip_id).ok_or(AxError::InvalidInput)?;
+    api_control::copy_to_user(arg, state)?;
+    Ok(0)
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(in crate::kvm) fn set_irqchip(
+    control_file: api_control::ControlFileId,
+    arg: usize,
+) -> AxResult<isize> {
+    let mut state = vec![0; abi::KVM_IRQCHIP_SIZE as usize];
+    api_control::copy_from_user(arg, &mut state)?;
+    let chip_id = u32::from_ne_bytes(state[..4].try_into().unwrap());
+
+    let mut control_files = CONTROL_FILES.lock();
+    let Some(ControlFileState::Vm(vm)) = control_files.get_mut(&control_file) else {
+        return ax_err!(NotFound);
+    };
+    if !vm.irqchip_created {
+        return ax_err!(InvalidInput);
+    }
+    let stored = vm
+        .irqchips
+        .get_mut(chip_id as usize)
+        .ok_or(AxError::InvalidInput)?;
+
+    if chip_id == abi::KVM_IRQCHIP_IOAPIC {
+        let selector = read_u32_at(&state, abi::KVM_IOAPIC_IOREGSEL_OFFSET)?;
+        let id = read_u32_at(&state, abi::KVM_IOAPIC_ID_OFFSET)?;
+        let irr = read_u32_at(&state, abi::KVM_IOAPIC_IRR_OFFSET)?;
+        let mut redirection_table = [0u64; abi::KVM_X86_IOAPIC_NUM_PINS as usize];
+        for (index, entry) in redirection_table.iter_mut().enumerate() {
+            let offset = abi::KVM_IOAPIC_REDIRENT_OFFSET + index * core::mem::size_of::<u64>();
+            *entry = read_u64_at(&state, offset)?;
+        }
+        if !vm
+            .vm
+            .get_devices()
+            .x86_ioapic_replace_state(selector, id, irr, redirection_table)
+        {
+            return ax_err!(NotFound);
+        }
+    }
+
+    *stored = state;
+    Ok(0)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn read_u32_at(bytes: &[u8], offset: usize) -> AxResult<u32> {
+    let value = bytes
+        .get(offset..offset + 4)
+        .ok_or(AxError::InvalidInput)?
+        .try_into()
+        .map_err(|_| AxError::InvalidInput)?;
+    Ok(u32::from_ne_bytes(value))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn read_u64_at(bytes: &[u8], offset: usize) -> AxResult<u64> {
+    let value = bytes
+        .get(offset..offset + 8)
+        .ok_or(AxError::InvalidInput)?
+        .try_into()
+        .map_err(|_| AxError::InvalidInput)?;
+    Ok(u64::from_ne_bytes(value))
 }
 
 pub(in crate::kvm) fn create_pit2(

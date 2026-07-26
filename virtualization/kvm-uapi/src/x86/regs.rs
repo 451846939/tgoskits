@@ -21,6 +21,7 @@ use crate::{KvmUapiError, Result};
 
 pub const KVM_REGS_SIZE: usize = 18 * 8;
 pub const KVM_SREGS_SIZE: usize = 312;
+pub const KVM_DEBUGREGS_SIZE: usize = 16 * 8;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct KvmRegs {
@@ -88,6 +89,15 @@ pub struct KvmSregs {
     pub interrupt_bitmap: [u64; 4],
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct KvmDebugregs {
+    pub db: [u64; 4],
+    pub dr6: u64,
+    pub dr7: u64,
+    pub flags: u64,
+    pub reserved: [u64; 9],
+}
+
 impl KvmRegs {
     pub fn decode(buf: &[u8]) -> Result<Self> {
         if buf.len() != KVM_REGS_SIZE {
@@ -137,6 +147,45 @@ impl KvmRegs {
         write_u64(buf, 120, self.r15);
         write_u64(buf, 128, self.rip);
         write_u64(buf, 136, self.rflags);
+        Ok(())
+    }
+}
+
+impl KvmDebugregs {
+    pub fn decode(buf: &[u8]) -> Result<Self> {
+        if buf.len() != KVM_DEBUGREGS_SIZE {
+            return Err(KvmUapiError::InvalidSize);
+        }
+        let mut db = [0; 4];
+        let mut reserved = [0; 9];
+        for (index, value) in db.iter_mut().enumerate() {
+            *value = read_u64(buf, index * 8);
+        }
+        for (index, value) in reserved.iter_mut().enumerate() {
+            *value = read_u64(buf, (index + 7) * 8);
+        }
+        Ok(Self {
+            db,
+            dr6: read_u64(buf, 32),
+            dr7: read_u64(buf, 40),
+            flags: read_u64(buf, 48),
+            reserved,
+        })
+    }
+
+    pub fn encode(self, buf: &mut [u8]) -> Result {
+        if buf.len() != KVM_DEBUGREGS_SIZE {
+            return Err(KvmUapiError::InvalidSize);
+        }
+        for (index, value) in self.db.iter().enumerate() {
+            write_u64(buf, index * 8, *value);
+        }
+        write_u64(buf, 32, self.dr6);
+        write_u64(buf, 40, self.dr7);
+        write_u64(buf, 48, self.flags);
+        for (index, value) in self.reserved.iter().enumerate() {
+            write_u64(buf, (index + 7) * 8, *value);
+        }
         Ok(())
     }
 }
@@ -304,4 +353,27 @@ fn write_u32(buf: &mut [u8], offset: usize, value: u32) {
 
 fn write_u64(buf: &mut [u8], offset: usize, value: u64) {
     buf[offset..offset + 8].copy_from_slice(&value.to_ne_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debugregs_round_trip_preserves_kvm_layout() {
+        let regs = KvmDebugregs {
+            db: [0x10, 0x11, 0x12, 0x13],
+            dr6: 0xffff_0ff0,
+            dr7: 0x400,
+            flags: 0,
+            reserved: [0; 9],
+        };
+        let mut bytes = [0; KVM_DEBUGREGS_SIZE];
+        regs.encode(&mut bytes).unwrap();
+
+        assert_eq!(read_u64(&bytes, 0), regs.db[0]);
+        assert_eq!(read_u64(&bytes, 32), regs.dr6);
+        assert_eq!(read_u64(&bytes, 40), regs.dr7);
+        assert_eq!(KvmDebugregs::decode(&bytes).unwrap(), regs);
+    }
 }

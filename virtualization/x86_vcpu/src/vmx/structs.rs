@@ -111,11 +111,112 @@ impl IOBitmap {
             self.set_intercept(port, intercept)
         }
     }
+
+    pub fn set_intercept_all(&mut self) {
+        self.io_bitmap_a_frame.fill(u8::MAX);
+        self.io_bitmap_b_frame.fill(u8::MAX);
+    }
 }
 
 #[derive(Debug)]
 pub struct MsrBitmap {
     frame: PhysFrame,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct VmxMsrEntry {
+    index: u32,
+    reserved: u32,
+    value: u64,
+}
+
+/// VM-entry/exit MSR areas used to switch guest and host syscall state.
+#[derive(Debug)]
+pub struct VmxMsrSwitch<const N: usize> {
+    frame: PhysFrame,
+}
+
+impl<const N: usize> VmxMsrSwitch<N> {
+    const ENTRY_LOAD_OFFSET: usize = 0;
+    const EXIT_STORE_OFFSET: usize = N * core::mem::size_of::<VmxMsrEntry>();
+    const EXIT_LOAD_OFFSET: usize = Self::EXIT_STORE_OFFSET * 2;
+
+    pub fn new(indices: [u32; N]) -> AxResult<Self> {
+        assert!(Self::EXIT_LOAD_OFFSET + N * core::mem::size_of::<VmxMsrEntry>() <= PAGE_SIZE);
+        let switch = Self {
+            frame: PhysFrame::alloc_zero()?,
+        };
+        for (slot, index) in indices.into_iter().enumerate() {
+            let entry = VmxMsrEntry {
+                index,
+                reserved: 0,
+                value: 0,
+            };
+            switch.write_entry(Self::ENTRY_LOAD_OFFSET, slot, entry);
+            switch.write_entry(Self::EXIT_STORE_OFFSET, slot, entry);
+            switch.write_entry(Self::EXIT_LOAD_OFFSET, slot, entry);
+        }
+        Ok(switch)
+    }
+
+    pub const fn count(&self) -> usize {
+        N
+    }
+
+    pub fn entry_load_addr(&self) -> HostPhysAddr {
+        self.frame.start_paddr() + Self::ENTRY_LOAD_OFFSET
+    }
+
+    pub fn exit_store_addr(&self) -> HostPhysAddr {
+        self.frame.start_paddr() + Self::EXIT_STORE_OFFSET
+    }
+
+    pub fn exit_load_addr(&self) -> HostPhysAddr {
+        self.frame.start_paddr() + Self::EXIT_LOAD_OFFSET
+    }
+
+    pub fn guest_value(&self, slot: usize) -> u64 {
+        self.read_entry(Self::ENTRY_LOAD_OFFSET, slot).value
+    }
+
+    pub fn set_guest_value(&self, slot: usize, value: u64) {
+        let mut entry = self.read_entry(Self::ENTRY_LOAD_OFFSET, slot);
+        entry.value = value;
+        self.write_entry(Self::ENTRY_LOAD_OFFSET, slot, entry);
+    }
+
+    pub fn set_host_value(&self, slot: usize, value: u64) {
+        let mut entry = self.read_entry(Self::EXIT_LOAD_OFFSET, slot);
+        entry.value = value;
+        self.write_entry(Self::EXIT_LOAD_OFFSET, slot, entry);
+    }
+
+    pub fn sync_guest_values_after_exit(&self) {
+        for slot in 0..N {
+            let value = self.read_entry(Self::EXIT_STORE_OFFSET, slot).value;
+            self.set_guest_value(slot, value);
+        }
+    }
+
+    fn read_entry(&self, offset: usize, slot: usize) -> VmxMsrEntry {
+        assert!(slot < N);
+        unsafe { core::ptr::read_volatile(self.entry_ptr(offset, slot)) }
+    }
+
+    fn write_entry(&self, offset: usize, slot: usize, entry: VmxMsrEntry) {
+        assert!(slot < N);
+        unsafe { core::ptr::write_volatile(self.entry_ptr(offset, slot), entry) };
+    }
+
+    fn entry_ptr(&self, offset: usize, slot: usize) -> *mut VmxMsrEntry {
+        unsafe {
+            self.frame
+                .as_mut_ptr()
+                .add(offset + slot * core::mem::size_of::<VmxMsrEntry>())
+                as *mut VmxMsrEntry
+        }
+    }
 }
 
 impl MsrBitmap {

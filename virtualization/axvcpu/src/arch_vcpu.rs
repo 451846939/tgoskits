@@ -111,6 +111,26 @@ pub trait AxArchVCpu: Sized {
         Err(AxError::Unsupported)
     }
 
+    /// Returns an x86 KVM MSR value from the architectural vCPU state.
+    fn get_kvm_msr(&self, _index: u32) -> AxResult<u64> {
+        Err(AxError::Unsupported)
+    }
+
+    /// Applies an x86 KVM MSR value to the architectural vCPU state.
+    fn set_kvm_msr(&mut self, _index: u32, _value: u64) -> AxResult {
+        Err(AxError::Unsupported)
+    }
+
+    /// Writes the x86 KVM debug-register state into `buf`.
+    fn get_kvm_debugregs(&self, _buf: &mut [u8]) -> AxResult {
+        Err(AxError::Unsupported)
+    }
+
+    /// Reads the x86 KVM debug-register state from `buf`.
+    fn set_kvm_debugregs(&mut self, _buf: &[u8]) -> AxResult {
+        Err(AxError::Unsupported)
+    }
+
     /// Writes the KVM-compatible general register state into `buf`.
     fn get_kvm_regs(&self, _buf: &mut [u8]) -> AxResult {
         Err(AxError::Unsupported)

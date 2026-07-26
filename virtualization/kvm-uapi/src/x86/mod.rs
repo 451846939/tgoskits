@@ -19,6 +19,7 @@
 
 #[cfg(target_arch = "x86_64")]
 mod cpuid;
+mod msi;
 mod pvclock;
 mod regs;
 
@@ -27,5 +28,9 @@ pub use cpuid::{
     KVM_HYPERVISOR_FEATURE_LEAF, KVM_HYPERVISOR_INFO_LEAF, kvm_hypervisor_cpuid,
     rustvisor_hypervisor_cpuid,
 };
+pub use msi::{X86MsiRoute, decode_msi_route};
 pub use pvclock::{PvClockVcpuTimeInfo, PvClockWallClock};
-pub use regs::{KVM_REGS_SIZE, KVM_SREGS_SIZE, KvmDtable, KvmRegs, KvmSegment, KvmSregs};
+pub use regs::{
+    KVM_DEBUGREGS_SIZE, KVM_REGS_SIZE, KVM_SREGS_SIZE, KvmDebugregs, KvmDtable, KvmRegs,
+    KvmSegment, KvmSregs,
+};

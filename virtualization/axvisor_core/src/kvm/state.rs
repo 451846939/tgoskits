@@ -34,6 +34,8 @@ pub(in crate::kvm) use kvm_uapi::{
     KvmCpuidEntry2, KvmEnableCap, KvmIoEventFd, KvmIrqFd, OneReg, UserspaceMemoryRegion,
 };
 
+#[cfg(target_arch = "x86_64")]
+use crate::kvm::abi;
 use crate::vmm::interrupt::VirtualInterrupt;
 
 #[derive(Clone)]
@@ -53,8 +55,11 @@ pub(in crate::kvm) struct VmFileState {
     pub(in crate::kvm) vcpu_files: BTreeMap<u32, api_control::ControlFileId>,
     pub(in crate::kvm) clock: Vec<u8>,
     pub(in crate::kvm) pit2: Vec<u8>,
+    #[cfg(target_arch = "x86_64")]
+    pub(in crate::kvm) irqchips: [Vec<u8>; abi::KVM_NR_IRQCHIPS],
     pub(in crate::kvm) tsc_khz: u32,
     pub(in crate::kvm) tss_addr: Option<usize>,
+    pub(in crate::kvm) identity_map_addr: Option<u64>,
     pub(in crate::kvm) irqchip_created: bool,
     pub(in crate::kvm) pit2_created: bool,
     pub(in crate::kvm) gsi_routing_count: u32,
@@ -71,18 +76,20 @@ pub(in crate::kvm) struct VcpuFileState {
     pub(in crate::kvm) mmap_area: api_control::MmapAreaId,
     pub(in crate::kvm) mp_state: u32,
     pub(in crate::kvm) halted: bool,
+    pub(in crate::kvm) run_diagnostic_started: bool,
+    pub(in crate::kvm) exit_diagnostic_logged: bool,
     pub(in crate::kvm) pending_interrupts: VecDeque<VirtualInterrupt>,
     pub(in crate::kvm) pending_mmio_read: Option<PendingMmioRead>,
     pub(in crate::kvm) pending_io_read: Option<PendingIoRead>,
     pub(in crate::kvm) cpuid: Vec<KvmCpuidEntry2>,
-    pub(in crate::kvm) msrs: BTreeMap<u32, u64>,
+    pub(in crate::kvm) emulated_msrs: BTreeMap<u32, u64>,
     pub(in crate::kvm) fpu: Vec<u8>,
     pub(in crate::kvm) vcpu_events: Vec<u8>,
-    pub(in crate::kvm) debugregs: Vec<u8>,
     pub(in crate::kvm) xsave: Vec<u8>,
     pub(in crate::kvm) xcrs: Vec<u8>,
     pub(in crate::kvm) signal_mask: Vec<u8>,
     pub(in crate::kvm) lapic: Vec<u8>,
+    pub(in crate::kvm) vapic_addr: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -94,8 +101,19 @@ pub(in crate::kvm) struct PendingMmioRead {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::kvm) struct PendingIoRead {
-    pub(in crate::kvm) width: AccessWidth,
+pub(in crate::kvm) enum PendingIoRead {
+    Accumulator {
+        width: AccessWidth,
+    },
+    String {
+        width: AccessWidth,
+        addr: axaddrspace::GuestPhysAddr,
+        repeat: bool,
+        remaining: u64,
+        next_rip: u64,
+        address_size: u8,
+        decrement: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -138,6 +156,12 @@ pub(in crate::kvm) struct IrqFd {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::kvm) enum GsiRoute {
-    IrqChip { pin: u32 },
-    Msi { vector: u8 },
+    IrqChip {
+        pin: u32,
+    },
+    Msi {
+        address_lo: u32,
+        address_hi: u32,
+        data: u32,
+    },
 }

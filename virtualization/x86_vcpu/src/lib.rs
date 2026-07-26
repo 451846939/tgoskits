@@ -32,6 +32,8 @@ mod test_utils;
 /// x86 vCPU setup configuration.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct X86VCpuSetupConfig {
+    /// Intercept every guest PIO access so a host VMM can emulate it.
+    pub intercept_all_io: bool,
     /// Intercept COM1 PIO ports so the VMM path can emulate or forward them.
     pub intercept_com1: bool,
     /// Expose KVM-compatible hypervisor CPUID leaves to the guest.
@@ -51,6 +53,8 @@ impl Default for X86VCpuCreateConfig {
     }
 }
 
+#[cfg(any(feature = "vmx", feature = "svm"))]
+mod debugregs;
 #[cfg(any(feature = "vmx", feature = "svm"))]
 pub(crate) mod kvm;
 pub(crate) mod msr;

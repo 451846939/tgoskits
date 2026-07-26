@@ -18,8 +18,9 @@
 //! from VMX/SVM state access.
 
 pub(crate) use kvm_uapi::x86::{
-    KVM_HYPERVISOR_FEATURE_LEAF, KVM_HYPERVISOR_INFO_LEAF, KVM_REGS_SIZE, KVM_SREGS_SIZE,
-    KvmDtable, KvmRegs, KvmSegment, KvmSregs, kvm_hypervisor_cpuid, rustvisor_hypervisor_cpuid,
+    KVM_DEBUGREGS_SIZE, KVM_HYPERVISOR_FEATURE_LEAF, KVM_HYPERVISOR_INFO_LEAF, KVM_REGS_SIZE,
+    KVM_SREGS_SIZE, KvmDebugregs, KvmDtable, KvmRegs, KvmSegment, KvmSregs, kvm_hypervisor_cpuid,
+    rustvisor_hypervisor_cpuid,
 };
 
 pub(crate) fn map_kvm_uapi_error(_err: kvm_uapi::KvmUapiError) -> ax_errno::AxError {

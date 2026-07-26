@@ -34,7 +34,8 @@ use ax_kspin::SpinNoIrq as Mutex;
 use axvisor_api::control::{self as api_control, ControlOps};
 use cpuid::{get_cpuid2, get_supported_cpuid, set_cpuid2};
 use eventfd::{
-    read_ioeventfd, read_irqfd, set_gsi_routing, stop_irqfd, update_ioeventfd, update_irqfd,
+    read_ioeventfd, read_irqfd, set_gsi_routing, set_irq_line, signal_msi, stop_irqfd,
+    update_ioeventfd, update_irqfd,
 };
 use memory::{read_userspace_memory_region, set_user_memory_region, unmap_memory_slot};
 use run::run_vcpu_file;
@@ -194,19 +195,6 @@ pub(in crate::kvm) fn vcpu_file_by_id(
         .ok_or(AxError::InvalidInput)
 }
 
-#[cfg(target_arch = "x86_64")]
-pub(in crate::kvm) fn vcpu_file_mp_state_by_id(
-    control_file: api_control::ControlFileId,
-    vcpu_id: usize,
-) -> AxResult<u32> {
-    let target_file = vcpu_file_by_id(control_file, vcpu_id)?;
-    let control_files = CONTROL_FILES.lock();
-    let Some(ControlFileState::Vcpu(vcpu)) = control_files.get(&target_file) else {
-        return ax_err!(NotFound);
-    };
-    Ok(vcpu.mp_state)
-}
-
 pub(in crate::kvm) fn set_vcpu_file_mp_state_by_id(
     control_file: api_control::ControlFileId,
     vcpu_id: usize,
@@ -267,6 +255,10 @@ fn system_ioctl(cmd: u32, arg: usize) -> AxResult<isize> {
         KVM_CHECK_EXTENSION => Ok(check_extension(arg) as isize),
         KVM_GET_VCPU_MMAP_SIZE => Ok(KVM_VCPU_MMAP_SIZE as isize),
         KVM_GET_SUPPORTED_CPUID => get_supported_cpuid(arg),
+        KVM_X86_GET_MCE_CAP_SUPPORTED if cfg!(target_arch = "x86_64") => {
+            api_control::copy_to_user(arg, &0u64.to_ne_bytes())?;
+            Ok(0)
+        }
         KVM_CREATE_VM => {
             let vm_file = create_vm_file()?;
             match api_control::create_user_fd(vm_file, KVM_CONTROL_OPS, None) {
@@ -299,7 +291,13 @@ fn vm_ioctl(control_file: api_control::ControlFileId, cmd: u32, arg: usize) -> A
             Ok(0)
         }
         KVM_SET_TSS_ADDR => set_tss_addr(control_file, arg),
+        KVM_SET_IDENTITY_MAP_ADDR => set_identity_map_addr(control_file, arg),
         KVM_CREATE_IRQCHIP => create_irqchip(control_file),
+        KVM_IRQ_LINE => set_irq_line(control_file, arg),
+        #[cfg(target_arch = "x86_64")]
+        KVM_GET_IRQCHIP => get_irqchip(control_file, arg),
+        #[cfg(target_arch = "x86_64")]
+        KVM_SET_IRQCHIP => set_irqchip(control_file, arg),
         KVM_CREATE_PIT2 => create_pit2(control_file, arg),
         KVM_GET_PIT2 => get_vm_blob(control_file, arg, |vm| &vm.pit2),
         KVM_SET_PIT2 => set_vm_blob(
@@ -327,6 +325,7 @@ fn vm_ioctl(control_file: api_control::ControlFileId, cmd: u32, arg: usize) -> A
             update_irqfd(control_file, irqfd)?;
             Ok(0)
         }
+        KVM_SIGNAL_MSI => signal_msi(control_file, arg),
         KVM_ENABLE_CAP => enable_cap(arg),
         _ => {
             debug!("unsupported KVM VM ioctl cmd={cmd:#x} arg={arg:#x}");
@@ -362,6 +361,7 @@ fn vcpu_ioctl(control_file: api_control::ControlFileId, cmd: u32, arg: usize) ->
         KVM_SET_LAPIC => set_lapic(control_file, arg),
         KVM_SET_CPUID2 => set_cpuid2(control_file, arg),
         KVM_GET_CPUID2 => get_cpuid2(control_file, arg),
+        KVM_SET_VAPIC_ADDR => set_vapic_addr(control_file, arg),
         KVM_GET_ONE_REG => get_one_reg(control_file, arg),
         KVM_SET_ONE_REG => set_one_reg(control_file, arg),
         KVM_GET_REG_LIST => get_reg_list(control_file, arg),
@@ -377,15 +377,8 @@ fn vcpu_ioctl(control_file: api_control::ControlFileId, cmd: u32, arg: usize) ->
                 vcpu.vcpu_events = bytes;
             },
         ),
-        KVM_GET_DEBUGREGS => get_vcpu_blob(control_file, arg, |vcpu| &vcpu.debugregs),
-        KVM_SET_DEBUGREGS => set_vcpu_blob(
-            control_file,
-            arg,
-            KVM_X86_DEBUGREGS_SIZE as usize,
-            |vcpu, bytes| {
-                vcpu.debugregs = bytes;
-            },
-        ),
+        KVM_GET_DEBUGREGS => get_kvm_debugregs(control_file, arg),
+        KVM_SET_DEBUGREGS => set_kvm_debugregs(control_file, arg),
         KVM_GET_XSAVE | KVM_GET_XSAVE2 => get_vcpu_blob(control_file, arg, |vcpu| &vcpu.xsave),
         KVM_SET_XSAVE => set_vcpu_blob(
             control_file,
@@ -425,17 +418,22 @@ fn check_extension(capability: usize) -> usize {
         KVM_CAP_NR_MEMSLOTS => KVM_MAX_MEMORY_SLOTS,
         KVM_CAP_MP_STATE => 1,
         KVM_CAP_DESTROY_MEMORY_REGION_WORKS => 1,
+        KVM_CAP_IRQ_ROUTING => usize::from(cfg!(target_arch = "x86_64")) * KVM_MAX_IRQ_ROUTES,
         KVM_CAP_JOIN_MEMORY_REGIONS_WORKS => 1,
+        KVM_CAP_MCE => usize::from(cfg!(target_arch = "x86_64")),
         KVM_CAP_IRQFD => usize::from(cfg!(target_arch = "x86_64")),
         KVM_CAP_PIT2 => usize::from(cfg!(target_arch = "x86_64")),
         KVM_CAP_PIT_STATE2 => usize::from(cfg!(target_arch = "x86_64")),
+        KVM_CAP_SET_IDENTITY_MAP_ADDR => usize::from(cfg!(target_arch = "x86_64")),
         KVM_CAP_ADJUST_CLOCK => usize::from(cfg!(target_arch = "x86_64")),
         KVM_CAP_INTERNAL_ERROR_DATA => 1,
         KVM_CAP_DEBUGREGS => usize::from(cfg!(target_arch = "x86_64")),
+        KVM_CAP_X86_ROBUST_SINGLESTEP => usize::from(cfg!(target_arch = "x86_64")),
         KVM_CAP_VCPU_EVENTS => usize::from(cfg!(target_arch = "x86_64")),
         KVM_CAP_XCRS => usize::from(cfg!(target_arch = "x86_64")),
         KVM_CAP_XSAVE => usize::from(cfg!(target_arch = "x86_64")),
         KVM_CAP_ONE_REG => usize::from(cfg!(target_arch = "riscv64")),
+        KVM_CAP_SIGNAL_MSI => usize::from(cfg!(target_arch = "x86_64")),
         KVM_CAP_IOEVENTFD_ANY_LENGTH => 1,
         KVM_CAP_IMMEDIATE_EXIT => 1,
         KVM_CAP_XSAVE2 => 0,

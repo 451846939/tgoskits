@@ -31,7 +31,15 @@ pub fn inject_due_pit_irq0(vm: &VMRef, vcpu: &VCpuRef) -> bool {
     if vm.interrupt_mode() != VMInterruptMode::Passthrough {
         return false;
     }
+    inject_due_pit_irq0_inner(vm, vcpu)
+}
 
+#[cfg(feature = "control")]
+pub(crate) fn inject_due_pit_irq0_for_control(vm: &VMRef, vcpu: &VCpuRef) -> bool {
+    inject_due_pit_irq0_inner(vm, vcpu)
+}
+
+fn inject_due_pit_irq0_inner(vm: &VMRef, vcpu: &VCpuRef) -> bool {
     if !ioapic_gsi_targets_current_vcpu(vm, vcpu, PIT_TIMER_GSI) {
         return false;
     }
@@ -60,7 +68,15 @@ pub fn inject_pending_serial_irq(vm: &VMRef, vcpu: &VCpuRef) -> bool {
     if vm.interrupt_mode() != VMInterruptMode::Passthrough {
         return false;
     }
+    inject_pending_serial_irq_inner(vm, vcpu)
+}
 
+#[cfg(feature = "control")]
+pub(crate) fn inject_pending_serial_irq_for_control(vm: &VMRef, vcpu: &VCpuRef) -> bool {
+    inject_pending_serial_irq_inner(vm, vcpu)
+}
+
+fn inject_pending_serial_irq_inner(vm: &VMRef, vcpu: &VCpuRef) -> bool {
     if !ioapic_gsi_targets_current_vcpu(vm, vcpu, COM1_GSI) {
         return false;
     }
@@ -88,7 +104,19 @@ pub fn inject_pending_ioapic_irq_after_eoi(vm: &VMRef, vcpu: &VCpuRef, vector: u
     if vm.interrupt_mode() != VMInterruptMode::Passthrough {
         return false;
     }
+    inject_pending_ioapic_irq_after_eoi_inner(vm, vcpu, vector)
+}
 
+#[cfg(feature = "control")]
+pub(crate) fn inject_pending_ioapic_irq_after_eoi_for_control(
+    vm: &VMRef,
+    vcpu: &VCpuRef,
+    vector: u8,
+) -> bool {
+    inject_pending_ioapic_irq_after_eoi_inner(vm, vcpu, vector)
+}
+
+fn inject_pending_ioapic_irq_after_eoi_inner(vm: &VMRef, vcpu: &VCpuRef, vector: u8) -> bool {
     let Some(irq) = vm.get_devices().x86_ioapic_end_of_interrupt(vector) else {
         return false;
     };

@@ -485,6 +485,34 @@ impl AxVmDevices {
         })
     }
 
+    /// Set an x86 IOAPIC GSI input level and return an interrupt on assertion.
+    #[cfg(target_arch = "x86_64")]
+    pub fn x86_ioapic_set_gsi_level(&self, gsi: usize, asserted: bool) -> Option<IoApicInterrupt> {
+        self.emu_mmio_devices.iter().find_map(|dev| {
+            map_device_of_type(dev, |ioapic: &EmulatedIoApic| {
+                ioapic.set_gsi_level(gsi, asserted)
+            })
+            .flatten()
+        })
+    }
+
+    /// Replace the x86 IOAPIC state from a KVM-compatible snapshot.
+    #[cfg(target_arch = "x86_64")]
+    pub fn x86_ioapic_replace_state(
+        &self,
+        selector: u32,
+        id: u32,
+        irr: u32,
+        redirection_table: [u64; 24],
+    ) -> bool {
+        self.emu_mmio_devices.iter().any(|dev| {
+            map_device_of_type(dev, |ioapic: &EmulatedIoApic| {
+                ioapic.replace_state(selector, id, irr, redirection_table);
+            })
+            .is_some()
+        })
+    }
+
     /// Broadcast an x86 local APIC EOI to the virtual IOAPIC.
     #[cfg(target_arch = "x86_64")]
     pub fn x86_ioapic_end_of_interrupt(&self, vector: u8) -> Option<IoApicInterrupt> {

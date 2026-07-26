@@ -15,7 +15,6 @@ const IOAPIC_VER: u32 = 0x01;
 const IOAPIC_ARB: u32 = 0x02;
 const IOREDTBL_BASE: u32 = 0x10;
 
-const IOAPIC_ID_VALUE: u32 = 0x0f << 24;
 const IOAPIC_VERSION_VALUE: u32 = 0x11 | ((MAX_REDIRECTION_ENTRY as u32) << 16);
 const MAX_REDIRECTION_ENTRY: usize = 23;
 const REDIRECTION_ENTRY_COUNT: usize = MAX_REDIRECTION_ENTRY + 1;
@@ -29,16 +28,20 @@ const REDIRECTION_ENTRY_DESTINATION_SHIFT: u64 = 56;
 #[derive(Debug)]
 struct IoApicState {
     selector: u32,
+    id: u8,
     redirection_table: [u64; REDIRECTION_ENTRY_COUNT],
     pending_level: [bool; REDIRECTION_ENTRY_COUNT],
+    line_level: [bool; REDIRECTION_ENTRY_COUNT],
 }
 
 impl IoApicState {
     const fn new() -> Self {
         Self {
             selector: 0,
+            id: 0x0f,
             redirection_table: [REDIRECTION_ENTRY_MASKED; REDIRECTION_ENTRY_COUNT],
             pending_level: [false; REDIRECTION_ENTRY_COUNT],
+            line_level: [false; REDIRECTION_ENTRY_COUNT],
         }
     }
 
@@ -73,6 +76,33 @@ impl IoApicState {
             level_triggered,
             target_vcpu,
         })
+    }
+
+    fn set_irq_line(&mut self, gsi: usize, asserted: bool) -> Option<IoApicInterrupt> {
+        *self.line_level.get_mut(gsi)? = asserted;
+        if !asserted {
+            self.pending_level[gsi] = false;
+            return None;
+        }
+        self.interrupt_for_entry(gsi)
+    }
+
+    fn end_of_interrupt(&mut self, vector: u8) -> Option<IoApicInterrupt> {
+        for gsi in 0..REDIRECTION_ENTRY_COUNT {
+            let entry = &mut self.redirection_table[gsi];
+            if (*entry & 0xff) as u8 != vector
+                || *entry & REDIRECTION_ENTRY_TRIGGER_MODE == 0
+                || *entry & REDIRECTION_ENTRY_REMOTE_IRR == 0
+            {
+                continue;
+            }
+
+            *entry &= !REDIRECTION_ENTRY_REMOTE_IRR;
+            if core::mem::take(&mut self.pending_level[gsi]) || self.line_level[gsi] {
+                return self.interrupt_for_entry(gsi);
+            }
+        }
+        None
     }
 }
 
@@ -143,25 +173,32 @@ impl EmulatedIoApic {
         state.interrupt_for_entry(gsi)
     }
 
+    /// Set an IO APIC input line and return an interrupt when asserting it.
+    pub fn set_gsi_level(&self, gsi: usize, asserted: bool) -> Option<IoApicInterrupt> {
+        let mut state = self.state.lock();
+        state.set_irq_line(gsi, asserted)
+    }
+
     /// Process an EOI broadcast from the local APIC.
     pub fn end_of_interrupt(&self, vector: u8) -> Option<IoApicInterrupt> {
         let mut state = self.state.lock();
-        for gsi in 0..REDIRECTION_ENTRY_COUNT {
-            let entry = &mut state.redirection_table[gsi];
-            if (*entry & 0xff) as u8 != vector
-                || *entry & REDIRECTION_ENTRY_TRIGGER_MODE == 0
-                || *entry & REDIRECTION_ENTRY_REMOTE_IRR == 0
-            {
-                continue;
-            }
+        state.end_of_interrupt(vector)
+    }
 
-            *entry &= !REDIRECTION_ENTRY_REMOTE_IRR;
-            if core::mem::take(&mut state.pending_level[gsi]) {
-                return state.interrupt_for_entry(gsi);
-            }
-        }
-
-        None
+    /// Replace state from a KVM-compatible IOAPIC snapshot.
+    pub fn replace_state(
+        &self,
+        selector: u32,
+        id: u32,
+        irr: u32,
+        redirection_table: [u64; REDIRECTION_ENTRY_COUNT],
+    ) {
+        let mut state = self.state.lock();
+        state.selector = selector;
+        state.id = id as u8;
+        state.redirection_table = redirection_table;
+        state.pending_level = [false; REDIRECTION_ENTRY_COUNT];
+        state.line_level = core::array::from_fn(|pin| irr & (1 << pin) != 0);
     }
 
     fn offset(&self, addr: GuestPhysAddr) -> usize {
@@ -170,9 +207,9 @@ impl EmulatedIoApic {
 
     fn read_selected_register(state: &IoApicState) -> AxResult<u32> {
         match state.selector {
-            IOAPIC_ID => Ok(IOAPIC_ID_VALUE),
+            IOAPIC_ID => Ok(u32::from(state.id) << 24),
             IOAPIC_VER => Ok(IOAPIC_VERSION_VALUE),
-            IOAPIC_ARB => Ok(IOAPIC_ID_VALUE),
+            IOAPIC_ARB => Ok(u32::from(state.id) << 24),
             reg @ IOREDTBL_BASE..=0x3f => {
                 let index = ((reg - IOREDTBL_BASE) / 2) as usize;
                 if index >= REDIRECTION_ENTRY_COUNT {
@@ -194,7 +231,11 @@ impl EmulatedIoApic {
 
     fn write_selected_register(state: &mut IoApicState, value: u32) -> AxResult {
         match state.selector {
-            IOAPIC_ID | IOAPIC_VER | IOAPIC_ARB => Ok(()),
+            IOAPIC_ID => {
+                state.id = ((value >> 24) & 0xf) as u8;
+                Ok(())
+            }
+            IOAPIC_VER | IOAPIC_ARB => Ok(()),
             reg @ IOREDTBL_BASE..=0x3f => {
                 let index = ((reg - IOREDTBL_BASE) / 2) as usize;
                 if index >= REDIRECTION_ENTRY_COUNT {
@@ -293,5 +334,54 @@ impl BaseDeviceOps<GuestPhysAddrRange> for EmulatedIoApic {
                 Ok(())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEST_GSI: usize = 5;
+    const TEST_VECTOR: u8 = 0x45;
+
+    fn level_state() -> IoApicState {
+        let mut state = IoApicState::new();
+        state.redirection_table[TEST_GSI] = u64::from(TEST_VECTOR) | REDIRECTION_ENTRY_TRIGGER_MODE;
+        state
+    }
+
+    #[test]
+    fn asserted_level_line_reinjects_after_eoi() {
+        let mut state = level_state();
+        let first = state.set_irq_line(TEST_GSI, true).unwrap();
+        assert_eq!(first.vector, TEST_VECTOR);
+        assert!(first.level_triggered);
+
+        let second = state.end_of_interrupt(TEST_VECTOR).unwrap();
+        assert_eq!(second.vector, TEST_VECTOR);
+        assert!(second.level_triggered);
+    }
+
+    #[test]
+    fn deasserted_level_line_stops_reinjection() {
+        let mut state = level_state();
+        assert!(state.set_irq_line(TEST_GSI, true).is_some());
+        assert!(state.set_irq_line(TEST_GSI, false).is_none());
+        assert!(state.end_of_interrupt(TEST_VECTOR).is_none());
+    }
+
+    #[test]
+    fn kvm_snapshot_replaces_programmable_state() {
+        let ioapic = EmulatedIoApic::new_default();
+        let mut redirection_table = [REDIRECTION_ENTRY_MASKED; REDIRECTION_ENTRY_COUNT];
+        redirection_table[TEST_GSI] = u64::from(TEST_VECTOR);
+
+        ioapic.replace_state(0x1a, 3, 1 << TEST_GSI, redirection_table);
+
+        let state = ioapic.state.lock();
+        assert_eq!(state.selector, 0x1a);
+        assert_eq!(state.id, 3);
+        assert_eq!(state.redirection_table[TEST_GSI], u64::from(TEST_VECTOR));
+        assert!(state.line_level[TEST_GSI]);
     }
 }

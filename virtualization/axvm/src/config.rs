@@ -79,6 +79,7 @@ pub struct VMImageConfig {
 pub struct AxVMConfig {
     id: usize,
     name: String,
+    host_controlled: bool,
     #[allow(dead_code)]
     vm_type: VMType,
     pub(crate) phys_cpu_ls: PhysCpuList,
@@ -101,6 +102,7 @@ impl From<AxVMCrateConfig> for AxVMConfig {
         Self {
             id: cfg.base.id,
             name: cfg.base.name,
+            host_controlled: false,
             vm_type: VMType::from(cfg.base.vm_type),
             phys_cpu_ls: PhysCpuList {
                 cpu_num: cfg.base.cpu_num,
@@ -173,6 +175,7 @@ impl AxVMConfig {
         Self {
             id,
             name,
+            host_controlled: true,
             vm_type: VMType::VMTLinux,
             phys_cpu_ls: PhysCpuList {
                 cpu_num: vcpu_count,
@@ -193,6 +196,11 @@ impl AxVMConfig {
     /// Returns VM id.
     pub fn id(&self) -> usize {
         self.id
+    }
+
+    /// Returns whether VM resources and execution are driven by a host control API.
+    pub fn host_controlled(&self) -> bool {
+        self.host_controlled
     }
 
     /// Returns VM name.

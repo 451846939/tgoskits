@@ -18,12 +18,41 @@ use tock_registers::interfaces::{Readable, Writeable};
 use super::SvmVcpu;
 use crate::{
     kvm::{
-        KVM_REGS_SIZE, KVM_SREGS_SIZE, KvmDtable, KvmRegs, KvmSegment, KvmSregs, map_kvm_uapi_error,
+        KVM_DEBUGREGS_SIZE, KVM_REGS_SIZE, KVM_SREGS_SIZE, KvmDebugregs, KvmDtable, KvmRegs,
+        KvmSegment, KvmSregs, map_kvm_uapi_error,
     },
     svm::vmcb::VmcbSegment,
 };
 
 impl SvmVcpu {
+    pub(super) fn encode_kvm_debugregs(&self, buf: &mut [u8]) -> AxResult {
+        if buf.len() != KVM_DEBUGREGS_SIZE {
+            return ax_errno::ax_err!(InvalidInput);
+        }
+        let state = &unsafe { self.vmcb.as_vmcb_ref() }.state;
+        KvmDebugregs {
+            db: self.debugregs.guest_db,
+            dr6: state.dr6.get(),
+            dr7: state.dr7.get(),
+            flags: 0,
+            reserved: [0; 9],
+        }
+        .encode(buf)
+        .map_err(map_kvm_uapi_error)
+    }
+
+    pub(super) fn decode_kvm_debugregs(&mut self, buf: &[u8]) -> AxResult {
+        let regs = KvmDebugregs::decode(buf).map_err(map_kvm_uapi_error)?;
+        if regs.flags != 0 || regs.reserved.iter().any(|value| *value != 0) {
+            return ax_errno::ax_err!(InvalidInput);
+        }
+        self.debugregs.guest_db = regs.db;
+        let state = &mut unsafe { self.vmcb.as_vmcb() }.state;
+        state.dr6.set(regs.dr6);
+        state.dr7.set(regs.dr7);
+        Ok(())
+    }
+
     pub(super) fn encode_kvm_regs(&self, buf: &mut [u8]) -> AxResult {
         if buf.len() != KVM_REGS_SIZE {
             return ax_errno::ax_err!(InvalidInput);

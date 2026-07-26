@@ -45,10 +45,11 @@ use x86_vlapic::EmulatedLocalApic;
 use super::{
     VmxExitInfo, as_axerr,
     definitions::VmxExitReason,
-    structs::{IOBitmap, MsrBitmap, VmxRegion},
+    structs::{IOBitmap, MsrBitmap, VmxMsrSwitch, VmxRegion},
     vmcs::{
         self, ApicAccessExitType, VmcsControl32, VmcsControl64, VmcsControlNW, VmcsGuest16,
         VmcsGuest32, VmcsGuest64, VmcsGuestNW, VmcsHost16, VmcsHost32, VmcsHost64, VmcsHostNW,
+        VmcsReadOnly32, VmcsReadOnlyNW,
     },
 };
 use crate::{
@@ -66,9 +67,43 @@ const X86_PIT_PORT_COUNT: u32 = 4;
 const X86_PIT_SPEAKER_PORT: u16 = 0x61;
 const X86_COM1_PORT_BASE: u16 = 0x3f8;
 const X86_COM1_PORT_COUNT: u32 = 8;
+const IA32_TSC: u32 = 0x10;
+const IA32_TSC_ADJUST: u32 = 0x3b;
+const IA32_APIC_BASE: u32 = 0x1b;
+const IA32_SYSENTER_CS: u32 = 0x174;
+const IA32_SYSENTER_ESP: u32 = 0x175;
+const IA32_SYSENTER_EIP: u32 = 0x176;
+const IA32_MISC_ENABLE: u32 = 0x1a0;
+const IA32_PAT: u32 = 0x277;
+const IA32_EFER: u32 = 0xc000_0080;
+const IA32_STAR: u32 = 0xc000_0081;
+const IA32_LSTAR: u32 = 0xc000_0082;
+const IA32_CSTAR: u32 = 0xc000_0083;
+const IA32_FMASK: u32 = 0xc000_0084;
+const IA32_FS_BASE: u32 = 0xc000_0100;
+const IA32_GS_BASE: u32 = 0xc000_0101;
+const IA32_KERNEL_GS_BASE: u32 = 0xc000_0102;
+const SWITCHED_MSR_INDICES: [u32; 5] = [
+    IA32_STAR,
+    IA32_LSTAR,
+    IA32_CSTAR,
+    IA32_FMASK,
+    IA32_KERNEL_GS_BASE,
+];
+const SWITCHED_HOST_MSRS: [Msr; 5] = [
+    Msr::IA32_STAR,
+    Msr::IA32_LSTAR,
+    Msr::IA32_CSTAR,
+    Msr::IA32_FMASK,
+    Msr::IA32_KERNEL_GSBASE,
+];
+
+fn switched_msr_slot(index: u32) -> Option<usize> {
+    SWITCHED_MSR_INDICES
+        .iter()
+        .position(|candidate| *candidate == index)
+}
 pub const X86_APIC_ACCESS_GPA: usize = 0xfee0_0000;
-const X86_IOAPIC_BASE: usize = 0xfec0_0000;
-const X86_IOAPIC_SIZE: usize = 0x1000;
 
 mod kvm_regs;
 
@@ -131,12 +166,23 @@ pub struct VmxVcpu {
     io_bitmap: IOBitmap,
     /// The MSR bitmap for the VMCS.
     msr_bitmap: MsrBitmap,
+    /// Guest/host syscall MSRs switched by VM-entry and VM-exit.
+    msr_switch: VmxMsrSwitch<5>,
 
     // Interrupt-related fields
     /// Pending events to be injected to the guest.
     pending_events: VecDeque<PendingEvent>,
     /// Emulated Local APIC.
     vlapic: EmulatedLocalApic,
+    /// Guest-visible IA32_TSC_ADJUST value.
+    tsc_adjust: u64,
+    /// Guest-visible IA32_MISC_ENABLE value.
+    misc_enable: u64,
+    /// Debug-address registers shared with the host.
+    debugregs: crate::debugregs::DebugRegisterState,
+    /// Guest and host DR6 values, which are not switched by VMX.
+    guest_dr6: u64,
+    host_dr6: u64,
 
     // Extra states
     /// The XState of the VCpu. Both host and guest.
@@ -167,8 +213,14 @@ impl VmxVcpu {
             vmcs: VmxRegion::new(vmcs_revision_id, false)?,
             io_bitmap: IOBitmap::passthrough_all()?,
             msr_bitmap: MsrBitmap::passthrough_all()?,
+            msr_switch: VmxMsrSwitch::new(SWITCHED_MSR_INDICES)?,
             pending_events: VecDeque::with_capacity(8),
             vlapic: EmulatedLocalApic::new(vm_id, vcpu_id),
+            tsc_adjust: 0,
+            misc_enable: 1,
+            debugregs: crate::debugregs::DebugRegisterState::new(),
+            guest_dr6: 0xffff_0ff0,
+            host_dr6: 0,
             xstate: XState::new(),
             #[cfg(feature = "tracing")]
             guest_regs_exiting: GeneralRegisters::default(),
@@ -249,6 +301,7 @@ impl VmxVcpu {
         self.inject_pending_events().unwrap();
 
         // Run guest
+        self.prepare_msr_switch();
         self.load_guest_xstate();
 
         #[cfg(feature = "tracing")]
@@ -275,6 +328,7 @@ impl VmxVcpu {
                 self.vmx_launch();
             }
         }
+        self.msr_switch.sync_guest_values_after_exit();
         self.load_host_xstate();
         restore_host_interrupt_flag(self.host_rflags);
 
@@ -481,7 +535,11 @@ impl VmxVcpu {
 // Implementation of private methods
 impl VmxVcpu {
     fn setup_io_bitmap(&mut self, config: X86VCpuSetupConfig) -> AxResult {
-        // By default, I/O bitmap is set as `intercept_all`.
+        if config.intercept_all_io {
+            self.io_bitmap.set_intercept_all();
+            return Ok(());
+        }
+        // Static VMs intercept only AxVisor-owned emulated ports.
         // Todo: these should be combined with emulated pio device management,
         // in `modules/axvm/src/device/x86_64/mod.rs` somehow.
         let io_to_be_intercepted = QEMU_EXIT_PORT..QEMU_EXIT_PORT + 1; // QEMU exit port.
@@ -506,6 +564,14 @@ impl VmxVcpu {
 
     #[allow(dead_code)]
     fn setup_msr_bitmap(&mut self) -> AxResult {
+        // Never let a guest change the physical TSC used by the host kernel.
+        self.msr_bitmap.set_read_intercept(IA32_TSC, true);
+        self.msr_bitmap.set_write_intercept(IA32_TSC, true);
+        self.msr_bitmap.set_read_intercept(IA32_TSC_ADJUST, true);
+        self.msr_bitmap.set_write_intercept(IA32_TSC_ADJUST, true);
+        self.msr_bitmap.set_read_intercept(IA32_MISC_ENABLE, true);
+        self.msr_bitmap.set_write_intercept(IA32_MISC_ENABLE, true);
+
         // Intercept IA32_APIC_BASE MSR accesses
         const IA32_APIC_BASE: u32 = 0x1b;
         self.msr_bitmap.set_read_intercept(IA32_APIC_BASE, true);
@@ -768,10 +834,16 @@ impl VmxVcpu {
 
         vmcs::set_ept_pointer(ept_root)?;
 
-        // No MSR switches if hypervisor doesn't use and there is only one vCPU.
-        VmcsControl32::VMEXIT_MSR_STORE_COUNT.write(0)?;
-        VmcsControl32::VMEXIT_MSR_LOAD_COUNT.write(0)?;
-        VmcsControl32::VMENTRY_MSR_LOAD_COUNT.write(0)?;
+        VmcsControl64::VMENTRY_MSR_LOAD_ADDR
+            .write(self.msr_switch.entry_load_addr().as_usize() as u64)?;
+        VmcsControl64::VMEXIT_MSR_STORE_ADDR
+            .write(self.msr_switch.exit_store_addr().as_usize() as u64)?;
+        VmcsControl64::VMEXIT_MSR_LOAD_ADDR
+            .write(self.msr_switch.exit_load_addr().as_usize() as u64)?;
+        let switched_msr_count = self.msr_switch.count() as u32;
+        VmcsControl32::VMEXIT_MSR_STORE_COUNT.write(switched_msr_count)?;
+        VmcsControl32::VMEXIT_MSR_LOAD_COUNT.write(switched_msr_count)?;
+        VmcsControl32::VMENTRY_MSR_LOAD_COUNT.write(switched_msr_count)?;
 
         // VmcsControlNW::CR4_GUEST_HOST_MASK.write(0)?;
         VmcsControl32::CR3_TARGET_COUNT.write(0)?;
@@ -1009,6 +1081,21 @@ impl VmxVcpu {
             VmxExitReason::CR_ACCESS => Some(self.handle_cr()),
             VmxExitReason::CPUID => Some(self.handle_cpuid()),
             msr_rw @ (VmxExitReason::MSR_READ | VmxExitReason::MSR_WRITE)
+                if self.regs().rcx as u32 == IA32_TSC =>
+            {
+                Some(self.handle_tsc_msr_access(msr_rw == VmxExitReason::MSR_WRITE))
+            }
+            msr_rw @ (VmxExitReason::MSR_READ | VmxExitReason::MSR_WRITE)
+                if self.regs().rcx as u32 == IA32_TSC_ADJUST =>
+            {
+                Some(self.handle_ignored_msr_access(msr_rw == VmxExitReason::MSR_WRITE))
+            }
+            msr_rw @ (VmxExitReason::MSR_READ | VmxExitReason::MSR_WRITE)
+                if self.regs().rcx as u32 == IA32_MISC_ENABLE =>
+            {
+                Some(self.handle_misc_enable_msr_access(msr_rw == VmxExitReason::MSR_WRITE))
+            }
+            msr_rw @ (VmxExitReason::MSR_READ | VmxExitReason::MSR_WRITE)
                 if self.regs().rcx as u32 == APIC_BASE_MSR =>
             {
                 Some(self.handle_apic_base_msr_access(msr_rw == VmxExitReason::MSR_WRITE))
@@ -1027,7 +1114,7 @@ impl VmxVcpu {
             msr_rw @ (VmxExitReason::MSR_READ | VmxExitReason::MSR_WRITE)
                 if self.regs().rcx as u32 == AMD64_DE_CFG =>
             {
-                Some(self.handle_amd64_de_cfg_msr_access(msr_rw == VmxExitReason::MSR_WRITE))
+                Some(self.handle_ignored_msr_access(msr_rw == VmxExitReason::MSR_WRITE))
             }
             VmxExitReason::APIC_ACCESS => Some(self.handle_apic_access(exit_info)),
             _ => None,
@@ -1043,6 +1130,30 @@ impl VmxVcpu {
     fn write_edx_eax(&mut self, val: u64) {
         self.regs_mut().rax = val & 0xffff_ffff;
         self.regs_mut().rdx = val >> 32;
+    }
+
+    fn handle_tsc_msr_access(&mut self, write: bool) -> AxResult {
+        const VMEXIT_INSTR_LEN_RDMSR_WRMSR: u8 = 2;
+
+        let host_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+        if write {
+            VmcsControl64::TSC_OFFSET.write(self.read_edx_eax().wrapping_sub(host_tsc))?;
+        } else {
+            let offset = VmcsControl64::TSC_OFFSET.read()?;
+            self.write_edx_eax(host_tsc.wrapping_add(offset));
+        }
+        self.advance_rip(VMEXIT_INSTR_LEN_RDMSR_WRMSR)
+    }
+
+    fn handle_misc_enable_msr_access(&mut self, write: bool) -> AxResult {
+        const VMEXIT_INSTR_LEN_RDMSR_WRMSR: u8 = 2;
+
+        if write {
+            self.misc_enable = self.read_edx_eax();
+        } else {
+            self.write_edx_eax(self.misc_enable);
+        }
+        self.advance_rip(VMEXIT_INSTR_LEN_RDMSR_WRMSR)
     }
 
     fn handle_apic_base_msr_access(&mut self, write: bool) -> AxResult {
@@ -1093,7 +1204,7 @@ impl VmxVcpu {
         }
     }
 
-    fn handle_amd64_de_cfg_msr_access(&mut self, write: bool) -> AxResult {
+    fn handle_ignored_msr_access(&mut self, write: bool) -> AxResult {
         const VMEXIT_INSTR_LEN_RDMSR_WRMSR: u8 = 2;
 
         self.advance_rip(VMEXIT_INSTR_LEN_RDMSR_WRMSR)?;
@@ -1192,15 +1303,8 @@ impl VmxVcpu {
         addr: GuestPhysAddr,
         write: bool,
     ) -> Option<AxVCpuExitReason> {
-        let is_ioapic =
-            (X86_IOAPIC_BASE..X86_IOAPIC_BASE + X86_IOAPIC_SIZE).contains(&addr.as_usize());
         let is_lapic = (X86_APIC_ACCESS_GPA..X86_APIC_ACCESS_GPA + ax_memory_addr::PAGE_SIZE_4K)
             .contains(&addr.as_usize());
-
-        // Only decode MMIO for device windows that Axvisor explicitly emulates.
-        if !is_ioapic && !is_lapic {
-            return None;
-        }
 
         let mut rip = self.gla2gva(GuestVirtAddr::from(exit_info.guest_rip));
         let mut rex = 0u8;
@@ -1475,6 +1579,8 @@ impl VmxVcpu {
                 const FEATURE_VMX: u32 = 1 << 5;
                 const FEATURE_HYPERVISOR: u32 = 1 << 31;
                 const FEATURE_MCE: u32 = 1 << 7;
+                const FEATURE_MTRR: u32 = 1 << 12;
+                const FEATURE_MCA: u32 = 1 << 14;
                 const FEATURE_X2APIC: u32 = 1 << 21;
                 const FEATURE_TSC_DEADLINE: u32 = 1 << 24;
                 const FEATURE_APIC: u32 = 1 << 9;
@@ -1485,7 +1591,7 @@ impl VmxVcpu {
                 res.ecx |= FEATURE_X2APIC;
                 res.ecx &= !FEATURE_TSC_DEADLINE;
                 res.ecx |= FEATURE_HYPERVISOR;
-                res.edx &= !FEATURE_MCE;
+                res.edx &= !(FEATURE_MCE | FEATURE_MTRR | FEATURE_MCA);
                 res.edx |= FEATURE_APIC;
                 res.ebx &= !(MAX_LOGICAL_PROCESSORS_MASK | INITIAL_APIC_ID_MASK);
                 res.ebx |= virtual_logical_processors << 16;
@@ -1606,11 +1712,45 @@ impl VmxVcpu {
     }
 
     fn load_guest_xstate(&mut self) {
+        self.debugregs.switch_to_guest();
+        self.host_dr6 = crate::debugregs::read_dr6();
+        crate::debugregs::write_dr6(self.guest_dr6);
         self.xstate.switch_to_guest();
     }
 
     fn load_host_xstate(&mut self) {
         self.xstate.switch_to_host();
+        self.guest_dr6 = crate::debugregs::read_dr6();
+        crate::debugregs::write_dr6(self.host_dr6);
+        self.debugregs.switch_to_host();
+    }
+
+    fn prepare_msr_switch(&mut self) {
+        for (slot, msr) in SWITCHED_HOST_MSRS.into_iter().enumerate() {
+            self.msr_switch.set_host_value(slot, msr.read());
+        }
+    }
+
+    fn complete_string_io_write(
+        &mut self,
+        address_size: u8,
+        width: AccessWidth,
+        repeat: bool,
+        remaining: u64,
+        next_rip: u64,
+        decrement: bool,
+    ) -> AxResult {
+        let delta = width.size() as u64;
+        self.guest_regs.rsi =
+            update_string_register(self.guest_regs.rsi, delta, address_size, decrement);
+        if repeat {
+            self.guest_regs.rcx =
+                update_string_register(self.guest_regs.rcx, 1, address_size, true);
+        }
+        if !repeat || remaining <= 1 {
+            VmcsGuestNW::RIP.write(next_rip as usize)?;
+        }
+        Ok(())
     }
 }
 
@@ -1716,15 +1856,67 @@ impl AxArchVCpu for VmxVcpu {
                     }
                     VmxExitReason::IO_INSTRUCTION => {
                         let io_info = self.io_exit_info().unwrap();
-                        self.advance_rip(exit_info.exit_instruction_length as _)?;
-
                         let port = io_info.port;
 
-                        if io_info.is_repeat || io_info.is_string {
-                            warn!("VMX unsupported IO-Exit: {io_info:#x?} of {exit_info:#x?}");
-                            warn!("VCpu {self:#x?}");
-                            AxVCpuExitReason::Halt
+                        if io_info.is_string {
+                            let address_size = match VmcsReadOnly32::VMEXIT_INSTRUCTION_INFO
+                                .read()?
+                                .get_bits(7..10)
+                            {
+                                0 => 16,
+                                1 => 32,
+                                2 => 64,
+                                _ => return ax_err!(InvalidData, "invalid VMX I/O address size"),
+                            };
+                            let remaining = if io_info.is_repeat {
+                                truncate_string_register(self.regs().rcx, address_size)
+                            } else {
+                                1
+                            };
+                            let decrement = VmcsGuestNW::RFLAGS.read()? & (1 << 10) != 0;
+                            let gva =
+                                GuestVirtAddr::from(VmcsReadOnlyNW::GUEST_LINEAR_ADDR.read()?);
+                            let gpa = self.translate_guest_linear(gva)?;
+                            let next_rip = exit_info
+                                .guest_rip
+                                .wrapping_add(exit_info.exit_instruction_length as usize)
+                                as u64;
+                            if io_info.is_in {
+                                AxVCpuExitReason::IoStringRead {
+                                    port: Port(port),
+                                    width: AccessWidth::try_from(io_info.access_size as usize)
+                                        .map_err(|_| ax_err_type!(InvalidData))?,
+                                    addr: gpa,
+                                    repeat: io_info.is_repeat,
+                                    remaining,
+                                    next_rip,
+                                    address_size,
+                                    decrement,
+                                }
+                            } else {
+                                let width = AccessWidth::try_from(io_info.access_size as usize)
+                                    .map_err(|_| ax_err_type!(InvalidData))?;
+                                let mut data = 0u64;
+                                for offset in 0..width.size() {
+                                    data |=
+                                        (self.read_guest_u8(gva + offset)? as u64) << (offset * 8);
+                                }
+                                self.complete_string_io_write(
+                                    address_size,
+                                    width,
+                                    io_info.is_repeat,
+                                    remaining,
+                                    next_rip,
+                                    decrement,
+                                )?;
+                                AxVCpuExitReason::IoWrite {
+                                    port: Port(port),
+                                    width,
+                                    data,
+                                }
+                            }
                         } else {
+                            self.advance_rip(exit_info.exit_instruction_length as _)?;
                             let width = match AccessWidth::try_from(io_info.access_size as usize) {
                                 Ok(width) => width,
                                 Err(_) => {
@@ -1812,6 +2004,7 @@ impl AxArchVCpu for VmxVcpu {
                         }
                     }
                     VmxExitReason::MSR_READ => {
+                        self.advance_rip(exit_info.exit_instruction_length as _)?;
                         // `reg` is unused here.
                         AxVCpuExitReason::SysRegRead {
                             addr: SysRegAddr::new(self.regs().rcx as _),
@@ -1819,6 +2012,7 @@ impl AxArchVCpu for VmxVcpu {
                         }
                     }
                     VmxExitReason::MSR_WRITE => {
+                        self.advance_rip(exit_info.exit_instruction_length as _)?;
                         let value = (self.regs().rax & 0xffff_ffff)
                             | ((self.regs().rdx & 0xffff_ffff) << 32);
                         AxVCpuExitReason::SysRegWrite {
@@ -1863,6 +2057,69 @@ impl AxArchVCpu for VmxVcpu {
 
     fn set_gpr(&mut self, reg: usize, val: usize) {
         self.regs_mut().set_reg_of_index(reg as u8, val as u64);
+    }
+
+    fn get_kvm_msr(&self, index: u32) -> AxResult<u64> {
+        if let Some(slot) = switched_msr_slot(index) {
+            return Ok(self.msr_switch.guest_value(slot));
+        }
+        match index {
+            IA32_TSC => Ok(unsafe { core::arch::x86_64::_rdtsc() }
+                .wrapping_add(VmcsControl64::TSC_OFFSET.read()?)),
+            IA32_TSC_ADJUST => Ok(self.tsc_adjust),
+            IA32_APIC_BASE => Ok(self.vlapic.apic_base()),
+            IA32_SYSENTER_CS => Ok(VmcsGuest32::IA32_SYSENTER_CS.read()? as u64),
+            IA32_SYSENTER_ESP => Ok(VmcsGuestNW::IA32_SYSENTER_ESP.read()? as u64),
+            IA32_SYSENTER_EIP => Ok(VmcsGuestNW::IA32_SYSENTER_EIP.read()? as u64),
+            IA32_MISC_ENABLE => Ok(self.misc_enable),
+            IA32_PAT => VmcsGuest64::IA32_PAT.read(),
+            IA32_EFER => VmcsGuest64::IA32_EFER.read(),
+            IA32_FS_BASE => Ok(VmcsGuestNW::FS_BASE.read()? as u64),
+            IA32_GS_BASE => Ok(VmcsGuestNW::GS_BASE.read()? as u64),
+            _ => ax_err!(Unsupported),
+        }
+    }
+
+    fn set_kvm_msr(&mut self, index: u32, value: u64) -> AxResult {
+        if let Some(slot) = switched_msr_slot(index) {
+            self.msr_switch.set_guest_value(slot, value);
+            return Ok(());
+        }
+        match index {
+            IA32_TSC => VmcsControl64::TSC_OFFSET
+                .write(value.wrapping_sub(unsafe { core::arch::x86_64::_rdtsc() })),
+            IA32_TSC_ADJUST => {
+                let delta = value.wrapping_sub(self.tsc_adjust);
+                let offset = VmcsControl64::TSC_OFFSET.read()?.wrapping_add(delta);
+                VmcsControl64::TSC_OFFSET.write(offset)?;
+                self.tsc_adjust = value;
+                Ok(())
+            }
+            IA32_MISC_ENABLE => {
+                self.misc_enable = value;
+                Ok(())
+            }
+            IA32_APIC_BASE => self.vlapic.set_apic_base(value),
+            IA32_SYSENTER_CS => VmcsGuest32::IA32_SYSENTER_CS.write(value as u32),
+            IA32_SYSENTER_ESP => VmcsGuestNW::IA32_SYSENTER_ESP.write(value as usize),
+            IA32_SYSENTER_EIP => VmcsGuestNW::IA32_SYSENTER_EIP.write(value as usize),
+            IA32_PAT => VmcsGuest64::IA32_PAT.write(value),
+            IA32_EFER => {
+                VmcsGuest64::IA32_EFER.write(value)?;
+                vmcs::update_efer()
+            }
+            IA32_FS_BASE => VmcsGuestNW::FS_BASE.write(value as usize),
+            IA32_GS_BASE => VmcsGuestNW::GS_BASE.write(value as usize),
+            _ => ax_err!(Unsupported),
+        }
+    }
+
+    fn get_kvm_debugregs(&self, buf: &mut [u8]) -> AxResult {
+        self.encode_kvm_debugregs(buf)
+    }
+
+    fn set_kvm_debugregs(&mut self, buf: &[u8]) -> AxResult {
+        self.decode_kvm_debugregs(buf)
     }
 
     fn get_kvm_regs(&self, buf: &mut [u8]) -> AxResult {
@@ -1915,6 +2172,33 @@ impl AxArchVCpu for VmxVcpu {
 
     fn set_return_value(&mut self, val: usize) {
         self.regs_mut().rax = val as u64;
+    }
+}
+
+fn truncate_string_register(value: u64, address_size: u8) -> u64 {
+    match address_size {
+        16 => value & 0xffff,
+        32 => value & 0xffff_ffff,
+        _ => value,
+    }
+}
+
+fn update_string_register(value: u64, delta: u64, address_size: u8, decrement: bool) -> u64 {
+    let mask = match address_size {
+        16 => 0xffff,
+        32 => 0xffff_ffff,
+        _ => u64::MAX,
+    };
+    let truncated = value & mask;
+    let updated = if decrement {
+        truncated.wrapping_sub(delta)
+    } else {
+        truncated.wrapping_add(delta)
+    } & mask;
+    if address_size == 16 {
+        (value & !mask) | updated
+    } else {
+        updated
     }
 }
 

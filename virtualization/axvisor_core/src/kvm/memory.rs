@@ -72,7 +72,6 @@ pub(in crate::kvm) fn set_user_memory_region(
         let _ = api_control::release_pinned_user_pages(pinned_pages);
         return Err(err);
     }
-
     let new_slot = MemorySlot {
         pinned_pages,
         ..region.into()

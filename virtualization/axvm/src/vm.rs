@@ -460,13 +460,13 @@ impl AxVM {
             let setup_config = <AxArchVCpuImpl as axvcpu::AxArchVCpu>::SetupConfig::default();
             #[cfg(target_arch = "x86_64")]
             let setup_config = crate::vcpu::AxVCpuSetupConfig {
+                intercept_all_io: inner_mut.config.host_controlled(),
                 intercept_com1: inner_mut
                     .config
                     .emu_devices()
                     .iter()
                     .any(|dev| dev.emu_type == axvmconfig::EmulatedDeviceType::Console),
-                expose_kvm_hypervisor: inner_mut.config.interrupt_mode()
-                    == axvmconfig::VMInterruptMode::NoIrq,
+                expose_kvm_hypervisor: inner_mut.config.host_controlled(),
             };
 
             let entry = if vcpu.id() == 0 {

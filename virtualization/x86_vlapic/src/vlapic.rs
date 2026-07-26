@@ -83,6 +83,8 @@ pub struct VirtualApicRegs {
     /// to maintain a coherent snapshot of the register (e.g. lvt_last)
     lvt_last: LocalVectorTable,
     pending_cpu_up: Option<VlapicCpuUp>,
+    init_targets: u64,
+    started_targets: u64,
     apic_page: PhysFrame,
 }
 
@@ -110,6 +112,8 @@ impl VirtualApicRegs {
             svr_last: SpuriousInterruptVectorRegisterLocal::new(RESET_SPURIOUS_INTERRUPT_VECTOR),
             lvt_last: LocalVectorTable::default(),
             pending_cpu_up: None,
+            init_targets: 0,
+            started_targets: 0,
             isrv: 0,
             apic_base: ApicBaseRegisterMsr::new(
                 DEFAULT_APIC_BASE as u64
@@ -421,9 +425,17 @@ impl VirtualApicRegs {
         mode: APICDeliveryMode,
         icr_low: InterruptCommandRegisterLowLocal,
     ) {
+        let target = 1u64 << vcpu_id;
         match mode {
-            APICDeliveryMode::INIT => {}
+            APICDeliveryMode::INIT => {
+                self.init_targets |= target;
+            }
             APICDeliveryMode::StartUp => {
+                if self.init_targets & target == 0 && self.started_targets & target != 0 {
+                    return;
+                }
+                self.init_targets &= !target;
+                self.started_targets |= target;
                 let vector = icr_low.read(INTERRUPT_COMMAND_LOW::Vector);
                 let entry_point = (vector as usize) << 12;
                 self.pending_cpu_up = Some(VlapicCpuUp {

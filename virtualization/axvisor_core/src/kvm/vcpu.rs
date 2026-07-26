@@ -18,6 +18,8 @@ use ax_errno::{AxError, AxResult, ax_err};
 use axvisor_api::control as api_control;
 
 use super::{CONTROL_FILES, ControlFileState, OneReg, VcpuFileState};
+#[cfg(target_arch = "x86_64")]
+use crate::kvm::run::apply_kvm_pv_msr_write;
 use crate::{
     kvm::{
         abi::raw as abi,
@@ -121,7 +123,7 @@ pub(in crate::kvm) fn set_mp_state(
     arg: usize,
 ) -> AxResult<isize> {
     let mp_state = read_u32_user(arg)?;
-    if mp_state != abi::KVM_MP_STATE_RUNNABLE && mp_state != abi::KVM_MP_STATE_STOPPED {
+    if mp_state > abi::KVM_MP_STATE_SUSPENDED {
         return ax_err!(Unsupported);
     }
 
@@ -216,6 +218,26 @@ pub(in crate::kvm) fn set_kvm_sregs(
     Ok(0)
 }
 
+pub(in crate::kvm) fn get_kvm_debugregs(
+    control_file: api_control::ControlFileId,
+    arg: usize,
+) -> AxResult<isize> {
+    let mut bytes = [0; abi::KVM_X86_DEBUGREGS_SIZE as usize];
+    get_vcpu(control_file)?.get_kvm_debugregs(&mut bytes)?;
+    api_control::copy_to_user(arg, &bytes)?;
+    Ok(0)
+}
+
+pub(in crate::kvm) fn set_kvm_debugregs(
+    control_file: api_control::ControlFileId,
+    arg: usize,
+) -> AxResult<isize> {
+    let mut bytes = [0; abi::KVM_X86_DEBUGREGS_SIZE as usize];
+    api_control::copy_from_user(arg, &mut bytes)?;
+    get_vcpu(control_file)?.set_kvm_debugregs(&bytes)?;
+    Ok(0)
+}
+
 pub(in crate::kvm) fn set_msrs(
     control_file: api_control::ControlFileId,
     arg: usize,
@@ -233,14 +255,34 @@ pub(in crate::kvm) fn set_msrs(
         entries.push((msr_index, data));
     }
 
-    let mut control_files = CONTROL_FILES.lock();
-    let Some(ControlFileState::Vcpu(vcpu)) = control_files.get_mut(&control_file) else {
-        return ax_err!(NotFound);
-    };
+    let vcpu = get_vcpu(control_file)?;
+    #[cfg(target_arch = "x86_64")]
+    let vm = get_vcpu_vm(control_file)?;
+    let mut processed = 0;
     for (index, data) in entries {
-        vcpu.msrs.insert(index, data);
+        #[cfg(target_arch = "x86_64")]
+        if is_kvm_pv_msr(index) {
+            apply_kvm_pv_msr_write(&vm, index as usize, data)?;
+            set_emulated_msr(control_file, index, data)?;
+            processed += 1;
+            continue;
+        }
+        #[cfg(target_arch = "x86_64")]
+        if is_mtrr_msr(index) {
+            set_emulated_msr(control_file, index, data)?;
+            processed += 1;
+            continue;
+        }
+        match vcpu.set_kvm_msr(index, data) {
+            Ok(()) => processed += 1,
+            Err(AxError::Unsupported) => {
+                crate::println!("KVM_SET_MSRS stopped at unsupported MSR {index:#x}");
+                break;
+            }
+            Err(err) => return Err(err),
+        }
     }
-    Ok(nmsrs as isize)
+    Ok(processed)
 }
 
 pub(in crate::kvm) fn get_msrs(
@@ -252,24 +294,25 @@ pub(in crate::kvm) fn get_msrs(
         return ax_err!(InvalidInput);
     }
     let entries_offset = checked_add(arg, abi::KVM_MSRS_SIZE as usize)?;
-    let msrs = {
-        let control_files = CONTROL_FILES.lock();
-        let Some(ControlFileState::Vcpu(vcpu)) = control_files.get(&control_file) else {
-            return ax_err!(NotFound);
-        };
-        vcpu.msrs.clone()
-    };
+    let vcpu = get_vcpu(control_file)?;
 
+    let mut processed = 0;
     for index in 0..nmsrs {
         let offset = checked_add(entries_offset, index * abi::KVM_MSR_ENTRY_SIZE)?;
         let msr_index = read_u32_user(offset)?;
-        let data = msrs
-            .get(&msr_index)
-            .copied()
-            .unwrap_or_else(|| default_msr_value(msr_index));
+        let data = if is_emulated_msr(msr_index) {
+            get_emulated_msr(control_file, msr_index)?
+        } else {
+            match vcpu.get_kvm_msr(msr_index) {
+                Ok(data) => data,
+                Err(AxError::Unsupported) => break,
+                Err(err) => return Err(err),
+            }
+        };
         write_u64_user(checked_add(offset, 8)?, data)?;
+        processed += 1;
     }
-    Ok(nmsrs as isize)
+    Ok(processed as isize)
 }
 
 pub(in crate::kvm) fn set_fpu(
@@ -315,6 +358,19 @@ pub(in crate::kvm) fn set_lapic(
     Ok(0)
 }
 
+pub(in crate::kvm) fn set_vapic_addr(
+    control_file: api_control::ControlFileId,
+    arg: usize,
+) -> AxResult<isize> {
+    let vapic_addr = read_u64_user(arg)?;
+    let mut control_files = CONTROL_FILES.lock();
+    let Some(ControlFileState::Vcpu(vcpu)) = control_files.get_mut(&control_file) else {
+        return ax_err!(NotFound);
+    };
+    vcpu.vapic_addr = Some(vapic_addr);
+    Ok(0)
+}
+
 pub(in crate::kvm) fn kvm_interrupt(
     control_file: api_control::ControlFileId,
     arg: usize,
@@ -347,12 +403,6 @@ pub(in crate::kvm) fn default_fpu() -> Vec<u8> {
     fpu
 }
 
-pub(in crate::kvm) fn default_debugregs() -> Vec<u8> {
-    let mut debugregs = vec![0; abi::KVM_X86_DEBUGREGS_SIZE as usize];
-    debugregs[40..48].copy_from_slice(&0x400u64.to_ne_bytes());
-    debugregs
-}
-
 pub(in crate::kvm) fn default_xcrs() -> Vec<u8> {
     let mut xcrs = vec![0; abi::KVM_X86_XCRS_SIZE as usize];
     xcrs[0..4].copy_from_slice(&1u32.to_ne_bytes());
@@ -376,6 +426,70 @@ fn get_vcpu(control_file: api_control::ControlFileId) -> AxResult<axvm::AxVCpuRe
     vm.vcpu(vcpu_id).ok_or(AxError::InvalidInput)
 }
 
+#[cfg(target_arch = "x86_64")]
+fn get_vcpu_vm(control_file: api_control::ControlFileId) -> AxResult<axvm::AxVMRef> {
+    let control_files = CONTROL_FILES.lock();
+    let Some(ControlFileState::Vcpu(vcpu)) = control_files.get(&control_file) else {
+        return ax_err!(NotFound);
+    };
+    let Some(ControlFileState::Vm(vm)) = control_files.get(&vcpu.vm_file) else {
+        return ax_err!(NotFound);
+    };
+    Ok(vm.vm.clone())
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(in crate::kvm) fn is_kvm_pv_msr(index: u32) -> bool {
+    matches!(
+        index as usize,
+        abi::MSR_KVM_WALL_CLOCK
+            | abi::MSR_KVM_SYSTEM_TIME
+            | abi::MSR_KVM_WALL_CLOCK_NEW
+            | abi::MSR_KVM_SYSTEM_TIME_NEW
+    )
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub(in crate::kvm) fn is_kvm_pv_msr(_index: u32) -> bool {
+    false
+}
+
+#[cfg(target_arch = "x86_64")]
+fn is_mtrr_msr(index: u32) -> bool {
+    matches!(index, 0x200..=0x20f | 0x250 | 0x258..=0x259 | 0x268..=0x26f | 0x2ff)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn is_mtrr_msr(_index: u32) -> bool {
+    false
+}
+
+fn is_emulated_msr(index: u32) -> bool {
+    is_kvm_pv_msr(index) || is_mtrr_msr(index)
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(in crate::kvm) fn set_emulated_msr(
+    control_file: api_control::ControlFileId,
+    index: u32,
+    value: u64,
+) -> AxResult {
+    let mut control_files = CONTROL_FILES.lock();
+    let Some(ControlFileState::Vcpu(vcpu)) = control_files.get_mut(&control_file) else {
+        return ax_err!(NotFound);
+    };
+    vcpu.emulated_msrs.insert(index, value);
+    Ok(())
+}
+
+fn get_emulated_msr(control_file: api_control::ControlFileId, index: u32) -> AxResult<u64> {
+    let control_files = CONTROL_FILES.lock();
+    let Some(ControlFileState::Vcpu(vcpu)) = control_files.get(&control_file) else {
+        return ax_err!(NotFound);
+    };
+    Ok(vcpu.emulated_msrs.get(&index).copied().unwrap_or(0))
+}
+
 fn read_one_reg(arg: usize) -> AxResult<OneReg> {
     let mut bytes = [0u8; abi::KVM_ONE_REG_SIZE as usize];
     api_control::copy_from_user(arg, &mut bytes)?;
@@ -384,12 +498,4 @@ fn read_one_reg(arg: usize) -> AxResult<OneReg> {
         id: u64::from_ne_bytes(bytes[0..8].try_into().unwrap()),
         addr: u64::from_ne_bytes(bytes[8..16].try_into().unwrap()),
     })
-}
-
-fn default_msr_value(msr: u32) -> u64 {
-    match msr {
-        0x0000_01a0 => 1,               // IA32_MISC_ENABLE fast string
-        0x0000_02ff => (1 << 11) | 0x6, // MTRR enabled, write-back default type
-        _ => 0,
-    }
 }
