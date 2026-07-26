@@ -28,6 +28,8 @@ impl RISCVVCpu {
             KvmRiscvRegKind::Config(index) => self.get_kvm_config_reg(index),
             KvmRiscvRegKind::Core(index) => self.get_kvm_core_reg(index),
             KvmRiscvRegKind::CsrGeneral(index) => self.get_kvm_csr_general_reg(index),
+            KvmRiscvRegKind::FpF(index) => self.get_kvm_fp_f_reg(index),
+            KvmRiscvRegKind::FpD(index) => self.get_kvm_fp_d_reg(index),
             KvmRiscvRegKind::IsaExt(index) => self.get_kvm_isa_ext_reg(index),
             KvmRiscvRegKind::Timer(index) => self.get_kvm_timer_reg(index),
         }
@@ -42,6 +44,8 @@ impl RISCVVCpu {
             KvmRiscvRegKind::Config(index) => self.set_kvm_config_reg(index, value),
             KvmRiscvRegKind::Core(index) => self.set_kvm_core_reg(index, value),
             KvmRiscvRegKind::CsrGeneral(index) => self.set_kvm_csr_general_reg(index, value),
+            KvmRiscvRegKind::FpF(index) => self.set_kvm_fp_f_reg(index, value),
+            KvmRiscvRegKind::FpD(index) => self.set_kvm_fp_d_reg(index, value),
             KvmRiscvRegKind::IsaExt(index) => self.set_kvm_isa_ext_reg(index, value),
             KvmRiscvRegKind::Timer(index) => self.set_kvm_timer_reg(index, value),
         }
@@ -133,6 +137,52 @@ impl RISCVVCpu {
             _ => return Err(AxError::Unsupported),
         }
         Ok(())
+    }
+
+    fn get_kvm_fp_f_reg(&self, index: u64) -> AxResult<u64> {
+        match index {
+            0..=31 => Ok(self.fp.regs[index as usize] as u32 as u64),
+            32 => Ok(self.fp.fcsr as u64),
+            _ => Err(AxError::Unsupported),
+        }
+    }
+
+    fn set_kvm_fp_f_reg(&mut self, index: u64, value: u64) -> AxResult {
+        let value = u32::try_from(value).map_err(|_| AxError::InvalidInput)?;
+        match index {
+            0..=31 => {
+                let reg = &mut self.fp.regs[index as usize];
+                *reg = (*reg & !u64::from(u32::MAX)) | u64::from(value);
+                Ok(())
+            }
+            32 => {
+                self.fp.fcsr = value;
+                Ok(())
+            }
+            _ => Err(AxError::Unsupported),
+        }
+    }
+
+    fn get_kvm_fp_d_reg(&self, index: u64) -> AxResult<u64> {
+        match index {
+            0..=31 => Ok(self.fp.regs[index as usize]),
+            32 => Ok(self.fp.fcsr as u64),
+            _ => Err(AxError::Unsupported),
+        }
+    }
+
+    fn set_kvm_fp_d_reg(&mut self, index: u64, value: u64) -> AxResult {
+        match index {
+            0..=31 => {
+                self.fp.regs[index as usize] = value;
+                Ok(())
+            }
+            32 => {
+                self.fp.fcsr = u32::try_from(value).map_err(|_| AxError::InvalidInput)?;
+                Ok(())
+            }
+            _ => Err(AxError::Unsupported),
+        }
     }
 
     fn get_kvm_isa_ext_reg(&self, index: u64) -> AxResult<u64> {

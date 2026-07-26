@@ -50,7 +50,11 @@ use crate::{
 
 unsafe extern "C" {
     fn _run_guest(state: *mut VmCpuRegisters);
+    fn _axvisor_save_fpu_context_d(state: *mut FpDState);
+    fn _axvisor_load_fpu_context_d(state: *const FpDState);
 }
+
+core::arch::global_asm!(include_str!("fpu.S"));
 
 mod kvm_regs;
 
@@ -76,8 +80,17 @@ fn instr_is_pseudo(ins: u32) -> bool {
 /// A virtual CPU within a guest
 pub struct RISCVVCpu {
     regs: VmCpuRegisters,
+    fp: FpDState,
     sbi: RISCVVCpuSbi,
     queued_hvip: AtomicUsize,
+}
+
+#[derive(Debug, Default)]
+#[repr(C)]
+struct FpDState {
+    regs: [u64; 32],
+    fcsr: u32,
+    _reserved: u32,
 }
 
 #[derive(RustSBI)]
@@ -126,6 +139,7 @@ impl axvcpu::AxArchVCpu for RISCVVCpu {
 
         Ok(Self {
             regs,
+            fp: FpDState::default(),
             sbi: RISCVVCpuSbi::default(),
             queued_hvip: AtomicUsize::new(0),
         })
@@ -188,6 +202,7 @@ impl axvcpu::AxArchVCpu for RISCVVCpu {
     }
 
     fn run(&mut self) -> AxResult<AxVCpuExitReason> {
+        let mut host_fp = FpDState::default();
         unsafe {
             sstatus::clear_sie();
             sie::set_sext();
@@ -195,9 +210,13 @@ impl axvcpu::AxArchVCpu for RISCVVCpu {
             sie::set_stimer();
         }
         unsafe {
+            _axvisor_save_fpu_context_d(&mut host_fp);
+            _axvisor_load_fpu_context_d(&self.fp);
             // Safe to run the guest as it only touches memory assigned to it by being owned
             // by its page table
             _run_guest(&mut self.regs);
+            _axvisor_save_fpu_context_d(&mut self.fp);
+            _axvisor_load_fpu_context_d(&host_fp);
         }
         unsafe {
             sie::clear_sext();

@@ -362,7 +362,10 @@ fn validate_ioeventfd(ioeventfd: KvmIoEventFd) -> AxResult {
     if ioeventfd.flags & !abi::KVM_IOEVENTFD_VALID_FLAGS != 0 {
         return ax_err!(InvalidInput);
     }
-    if !matches!(ioeventfd.len, 1 | 2 | 4 | 8) {
+    if !matches!(ioeventfd.len, 0 | 1 | 2 | 4 | 8) {
+        return ax_err!(InvalidInput);
+    }
+    if ioeventfd.len == 0 && ioeventfd.flags & abi::KVM_IOEVENTFD_FLAG_DATAMATCH != 0 {
         return ax_err!(InvalidInput);
     }
     if ioeventfd.fd < 0 {
@@ -413,7 +416,8 @@ fn ioeventfd_matches(
     if (ioeventfd.flags & abi::KVM_IOEVENTFD_FLAG_PIO != 0) != pio {
         return false;
     }
-    if ioeventfd.addr != addr || ioeventfd.len != access_width_bytes(width) {
+    if ioeventfd.addr != addr || (ioeventfd.len != 0 && ioeventfd.len != access_width_bytes(width))
+    {
         return false;
     }
     if ioeventfd.flags & abi::KVM_IOEVENTFD_FLAG_DATAMATCH == 0 {

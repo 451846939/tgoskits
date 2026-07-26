@@ -20,6 +20,9 @@
 use crate::{KvmUapiError, Result};
 
 pub const KVM_REG_RISCV: u64 = 0x8000_0000_0000_0000;
+pub const KVM_REG_ARCH_MASK: u64 = 0xff00_0000_0000_0000;
+pub const KVM_REG_SIZE_MASK: u64 = 0x00f0_0000_0000_0000;
+pub const KVM_REG_SIZE_U32: u64 = 0x0020_0000_0000_0000;
 pub const KVM_REG_SIZE_U64: u64 = 0x0030_0000_0000_0000;
 pub const KVM_REG_RISCV_TYPE_MASK: u64 = 0x0000_0000_ff00_0000;
 pub const KVM_REG_RISCV_SUBTYPE_MASK: u64 = 0x0000_0000_00ff_0000;
@@ -28,8 +31,11 @@ pub const KVM_REG_RISCV_CORE: u64 = 0x02 << 24;
 pub const KVM_REG_RISCV_CSR: u64 = 0x03 << 24;
 pub const KVM_REG_RISCV_CSR_GENERAL: u64 = 0x00 << 16;
 pub const KVM_REG_RISCV_TIMER: u64 = 0x04 << 24;
+pub const KVM_REG_RISCV_FP_F: u64 = 0x05 << 24;
+pub const KVM_REG_RISCV_FP_D: u64 = 0x06 << 24;
 pub const KVM_REG_RISCV_ISA_EXT: u64 = 0x07 << 24;
-pub const KVM_RISCV_BASE_ISA: u64 = (1 << 0) | (1 << 2) | (1 << 8) | (1 << 12);
+pub const KVM_RISCV_BASE_ISA: u64 =
+    (1 << 0) | (1 << 2) | (1 << 3) | (1 << 5) | (1 << 8) | (1 << 12);
 pub const KVM_REG_RISCV_MODE_S: u64 = 1;
 pub const KVM_RISCV_TIMER_STATE_OFF: u64 = 0;
 pub const KVM_RISCV_TIMER_STATE_ON: u64 = 1;
@@ -67,7 +73,7 @@ pub const KVM_RISCV_ISA_EXT_ZICSR: u64 = 20;
 pub const KVM_RISCV_ISA_EXT_ZIFENCEI: u64 = 21;
 
 /// Register IDs reported by `KVM_GET_REG_LIST` for the supported RISC-V subset.
-pub const RISCV_REG_IDS: [u64; 53] = [
+pub const RISCV_REG_IDS: [u64; 119] = [
     riscv_config_reg_id(KVM_REG_RISCV_CONFIG_ISA),
     riscv_config_reg_id(KVM_REG_RISCV_CONFIG_MVENDORID),
     riscv_config_reg_id(KVM_REG_RISCV_CONFIG_MARCHID),
@@ -117,6 +123,72 @@ pub const RISCV_REG_IDS: [u64; 53] = [
     riscv_csr_general_reg_id(KVM_REG_RISCV_CSR_SATP),
     riscv_csr_general_reg_id(KVM_REG_RISCV_CSR_SCOUNTEREN),
     riscv_csr_general_reg_id(KVM_REG_RISCV_CSR_SENVCFG),
+    riscv_fp_f_reg_id(0),
+    riscv_fp_f_reg_id(1),
+    riscv_fp_f_reg_id(2),
+    riscv_fp_f_reg_id(3),
+    riscv_fp_f_reg_id(4),
+    riscv_fp_f_reg_id(5),
+    riscv_fp_f_reg_id(6),
+    riscv_fp_f_reg_id(7),
+    riscv_fp_f_reg_id(8),
+    riscv_fp_f_reg_id(9),
+    riscv_fp_f_reg_id(10),
+    riscv_fp_f_reg_id(11),
+    riscv_fp_f_reg_id(12),
+    riscv_fp_f_reg_id(13),
+    riscv_fp_f_reg_id(14),
+    riscv_fp_f_reg_id(15),
+    riscv_fp_f_reg_id(16),
+    riscv_fp_f_reg_id(17),
+    riscv_fp_f_reg_id(18),
+    riscv_fp_f_reg_id(19),
+    riscv_fp_f_reg_id(20),
+    riscv_fp_f_reg_id(21),
+    riscv_fp_f_reg_id(22),
+    riscv_fp_f_reg_id(23),
+    riscv_fp_f_reg_id(24),
+    riscv_fp_f_reg_id(25),
+    riscv_fp_f_reg_id(26),
+    riscv_fp_f_reg_id(27),
+    riscv_fp_f_reg_id(28),
+    riscv_fp_f_reg_id(29),
+    riscv_fp_f_reg_id(30),
+    riscv_fp_f_reg_id(31),
+    riscv_fp_f_reg_id(32),
+    riscv_fp_d_reg_id(0),
+    riscv_fp_d_reg_id(1),
+    riscv_fp_d_reg_id(2),
+    riscv_fp_d_reg_id(3),
+    riscv_fp_d_reg_id(4),
+    riscv_fp_d_reg_id(5),
+    riscv_fp_d_reg_id(6),
+    riscv_fp_d_reg_id(7),
+    riscv_fp_d_reg_id(8),
+    riscv_fp_d_reg_id(9),
+    riscv_fp_d_reg_id(10),
+    riscv_fp_d_reg_id(11),
+    riscv_fp_d_reg_id(12),
+    riscv_fp_d_reg_id(13),
+    riscv_fp_d_reg_id(14),
+    riscv_fp_d_reg_id(15),
+    riscv_fp_d_reg_id(16),
+    riscv_fp_d_reg_id(17),
+    riscv_fp_d_reg_id(18),
+    riscv_fp_d_reg_id(19),
+    riscv_fp_d_reg_id(20),
+    riscv_fp_d_reg_id(21),
+    riscv_fp_d_reg_id(22),
+    riscv_fp_d_reg_id(23),
+    riscv_fp_d_reg_id(24),
+    riscv_fp_d_reg_id(25),
+    riscv_fp_d_reg_id(26),
+    riscv_fp_d_reg_id(27),
+    riscv_fp_d_reg_id(28),
+    riscv_fp_d_reg_id(29),
+    riscv_fp_d_reg_id(30),
+    riscv_fp_d_reg_id(31),
+    riscv_fp_d_reg_id(32),
     riscv_timer_reg_id(KVM_REG_RISCV_TIMER_FREQUENCY_INDEX),
     riscv_timer_reg_id(KVM_REG_RISCV_TIMER_TIME),
     riscv_timer_reg_id(KVM_REG_RISCV_TIMER_COMPARE),
@@ -128,6 +200,8 @@ pub enum KvmRiscvRegKind {
     Config(u64),
     Core(u64),
     CsrGeneral(u64),
+    FpF(u64),
+    FpD(u64),
     IsaExt(u64),
     Timer(u64),
 }
@@ -148,6 +222,19 @@ pub const fn riscv_timer_reg_id(index: u64) -> u64 {
     KVM_REG_RISCV | KVM_REG_SIZE_U64 | KVM_REG_RISCV_TIMER | index
 }
 
+pub const fn riscv_fp_f_reg_id(index: u64) -> u64 {
+    KVM_REG_RISCV | KVM_REG_SIZE_U32 | KVM_REG_RISCV_FP_F | index
+}
+
+pub const fn riscv_fp_d_reg_id(index: u64) -> u64 {
+    let size = if index == 32 {
+        KVM_REG_SIZE_U32
+    } else {
+        KVM_REG_SIZE_U64
+    };
+    KVM_REG_RISCV | size | KVM_REG_RISCV_FP_D | index
+}
+
 pub const fn kvm_isa_ext_supported(index: u64) -> bool {
     matches!(
         index,
@@ -164,25 +251,71 @@ pub const fn kvm_isa_ext_supported(index: u64) -> bool {
 
 /// Classifies a RISC-V KVM one-reg ID into the state group it addresses.
 pub fn riscv_reg_kind(reg_id: u64) -> Result<KvmRiscvRegKind> {
-    if reg_id & (KVM_REG_RISCV | KVM_REG_SIZE_U64) != KVM_REG_RISCV | KVM_REG_SIZE_U64 {
+    if reg_id & KVM_REG_ARCH_MASK != KVM_REG_RISCV {
         return Err(KvmUapiError::Unsupported);
     }
 
     let reg_type = reg_id & KVM_REG_RISCV_TYPE_MASK;
+    let reg_size = reg_id & KVM_REG_SIZE_MASK;
     let index = reg_id
-        & !(KVM_REG_RISCV
-            | KVM_REG_SIZE_U64
+        & !(KVM_REG_ARCH_MASK
+            | KVM_REG_SIZE_MASK
             | KVM_REG_RISCV_TYPE_MASK
             | KVM_REG_RISCV_SUBTYPE_MASK);
     match reg_type {
-        KVM_REG_RISCV_CONFIG => Ok(KvmRiscvRegKind::Config(index)),
-        KVM_REG_RISCV_CORE => Ok(KvmRiscvRegKind::Core(index)),
-        KVM_REG_RISCV_CSR => match reg_id & KVM_REG_RISCV_SUBTYPE_MASK {
-            KVM_REG_RISCV_CSR_GENERAL => Ok(KvmRiscvRegKind::CsrGeneral(index)),
-            _ => Err(KvmUapiError::Unsupported),
-        },
-        KVM_REG_RISCV_TIMER => Ok(KvmRiscvRegKind::Timer(index)),
-        KVM_REG_RISCV_ISA_EXT => Ok(KvmRiscvRegKind::IsaExt(index)),
+        KVM_REG_RISCV_CONFIG if reg_size == KVM_REG_SIZE_U64 => Ok(KvmRiscvRegKind::Config(index)),
+        KVM_REG_RISCV_CORE if reg_size == KVM_REG_SIZE_U64 => Ok(KvmRiscvRegKind::Core(index)),
+        KVM_REG_RISCV_CSR if reg_size == KVM_REG_SIZE_U64 => {
+            match reg_id & KVM_REG_RISCV_SUBTYPE_MASK {
+                KVM_REG_RISCV_CSR_GENERAL => Ok(KvmRiscvRegKind::CsrGeneral(index)),
+                _ => Err(KvmUapiError::Unsupported),
+            }
+        }
+        KVM_REG_RISCV_FP_F if reg_size == KVM_REG_SIZE_U32 => Ok(KvmRiscvRegKind::FpF(index)),
+        KVM_REG_RISCV_FP_D
+            if (index <= 31 && reg_size == KVM_REG_SIZE_U64)
+                || (index == 32 && reg_size == KVM_REG_SIZE_U32) =>
+        {
+            Ok(KvmRiscvRegKind::FpD(index))
+        }
+        KVM_REG_RISCV_TIMER if reg_size == KVM_REG_SIZE_U64 => Ok(KvmRiscvRegKind::Timer(index)),
+        KVM_REG_RISCV_ISA_EXT if reg_size == KVM_REG_SIZE_U64 => Ok(KvmRiscvRegKind::IsaExt(index)),
         _ => Err(KvmUapiError::Unsupported),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base_isa_contains_linux_guest_requirements() {
+        for misa_bit in [0, 2, 3, 5, 8, 12] {
+            assert_ne!(KVM_RISCV_BASE_ISA & (1 << misa_bit), 0);
+        }
+    }
+
+    #[test]
+    fn classifies_fp_register_ids() {
+        assert_eq!(
+            riscv_reg_kind(riscv_fp_f_reg_id(31)),
+            Ok(KvmRiscvRegKind::FpF(31))
+        );
+        assert_eq!(
+            riscv_reg_kind(riscv_fp_d_reg_id(31)),
+            Ok(KvmRiscvRegKind::FpD(31))
+        );
+        assert_eq!(
+            riscv_reg_kind(riscv_fp_d_reg_id(32)),
+            Ok(KvmRiscvRegKind::FpD(32))
+        );
+        assert_eq!(
+            riscv_reg_kind(KVM_REG_RISCV | KVM_REG_SIZE_U64 | KVM_REG_RISCV_FP_F),
+            Err(KvmUapiError::Unsupported)
+        );
+        assert_eq!(
+            riscv_reg_kind(KVM_REG_RISCV | KVM_REG_SIZE_U32 | KVM_REG_RISCV_FP_D),
+            Err(KvmUapiError::Unsupported)
+        );
     }
 }

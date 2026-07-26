@@ -126,6 +126,12 @@ pub(in crate::kvm) fn run_vcpu_file(control_file: api_control::ControlFileId) ->
             Ok(exit_reason) => exit_reason,
             Err(err) => {
                 warn!("KVM_RUN vCPU error: {:?}", err);
+                write_vcpu_run_u32(
+                    control_file,
+                    abi::KVM_RUN_INTERNAL_SUBERROR_OFFSET,
+                    abi::KVM_INTERNAL_ERROR_EMULATION,
+                )?;
+                write_vcpu_run_u32(control_file, abi::KVM_RUN_INTERNAL_NDATA_OFFSET, 0)?;
                 break abi::KVM_EXIT_INTERNAL_ERROR;
             }
         };
