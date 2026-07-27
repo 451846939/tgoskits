@@ -179,7 +179,7 @@ pub(crate) enum PendingInterrupt {
 /// Runtime-only resources owned by Running/Paused/Stopping lifecycle states.
 pub(crate) struct VmRuntimeHandle {
     wait_queue: crate::WaitQueue,
-    vcpu_task_list: Mutex<BTreeMap<usize, crate::AxTaskRef>>,
+    vcpu_task_list: Mutex<BTreeMap<usize, crate::TaskHandle>>,
     pending_interrupts: Mutex<BTreeMap<usize, Vec<PendingInterrupt>>>,
     irq_dispatcher: VcpuIrqDispatcher,
     running_halting_vcpu_count: AtomicUsize,
@@ -214,7 +214,7 @@ impl VmRuntimeHandle {
         }
     }
 
-    pub(crate) fn add_vcpu_task(&self, vcpu_id: usize, vcpu_task: crate::AxTaskRef) {
+    pub(crate) fn add_vcpu_task(&self, vcpu_id: usize, vcpu_task: crate::TaskHandle) {
         self.irq_dispatcher
             .register_vcpu_task(vcpu_id, vcpu_task.clone());
         self.vcpu_task_list.lock().insert(vcpu_id, vcpu_task);
@@ -233,7 +233,7 @@ impl VmRuntimeHandle {
             .entry(vcpu_id)
             .or_default()
             .push(PendingInterrupt::Normal(vector));
-        Ok(task.cpu_id() as usize)
+        Ok(crate::host::task::task_cpu_id(&task))
     }
 
     #[expect(
@@ -260,7 +260,7 @@ impl VmRuntimeHandle {
                 vector,
                 physical_irq,
             });
-        Ok(task.cpu_id() as usize)
+        Ok(crate::host::task::task_cpu_id(&task))
     }
 
     /// New delivery path: enqueue → notify → host IPI.
@@ -309,11 +309,11 @@ impl VmRuntimeHandle {
     }
 
     pub(crate) fn notify_one(&self) {
-        self.wait_queue.notify_one(false);
+        self.wait_queue.notify_one();
     }
 
     pub(crate) fn notify_all(&self) {
-        self.wait_queue.notify_all(false);
+        self.wait_queue.notify_all();
     }
 
     pub(crate) fn mark_vcpu_running(&self) {
@@ -335,19 +335,15 @@ impl VmRuntimeHandle {
             .vcpu_task_list
             .lock()
             .values()
-            .filter(|task| !current.ptr_eq(task))
+            .filter(|task| current.id() != task.id())
             .cloned()
             .collect();
         let task_count = tasks.len();
         info!("VM[{vm_id}] Joining {task_count} VCpu tasks...");
         for (idx, task) in tasks.iter().enumerate() {
-            debug!(
-                "VM[{}] Joining VCpu task[{}]: {}",
-                vm_id,
-                idx,
-                task.id_name()
-            );
-            let exit_code = task.join();
+            debug!("VM[{}] Joining VCpu task[{}]: {:?}", vm_id, idx, task.id());
+            let exit_code = crate::host::task::join_task(task.clone())
+                .unwrap_or_else(|error| panic!("failed to join AxVM vCPU task: {error}"));
             debug!("VM[{vm_id}] VCpu task[{idx}] exited with code: {exit_code}");
         }
         info!("VM[{vm_id}] VCpu resources cleaned up, {task_count} VCpu tasks joined");
@@ -787,7 +783,6 @@ impl AxVM {
         let primary_vcpu = self
             .vcpu(0)
             .ok_or_else(|| ax_err_type!(BadState, "VM primary vCPU is not prepared"))?;
-        let primary_task = crate::runtime::vcpus::build_vcpu_task(self, primary_vcpu);
         let runtime = Arc::new(VmRuntimeHandle::new());
 
         self.machine.lock().start_with(|resources| {
@@ -803,7 +798,7 @@ impl AxVM {
             Ok(runtime.clone())
         })?;
 
-        let task = crate::host::task::spawn_task(primary_task);
+        let task = crate::runtime::vcpus::alloc_vcpu_task(self, primary_vcpu);
         runtime.add_vcpu_task(0, task);
         Ok(())
     }

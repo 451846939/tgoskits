@@ -21,10 +21,17 @@
 
 use alloc::{collections::BTreeMap, vec::Vec};
 
+#[cfg(not(feature = "host-test"))]
 use ax_kspin::SpinNoIrq as Mutex;
+// Host tests have no scheduler CPU-local state, so they retain the atomic
+// exclusion but must not enter the runtime preemption guard.
+#[cfg(feature = "host-test")]
+use ax_kspin::SpinRaw as Mutex;
 
 use super::queue::VcpuInterruptQueue;
-use crate::{AxTaskRef, AxVmResult, ax_err_type, irq::model::PendingVcpuInterrupt};
+use crate::{
+    AxVmResult, TaskHandle, ax_err_type, host::task::task_cpu_id, irq::model::PendingVcpuInterrupt,
+};
 
 /// Runtime-owned vCPU interrupt queue.
 ///
@@ -39,7 +46,7 @@ use crate::{AxTaskRef, AxVmResult, ax_err_type, irq::model::PendingVcpuInterrupt
 /// architecture-specific injection path.
 pub struct VcpuIrqDispatcher {
     queue: VcpuInterruptQueue,
-    vcpu_tasks: Mutex<BTreeMap<usize, AxTaskRef>>,
+    vcpu_tasks: Mutex<BTreeMap<usize, TaskHandle>>,
     /// Test-only cpu_id registry so that round-trip tests can exercise
     /// enqueue / drain without a full ArceOS task infrastructure.
     #[cfg(all(test, feature = "host-test"))]
@@ -65,7 +72,7 @@ impl VcpuIrqDispatcher {
     ///
     /// Called from `VmRuntimeHandle::add_vcpu_task` when a vCPU task is
     /// spawned and bound to the VM runtime.
-    pub fn register_vcpu_task(&self, vcpu_id: usize, task: AxTaskRef) {
+    pub fn register_vcpu_task(&self, vcpu_id: usize, task: TaskHandle) {
         self.vcpu_tasks.lock().insert(vcpu_id, task);
     }
 
@@ -74,7 +81,8 @@ impl VcpuIrqDispatcher {
     /// Returns the physical CPU id the target vCPU task is currently running
     /// on. The two internal locks are held **sequentially** (never together):
     ///
-    /// 1. Lock `vcpu_tasks`, obtain `task.cpu_id()`, release.
+    /// 1. Lock `vcpu_tasks`, query the task's CPU through the host facade,
+    ///    release.
     /// 2. Lock `queue`, push the interrupt, release.
     ///
     /// A task migration window exists between steps 1 and 2 (the pCPU may
@@ -104,7 +112,7 @@ impl VcpuIrqDispatcher {
         let tasks = self.vcpu_tasks.lock();
         tasks
             .get(&vcpu_id)
-            .map(|t| t.cpu_id() as usize)
+            .map(task_cpu_id)
             .ok_or_else(|| ax_err_type!(NotFound, format_args!("vCPU {vcpu_id} task not found")))
     }
 
@@ -125,7 +133,7 @@ impl VcpuIrqDispatcher {
 impl VcpuIrqDispatcher {
     /// Registers a vCPU with a known physical CPU id for unit testing.
     ///
-    /// This bypasses the real `AxTaskRef` requirement so that round-trip
+    /// This bypasses the real [`TaskHandle`] requirement so that round-trip
     /// enqueue→drain tests can run on the host.
     pub(crate) fn register_test_vcpu(&self, vcpu_id: usize, cpu_id: usize) {
         self.test_vcpu_cpu_ids.lock().insert(vcpu_id, cpu_id);

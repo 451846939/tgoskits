@@ -223,38 +223,36 @@ pub(crate) fn vcpu_on(
     Ok(())
 }
 
-#[expect(
-    dead_code,
-    reason = "only non-x86 guest firmware boots secondary vCPUs"
-)]
-pub(crate) fn alloc_vcpu_task(vm: &VMRef, vcpu: VCpuRef) -> crate::AxTaskRef {
-    crate::host::task::spawn_task(build_vcpu_task(vm, vcpu))
-}
-
-pub(crate) fn build_vcpu_task(vm: &VMRef, vcpu: VCpuRef) -> crate::TaskInner {
+pub(crate) fn alloc_vcpu_task(vm: &VMRef, vcpu: VCpuRef) -> crate::TaskHandle {
     info!("Spawning task for VM[{}] VCpu[{}]", vm.id(), vcpu.id());
-    let mut vcpu_task = crate::TaskInner::new(
-        vcpu_run,
-        format!("VM[{}]-VCpu[{}]", vm.id(), vcpu.id()),
-        KERNEL_STACK_SIZE,
-    );
+    let name = format!("VM[{}]-VCpu[{}]", vm.id(), vcpu.id());
+    let affinity = vcpu.phys_cpu_set().map(|phys_cpu_set| {
+        crate::host::task::task_cpu_set_from_raw_bits(vcpu_task_cpu_mask(
+            vm.id(),
+            vcpu.id(),
+            phys_cpu_set,
+        ))
+    });
 
-    if let Some(phys_cpu_set) = vcpu.phys_cpu_set() {
-        vcpu_task.set_cpumask(crate::host::task::cpu_mask_from_raw_bits(
-            vcpu_task_cpu_mask(vm.id(), vcpu.id(), phys_cpu_set),
-        ));
+    // Keep only a weak VM reference in the scheduler extension so a retained
+    // task handle cannot keep the VM resource graph alive.
+    let extension = VCpuTask::new(vm, vcpu).into_thread_extension();
+    // SAFETY: `extension` is a unique owner created immediately above and is
+    // transferred exactly once. The optional affinity was validated against
+    // the runtime topology by the host adapter.
+    let task = unsafe {
+        crate::host::task::spawn_task_with_extension_and_affinity(
+            vcpu_run,
+            name,
+            KERNEL_STACK_SIZE,
+            Some(extension),
+            affinity,
+        )
     }
+    .unwrap_or_else(|error| panic!("failed to spawn AxVM vCPU task: {error}"));
 
-    // Use Weak reference in TaskExt to avoid keeping VM alive
-    let inner = VCpuTask::new(vm, vcpu);
-    *vcpu_task.task_ext_mut() = Some(crate::AxTaskExt::from_impl(inner));
-
-    info!(
-        "VCpu task {} created {:?}",
-        vcpu_task.id_name(),
-        vcpu_task.cpumask()
-    );
-    vcpu_task
+    info!("VCpu task {:?} created", task.id());
+    task
 }
 
 fn vcpu_task_cpu_mask(vm_id: usize, vcpu_id: usize, requested_mask: usize) -> usize {
