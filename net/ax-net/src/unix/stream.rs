@@ -27,7 +27,7 @@ use core::{
 use async_trait::async_trait;
 use ax_errno::{AxError, AxResult};
 use ax_io::{IoBuf, Read, Write};
-use ax_sync::Mutex;
+use ax_sync::SpinMutex;
 use axpoll::{IoEvents, PollSet, Pollable};
 use ringbuf::{
     HeapCons, HeapProd, HeapRb,
@@ -61,7 +61,7 @@ struct PendingCmsg {
     cmsg: Vec<CMsgData>,
 }
 
-type CmsgQueue = Arc<Mutex<VecDeque<PendingCmsg>>>;
+type CmsgQueue = Arc<SpinMutex<VecDeque<PendingCmsg>>>;
 
 fn new_uni_channel() -> (HeapProd<u8>, HeapCons<u8>) {
     let rb = HeapRb::new(BUF_SIZE);
@@ -193,9 +193,9 @@ struct ConnRequest {
 /// Stream transport for Unix domain sockets.
 pub struct StreamTransport {
     /// Connected channel, if this endpoint is connected or accepted.
-    channel: Mutex<Option<Channel>>,
+    channel: SpinMutex<Option<Channel>>,
     /// Listener receive queue installed by bind/listen.
-    conn_rx: Mutex<Option<(async_channel::Receiver<ConnRequest>, Arc<PollSet>)>>,
+    conn_rx: SpinMutex<Option<(async_channel::Receiver<ConnRequest>, Arc<PollSet>)>>,
     /// True after `listen` publishes the bound endpoint for connection attempts.
     listening: Arc<AtomicBool>,
     /// Poll set for local stream state.
@@ -223,8 +223,8 @@ impl StreamTransport {
         receive_credentials: Arc<AtomicBool>,
     ) -> Self {
         StreamTransport {
-            channel: Mutex::new(channel),
-            conn_rx: Mutex::new(None),
+            channel: SpinMutex::new(channel),
+            conn_rx: SpinMutex::new(None),
             listening: Arc::new(AtomicBool::new(false)),
             poll_state: PollSet::new(),
             general: GeneralOptions::new(1, 1, 0), // SOCK_STREAM

@@ -17,9 +17,9 @@
 //! [`VcpuInterruptQueue`] is the host-testable core extracted from
 //! [`VcpuIrqDispatcher`](super::VcpuIrqDispatcher). It owns only the
 //! `pending` BTreeMap and exposes `push` / `drain` without referencing
-//! `AxTaskRef`, so its semantics (FIFO, vCPU isolation, drain) can be
-//! covered by `#[test]` on the host when the `host-test` feature is
-//! enabled.
+//! the host task facade, so its semantics (FIFO, vCPU isolation, drain)
+//! can be covered by `#[test]` on the host when the `host-test` feature
+//! is enabled.
 
 use std::{collections::BTreeMap, vec::Vec};
 

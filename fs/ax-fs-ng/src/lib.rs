@@ -34,6 +34,9 @@ fn register_mounted_filesystem(fs: Filesystem) {
     MOUNTED_FILESYSTEMS.lock().push(fs);
 }
 
+#[cfg(test)]
+mod test_runtime;
+
 pub use block::{
     BlockRegion,
     runtime::{

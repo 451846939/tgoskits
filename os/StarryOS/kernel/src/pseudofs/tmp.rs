@@ -14,7 +14,7 @@ use core::{
 };
 
 use ax_kspin::SpinNoIrq;
-use ax_sync::Mutex;
+use ax_sync::PiMutex;
 use axfs_ng_vfs::{
     DeviceId, DirEntry, DirEntrySink, DirNode, DirNodeOps, FileNode, FileNodeOps, Filesystem,
     FilesystemOps, FsIoEvents, FsPollable, Metadata, MetadataUpdate, NodeFlags, NodeOps,
@@ -258,7 +258,7 @@ struct FileContent {
     /// We only need to store the length here because we delegate the actual
     /// content management to page cache.
     length: AtomicU64,
-    symlink: Mutex<Option<String>>,
+    symlink: PiMutex<Option<String>>,
 }
 
 struct DirContent {

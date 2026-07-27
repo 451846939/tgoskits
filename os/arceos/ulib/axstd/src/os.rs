@@ -49,6 +49,12 @@ pub mod arceos {
         /// A guard returned by [`RawSpinLock::lock`].
         pub type RawSpinLockGuard<'a, T> = ax_kspin::SpinRawGuard<'a, T>;
     }
+
+    /// OS-independent task scheduler types and ArceOS runtime operations.
+    #[cfg(feature = "multitask")]
+    pub mod task {
+        pub use ax_runtime::task::*;
+    }
 }
 
 #[cfg(feature = "std-compat")]

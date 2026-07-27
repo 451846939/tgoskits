@@ -14,7 +14,7 @@ use super::{
 };
 use crate::{
     block::{BlockRegion, FsBlockDevice},
-    os::sync::{IrqMutex, SleepMutex, SleepMutexGuard},
+    os::sync::{PiMutex, PiMutexGuard, SpinMutex},
 };
 
 pub struct FatFilesystemInner {
@@ -77,7 +77,7 @@ impl FatFilesystem {
     ///
     /// FAT operations may block on channel-backed block completion while this
     /// guard is held, so this state must never use an IRQ-disabling lock.
-    pub(crate) fn lock(&self) -> SleepMutexGuard<'_, FatFilesystemInner> {
+    pub(crate) fn lock(&self) -> PiMutexGuard<'_, FatFilesystemInner> {
         self.inner.lock()
     }
 }
