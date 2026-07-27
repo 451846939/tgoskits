@@ -945,7 +945,7 @@ struct NsDir {
 impl SimpleDirOps for NsDir {
     fn child_names<'a>(&'a self) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a> {
         Box::new(
-            ["uts", "ipc", "mnt", "pid", "net", "user"]
+            ["uts", "ipc", "mnt", "pid", "net", "user", "cgroup"]
                 .into_iter()
                 .map(Cow::Borrowed),
         )
@@ -989,6 +989,11 @@ impl SimpleDirOps for NsDir {
                 let nsproxy = proc_data.nsproxy.lock();
                 let ns_id = nsproxy.user_ns.lock().id;
                 format!("user:[{}]\n", ns_id)
+            }
+            "cgroup" => {
+                let nsproxy = proc_data.nsproxy.lock();
+                let ns_id = nsproxy.cgroup_ns.lock().id();
+                format!("cgroup:[{}]\n", ns_id)
             }
             _ => return Err(VfsError::NotFound),
         };
@@ -1565,7 +1570,21 @@ impl SimpleDirOps for ThreadDir {
                 }),
             )
             .into(),
-            "cgroup" => SimpleFile::new_regular(fs, move || Ok("0::/\n")).into(),
+            "cgroup" => SimpleFile::new_regular(fs, move || {
+                let reader = current();
+                let reader_cgroup_ns = reader
+                    .as_thread()
+                    .proc_data
+                    .nsproxy
+                    .lock()
+                    .cgroup_ns
+                    .clone();
+                let reader_root = reader_cgroup_ns.lock().root();
+                let target_membership = task.as_thread().proc_data.cgroup.read().clone();
+                let path = crate::cgroup::relative_path(&reader_root, &target_membership);
+                Ok(format!("0::{path}\n"))
+            })
+            .into(),
             "ns" => SimpleDir::new_maker(
                 fs.clone(),
                 Arc::new(NsDir {
@@ -1936,6 +1955,41 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
                 SimpleDir::new_maker(fs.clone(), Arc::new(core))
             });
             SimpleDir::new_maker(fs.clone(), Arc::new(net))
+        });
+
+        // /proc/sys/user/max_*_namespaces — nix checks these to decide
+        // whether namespaces are available for sandboxed builds.
+        sys.add("user", {
+            let mut user = DirMapping::new();
+            user.add(
+                "max_user_namespaces",
+                SimpleFile::new_regular(fs.clone(), || Ok("65536\n")),
+            );
+            user.add(
+                "max_mnt_namespaces",
+                SimpleFile::new_regular(fs.clone(), || Ok("65536\n")),
+            );
+            user.add(
+                "max_pid_namespaces",
+                SimpleFile::new_regular(fs.clone(), || Ok("65536\n")),
+            );
+            user.add(
+                "max_net_namespaces",
+                SimpleFile::new_regular(fs.clone(), || Ok("65536\n")),
+            );
+            user.add(
+                "max_uts_namespaces",
+                SimpleFile::new_regular(fs.clone(), || Ok("65536\n")),
+            );
+            user.add(
+                "max_ipc_namespaces",
+                SimpleFile::new_regular(fs.clone(), || Ok("65536\n")),
+            );
+            user.add(
+                "max_cgroup_namespaces",
+                SimpleFile::new_regular(fs.clone(), || Ok("65536\n")),
+            );
+            SimpleDir::new_maker(fs.clone(), Arc::new(user))
         });
 
         SimpleDir::new_maker(fs.clone(), Arc::new(sys))
