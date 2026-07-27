@@ -126,11 +126,6 @@ impl Axvisor {
         for build_group in &mut build_groups {
             rootfs::ensure_qemu_rootfs_ready(&build_group.request, self.app.workspace_root(), None)
                 .await?;
-            rootfs::prepare_loongarch_linux_vmconfigs(
-                &mut build_group.request,
-                self.app.workspace_root(),
-                None,
-            )?;
             build_group.cargo = build::load_cargo_config(&build_group.request)?;
             for guest_request in arceos_ivc_guest_requests(&build_group.request)? {
                 let package = guest_request.package.clone();
@@ -218,7 +213,7 @@ impl Axvisor {
                 &case.build_config_path,
                 &mut cargo_by_build_config,
             )?;
-            let mut qemu = self
+            let qemu = self
                 .app
                 .read_qemu_config_from_path_for_cargo(&cargo, &case.case.qemu_config_path)
                 .await
@@ -228,7 +223,6 @@ impl Axvisor {
                         case.case.display_name
                     )
                 })?;
-            test_qemu::apply_dynamic_platform_qemu_boot(&mut qemu, &cargo);
             test_qemu::validate_grouped_qemu_commands(&qemu, &case.case, "Axvisor")?;
             prepared.push(PreparedAxvisorQemuCase { case, qemu });
         }
@@ -340,8 +334,6 @@ impl Axvisor {
         if qemu.uefi {
             test_qemu::apply_drive_snapshot_without_global_snapshot(&mut qemu);
         }
-        let cargo = build::load_cargo_config(request)?;
-        test_qemu::apply_dynamic_platform_qemu_boot(&mut qemu, &cargo);
         Ok((qemu, prepared_assets))
     }
 
