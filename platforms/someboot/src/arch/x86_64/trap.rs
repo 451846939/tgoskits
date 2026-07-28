@@ -723,12 +723,22 @@ pub(crate) fn trap_msr_and_efer_constants_hold_for_test() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_scheduler_counter, ticks_to_apic_counts};
+    use core::sync::atomic::Ordering;
+
+    use super::{
+        APIC_COUNTS_PER_TSC_Q32, LAPIC_TIMER_MIN_DELTA_TICKS, classify_scheduler_counter,
+        ticks_to_apic_counts,
+    };
     use crate::timer::CounterStability;
 
     #[test]
     fn legacy_lapic_clamps_overdue_events_to_the_device_minimum() {
-        assert_eq!(ticks_to_apic_counts(1), 0x0f);
+        APIC_COUNTS_PER_TSC_Q32.store(0, Ordering::Release);
+        assert_eq!(
+            ticks_to_apic_counts(1),
+            LAPIC_TIMER_MIN_DELTA_TICKS,
+            "Linux clockevents uses 0x0f LAPIC ticks as the minimum safe delta"
+        );
     }
 
     #[test]
