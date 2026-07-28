@@ -14,4 +14,8 @@ ax-dma = { workspace = true }
 ax-errno = { workspace = true }
 ax-kspin.workspace = true
 ax-memory-addr = { workspace = true }
+bytemuck = { version = "1.24", default-features = false, features = [
+    "derive",
+    "min_const_generics",
+] }
 log = "0.4"

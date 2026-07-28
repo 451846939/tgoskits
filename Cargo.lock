@@ -7100,6 +7100,7 @@ version = "0.2.11"
 dependencies = [
  "aarch64-cpu-ext",
  "bitflags 2.13.1",
+ "bytemuck",
  "dma-api",
  "log",
  "mbarrier",
@@ -7132,6 +7133,7 @@ dependencies = [
 name = "rockchip-rga"
 version = "0.1.6"
 dependencies = [
+ "bytemuck",
  "dma-api",
  "rdif-base",
 ]
@@ -7695,6 +7697,7 @@ dependencies = [
  "ax-errno 0.6.1",
  "ax-kspin",
  "ax-memory-addr",
+ "bytemuck",
  "log",
 ]
 
