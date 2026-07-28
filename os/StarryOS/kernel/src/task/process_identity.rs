@@ -12,7 +12,6 @@ use alloc::{
 
 use ax_errno::{AxError, AxResult};
 use ax_kspin::{SpinNoIrq, SpinRwLock as RwLock};
-use axnsproxy::PidNamespace;
 use axpoll::{IoEvents, PollSet};
 use starry_process::{Pid, Process, ProcessCpuTime, init_proc};
 
@@ -21,7 +20,7 @@ use super::{Cred, ProcessData, current_user_task};
 /// Generation-specific identity retained by the PID registry and pidfds.
 pub(crate) struct ProcessIdentity {
     process: Arc<Process>,
-    pid_ns: SpinNoIrq<Option<Arc<SpinNoIrq<PidNamespace>>>>,
+    pid_namespace: Arc<SpinNoIrq<axnsproxy::PidNamespace>>,
     exit_event: Arc<PollSet>,
     state: SpinNoIrq<ProcessIdentityState>,
 }
@@ -54,10 +53,11 @@ impl ProcessIdentity {
         process: Arc<Process>,
         exit_event: Arc<PollSet>,
         proc_data: Weak<ProcessData>,
+        pid_namespace: Arc<SpinNoIrq<axnsproxy::PidNamespace>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             process,
-            pid_ns: SpinNoIrq::new(None),
+            pid_namespace,
             exit_event,
             state: SpinNoIrq::new(ProcessIdentityState::Live(proc_data)),
         })
@@ -73,24 +73,9 @@ impl ProcessIdentity {
         self.process.pid()
     }
 
-    /// Binds the process PID namespace when this identity is first published.
-    pub(crate) fn bind_pid_ns(&self, pid_ns: Arc<SpinNoIrq<PidNamespace>>) {
-        let mut bound_pid_ns = self.pid_ns.lock();
-        if let Some(bound_pid_ns) = bound_pid_ns.as_ref() {
-            assert!(
-                Arc::ptr_eq(bound_pid_ns, &pid_ns),
-                "process identity PID namespace changed after publication"
-            );
-        } else {
-            *bound_pid_ns = Some(pid_ns);
-        }
-    }
-
-    pub(crate) fn pid_ns(&self) -> Arc<SpinNoIrq<PidNamespace>> {
-        self.pid_ns
-            .lock()
-            .clone()
-            .expect("published process identity must have a PID namespace")
+    /// Returns the immutable PID namespace membership for this generation.
+    pub(crate) fn pid_namespace(&self) -> Arc<SpinNoIrq<axnsproxy::PidNamespace>> {
+        self.pid_namespace.clone()
     }
 
     /// Returns the event shared by process pidfds across all lifecycle states.
@@ -227,8 +212,6 @@ static PROCESS_TABLE: RwLock<BTreeMap<Pid, Arc<ProcessIdentity>>> = RwLock::new(
 pub(crate) fn register_process_identity(proc_data: &Arc<ProcessData>) {
     let pid = proc_data.proc.pid();
     let identity = proc_data.identity();
-    let pid_ns = proc_data.nsproxy.lock().pid_ns.clone();
-    identity.bind_pid_ns(pid_ns);
     let mut process_table = PROCESS_TABLE.write();
     match process_table.get(&pid) {
         Some(registered) if Arc::ptr_eq(registered, &identity) => {}
@@ -247,8 +230,6 @@ pub(crate) fn register_process_identity(proc_data: &Arc<ProcessData>) {
 pub(crate) fn register_prepared_process_identity(proc_data: &Arc<ProcessData>) -> AxResult<()> {
     let pid = proc_data.proc.pid();
     let identity = proc_data.identity();
-    let pid_ns = proc_data.nsproxy.lock().pid_ns.clone();
-    identity.bind_pid_ns(pid_ns);
     let mut process_table = PROCESS_TABLE.write();
     if process_table.contains_key(&pid) {
         return Err(AxError::BadState);
@@ -391,24 +372,69 @@ fn is_live_process(process: &Arc<Process>) -> bool {
     process_identity(process).is_some_and(|identity| identity.live_data().is_some())
 }
 
-/// Chooses the nearest live child subreaper, falling back to init.
-pub(crate) fn orphan_reaper_for(process: &Arc<Process>) -> Arc<Process> {
-    let init = init_proc();
+/// Relationship action selected for the last exiting thread of a process.
+pub(crate) enum OrphanReaper {
+    /// Reparent existing children to a live reaper in the same PID namespace.
+    ReparentTo(Arc<Process>),
+    /// Retain children while the PID namespace reaper shuts the namespace down.
+    ShutdownNamespace(Arc<SpinNoIrq<axnsproxy::PidNamespace>>),
+}
+
+fn same_pid_namespace(
+    process: &Arc<Process>,
+    namespace: &Arc<SpinNoIrq<axnsproxy::PidNamespace>>,
+) -> bool {
+    process_identity(process)
+        .is_some_and(|identity| Arc::ptr_eq(&identity.pid_namespace(), namespace))
+}
+
+fn registered_process(pid: Pid) -> Option<Arc<Process>> {
+    PROCESS_TABLE
+        .read()
+        .get(&pid)
+        .map(|identity| identity.process())
+}
+
+/// Chooses the nearest live child subreaper without crossing a PID namespace.
+pub(crate) fn orphan_reaper_for(proc_data: &Arc<ProcessData>) -> OrphanReaper {
+    let process = &proc_data.proc;
+    let namespace = proc_data.identity().pid_namespace();
+    let (level, init_global_tid) = {
+        let state = namespace.lock();
+        (state.level, state.init_global_tid())
+    };
+
+    if level > 0 && init_global_tid == Some(process.pid() as u64) {
+        return OrphanReaper::ShutdownNamespace(namespace);
+    }
+
+    let init = if level == 0 {
+        init_proc()
+    } else {
+        let init_pid = init_global_tid
+            .and_then(|tid| Pid::try_from(tid).ok())
+            .expect("published PID namespace must retain its init identity");
+        registered_process(init_pid)
+            .expect("PID namespace init identity must outlive every namespace member")
+    };
     let mut cursor = process.parent();
 
     while let Some(candidate) = cursor {
         if Arc::ptr_eq(&candidate, &init) {
             break;
         }
+        if !same_pid_namespace(&candidate, &namespace) {
+            break;
+        }
         if candidate.is_child_subreaper()
             && candidate.accepts_child_publication()
             && is_live_process(&candidate)
         {
-            return candidate;
+            return OrphanReaper::ReparentTo(candidate);
         }
         cursor = candidate.parent();
     }
-    init
+    OrphanReaper::ReparentTo(init)
 }
 
 /// Finds the stable process object for a publicly visible live or zombie PID.

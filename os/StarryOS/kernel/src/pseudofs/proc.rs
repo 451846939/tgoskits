@@ -991,7 +991,7 @@ impl SimpleDirOps for ThreadFdInfoDir {
                 let observer_pid_ns = task.as_thread().proc_data.nsproxy.lock().pid_ns.clone();
                 PidNamespace::visible_pid_chain(
                     &observer_pid_ns,
-                    &identity.pid_ns(),
+                    &identity.pid_namespace(),
                     target_pid as u64,
                 )
                 .map(|pids| pids.into_iter().map(|pid| pid as i32).collect())
