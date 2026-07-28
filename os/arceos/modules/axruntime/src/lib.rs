@@ -53,7 +53,7 @@ mod mp;
 mod guard;
 mod klib;
 
-#[cfg(feature = "irq")]
+#[cfg(any(feature = "irq", test))]
 mod clock_event;
 mod devices;
 mod fs;
