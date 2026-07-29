@@ -166,10 +166,83 @@ fn aarch64_device_passthrough_still_uses_the_virtual_gic() {
             && irq.contains("vcpu.inject_interrupt_with_trigger(intid, trigger)"),
         "physical device IRQs must be latched by the host action and injected on the target vCPU"
     );
+    let handler = irq
+        .split_once("fn passthrough_irq_handler(")
+        .expect("AArch64 passthrough handler must exist")
+        .1;
+    assert!(
+        handler.contains("IrqReturn::HandledAndMask"),
+        "a level physical IRQ must request masking before the host controller completes it"
+    );
+    let drain = irq
+        .split_once("pub(super) fn drain_passthrough_irqs(")
+        .expect("AArch64 passthrough drain must exist")
+        .1
+        .split_once("/// Rearms a level-triggered physical line")
+        .expect("AArch64 passthrough drain must precede the rearm path")
+        .0;
+    assert!(
+        !drain.contains("set_enable(handle.irq(), false)"),
+        "the physical line must already be masked before host EOI, not later from the vCPU"
+    );
+    assert!(
+        drain.contains("PASSTHROUGH_IRQ_PENDING[intid].swap(false"),
+        "the pinned vCPU path must consume the latched event"
+    );
+    assert!(
+        irq.contains("let guest_enabled = vgic.irq_enabled(intid as u32);")
+            && irq.contains("let should_enable = guest_enabled;"),
+        "a physical route must remain masked until the guest enables the matching vGIC line"
+    );
     assert!(
         architecture.contains("irq::drain_passthrough_irqs(vm, vcpu)")
             && architecture.contains("irq::release_passthrough_irq_routes(vm_id)"),
         "AArch64 must drain and release VM-owned physical IRQ routes through lifecycle hooks"
+    );
+}
+
+#[test]
+fn aarch64_virtual_devices_share_controller_owned_level_state() {
+    let architecture = include_str!("../src/arch/aarch64/mod.rs");
+    let irq = include_str!("../src/arch/aarch64/irq.rs");
+    let vm = include_str!("../src/arch/aarch64/vm.rs");
+
+    assert!(
+        vm.contains("super::irq::configure(")
+            && irq.contains("struct Aarch64VgicFactory")
+            && irq.contains("vgic: Arc<arm_vgic::Vgic>")
+            && irq.contains("MmioDeviceAdapter::from_arc(self.vgic.clone())"),
+        "the MMIO distributor and virtual-device IRQ sink must share one vGIC state owner"
+    );
+    assert!(
+        irq.contains(".set_irq_line_level(intid, asserted)")
+            && irq.contains("vgic.asserted_enabled_irqs()")
+            && irq.contains("virtual_interrupt_inactive(intid)")
+            && architecture.contains("irq::reinject_asserted_virtual_irqs(vm, vcpu)"),
+        "level inputs must remain controller-owned and be redelivered after guest EOI"
+    );
+}
+
+#[test]
+fn aarch64_wired_irqs_follow_the_guest_irouter_target() {
+    let irq = include_str!("../src/arch/aarch64/irq.rs");
+
+    assert!(
+        irq.contains("fn target_vcpu_for_route")
+            && irq.contains("vgic.irq_route(intid)")
+            && irq.contains("target_vcpu_for_irq(vm, vgic, intid)")
+            && !irq.contains("vcpu_id: 0,"),
+        "virtual-device and passthrough SPIs must follow the guest-programmed IROUTER affinity"
+    );
+}
+
+#[test]
+fn aarch64_passthrough_routes_reject_intids_outside_the_virtual_gic() {
+    let irq = include_str!("../src/arch/aarch64/irq.rs");
+
+    assert!(
+        irq.contains("arm_vgic::Vgic::MAX_INTID_EXCLUSIVE"),
+        "physical IRQ routes must be bounded by the implemented guest distributor capacity"
     );
 }
 
@@ -181,6 +254,7 @@ fn aarch64_preserves_host_irq_identity_and_reinjects_the_guest_virtual_timer() {
             .expect("ArceOS IRQ facade must be readable");
     let architecture = include_str!("../src/arch/aarch64/mod.rs");
     let gic = include_str!("../src/arch/aarch64/gic.rs");
+    let manager = include_str!("../src/manager.rs");
 
     assert!(
         axhal_irq.contains("pub fn handle_irq_id(vector: usize) -> Option<IrqId>"),
@@ -192,10 +266,11 @@ fn aarch64_preserves_host_irq_identity_and_reinjects_the_guest_virtual_timer() {
     );
     assert!(
         architecture.contains("const GUEST_VIRTUAL_TIMER_IRQ: usize = 27;")
-            && architecture.contains("fn after_external_interrupt(")
-            && architecture.contains("vector == GUEST_VIRTUAL_TIMER_IRQ")
-            && architecture.contains("vcpu.inject_interrupt(vector)"),
-        "CNTV PPI 27 must be reinjected through the guest virtual GIC"
+            && manager.contains("pub fn dispatch_current_vcpu_interrupt")
+            && manager.contains("crate::runtime::vcpus::queue_interrupt(vm_id, vcpu_id, vector)")
+            && manager.contains("inject_interrupt(vm_id, vcpu_id, vector)")
+            && gic.contains("dispatch_current_vcpu_interrupt(GUEST_VIRTUAL_TIMER_IRQ)"),
+        "CNTV PPI 27 must be published to the target vCPU runtime before wakeup"
     );
     assert!(
         architecture.contains("fn register_platform_irq_injector()")
@@ -205,7 +280,7 @@ fn aarch64_preserves_host_irq_identity_and_reinjects_the_guest_virtual_timer() {
             && gic.contains("IrqScope::PerCpu")
             && gic.contains("ShareMode::Shared")
             && gic.contains("set_enable(ctx.irq, false)")
-            && gic.contains("inject_current_vcpu_interrupt(GUEST_VIRTUAL_TIMER_IRQ)")
+            && gic.contains("dispatch_current_vcpu_interrupt(GUEST_VIRTUAL_TIMER_IRQ)")
             && gic.contains("rearm_guest_virtual_timer_irq_if_inactive")
             && architecture.contains("gic::rearm_guest_virtual_timer_irq_if_inactive"),
         "CNTV PPI 27 must be registered, masked while forwarded, and rearmed only after the guest \
@@ -278,6 +353,33 @@ fn aarch64_keeps_the_guest_timer_ppi_inside_the_current_vcpu_scope() {
         architecture.contains("fn after_vcpu_run(")
             && architecture.contains("gic::mask_guest_virtual_timer_irq"),
         "AArch64 must mask the physical CNTV PPI before leaving the current-vCPU scope"
+    );
+}
+
+#[test]
+fn riscv_physical_irqs_use_explicit_vm_targets_and_runtime_dispatch() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let platform_irq =
+        std::fs::read_to_string(manifest_dir.join("../../platforms/axplat-dyn/src/irq.rs"))
+            .expect("dynamic platform IRQ implementation must be readable");
+    let architecture = include_str!("../src/arch/riscv64/mod.rs");
+    let irq = include_str!("../src/arch/riscv64/irq.rs");
+
+    assert!(
+        platform_irq.contains("struct RiscvVirtualIrqRoute")
+            && platform_irq.contains("VIRTUAL_IRQ_ROUTES")
+            && platform_irq.contains("vm_id")
+            && platform_irq.contains("vcpu_id"),
+        "each forwarded PLIC source must retain an explicit VM and vCPU route"
+    );
+    assert!(
+        architecture.contains("fn inject_virtual_irq(vm_id: usize, vcpu_id: usize, irq_id: usize)")
+            && !architecture.contains("crate::current_vm_id()"),
+        "physical IRQ injection must not depend on a transient current-VM scope"
+    );
+    assert!(
+        irq.contains("dispatch_runtime_interrupt("),
+        "vPLIC inputs must publish through the target vCPU runtime queue"
     );
 }
 

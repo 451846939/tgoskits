@@ -283,17 +283,6 @@ impl<A: VmArchVcpuOps> AxVCpu<A> {
         })
     }
 
-    /// Sets the guest entry point.
-    #[expect(
-        dead_code,
-        reason = "only non-x86 guest firmware updates secondary vCPU entries"
-    )]
-    pub fn set_entry(&self, entry: GuestPhysAddr) -> AxVmResult {
-        self.get_arch_vcpu()
-            .set_entry(entry)
-            .map_err(|error| map_vcpu_backend_error("set vCPU entry", error))
-    }
-
     /// Sets a guest general-purpose register.
     pub fn set_gpr(&self, reg: usize, val: usize) {
         self.get_arch_vcpu().set_gpr(reg, val);
@@ -423,7 +412,7 @@ impl<A: VmArchPerCpuOps> Drop for AxPerCpu<A> {
     }
 }
 
-fn map_vcpu_backend_error(operation: &'static str, error: VmBackendError) -> AxVmError {
+pub(crate) fn map_vcpu_backend_error(operation: &'static str, error: VmBackendError) -> AxVmError {
     match error {
         VmBackendError::InvalidInput => AxVmError::invalid_input(operation, error),
         VmBackendError::InvalidData => AxVmError::vcpu(operation, error),

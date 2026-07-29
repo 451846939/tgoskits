@@ -17,14 +17,17 @@
 use alloc::{string::String, sync::Arc, vec::Vec};
 
 use axdevice::{NullSerialBackend, SerialBackend};
-use axvm_types::InterruptTriggerMode;
 pub use axvm_types::{
     AddressSpacePolicy, EmulatedDeviceConfig, GuestPhysAddr, PassThroughAddressConfig,
     PassThroughDeviceConfig, PassThroughPortConfig, ReservedAddressConfig, VMBootProtocol,
     VMInterruptMode, VmMemConfig, VmMemMappingType,
 };
+use axvm_types::{EmulatedDeviceType, InterruptTriggerMode};
 
-use crate::arch::{ArchOps, CurrentArch};
+use crate::{
+    arch::{ArchOps, CurrentArch},
+    machine::{GuestGicProfile, GuestPlicProfile, GuestSerialFdtIdentity, GuestSerialProfile},
+};
 
 /// Policy used by AxVM when deriving runtime guest boot image addresses.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -101,6 +104,10 @@ pub struct AxVMConfig {
     // Physical interrupt sources forwarded to the guest in passthrough mode.
     passthrough_irq_list: Vec<PassthroughInterrupt>,
     interrupt_mode: VMInterruptMode,
+    serial_profile: GuestSerialProfile,
+    serial_fdt_identity: Option<GuestSerialFdtIdentity>,
+    gic_profile: Option<GuestGicProfile>,
+    plic_profile: Option<GuestPlicProfile>,
     serial_backend: Arc<dyn SerialBackend>,
 }
 
@@ -122,12 +129,17 @@ pub struct AxVMConfigParams {
     pub memory_regions: Vec<VmMemConfig>,
     pub boot_policy: GuestBootPolicy,
     pub interrupt_mode: VMInterruptMode,
+    /// Machine-owned virtual serial resources.
+    pub serial_profile: Option<GuestSerialProfile>,
     /// App-owned byte stream used by the mandatory virtual serial device.
     pub serial_backend: Option<Arc<dyn SerialBackend>>,
 }
 
 impl AxVMConfig {
     pub fn new(params: AxVMConfigParams) -> Self {
+        let serial_profile = params.serial_profile.unwrap_or_else(|| {
+            crate::machine::current_machine_profile(params.phys_cpu_ls.cpu_num()).serial
+        });
         Self {
             id: params.id,
             name: params.name,
@@ -145,6 +157,10 @@ impl AxVMConfig {
             boot_policy: params.boot_policy,
             passthrough_irq_list: Vec::new(),
             interrupt_mode: params.interrupt_mode,
+            serial_profile,
+            serial_fdt_identity: None,
+            gic_profile: None,
+            plic_profile: None,
             serial_backend: params
                 .serial_backend
                 .unwrap_or_else(|| Arc::new(NullSerialBackend)),
@@ -319,6 +335,143 @@ impl AxVMConfig {
         self.interrupt_mode
     }
 
+    /// Returns the machine-owned virtual serial resources.
+    pub(crate) const fn serial_profile(&self) -> GuestSerialProfile {
+        self.serial_profile
+    }
+
+    /// Replaces the machine serial resources and its bus descriptor atomically.
+    pub fn replace_machine_serial(
+        &mut self,
+        profile: GuestSerialProfile,
+        identity: Option<GuestSerialFdtIdentity>,
+    ) -> crate::AxVmResult {
+        let mut serial_index = None;
+        for (index, device) in self.emu_devices.iter().enumerate() {
+            if device.emu_type != EmulatedDeviceType::Console {
+                continue;
+            }
+            if serial_index.replace(index).is_some() {
+                return Err(crate::AxVmError::invalid_config(
+                    "machine profile has more than one serial device",
+                ));
+            }
+        }
+        let serial_index = serial_index.ok_or_else(|| {
+            crate::AxVmError::invalid_config("machine profile has no serial device")
+        })?;
+
+        self.emu_devices[serial_index] = crate::machine::serial_device_config(profile);
+        self.serial_profile = profile;
+        self.serial_fdt_identity = identity;
+        Ok(())
+    }
+
+    /// Returns firmware identity retained for the virtual serial node.
+    pub fn serial_fdt_identity(&self) -> Option<&GuestSerialFdtIdentity> {
+        self.serial_fdt_identity.as_ref()
+    }
+
+    /// Replaces the virtual GIC windows with host firmware resources.
+    pub fn replace_machine_gic(&mut self, profile: GuestGicProfile) -> crate::AxVmResult {
+        const GICD_MINIMUM_SIZE: usize = 0x1_0000;
+        if profile.distributor_length < GICD_MINIMUM_SIZE {
+            return Err(crate::AxVmError::invalid_config(alloc::format!(
+                "AArch64 GIC distributor window {:#x} is smaller than {GICD_MINIMUM_SIZE:#x}",
+                profile.distributor_length
+            )));
+        }
+        let required_redistributor_size = self
+            .phys_cpu_ls
+            .cpu_num()
+            .max(1)
+            .checked_mul(crate::machine::AARCH64_GIC_REDISTRIBUTOR_FRAME_SIZE)
+            .ok_or_else(|| {
+                crate::AxVmError::invalid_config(
+                    "AArch64 redistributor window size overflows usize",
+                )
+            })?;
+        if profile.redistributor_length < required_redistributor_size {
+            return Err(crate::AxVmError::invalid_config(alloc::format!(
+                "AArch64 GIC redistributor window {:#x} is smaller than required size \
+                 {required_redistributor_size:#x}",
+                profile.redistributor_length
+            )));
+        }
+
+        let distributor = self
+            .emu_devices
+            .iter_mut()
+            .find(|device| device.emu_type == EmulatedDeviceType::InterruptController)
+            .ok_or_else(|| {
+                crate::AxVmError::invalid_config(
+                    "AArch64 machine profile has no interrupt controller",
+                )
+            })?;
+        distributor.base_gpa = profile.distributor_base;
+        distributor.length = profile.distributor_length;
+
+        let redistributor = self
+            .emu_devices
+            .iter_mut()
+            .find(|device| device.emu_type == EmulatedDeviceType::ArmGicRedistributor)
+            .ok_or_else(|| {
+                crate::AxVmError::invalid_config("AArch64 machine profile has no redistributor")
+            })?;
+        redistributor.base_gpa = profile.redistributor_base;
+        redistributor.length = profile.redistributor_length;
+
+        self.gic_profile = Some(profile);
+        Ok(())
+    }
+
+    /// Returns host firmware resources retained by the virtual GIC.
+    pub fn gic_profile(&self) -> Option<&GuestGicProfile> {
+        self.gic_profile.as_ref()
+    }
+
+    /// Replaces the virtual PLIC window with host firmware resources.
+    pub fn replace_machine_plic(&mut self, profile: GuestPlicProfile) -> crate::AxVmResult {
+        let plic = self
+            .emu_devices
+            .iter_mut()
+            .find(|device| device.emu_type == EmulatedDeviceType::PPPTGlobal)
+            .ok_or_else(|| {
+                crate::AxVmError::invalid_config("RISC-V machine profile has no PLIC controller")
+            })?;
+        let [contexts] = plic.cfg_list.as_slice() else {
+            return Err(crate::AxVmError::invalid_config(
+                "RISC-V PLIC profile has no context count",
+            ));
+        };
+        const CONTEXT_CONTROL_OFFSET: usize = 0x20_0000;
+        const CONTEXT_STRIDE: usize = 0x1000;
+        const CLAIM_COMPLETE_SIZE: usize = 8;
+        let minimum_length = contexts
+            .checked_mul(CONTEXT_STRIDE)
+            .and_then(|offset| offset.checked_add(CONTEXT_CONTROL_OFFSET))
+            .and_then(|offset| offset.checked_add(CLAIM_COMPLETE_SIZE))
+            .ok_or_else(|| {
+                crate::AxVmError::invalid_config("RISC-V PLIC context window size overflows usize")
+            })?;
+        if profile.length < minimum_length {
+            return Err(crate::AxVmError::invalid_config(alloc::format!(
+                "RISC-V PLIC window {:#x} is smaller than required size {minimum_length:#x}",
+                profile.length
+            )));
+        }
+
+        plic.base_gpa = profile.base;
+        plic.length = profile.length;
+        self.plic_profile = Some(profile);
+        Ok(())
+    }
+
+    /// Returns host firmware resources retained by the virtual PLIC.
+    pub fn plic_profile(&self) -> Option<&GuestPlicProfile> {
+        self.plic_profile.as_ref()
+    }
+
     /// Returns the byte stream attached to the mandatory virtual serial port.
     pub fn serial_backend(&self) -> Arc<dyn SerialBackend> {
         self.serial_backend.clone()
@@ -458,5 +611,122 @@ mod tests {
         assert_eq!(regions[1].gpa, 0x110000);
         assert_eq!(regions[1].size, 0x10000);
         assert_eq!(regions[1].map_type, VmMemMappingType::MapReserved);
+    }
+
+    #[test]
+    fn replacing_machine_serial_updates_the_internal_bus_descriptor() {
+        let machine =
+            crate::machine::machine_profile_for(crate::machine::MachineArchitecture::Aarch64, 1);
+        let mut config = AxVMConfig::new(AxVMConfigParams {
+            phys_cpu_ls: PhysCpuList::new(1, None, None),
+            emu_devices: machine.emulated_devices,
+            serial_profile: Some(machine.serial),
+            ..Default::default()
+        });
+        let profile = GuestSerialProfile {
+            model: crate::machine::GuestSerialModel::Uart16550,
+            transport: crate::machine::GuestSerialTransport::Mmio {
+                base: 0xfeb5_0000,
+                length: 0x100,
+                register_shift: 2,
+                register_width: axdevice_base::AccessWidth::Dword,
+            },
+            irq: 33,
+            clock_hz: 24_000_000,
+        };
+        let identity = GuestSerialFdtIdentity {
+            node_path: "/serial@feb50000".into(),
+            node_phandle: Some(0x2d1),
+            interrupt_parent: 1,
+            interrupt_specifier: vec![0, 0x14d, 4],
+            stdout_path: "/serial@feb50000:1500000".into(),
+        };
+
+        config
+            .replace_machine_serial(profile, Some(identity.clone()))
+            .unwrap();
+
+        assert_eq!(config.serial_profile(), profile);
+        assert_eq!(config.serial_fdt_identity(), Some(&identity));
+        let descriptor = config
+            .emu_devices()
+            .iter()
+            .find(|device| device.emu_type == EmulatedDeviceType::Console)
+            .unwrap();
+        assert_eq!(descriptor.name, "uart");
+        assert_eq!(descriptor.base_gpa, 0xfeb5_0000);
+        assert_eq!(descriptor.length, 0x100);
+        assert_eq!(descriptor.irq_id, 33);
+        assert_eq!(descriptor.cfg_list, [24_000_000, 2, 4]);
+    }
+
+    #[test]
+    fn replacing_machine_gic_updates_both_trapped_windows() {
+        let machine =
+            crate::machine::machine_profile_for(crate::machine::MachineArchitecture::Aarch64, 1);
+        let mut config = AxVMConfig::new(AxVMConfigParams {
+            phys_cpu_ls: PhysCpuList::new(1, None, None),
+            emu_devices: machine.emulated_devices,
+            serial_profile: Some(machine.serial),
+            ..Default::default()
+        });
+        let profile = GuestGicProfile {
+            node_path: "/interrupt-controller@fe600000".into(),
+            node_phandle: Some(1),
+            distributor_base: 0xfe60_0000,
+            distributor_length: 0x1_0000,
+            redistributor_base: 0xfe68_0000,
+            redistributor_length: 0x10_0000,
+        };
+
+        config.replace_machine_gic(profile.clone()).unwrap();
+
+        assert_eq!(config.gic_profile(), Some(&profile));
+        let distributor = config
+            .emu_devices()
+            .iter()
+            .find(|device| device.emu_type == EmulatedDeviceType::InterruptController)
+            .unwrap();
+        assert_eq!(
+            (distributor.base_gpa, distributor.length),
+            (0xfe60_0000, 0x1_0000)
+        );
+        let redistributor = config
+            .emu_devices()
+            .iter()
+            .find(|device| device.emu_type == EmulatedDeviceType::ArmGicRedistributor)
+            .unwrap();
+        assert_eq!(
+            (redistributor.base_gpa, redistributor.length),
+            (0xfe68_0000, 0x10_0000)
+        );
+    }
+
+    #[test]
+    fn replacing_machine_plic_updates_the_trapped_window() {
+        let machine =
+            crate::machine::machine_profile_for(crate::machine::MachineArchitecture::Riscv64, 1);
+        let mut config = AxVMConfig::new(AxVMConfigParams {
+            phys_cpu_ls: PhysCpuList::new(1, None, None),
+            emu_devices: machine.emulated_devices,
+            serial_profile: Some(machine.serial),
+            ..Default::default()
+        });
+        let profile = GuestPlicProfile {
+            node_path: "/soc/plic@d000000".into(),
+            node_phandle: Some(9),
+            base: 0x0d00_0000,
+            length: 0x80_0000,
+        };
+
+        config.replace_machine_plic(profile.clone()).unwrap();
+
+        assert_eq!(config.plic_profile(), Some(&profile));
+        let plic = config
+            .emu_devices()
+            .iter()
+            .find(|device| device.emu_type == EmulatedDeviceType::PPPTGlobal)
+            .unwrap();
+        assert_eq!((plic.base_gpa, plic.length), (0x0d00_0000, 0x80_0000));
     }
 }

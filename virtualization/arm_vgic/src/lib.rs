@@ -74,5 +74,5 @@ mod api_reexp {
         pa!(0)
     }
 
-    pub fn hardware_inject_virtual_interrupt(_vector: u8) {}
+    pub fn hardware_inject_virtual_interrupt(_vector: u32) {}
 }

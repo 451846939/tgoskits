@@ -439,6 +439,17 @@ impl GuestType {
             Self::Passthrough => AddressSpacePolicy::Passthrough,
         }
     }
+
+    /// Returns AxVM's internal physical-interrupt forwarding policy.
+    ///
+    /// Passthrough devices still terminate at the guest's virtual interrupt
+    /// controller; this mode only enables forwarding their physical sources.
+    pub const fn interrupt_mode(self) -> VMInterruptMode {
+        match self {
+            Self::Virtualized => VMInterruptMode::Emulated,
+            Self::Passthrough => VMInterruptMode::Passthrough,
+        }
+    }
 }
 
 /// A structured reference to a host physical device.

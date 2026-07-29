@@ -27,6 +27,8 @@ pub struct VPlicGlobal {
     pub pending_irqs: Mutex<Bitmap<{ PLIC_NUM_SOURCES }>>,
     /// Active IRQs for this VPlicGlobal.
     pub active_irqs: Mutex<Bitmap<{ PLIC_NUM_SOURCES }>>,
+    /// Level-triggered device inputs that remain physically asserted.
+    pub(crate) line_asserted_irqs: Mutex<Bitmap<{ PLIC_NUM_SOURCES }>>,
     /// The host physical address of the PLIC.
     pub host_plic_addr: HostPhysAddr,
 }
@@ -66,6 +68,7 @@ impl VPlicGlobal {
             assigned_irqs: Mutex::new(Bitmap::new()),
             pending_irqs: Mutex::new(Bitmap::new()),
             active_irqs: Mutex::new(Bitmap::new()),
+            line_asserted_irqs: Mutex::new(Bitmap::new()),
             contexts_num,
             host_plic_addr: HostPhysAddr::from_usize(addr.as_usize()), /* Currently we assume host_plic_addr = guest_vplic_addr */
         })

@@ -36,7 +36,8 @@ impl Riscv64Arch {
                 let mut factories = default_device_factories()?;
                 let mode = vm.interrupt_mode();
                 let emulated_devices = vm.with_config(|config| config.emu_devices().clone());
-                let interrupt_fabric = irq::configure(&mut factories, mode, &emulated_devices)?;
+                let interrupt_fabric =
+                    irq::configure(vm.id(), &mut factories, mode, &emulated_devices)?;
                 init_vm_with(vm, &factories, interrupt_fabric)
             }
             VmInitRequest::Provided {
@@ -85,13 +86,15 @@ fn build_vcpu_setup_config(
 }
 
 fn guest_page_table_levels(vcpu_mappings: &[(usize, Option<usize>, usize)]) -> AxVmResult<usize> {
-    let mut levels = riscv_vcpu::max_guest_page_table_levels();
-    for cpu_id in crate::architecture::ops::target_phys_cpu_ids(vcpu_mappings) {
-        levels = levels.min(
-            crate::percpu::cpu_max_guest_page_table_levels(cpu_id)
-                .unwrap_or_else(riscv_vcpu::max_guest_page_table_levels),
-        );
-    }
+    let levels = crate::architecture::minimum_cpu_capability(
+        riscv_vcpu::max_guest_page_table_levels(),
+        crate::architecture::ops::target_phys_cpu_ids(vcpu_mappings)
+            .into_iter()
+            .map(|cpu_id| {
+                crate::percpu::cpu_max_guest_page_table_levels(cpu_id)
+                    .unwrap_or_else(riscv_vcpu::max_guest_page_table_levels)
+            }),
+    );
     match levels {
         3 | 4 => Ok(levels),
         _ => ax_err!(Unsupported, "no supported RISC-V G-stage paging mode"),

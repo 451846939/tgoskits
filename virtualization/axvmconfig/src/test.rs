@@ -14,7 +14,7 @@
 
 use crate::{
     AddressSpacePolicy, AxVmConfigError, GuestConfig, GuestDevices, GuestType, PhysicalDeviceRef,
-    VMBootProtocol, VMKernelConfig, VmMemMappingType,
+    VMBootProtocol, VMInterruptMode, VMKernelConfig, VmMemMappingType,
 };
 
 const MINIMAL_CONFIG: &str = r#"
@@ -99,6 +99,18 @@ fn guest_type_owns_address_space_policy() {
     assert!(
         unresolved.iter().all(|device| device.name != "/"),
         "the config layer must not invent an unresolved root selector"
+    );
+}
+
+#[test]
+fn guest_type_owns_interrupt_delivery_policy() {
+    assert_eq!(
+        GuestType::Virtualized.interrupt_mode(),
+        VMInterruptMode::Emulated
+    );
+    assert_eq!(
+        GuestType::Passthrough.interrupt_mode(),
+        VMInterruptMode::Passthrough
     );
 }
 

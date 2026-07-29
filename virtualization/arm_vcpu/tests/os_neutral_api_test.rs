@@ -14,19 +14,25 @@
 
 #![cfg(target_arch = "aarch64")]
 
-use core::mem::size_of;
+use core::{
+    mem::size_of,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use arm_vcpu::{
     ARM_VCPU_HOST_SP_EL0_OFFSET, ARM_VCPU_HOST_STACK_TOP_OFFSET, ARM_VCPU_TRAP_FRAME_SIZE,
     Aarch64PerCpu, Aarch64VCpu, ArmAccessWidth, ArmGuestPhysAddr, ArmHostOps,
-    ArmNestedPagingConfig, ArmPerCpu, ArmSysRegAddr, ArmVcpu, ArmVcpuError, ArmVcpuResult,
-    ArmVmExit, TrapFrame,
+    ArmNestedPagingConfig, ArmPerCpu, ArmSysRegAddr, ArmVcpu, ArmVcpuCreateConfig, ArmVcpuError,
+    ArmVcpuResult, ArmVmExit, TrapFrame,
 };
 
 struct DummyHost;
 
+static INJECTED_INTERRUPT: AtomicUsize = AtomicUsize::new(usize::MAX);
+
 impl ArmHostOps for DummyHost {
-    fn inject_virtual_interrupt(_vector: u8) -> ArmVcpuResult {
+    fn inject_virtual_interrupt(vector: u32) -> ArmVcpuResult {
+        INJECTED_INTERRUPT.store(vector as usize, Ordering::Relaxed);
         Ok(())
     }
 
@@ -100,6 +106,17 @@ fn vm_exit_types_are_defined_by_arm_vcpu_core() {
 #[test]
 fn host_ops_can_report_typed_errors() {
     assert_eq!(Err(ArmVcpuError::Unsupported), unsupported_host_call());
+}
+
+#[test]
+fn virtual_interrupt_id_preserves_full_gic_intid() {
+    const HOST_UART_INTID: usize = 365;
+
+    INJECTED_INTERRUPT.store(usize::MAX, Ordering::Relaxed);
+    let mut vcpu = ArmVcpu::<DummyHost>::new(1, 0, ArmVcpuCreateConfig::default()).unwrap();
+    vcpu.inject_interrupt(HOST_UART_INTID).unwrap();
+
+    assert_eq!(INJECTED_INTERRUPT.load(Ordering::Relaxed), HOST_UART_INTID);
 }
 
 fn unsupported_host_call() -> ArmVcpuResult {

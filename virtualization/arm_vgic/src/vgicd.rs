@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use alloc::vec::Vec;
+
 use crate::{
     consts::{PPI_ID_MAX, SPI_ID_MAX},
     interrupt::{InterruptStatus, TriggerMode, VgicInt},
@@ -23,13 +25,17 @@ use crate::{
 };
 
 const GICD_CTLR_WRITABLE_MASK: u32 = 0x0000_00f7;
-const GICD_TYPER_VALUE: u32 = (SPI_ID_MAX / 32 - 1) as u32;
+const GICD_TYPER_ID_BITS_SHIFT: u32 = 19;
+const GICD_ID_BITS_VALUE: u32 = usize::BITS - (SPI_ID_MAX - 1).leading_zeros() - 1;
+const GICD_TYPER_VALUE: u32 =
+    (SPI_ID_MAX / 32 - 1) as u32 | (GICD_ID_BITS_VALUE << GICD_TYPER_ID_BITS_SHIFT);
 const GICD_IIDR_VALUE: u32 = 0x0102_043b;
 
 pub struct Vgicd {
     ctrlr: u32,
     groups: [bool; SPI_ID_MAX],
     interrupt: [VgicInt; SPI_ID_MAX],
+    line_asserted: [bool; SPI_ID_MAX],
     routes: [u64; SPI_ID_MAX],
 }
 
@@ -46,6 +52,7 @@ impl Vgicd {
             ctrlr: 0,
             groups: [false; SPI_ID_MAX],
             interrupt: gic_int,
+            line_asserted: [false; SPI_ID_MAX],
             routes: [0; SPI_ID_MAX],
         }
     }
@@ -289,6 +296,47 @@ impl Vgicd {
         interrupt.set_vcpu_id((self.routes[idx] & 0xff) as u32);
         interrupt
     }
+
+    pub(crate) fn irq_enabled(&self, idx: u32) -> bool {
+        self.interrupt
+            .get(idx as usize)
+            .is_some_and(VgicInt::get_enable)
+    }
+
+    pub(crate) fn irq_route(&self, idx: u32) -> crate::VgicResult<u64> {
+        let idx = idx as usize;
+        self.routes
+            .get(idx)
+            .copied()
+            .ok_or(crate::VgicError::InvalidIrq {
+                irq: idx,
+                max: SPI_ID_MAX,
+            })
+    }
+
+    pub(crate) fn set_irq_line_level(
+        &mut self,
+        idx: u32,
+        asserted: bool,
+    ) -> crate::VgicResult<bool> {
+        let idx = idx as usize;
+        let Some(line_asserted) = self.line_asserted.get_mut(idx) else {
+            return Err(crate::VgicError::InvalidIrq {
+                irq: idx,
+                max: SPI_ID_MAX,
+            });
+        };
+        let newly_asserted = asserted && !*line_asserted;
+        *line_asserted = asserted;
+        Ok(newly_asserted && self.interrupt[idx].get_enable())
+    }
+
+    pub(crate) fn asserted_enabled_irqs(&self) -> Vec<u32> {
+        (PPI_ID_MAX..SPI_ID_MAX)
+            .filter(|idx| self.line_asserted[*idx] && self.interrupt[*idx].get_enable())
+            .map(|idx| idx as u32)
+            .collect()
+    }
 }
 
 fn read_u32_byte(value: u32, byte_index: usize) -> u8 {
@@ -343,4 +391,19 @@ fn clear_active(interrupt: &mut VgicInt) {
         status => status,
     };
     interrupt.set_status(status);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn typer_id_bits_cover_every_emulated_interrupt() {
+        let typer = Vgicd::new().read(GICD_TYPER, core::mem::size_of::<u32>()) as u32;
+        let id_bits = (typer >> 19) & 0x1f;
+        let max_intid = 1u32 << (id_bits + 1);
+
+        assert_eq!(max_intid, SPI_ID_MAX as u32);
+        assert!(27 < max_intid, "virtual timer PPI must be configurable");
+    }
 }

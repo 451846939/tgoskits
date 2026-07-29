@@ -37,7 +37,7 @@ impl BaseDeviceOps<GuestPhysAddrRange> for Vgic {
     /// # Returns
     /// An `AddrRange` instance representing the address range from `0x800_0000` to `0x800_FFFF`.
     fn address_range(&self) -> GuestPhysAddrRange {
-        GuestPhysAddrRange::from_start_size(0x800_0000.into(), 0x10000)
+        self.configured_range()
     }
 
     /// Handles memory read operations.
@@ -139,6 +139,22 @@ mod tests {
     }
 
     #[test]
+    fn machine_selected_distributor_base_is_the_trapped_range() {
+        let base = 0xfe60_0000;
+        let vgic = Vgic::new_at(GuestPhysAddr::from(base), 0x1_0000);
+
+        assert_eq!(vgic.address_range().start.as_usize(), base);
+        assert_eq!(vgic.address_range().size(), 0x1_0000);
+        let value = <Vgic as BaseDeviceOps<GuestPhysAddrRange>>::handle_read(
+            &vgic,
+            GuestPhysAddr::from(base + 0xffe8),
+            AccessWidth::Dword,
+        )
+        .unwrap();
+        assert_eq!(value & 0xf0, 0x30);
+    }
+
+    #[test]
     fn spi_distributor_registers_keep_guest_owned_state() {
         let vgic = Vgic::new();
         let spi_33_bit = 1 << 1;
@@ -170,6 +186,44 @@ mod tests {
     }
 
     #[test]
+    fn spi_delivery_state_follows_guest_enable_registers() {
+        const HDMI_INTID: u32 = 204;
+        const ENABLE_OFFSET: usize = 0x0100 + (HDMI_INTID as usize / 32) * 4;
+        const ENABLE_BIT: usize = 1 << (HDMI_INTID % 32);
+        const DISABLE_OFFSET: usize = 0x0180 + (HDMI_INTID as usize / 32) * 4;
+
+        let vgic = Vgic::new();
+        assert!(!vgic.irq_enabled(HDMI_INTID));
+
+        write(&vgic, ENABLE_OFFSET, AccessWidth::Dword, ENABLE_BIT);
+        assert!(vgic.irq_enabled(HDMI_INTID));
+
+        write(&vgic, DISABLE_OFFSET, AccessWidth::Dword, ENABLE_BIT);
+        assert!(!vgic.irq_enabled(HDMI_INTID));
+        assert!(!vgic.irq_enabled(u32::MAX));
+    }
+
+    #[test]
+    fn asserted_device_level_survives_delivery_until_the_source_lowers() {
+        const UART_INTID: u32 = 365;
+        const ENABLE_OFFSET: usize = 0x0100 + (UART_INTID as usize / 32) * 4;
+        const ENABLE_BIT: usize = 1 << (UART_INTID % 32);
+
+        let vgic = Vgic::new();
+        write(&vgic, ENABLE_OFFSET, AccessWidth::Dword, ENABLE_BIT);
+
+        assert!(vgic.set_irq_line_level(UART_INTID, true).unwrap());
+        assert!(
+            !vgic.set_irq_line_level(UART_INTID, true).unwrap(),
+            "an already-asserted level must not enqueue duplicate initial deliveries"
+        );
+        assert_eq!(vgic.asserted_enabled_irqs(), [UART_INTID]);
+
+        assert!(!vgic.set_irq_line_level(UART_INTID, false).unwrap());
+        assert!(vgic.asserted_enabled_irqs().is_empty());
+    }
+
+    #[test]
     fn irouter_supports_full_width_guest_affinity_routes() {
         let vgic = Vgic::new();
         let spi_33_irouter = 0x6000 + 33 * 8;
@@ -178,6 +232,7 @@ mod tests {
         write(&vgic, spi_33_irouter, AccessWidth::Qword, route);
 
         assert_eq!(read(&vgic, spi_33_irouter, AccessWidth::Qword), route);
+        assert_eq!(vgic.irq_route(33).unwrap(), route as u64);
     }
 
     #[test]

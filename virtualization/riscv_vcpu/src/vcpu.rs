@@ -37,7 +37,7 @@ use sbi_spec::{hsm, legacy, pmu, rfnc, srst};
 
 use crate::{
     EID_HVC, RiscvVcpuCreateConfig,
-    consts::traps::irq::S_EXT,
+    consts::traps::irq::{S_EXT, is_supervisor_external},
     guest_mem,
     host::RiscvHostOps,
     registers::hgatp_value,
@@ -334,7 +334,7 @@ impl<H: RiscvHostOps> RiscvVcpu<H> {
 
     /// Injects a virtual interrupt into the guest.
     pub fn inject_interrupt(&mut self, vector: usize) -> RiscvVcpuResult {
-        if vector != S_EXT {
+        if !is_supervisor_external(vector) {
             return Err(RiscvVcpuError::Unsupported);
         }
         unsafe {
@@ -890,7 +890,8 @@ impl<H: RiscvHostOps> RiscvVcpu<H> {
         }
 
         let guest_pc = RiscvGuestVirtAddr::from(self.regs.guest_regs.sepc);
-        match guest_mem::fetch_guest_instruction(guest_pc) {
+        let supervisor = hstatus::Hstatus::from_bits(self.regs.guest_regs.hstatus).spvp();
+        match guest_mem::fetch_guest_instruction(guest_pc, supervisor) {
             Ok(instr) => Ok(VirtualInstructionRead::Instruction(instr)),
             Err(fault) => self
                 .handle_guest_instruction_fetch_fault(fault)
@@ -915,13 +916,14 @@ impl<H: RiscvHostOps> RiscvVcpu<H> {
     /// Decode the instruction at the given virtual address. Return the decoded instruction and its
     /// length in bytes, or an exit reason already produced while fetching it.
     fn decode_instr_at(&mut self, vaddr: RiscvGuestVirtAddr) -> RiscvVcpuResult<InstructionDecode> {
-        // The htinst CSR contains "transformed instruction" that caused the page fault. We
-        // can use it but we use the sepc to fetch the original instruction instead for now.
-        let mut instr = riscv_h::register::htinst::read();
+        // Use the value captured together with the guest trap. Reading the
+        // live CSR here races with host interrupts, which may overwrite it.
+        let mut instr = self.regs.trap_csrs.htinst;
         let instr_len;
         if instr == 0 {
             // Read the instruction from guest memory.
-            instr = match guest_mem::fetch_guest_instruction(vaddr) {
+            let supervisor = hstatus::Hstatus::from_bits(self.regs.guest_regs.hstatus).spvp();
+            instr = match guest_mem::fetch_guest_instruction(vaddr, supervisor) {
                 Ok(instr) => instr as _,
                 Err(fault) => {
                     return self

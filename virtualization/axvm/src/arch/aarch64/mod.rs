@@ -95,33 +95,26 @@ impl ArchOps for Aarch64Arch {
                 );
             }
         }
-        irq::enable_passthrough_irq_routes(vm.id(), vcpu.id());
     }
 
     fn before_vcpu_run(vm: &crate::AxVMRef, vcpu: &crate::vm::AxVCpuRef<Self::VCpu>) {
         gic::register_guest_virtual_timer_irq_on_current_cpu();
         gic::rearm_guest_virtual_timer_irq_if_inactive();
+        irq::reinject_asserted_virtual_irqs(vm, vcpu);
+        irq::sync_passthrough_irq_routes(vm, vcpu);
         irq::drain_passthrough_irqs(vm, vcpu);
     }
 
-    fn after_vcpu_run(_vm: &crate::AxVMRef, _vcpu: &crate::vm::AxVCpuRef<Self::VCpu>) {
+    fn after_vcpu_run(vm: &crate::AxVMRef, vcpu: &crate::vm::AxVCpuRef<Self::VCpu>) {
         gic::mask_guest_virtual_timer_irq();
+        irq::rearm_passthrough_irq_routes_after_eoi(vm, vcpu);
     }
 
     fn after_external_interrupt(
         _vm: &crate::AxVMRef,
-        vcpu: &crate::vm::AxVCpuRef<Self::VCpu>,
-        vector: usize,
+        _vcpu: &crate::vm::AxVCpuRef<Self::VCpu>,
+        _vector: usize,
     ) {
-        if vector == GUEST_VIRTUAL_TIMER_IRQ
-            && let Err(err) = vcpu.with_current_cpu_set(|| vcpu.inject_interrupt(vector))
-        {
-            warn!(
-                "VM[{}] VCpu[{}] failed to inject virtual timer IRQ {vector}: {err:?}",
-                vcpu.vm_id(),
-                vcpu.id()
-            );
-        }
         crate::check_timer_events();
     }
 
@@ -266,7 +259,7 @@ impl ArchOps for Aarch64Arch {
 struct AxvmArmHostOps;
 
 impl ArmHostOps for AxvmArmHostOps {
-    fn inject_virtual_interrupt(vector: u8) -> ArmVcpuResult {
+    fn inject_virtual_interrupt(vector: u32) -> ArmVcpuResult {
         gic::inject_interrupt(vector as usize);
         Ok(())
     }
@@ -511,7 +504,7 @@ impl ArmVgicHostIf for ArmVgicHostIfImpl {
         gic::host_gicr_base()
     }
 
-    fn hardware_inject_virtual_interrupt(vector: u8) {
+    fn hardware_inject_virtual_interrupt(vector: u32) {
         gic::inject_interrupt(vector as usize);
     }
 }

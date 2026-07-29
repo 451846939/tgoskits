@@ -1,13 +1,18 @@
 //! Architecture machine profiles for guest-visible platform devices.
 //!
-//! User configuration selects physical devices only. Stable virtual platform
-//! resources are owned by the architecture machine profile in this module.
+//! User configuration selects physical devices only. Virtual platform resources
+//! are owned by the machine profile; firmware-backed hosts may replace the
+//! default virtual UART with the host-selected UART's register model, layout,
+//! address, and firmware identity before VM construction.
 
-use alloc::{vec, vec::Vec};
+use alloc::{string::String, vec, vec::Vec};
 
+use axdevice_base::AccessWidth;
 use axvm_types::{EmulatedDeviceConfig, EmulatedDeviceType};
 
 use crate::{arch::CurrentArch, architecture::MachinePlatform};
+
+pub(crate) const AARCH64_GIC_REDISTRIBUTOR_FRAME_SIZE: usize = 0x2_0000;
 
 /// Guest-visible serial register model.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,10 +34,12 @@ pub enum GuestSerialTransport {
         length: usize,
         /// Address stride expressed as a power-of-two register shift.
         register_shift: u8,
+        /// Bus width used to access one register.
+        register_width: AccessWidth,
     },
 }
 
-/// Fixed serial resources selected by the current architecture's machine.
+/// Machine-owned serial resources selected for one guest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GuestSerialProfile {
     /// Guest-visible UART model.
@@ -43,6 +50,51 @@ pub struct GuestSerialProfile {
     pub irq: usize,
     /// UART reference clock in hertz.
     pub clock_hz: u32,
+}
+
+/// Firmware identity retained when a host UART is replaced by a virtual UART.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GuestSerialFdtIdentity {
+    /// Absolute path of the firmware-selected UART node.
+    pub node_path: String,
+    /// UART node phandle, when supplied by firmware.
+    pub node_phandle: Option<u32>,
+    /// Effective interrupt-controller phandle.
+    pub interrupt_parent: u32,
+    /// Raw firmware interrupt specifier.
+    pub interrupt_specifier: Vec<u32>,
+    /// Original `stdout-path` selector, including any line settings.
+    pub stdout_path: String,
+}
+
+/// Host firmware resources retained by the virtual GIC.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GuestGicProfile {
+    /// Absolute path of the host GICv3 node.
+    pub node_path: String,
+    /// GIC node phandle, when supplied by firmware.
+    pub node_phandle: Option<u32>,
+    /// Guest-visible distributor base.
+    pub distributor_base: usize,
+    /// Guest-visible distributor span.
+    pub distributor_length: usize,
+    /// Guest-visible redistributor base.
+    pub redistributor_base: usize,
+    /// Guest-visible redistributor span.
+    pub redistributor_length: usize,
+}
+
+/// Host firmware resources retained by the virtual PLIC.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GuestPlicProfile {
+    /// Absolute path of the host PLIC node.
+    pub node_path: String,
+    /// PLIC node phandle, when supplied by firmware.
+    pub node_phandle: Option<u32>,
+    /// Guest-visible PLIC register base.
+    pub base: usize,
+    /// Guest-visible PLIC register span.
+    pub length: usize,
 }
 
 /// Interrupt encoding used when the common FDT pipeline describes a UART.
@@ -89,6 +141,49 @@ fn device(
     }
 }
 
+pub(crate) fn serial_device_config(serial: GuestSerialProfile) -> EmulatedDeviceConfig {
+    let (name, base_gpa, length, cfg_list) = match (serial.model, serial.transport) {
+        (GuestSerialModel::Uart16550, GuestSerialTransport::Port { base, length }) => {
+            ("com1", usize::from(base), usize::from(length), vec![])
+        }
+        (
+            GuestSerialModel::Uart16550,
+            GuestSerialTransport::Mmio {
+                base,
+                length,
+                register_shift,
+                register_width,
+            },
+        ) => (
+            "uart",
+            base,
+            length,
+            vec![
+                serial.clock_hz as usize,
+                usize::from(register_shift),
+                register_width.size(),
+            ],
+        ),
+        (GuestSerialModel::Pl011, GuestSerialTransport::Mmio { base, length, .. }) => {
+            ("pl011", base, length, vec![serial.clock_hz as usize])
+        }
+        (GuestSerialModel::Pl011, GuestSerialTransport::Port { base, length }) => (
+            "pl011",
+            usize::from(base),
+            usize::from(length),
+            vec![serial.clock_hz as usize],
+        ),
+    };
+    device(
+        name,
+        base_gpa,
+        length,
+        serial.irq,
+        EmulatedDeviceType::Console,
+        cfg_list,
+    )
+}
+
 fn x86_64_profile() -> MachineProfile {
     let serial = GuestSerialProfile {
         model: GuestSerialModel::Uart16550,
@@ -104,14 +199,7 @@ fn x86_64_profile() -> MachineProfile {
         serial_fdt_interrupt: None,
         default_passthrough_device_path: None,
         emulated_devices: vec![
-            device(
-                "com1",
-                0x3f8,
-                8,
-                serial.irq,
-                EmulatedDeviceType::Console,
-                vec![],
-            ),
+            serial_device_config(serial),
             device(
                 "ioapic",
                 0xfec0_0000,
@@ -133,6 +221,7 @@ fn aarch64_profile(cpu_num: usize) -> MachineProfile {
             base: 0x0900_0000,
             length: 0x1000,
             register_shift: 0,
+            register_width: AccessWidth::Dword,
         },
         irq: 33,
         clock_hz: 24_000_000,
@@ -153,19 +242,12 @@ fn aarch64_profile(cpu_num: usize) -> MachineProfile {
             device(
                 "gic-redistributor",
                 0x080a_0000,
-                cpu_num.saturating_mul(0x2_0000),
+                cpu_num.saturating_mul(AARCH64_GIC_REDISTRIBUTOR_FRAME_SIZE),
                 0,
                 EmulatedDeviceType::ArmGicRedistributor,
                 vec![cpu_num],
             ),
-            device(
-                "pl011",
-                0x0900_0000,
-                0x1000,
-                serial.irq,
-                EmulatedDeviceType::Console,
-                vec![serial.clock_hz as usize],
-            ),
+            serial_device_config(serial),
         ],
     }
 }
@@ -177,6 +259,7 @@ fn riscv64_profile(cpu_num: usize) -> MachineProfile {
             base: 0x1000_0000,
             length: 0x100,
             register_shift: 0,
+            register_width: AccessWidth::Byte,
         },
         irq: 10,
         clock_hz: 3_686_400,
@@ -194,14 +277,7 @@ fn riscv64_profile(cpu_num: usize) -> MachineProfile {
                 EmulatedDeviceType::PPPTGlobal,
                 vec![cpu_num * 2],
             ),
-            device(
-                "uart",
-                0x1000_0000,
-                0x100,
-                serial.irq,
-                EmulatedDeviceType::Console,
-                vec![serial.clock_hz as usize, 0],
-            ),
+            serial_device_config(serial),
         ],
     }
 }
@@ -213,6 +289,7 @@ fn loongarch64_profile() -> MachineProfile {
             base: 0x1fe0_01e0,
             length: 0x100,
             register_shift: 0,
+            register_width: AccessWidth::Byte,
         },
         irq: 2,
         clock_hz: 100_000_000,
@@ -238,14 +315,7 @@ fn loongarch64_profile() -> MachineProfile {
                 EmulatedDeviceType::LoongArchPchPic,
                 vec![],
             ),
-            device(
-                "uart",
-                0x1fe0_01e0,
-                0x100,
-                serial.irq,
-                EmulatedDeviceType::Console,
-                vec![serial.clock_hz as usize, 0],
-            ),
+            serial_device_config(serial),
         ],
     }
 }
@@ -345,6 +415,7 @@ mod tests {
                     base: 0x0900_0000,
                     length: 0x1000,
                     register_shift: 0,
+                    register_width: AccessWidth::Dword,
                 },
                 irq: 33,
                 clock_hz: 24_000_000,
@@ -358,6 +429,7 @@ mod tests {
                     base: 0x1000_0000,
                     length: 0x100,
                     register_shift: 0,
+                    register_width: AccessWidth::Byte,
                 },
                 irq: 10,
                 clock_hz: 3_686_400,
@@ -371,6 +443,7 @@ mod tests {
                     base: 0x1fe0_01e0,
                     length: 0x100,
                     register_shift: 0,
+                    register_width: AccessWidth::Byte,
                 },
                 irq: 2,
                 clock_hz: 100_000_000,

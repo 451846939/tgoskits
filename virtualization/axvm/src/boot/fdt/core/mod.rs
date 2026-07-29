@@ -22,7 +22,7 @@ pub(crate) mod tree;
 #[cfg(test)]
 mod tree_tests;
 
-pub use create::{patch_guest_fdt_for_runtime, update_fdt};
+pub use create::update_fdt;
 pub use parser::*;
 pub use policy::{DecodedInterrupt, GuestFdtPolicy};
 
@@ -31,15 +31,67 @@ pub fn prepare_dtb_guest(
     vm_create_config: &mut GuestConfig,
     provider: &dyn BootImageProvider,
 ) -> AxVmResult<Option<GuestDtbImage>> {
+    let host_fdt_bytes = try_get_host_fdt();
+    resolve_machine_resources_from_host(vm_config, host_fdt_bytes)?;
+
     if vm_create_config.kernel.effective_boot_protocol() == VMBootProtocol::Uefi {
         skip_guest_dtb(vm_config, vm_create_config);
         return Ok(None);
     }
 
-    let host_fdt_bytes = try_get_host_fdt();
     let guest_dtb = build_guest_dtb(vm_config, vm_create_config, provider, host_fdt_bytes)?;
     enrich_guest_config(vm_config, vm_create_config, guest_dtb.as_ref())?;
     Ok(guest_dtb)
+}
+
+fn resolve_machine_resources_from_host(
+    vm_config: &mut AxVMConfig,
+    host_fdt_bytes: Option<&[u8]>,
+) -> AxVmResult {
+    let Some(host_fdt_bytes) = host_fdt_bytes else {
+        return Ok(());
+    };
+    let host_fdt = fdt_edit::Fdt::from_bytes(host_fdt_bytes).map_err(|err| {
+        ax_err_type!(
+            InvalidData,
+            format!("Failed to parse host FDT while resolving the virtual UART: {err:#?}")
+        )
+    })?;
+    let current = vm_config.serial_profile();
+    if let Some(interrupt_encoding) =
+        crate::machine::current_machine_profile(1).serial_fdt_interrupt
+    {
+        if let Some(resolved) =
+            serial::host_selected_serial(&host_fdt, current, interrupt_encoding)?
+        {
+            if resolved.profile != current {
+                info!(
+                    "VM[{}] virtual UART follows the host-selected UART: {:?}",
+                    vm_config.id(),
+                    resolved.profile
+                );
+            }
+            vm_config.replace_machine_serial(resolved.profile, Some(resolved.identity))?;
+        }
+    }
+
+    if let Some(gic) = interrupt::host_gic_profile(&host_fdt)? {
+        info!(
+            "VM[{}] virtual GIC follows host firmware resources: {:?}",
+            vm_config.id(),
+            gic
+        );
+        vm_config.replace_machine_gic(gic)?;
+    }
+    if let Some(plic) = interrupt::host_plic_profile(&host_fdt)? {
+        info!(
+            "VM[{}] virtual PLIC follows host firmware resources: {:?}",
+            vm_config.id(),
+            plic
+        );
+        vm_config.replace_machine_plic(plic)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn selected_guest_fdt_policy() -> GuestFdtPolicy {
@@ -117,8 +169,8 @@ fn enrich_guest_config(
     };
 
     parse_reserved_memory_regions(vm_create_config, dtb)?;
-    parse_passthrough_devices_address(vm_config, vm_create_config, dtb)?;
-    parse_vm_interrupt(vm_config, dtb)
+    parse_vm_interrupt(vm_config, dtb)?;
+    parse_passthrough_devices_address(vm_config, vm_create_config, dtb)
 }
 
 fn clear_unresolved_dtb_config(vm_config: &mut AxVMConfig, vm_create_config: &mut GuestConfig) {

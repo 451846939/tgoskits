@@ -37,4 +37,4 @@ pub fn ipi_irq() -> ax_plat::irq::IrqId {
     somehal::irq::ipi_irq()
 }
 #[cfg(all(feature = "irq", target_arch = "riscv64", feature = "hv"))]
-pub use irq::{register_virtual_irq_injector, set_virtual_irq_targets};
+pub use irq::{clear_virtual_irq_targets, register_virtual_irq_injector, set_virtual_irq_targets};

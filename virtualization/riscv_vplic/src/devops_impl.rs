@@ -47,14 +47,29 @@ impl VPlicGlobal {
     /// empty assignment bitmap preserves the existing unrestricted behavior;
     /// once assignments are populated, only assigned sources are accepted.
     pub fn set_pending(&self, irq_id: usize) -> VplicResult {
-        self.update_pending_irq(irq_id, true)?;
-        self.sync_all_guest_contexts_vseip()
+        self.update_pending_irq(irq_id, true)
     }
 
     /// Clears the pending state of one interrupt source.
     pub fn clear_pending(&self, irq_id: usize) -> VplicResult {
-        self.update_pending_irq(irq_id, false)?;
-        self.sync_all_guest_contexts_vseip()
+        self.update_pending_irq(irq_id, false)
+    }
+
+    /// Updates one level-triggered device input.
+    ///
+    /// Returns `true` when a low-to-high transition needs initial delivery.
+    /// The asserted state remains controller-owned so completion can repend
+    /// the source until the device lowers the line.
+    pub fn set_irq_line_level(&self, irq_id: usize, asserted: bool) -> VplicResult<bool> {
+        self.validate_assigned_irq(irq_id)?;
+        let newly_asserted = {
+            let mut asserted_irqs = self.line_asserted_irqs.lock();
+            let was_asserted = asserted_irqs.get(irq_id);
+            asserted_irqs.set(irq_id, asserted);
+            asserted && !was_asserted
+        };
+        self.pending_irqs.lock().set(irq_id, asserted);
+        Ok(newly_asserted)
     }
 
     /// Returns whether one interrupt source is pending.
@@ -413,9 +428,11 @@ impl BaseDeviceOps<GuestPhysAddrRange> for VPlicGlobal {
                     if irq_id == 0 || irq_id >= PLIC_NUM_SOURCES {
                         return self.sync_vseip(context_id);
                     }
+                    let asserted_irqs = self.line_asserted_irqs.lock();
                     let mut active_irqs = self.active_irqs.lock();
                     if !active_irqs.get(irq_id) {
                         drop(active_irqs);
+                        drop(asserted_irqs);
                         return self.sync_vseip(context_id);
                     }
 
@@ -424,6 +441,10 @@ impl BaseDeviceOps<GuestPhysAddrRange> for VPlicGlobal {
                     // Clear the active bit only after the completion is accepted.
                     active_irqs.set(irq_id, false);
                     drop(active_irqs);
+                    if asserted_irqs.get(irq_id) {
+                        self.pending_irqs.lock().set(irq_id, true);
+                    }
+                    drop(asserted_irqs);
                     self.sync_vseip(context_id)
                 }
                 _ => Err(VplicError::UnsupportedRegister {

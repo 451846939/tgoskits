@@ -20,6 +20,7 @@ const REG_RIS: usize = 0x03c;
 const REG_MIS: usize = 0x040;
 const REG_ICR: usize = 0x044;
 const REG_DMACR: usize = 0x048;
+const REGISTER_BLOCK_SIZE: usize = 0x1000;
 
 const FR_TXFE: u32 = 1 << 7;
 const FR_RXFF: u32 = 1 << 6;
@@ -148,6 +149,7 @@ impl Pl011 {
                 REG_MIS => state.raw_interrupts() & state.interrupt_mask,
                 REG_DMACR => state.dma_control,
                 0xfe0..=0xffc if offset & 3 == 0 => peripheral_id(offset),
+                _ if offset < REGISTER_BLOCK_SIZE => 0,
                 _ => {
                     return Err(DeviceError::OutOfRange {
                         addr: offset as u64,
@@ -193,6 +195,7 @@ impl Pl011 {
                 }
                 REG_DMACR => state.dma_control = value & 0x7,
                 REG_FR | REG_RIS | REG_MIS | 0xfe0..=0xffc => {}
+                _ if offset < REGISTER_BLOCK_SIZE => {}
                 _ => {
                     return Err(DeviceError::OutOfRange {
                         addr: offset as u64,

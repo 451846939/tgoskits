@@ -165,9 +165,10 @@ fn map_arch_address_space(resources: &mut AxVMResources) -> AxVmResult {
 }
 
 fn guest_page_table_levels(vcpu_mappings: &[(usize, Option<usize>, usize)]) -> usize {
-    let mut levels = 4;
-    for cpu_id in crate::architecture::ops::target_phys_cpu_ids(vcpu_mappings) {
-        levels = levels.min(crate::percpu::cpu_max_guest_page_table_levels(cpu_id).unwrap_or(4));
-    }
-    levels
+    crate::architecture::minimum_cpu_capability(
+        4,
+        crate::architecture::ops::target_phys_cpu_ids(vcpu_mappings)
+            .into_iter()
+            .map(|cpu_id| crate::percpu::cpu_max_guest_page_table_levels(cpu_id).unwrap_or(4)),
+    )
 }

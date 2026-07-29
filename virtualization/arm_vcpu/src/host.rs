@@ -11,7 +11,7 @@ use crate::ArmVcpuResult;
 /// physical interrupt reporting, and current-EL interrupt dispatch.
 pub trait ArmHostOps {
     /// Inject a virtual interrupt through host interrupt-controller state.
-    fn inject_virtual_interrupt(vector: u8) -> ArmVcpuResult;
+    fn inject_virtual_interrupt(vector: u32) -> ArmVcpuResult;
 
     /// Report a pending host IRQ after a lower-EL IRQ VM exit.
     fn fetch_pending_host_irq() -> Option<usize>;

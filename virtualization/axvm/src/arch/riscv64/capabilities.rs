@@ -76,10 +76,21 @@ pub(super) fn patch_runtime_fdt(
                 format!("Failed to parse host FDT while updating guest FDT: {err:#?}")
             )
         })?;
-    let guest_fdt = super::fdt::core::patch_guest_fdt_for_runtime(
+    let (serial_profile, serial_identity, plic_profile) = vm.with_config(|config| {
+        (
+            config.serial_profile(),
+            config.serial_fdt_identity().cloned(),
+            config.plic_profile().cloned(),
+        )
+    });
+    let guest_fdt = super::fdt::core::create::patch_guest_fdt_for_runtime(
         fdt_bytes,
         &vm.memory_regions(),
         crate_config,
+        serial_profile,
+        serial_identity.as_ref(),
+        None,
+        plic_profile.as_ref(),
         None,
         false,
     )?;

@@ -15,7 +15,7 @@
 use alloc::format;
 
 use crate::{
-    AsVCpuTask, AxVmResult, GuestPhysAddr, StopReason, VCpuTask, VmStatus, VmVcpuState,
+    AsVCpuTask, AxVmResult, StopReason, VCpuTask, VmStatus,
     arch::{ArchOps, CurrentArch, VcpuRunAction},
     ax_err_type,
     runtime::{VCpuRef, VMRef, sub_running_vm_count},
@@ -102,6 +102,25 @@ pub(crate) fn queue_interrupt(vm_id: usize, vcpu_id: usize, vector: usize) -> Ax
     Ok(())
 }
 
+/// Wake and kick a target vCPU after an architecture IRQ backend has
+/// published pending state outside the generic runtime queue.
+pub(crate) fn notify_vcpu(vm_id: usize, vcpu_id: usize) -> AxVmResult {
+    let vm = crate::get_vm_by_id(vm_id)
+        .ok_or_else(|| ax_err_type!(NotFound, format!("VM[{vm_id}] not found")))?;
+    if !matches!(vm.status(), VmStatus::Running | VmStatus::Paused) {
+        return Err(ax_err_type!(
+            BadState,
+            format!("VM[{vm_id}] is not accepting interrupts")
+        ));
+    }
+
+    let runtime = vm.with_runtime(|runtime| Ok(runtime.clone()))?;
+    let cpu_id = runtime.vcpu_cpu_id(vcpu_id)?;
+    runtime.notify_all();
+    crate::host::task::send_ipi(cpu_id);
+    Ok(())
+}
+
 #[expect(
     dead_code,
     reason = "only the LoongArch IRQ backend queues physical interrupts"
@@ -179,56 +198,6 @@ fn mark_vcpu_running(vm: &VMRef) {
         runtime.mark_vcpu_running();
         Ok(())
     });
-}
-
-/// Boot target VCpu on the specified VM.
-/// This function is used to boot a secondary VCpu on a VM, setting the entry point and argument for the VCpu.
-///
-/// # Arguments
-///
-/// * `vm_id` - The ID of the VM on which the VCpu is to be booted.
-/// * `vcpu_id` - The ID of the VCpu to be booted.
-/// * `entry_point` - The entry point of the VCpu.
-/// * `arg` - The argument to be passed to the VCpu.
-#[expect(
-    dead_code,
-    reason = "only non-x86 guest firmware boots secondary vCPUs"
-)]
-pub(crate) fn vcpu_on(
-    vm: VMRef,
-    vcpu_id: usize,
-    entry_point: GuestPhysAddr,
-    arg: usize,
-) -> AxVmResult {
-    let vcpu = vm
-        .vcpu_list()
-        .get(vcpu_id)
-        .cloned()
-        .ok_or_else(|| ax_err_type!(NotFound, format!("vCPU {vcpu_id} not found")))?;
-    if vcpu.state() != VmVcpuState::Free {
-        return Err(ax_err_type!(
-            BadState,
-            format!("vCPU {} invalid state {:?}", vcpu.id(), vcpu.state())
-        ));
-    }
-
-    vcpu.set_entry(entry_point)?;
-    CurrentArch::set_vcpu_on_args(&vcpu, vcpu_id, arg);
-
-    let vcpu_task = alloc_vcpu_task(&vm, vcpu);
-    vm.with_runtime(|runtime| {
-        runtime.add_vcpu_task(vcpu_id, vcpu_task);
-        Ok(())
-    })?;
-    Ok(())
-}
-
-#[expect(
-    dead_code,
-    reason = "only non-x86 guest firmware boots secondary vCPUs"
-)]
-pub(crate) fn alloc_vcpu_task(vm: &VMRef, vcpu: VCpuRef) -> crate::AxTaskRef {
-    crate::host::task::spawn_task(build_vcpu_task(vm, vcpu))
 }
 
 pub(crate) fn build_vcpu_task(vm: &VMRef, vcpu: VCpuRef) -> crate::TaskInner {

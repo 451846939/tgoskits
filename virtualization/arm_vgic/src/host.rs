@@ -42,7 +42,7 @@ pub trait ArmVgicHostIf {
     fn get_host_gicr_base() -> PhysAddr;
 
     /// Inject a virtual interrupt.
-    fn hardware_inject_virtual_interrupt(vector: u8);
+    fn hardware_inject_virtual_interrupt(vector: u32);
 }
 
 #[cfg(feature = "vgicv3")]
@@ -98,6 +98,6 @@ pub fn get_host_gicr_base() -> PhysAddr {
     ax_crate_interface::call_interface!(ArmVgicHostIf::get_host_gicr_base())
 }
 
-pub fn hardware_inject_virtual_interrupt(vector: u8) {
+pub fn hardware_inject_virtual_interrupt(vector: u32) {
     ax_crate_interface::call_interface!(ArmVgicHostIf::hardware_inject_virtual_interrupt(vector));
 }

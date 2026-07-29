@@ -2,6 +2,7 @@
 
 use alloc::{format, string::String, vec, vec::Vec};
 
+use axdevice_base::AccessWidth;
 use fdt_edit::{Fdt, Node, Property};
 use fdt_raw::RegInfo;
 
@@ -9,21 +10,30 @@ use super::tree::{FdtTree, prop_string};
 use crate::{
     AxVmResult, ax_err_type,
     machine::{
-        GuestSerialFdtInterrupt, GuestSerialModel, GuestSerialProfile, GuestSerialTransport,
+        GuestSerialFdtIdentity, GuestSerialFdtInterrupt, GuestSerialModel, GuestSerialProfile,
+        GuestSerialTransport,
     },
 };
 
+pub(crate) struct HostSelectedSerial {
+    pub profile: GuestSerialProfile,
+    pub identity: GuestSerialFdtIdentity,
+}
+
 /// Replaces firmware-provided UARTs with the current machine's virtual UART.
-pub(crate) fn install_machine_serial(tree: &mut FdtTree) -> AxVmResult {
+pub(crate) fn install_machine_serial(
+    tree: &mut FdtTree,
+    profile: GuestSerialProfile,
+    identity: Option<&GuestSerialFdtIdentity>,
+) -> AxVmResult {
     let machine = crate::machine::current_machine_profile(1);
-    let profile = machine.serial;
     let GuestSerialTransport::Mmio { .. } = profile.transport else {
         return Ok(());
     };
     let Some(interrupt_encoding) = machine.serial_fdt_interrupt else {
         return Ok(());
     };
-    install_mmio_serial(tree, profile, interrupt_encoding)
+    install_mmio_serial(tree, profile, interrupt_encoding, identity)
 }
 
 /// Returns physical UART nodes that must remain owned by the host.
@@ -53,15 +63,207 @@ pub(crate) fn physical_serial_paths(fdt: &Fdt) -> Vec<String> {
     paths
 }
 
+/// Resolves the guest virtual UART identity from the firmware-selected host UART.
+///
+/// Firmware-backed machines retain the selected host UART's register model and
+/// bus layout while replacing the physical device with an emulated UART.
+pub(crate) fn host_selected_serial(
+    fdt: &Fdt,
+    fallback: GuestSerialProfile,
+    interrupt_encoding: GuestSerialFdtInterrupt,
+) -> AxVmResult<Option<HostSelectedSerial>> {
+    let Some((stdout_selector, path)) = stdout_selection(fdt) else {
+        return Ok(None);
+    };
+    let serial = fdt.get_by_path(&path).ok_or_else(|| {
+        ax_err_type!(
+            InvalidData,
+            format!("host stdout UART node {path} is missing")
+        )
+    })?;
+    let node = serial.as_node();
+    let compatibles = node.compatibles().collect::<Vec<_>>();
+    let model = if compatibles.contains(&"arm,pl011") {
+        GuestSerialModel::Pl011
+    } else if compatibles
+        .iter()
+        .any(|compatible| matches!(*compatible, "ns16550" | "ns16550a" | "snps,dw-apb-uart"))
+    {
+        GuestSerialModel::Uart16550
+    } else {
+        return Err(ax_err_type!(
+            Unsupported,
+            format!(
+                "host stdout UART node {path} has no supported virtual register model: \
+                 {compatibles:?}"
+            )
+        ));
+    };
+
+    let reg = serial.regs().into_iter().next().ok_or_else(|| {
+        ax_err_type!(
+            InvalidData,
+            format!("host stdout UART node {path} has no register range")
+        )
+    })?;
+    let base = usize::try_from(reg.address).map_err(|_| {
+        ax_err_type!(
+            InvalidData,
+            format!(
+                "host stdout UART address does not fit usize: {:#x}",
+                reg.address
+            )
+        )
+    })?;
+    let length = reg
+        .size
+        .ok_or_else(|| {
+            ax_err_type!(
+                InvalidData,
+                format!("host stdout UART node {path} has no register range size")
+            )
+        })
+        .and_then(|length| {
+            usize::try_from(length).map_err(|_| {
+                ax_err_type!(
+                    InvalidData,
+                    format!("host stdout UART range size does not fit usize: {length:#x}")
+                )
+            })
+        })?;
+    if length == 0 {
+        return Err(ax_err_type!(
+            InvalidData,
+            format!("host stdout UART node {path} has an empty register range")
+        ));
+    }
+
+    let GuestSerialTransport::Mmio { .. } = fallback.transport else {
+        return Err(ax_err_type!(
+            InvalidData,
+            "FDT-backed machine serial profile is not MMIO"
+        ));
+    };
+    let (register_shift, register_width, clock_hz) = match model {
+        GuestSerialModel::Pl011 => (0, AccessWidth::Dword, fallback.clock_hz),
+        GuestSerialModel::Uart16550 => {
+            let shift = node
+                .get_property("reg-shift")
+                .and_then(Property::get_u32)
+                .unwrap_or(0);
+            if shift >= usize::BITS {
+                return Err(ax_err_type!(
+                    InvalidData,
+                    format!("host stdout UART reg-shift {shift} is too large")
+                ));
+            }
+            let register_width = node
+                .get_property("reg-io-width")
+                .and_then(Property::get_u32)
+                .map_or(Ok(AccessWidth::Byte), |width| {
+                    AccessWidth::try_from(width as usize).map_err(|_| {
+                        ax_err_type!(
+                            InvalidData,
+                            format!("host stdout UART reg-io-width {width} is unsupported")
+                        )
+                    })
+                })?;
+            let clock_hz = node
+                .get_property("clock-frequency")
+                .and_then(Property::get_u32)
+                .filter(|clock| *clock != 0)
+                .unwrap_or(fallback.clock_hz);
+            (shift as u8, register_width, clock_hz)
+        }
+    };
+    let interrupt = serial.interrupts().into_iter().next().ok_or_else(|| {
+        ax_err_type!(
+            InvalidData,
+            format!("host stdout UART node {path} has no interrupt")
+        )
+    })?;
+    let irq = decode_interrupt_id(&path, interrupt_encoding, &interrupt.specifier)?;
+    let node_phandle = node
+        .get_property("phandle")
+        .or_else(|| node.get_property("linux,phandle"))
+        .and_then(Property::get_u32);
+
+    Ok(Some(HostSelectedSerial {
+        profile: GuestSerialProfile {
+            model,
+            transport: GuestSerialTransport::Mmio {
+                base,
+                length,
+                register_shift,
+                register_width,
+            },
+            irq,
+            clock_hz,
+        },
+        identity: GuestSerialFdtIdentity {
+            node_path: path,
+            node_phandle,
+            interrupt_parent: interrupt.interrupt_parent.raw(),
+            interrupt_specifier: interrupt.specifier,
+            stdout_path: stdout_selector,
+        },
+    }))
+}
+
+fn decode_interrupt_id(
+    path: &str,
+    encoding: GuestSerialFdtInterrupt,
+    specifier: &[u32],
+) -> AxVmResult<usize> {
+    let raw = match encoding {
+        GuestSerialFdtInterrupt::GicSpi => {
+            if specifier.first().copied() != Some(0) {
+                return Err(ax_err_type!(
+                    Unsupported,
+                    format!("host stdout UART node {path} is not connected to a GIC SPI")
+                ));
+            }
+            specifier
+                .get(1)
+                .copied()
+                .and_then(|source| source.checked_add(32))
+                .ok_or_else(|| {
+                    ax_err_type!(
+                        InvalidData,
+                        format!("host stdout UART node {path} has an invalid GIC interrupt")
+                    )
+                })?
+        }
+        GuestSerialFdtInterrupt::PlicSource => specifier
+            .first()
+            .copied()
+            .filter(|source| *source != 0)
+            .ok_or_else(|| {
+                ax_err_type!(
+                    InvalidData,
+                    format!("host stdout UART node {path} has an invalid PLIC interrupt")
+                )
+            })?,
+    };
+    usize::try_from(raw).map_err(|_| {
+        ax_err_type!(
+            InvalidData,
+            format!("host stdout UART interrupt does not fit usize: {raw}")
+        )
+    })
+}
+
 fn install_mmio_serial(
     tree: &mut FdtTree,
     profile: GuestSerialProfile,
     interrupt_encoding: GuestSerialFdtInterrupt,
+    identity: Option<&GuestSerialFdtIdentity>,
 ) -> AxVmResult {
     let GuestSerialTransport::Mmio {
         base,
         length,
         register_shift,
+        register_width,
     } = profile.transport
     else {
         return Err(ax_err_type!(
@@ -69,7 +271,10 @@ fn install_mmio_serial(
             "device-tree serial profile is not MMIO"
         ));
     };
-    let interrupt_parent = interrupt_controller_phandle(tree, interrupt_encoding)?;
+    let interrupt_parent = match identity {
+        Some(identity) => identity.interrupt_parent,
+        None => interrupt_controller_phandle(tree, interrupt_encoding)?,
+    };
 
     let mut old_paths = physical_serial_paths(tree.inner());
     old_paths.sort_by_key(|path| core::cmp::Reverse(path.matches('/').count()));
@@ -77,11 +282,25 @@ fn install_mmio_serial(
         tree.inner_mut().remove_by_path(&path);
     }
 
-    let serial_path = match profile.model {
-        GuestSerialModel::Pl011 => format!("/pl011@{base:x}"),
-        GuestSerialModel::Uart16550 => format!("/serial@{base:x}"),
+    let serial_path = match identity {
+        Some(identity) => identity.node_path.clone(),
+        None => match profile.model {
+            GuestSerialModel::Pl011 => format!("/pl011@{base:x}"),
+            GuestSerialModel::Uart16550 => format!("/serial@{base:x}"),
+        },
     };
-    let serial_id = tree.add_node(tree.inner().root_id(), Node::new(&serial_path[1..]));
+    let (parent_path, node_name) = serial_path.rsplit_once('/').ok_or_else(|| {
+        ax_err_type!(
+            InvalidData,
+            format!("virtual serial node path is not absolute: {serial_path}")
+        )
+    })?;
+    let parent = if parent_path.is_empty() {
+        tree.inner().root_id()
+    } else {
+        tree.ensure_path(parent_path)?
+    };
+    let serial_id = tree.add_node(parent, Node::new(node_name));
     tree.inner_mut()
         .view_typed_mut(serial_id)
         .ok_or_else(|| ax_err_type!(InvalidData, "new serial FDT node is missing"))?
@@ -103,14 +322,18 @@ fn install_mmio_serial(
         GuestSerialModel::Uart16550 => {
             tree.set_property(serial_id, prop_string("compatible", "ns16550a"))?;
             tree.set_property(serial_id, prop_u32("reg-shift", u32::from(register_shift)))?;
+            tree.set_property(
+                serial_id,
+                prop_u32("reg-io-width", register_width.size() as u32),
+            )?;
         }
     }
     tree.set_property(serial_id, prop_u32("clock-frequency", profile.clock_hz))?;
     tree.set_property(serial_id, prop_u32("current-speed", 115_200))?;
     tree.set_property(serial_id, prop_u32("interrupt-parent", interrupt_parent))?;
-    tree.set_property(
-        serial_id,
-        match interrupt_encoding {
+    let interrupts = match identity {
+        Some(identity) => prop_u32_list("interrupts", &identity.interrupt_specifier),
+        None => match interrupt_encoding {
             GuestSerialFdtInterrupt::GicSpi => {
                 let spi = profile.irq.checked_sub(32).ok_or_else(|| {
                     ax_err_type!(InvalidData, "PL011 interrupt ID is not a GIC SPI")
@@ -121,32 +344,46 @@ fn install_mmio_serial(
                 prop_u32_list("interrupts", &[profile.irq as u32])
             }
         },
-    )?;
+    };
+    tree.set_property(serial_id, interrupts)?;
+    if let Some(phandle) = identity.and_then(|identity| identity.node_phandle) {
+        tree.set_property(serial_id, prop_u32("phandle", phandle))?;
+        tree.set_property(serial_id, prop_u32("linux,phandle", phandle))?;
+    }
 
-    let aliases = tree.ensure_path("/aliases")?;
-    tree.set_property(aliases, prop_string("serial0", &serial_path))?;
+    if identity.is_none() {
+        let aliases = tree.ensure_path("/aliases")?;
+        tree.set_property(aliases, prop_string("serial0", &serial_path))?;
+    }
     let chosen = tree.ensure_path("/chosen")?;
-    tree.set_property(chosen, prop_string("stdout-path", &serial_path))?;
+    let stdout_path = identity
+        .map(|identity| identity.stdout_path.as_str())
+        .unwrap_or(&serial_path);
+    let stdout_selector = stdout_path.split(':').next().unwrap_or(stdout_path);
+    if !stdout_selector.starts_with('/') {
+        let aliases = tree.ensure_path("/aliases")?;
+        tree.set_property(aliases, prop_string(stdout_selector, &serial_path))?;
+    }
+    tree.set_property(chosen, prop_string("stdout-path", stdout_path))?;
     Ok(())
 }
 
 fn install_pl011_clock(tree: &mut FdtTree, clock_hz: u32) -> AxVmResult<u32> {
-    let clock = tree.ensure_path("/apb-pclk")?;
-    let phandle = tree
-        .inner()
-        .node(clock)
-        .and_then(|node| {
-            node.get_property("phandle")
-                .or_else(|| node.get_property("linux,phandle"))
-        })
-        .and_then(Property::get_u32)
-        .unwrap_or_else(|| next_phandle(tree.inner()));
+    const CLOCK_PATH: &str = "/vuart-clock";
+
+    tree.inner_mut().remove_by_path(CLOCK_PATH);
+    let phandle = next_phandle(tree.inner());
+    let clock = tree.add_node(tree.inner().root_id(), Node::new("vuart-clock"));
 
     tree.set_property(clock, prop_string("compatible", "fixed-clock"))?;
     tree.set_property(clock, prop_u32("#clock-cells", 0))?;
     tree.set_property(clock, prop_u32("clock-frequency", clock_hz))?;
-    tree.set_property(clock, prop_string("clock-output-names", "clk24mhz"))?;
+    tree.set_property(
+        clock,
+        prop_string("clock-output-names", "virtual-uart-clock"),
+    )?;
     tree.set_property(clock, prop_u32("phandle", phandle))?;
+    tree.set_property(clock, prop_u32("linux,phandle", phandle))?;
     Ok(phandle)
 }
 
@@ -190,6 +427,7 @@ fn interrupt_controller_phandle(
 
     let phandle = next_phandle(tree.inner());
     tree.set_property(controller, prop_u32("phandle", phandle))?;
+    tree.set_property(controller, prop_u32("linux,phandle", phandle))?;
     Ok(phandle)
 }
 
@@ -207,20 +445,25 @@ fn next_phandle(fdt: &Fdt) -> u32 {
         .max(1)
 }
 
-fn stdout_path(fdt: &Fdt) -> Option<String> {
+fn stdout_selection(fdt: &Fdt) -> Option<(String, String)> {
     let chosen = fdt.get_by_path("/chosen")?;
     let raw = ["stdout-path", "linux,stdout-path"]
         .into_iter()
         .find_map(|name| chosen.as_node().get_property(name)?.as_str())?;
     let selector = raw.split(':').next().unwrap_or(raw);
-    if selector.starts_with('/') {
-        return Some(selector.into());
-    }
-    fdt.get_by_path("/aliases")?
-        .as_node()
-        .get_property(selector)?
-        .as_str()
-        .map(Into::into)
+    let path = if selector.starts_with('/') {
+        selector
+    } else {
+        fdt.get_by_path("/aliases")?
+            .as_node()
+            .get_property(selector)?
+            .as_str()?
+    };
+    Some((raw.into(), path.into()))
+}
+
+fn stdout_path(fdt: &Fdt) -> Option<String> {
+    stdout_selection(fdt).map(|(_, path)| path)
 }
 
 fn prop_u32(name: &str, value: u32) -> Property {
@@ -249,11 +492,21 @@ mod tests {
         tree.set_property(root, prop_u32("#address-cells", 2))
             .unwrap();
         tree.set_property(root, prop_u32("#size-cells", 2)).unwrap();
+        tree.set_property(root, prop_u32("interrupt-parent", 7))
+            .unwrap();
         let controller = tree.add_node(root, Node::new(name));
         tree.set_property(controller, prop_string("compatible", compatible))
             .unwrap();
         tree.set_property(controller, Property::new("interrupt-controller", vec![]))
             .unwrap();
+        tree.set_property(
+            controller,
+            prop_u32(
+                "#interrupt-cells",
+                if compatible.contains("gic") { 3 } else { 1 },
+            ),
+        )
+        .unwrap();
         tree.set_property(controller, prop_u32("phandle", 7))
             .unwrap();
         tree
@@ -268,12 +521,13 @@ mod tests {
                 base: 0x0900_0000,
                 length: 0x1000,
                 register_shift: 0,
+                register_width: AccessWidth::Dword,
             },
             irq: 33,
             clock_hz: 24_000_000,
         };
 
-        install_mmio_serial(&mut tree, profile, GuestSerialFdtInterrupt::GicSpi).unwrap();
+        install_mmio_serial(&mut tree, profile, GuestSerialFdtInterrupt::GicSpi, None).unwrap();
         let fdt = Fdt::from_bytes(&tree.finish()).unwrap();
         let serial = fdt.get_by_path("/pl011@9000000").unwrap();
         let regs = serial.regs();
@@ -312,7 +566,29 @@ mod tests {
                 .collect::<Vec<_>>(),
             [0, 1, 4]
         );
-        let clock = fdt.get_by_path("/apb-pclk").unwrap();
+        let clock = fdt.get_by_path("/vuart-clock").unwrap();
+        assert!(
+            clock
+                .as_node()
+                .compatibles()
+                .any(|value| value == "fixed-clock")
+        );
+        assert_eq!(
+            clock
+                .as_node()
+                .get_property("#clock-cells")
+                .unwrap()
+                .get_u32(),
+            Some(0)
+        );
+        assert_eq!(
+            clock
+                .as_node()
+                .get_property("clock-frequency")
+                .unwrap()
+                .get_u32(),
+            Some(24_000_000)
+        );
         let clock_phandle = clock
             .as_node()
             .get_property("phandle")
@@ -357,12 +633,19 @@ mod tests {
                 base: 0x1000_0000,
                 length: 0x100,
                 register_shift: 0,
+                register_width: AccessWidth::Byte,
             },
             irq: 10,
             clock_hz: 3_686_400,
         };
 
-        install_mmio_serial(&mut tree, profile, GuestSerialFdtInterrupt::PlicSource).unwrap();
+        install_mmio_serial(
+            &mut tree,
+            profile,
+            GuestSerialFdtInterrupt::PlicSource,
+            None,
+        )
+        .unwrap();
         let fdt = Fdt::from_bytes(&tree.finish()).unwrap();
         let serial = fdt.get_by_path("/serial@10000000").unwrap();
         let regs = serial.regs();
@@ -383,6 +666,14 @@ mod tests {
                 .unwrap()
                 .get_u32(),
             Some(0)
+        );
+        assert_eq!(
+            serial
+                .as_node()
+                .get_property("reg-io-width")
+                .unwrap()
+                .get_u32(),
+            Some(1)
         );
         assert_eq!(
             serial
@@ -436,11 +727,18 @@ mod tests {
                 base: 0x1000_0000,
                 length: 0x100,
                 register_shift: 0,
+                register_width: AccessWidth::Byte,
             },
             irq: 10,
             clock_hz: 3_686_400,
         };
-        install_mmio_serial(&mut tree, profile, GuestSerialFdtInterrupt::PlicSource).unwrap();
+        install_mmio_serial(
+            &mut tree,
+            profile,
+            GuestSerialFdtInterrupt::PlicSource,
+            None,
+        )
+        .unwrap();
 
         let fdt = Fdt::from_bytes(&tree.finish()).unwrap();
         assert!(fdt.get_by_path("/soc/uart@1000").is_none());
@@ -464,5 +762,232 @@ mod tests {
                 .as_str(),
             Some("/serial@10000000")
         );
+    }
+
+    #[test]
+    fn installs_pl011_with_host_irq_phandle_and_stdout_identity() {
+        let mut tree = tree_with_controller("arm,gic-v3", "interrupt-controller@fe600000");
+        let root = tree.inner().root_id();
+        let host_serial = tree.add_node(root, Node::new("serial@feb50000"));
+        tree.set_property(
+            host_serial,
+            prop_string_list("compatible", &["arm,pl011", "arm,primecell"]),
+        )
+        .unwrap();
+        tree.inner_mut()
+            .view_typed_mut(host_serial)
+            .unwrap()
+            .set_regs(&[RegInfo::new(0xfeb5_0000, Some(0x1000))]);
+        tree.set_property(host_serial, prop_u32_list("interrupts", &[0, 0x14d, 4]))
+            .unwrap();
+        tree.set_property(host_serial, prop_u32("phandle", 0x2d1))
+            .unwrap();
+        let aliases = tree.ensure_path("/aliases").unwrap();
+        tree.set_property(aliases, prop_string("serial2", "/serial@feb50000"))
+            .unwrap();
+        let chosen = tree.ensure_path("/chosen").unwrap();
+        tree.set_property(chosen, prop_string("stdout-path", "serial2:1500000"))
+            .unwrap();
+
+        let host_dtb = tree.finish();
+        let host_fdt = Fdt::from_bytes(&host_dtb).unwrap();
+        let fallback = GuestSerialProfile {
+            model: GuestSerialModel::Pl011,
+            transport: GuestSerialTransport::Mmio {
+                base: 0x0900_0000,
+                length: 0x1000,
+                register_shift: 0,
+                register_width: AccessWidth::Dword,
+            },
+            irq: 33,
+            clock_hz: 24_000_000,
+        };
+        let resolved = host_selected_serial(&host_fdt, fallback, GuestSerialFdtInterrupt::GicSpi)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.profile.model, GuestSerialModel::Pl011);
+
+        let mut tree = FdtTree::from_bytes(&host_dtb).unwrap();
+        install_mmio_serial(
+            &mut tree,
+            resolved.profile,
+            GuestSerialFdtInterrupt::GicSpi,
+            Some(&resolved.identity),
+        )
+        .unwrap();
+        let fdt = Fdt::from_bytes(&tree.finish()).unwrap();
+        let serial = fdt.get_by_path("/serial@feb50000").unwrap();
+
+        assert!(
+            serial
+                .as_node()
+                .compatibles()
+                .any(|value| value == "arm,pl011")
+        );
+        assert!(serial.as_node().get_property("reg-shift").is_none());
+        assert!(serial.as_node().get_property("reg-io-width").is_none());
+        assert_eq!(serial.regs()[0].address, 0xfeb5_0000);
+        assert_eq!(serial.regs()[0].size, Some(0x1000));
+        assert_eq!(
+            serial.as_node().get_property("phandle").unwrap().get_u32(),
+            Some(0x2d1)
+        );
+        assert_eq!(
+            serial
+                .as_node()
+                .get_property("linux,phandle")
+                .unwrap()
+                .get_u32(),
+            Some(0x2d1)
+        );
+        assert_eq!(
+            serial
+                .as_node()
+                .get_property("interrupt-parent")
+                .unwrap()
+                .get_u32(),
+            Some(7)
+        );
+        assert_eq!(
+            serial
+                .as_node()
+                .get_property("interrupts")
+                .unwrap()
+                .get_u32_iter()
+                .collect::<Vec<_>>(),
+            [0, 0x14d, 4]
+        );
+        assert_eq!(
+            fdt.get_by_path("/aliases")
+                .unwrap()
+                .as_node()
+                .get_property("serial2")
+                .unwrap()
+                .as_str(),
+            Some("/serial@feb50000")
+        );
+        assert_eq!(
+            fdt.get_by_path("/chosen")
+                .unwrap()
+                .as_node()
+                .get_property("stdout-path")
+                .unwrap()
+                .as_str(),
+            Some("serial2:1500000")
+        );
+    }
+
+    #[test]
+    fn resolves_dw_apb_uart_as_virtual_16550() {
+        let mut tree = FdtTree::new();
+        let root = tree.inner().root_id();
+        tree.set_property(root, prop_u32("#address-cells", 2))
+            .unwrap();
+        tree.set_property(root, prop_u32("#size-cells", 2)).unwrap();
+        tree.set_property(root, prop_u32("interrupt-parent", 1))
+            .unwrap();
+        let gic = tree.add_node(root, Node::new("interrupt-controller@fe600000"));
+        tree.set_property(gic, prop_string("compatible", "arm,gic-v3"))
+            .unwrap();
+        tree.set_property(gic, Property::new("interrupt-controller", vec![]))
+            .unwrap();
+        tree.set_property(gic, prop_u32("#interrupt-cells", 3))
+            .unwrap();
+        tree.set_property(gic, prop_u32("phandle", 1)).unwrap();
+        let serial = tree.add_node(root, Node::new("serial@feb50000"));
+        tree.set_property(
+            serial,
+            prop_string_list("compatible", &["rockchip,rk3588-uart", "snps,dw-apb-uart"]),
+        )
+        .unwrap();
+        tree.inner_mut()
+            .view_typed_mut(serial)
+            .unwrap()
+            .set_regs(&[RegInfo::new(0xfeb5_0000, Some(0x100))]);
+        tree.set_property(serial, prop_u32("reg-shift", 2)).unwrap();
+        tree.set_property(serial, prop_u32("reg-io-width", 4))
+            .unwrap();
+        tree.set_property(serial, prop_u32_list("interrupts", &[0, 0x14d, 4]))
+            .unwrap();
+        tree.set_property(serial, prop_u32("phandle", 0x2d1))
+            .unwrap();
+        let chosen = tree.ensure_path("/chosen").unwrap();
+        tree.set_property(
+            chosen,
+            prop_string("stdout-path", "/serial@feb50000:1500000"),
+        )
+        .unwrap();
+
+        let host_dtb = tree.finish();
+        let host_fdt = Fdt::from_bytes(&host_dtb).unwrap();
+        let fallback = GuestSerialProfile {
+            model: GuestSerialModel::Pl011,
+            transport: GuestSerialTransport::Mmio {
+                base: 0x0900_0000,
+                length: 0x1000,
+                register_shift: 0,
+                register_width: AccessWidth::Dword,
+            },
+            irq: 33,
+            clock_hz: 24_000_000,
+        };
+
+        let resolved = host_selected_serial(&host_fdt, fallback, GuestSerialFdtInterrupt::GicSpi)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            resolved.profile,
+            GuestSerialProfile {
+                model: GuestSerialModel::Uart16550,
+                transport: GuestSerialTransport::Mmio {
+                    base: 0xfeb5_0000,
+                    length: 0x100,
+                    register_shift: 2,
+                    register_width: AccessWidth::Dword,
+                },
+                irq: 365,
+                clock_hz: 24_000_000,
+            }
+        );
+        assert_eq!(resolved.identity.node_path, "/serial@feb50000");
+        assert_eq!(resolved.identity.node_phandle, Some(0x2d1));
+        assert_eq!(resolved.identity.interrupt_parent, 1);
+        assert_eq!(resolved.identity.interrupt_specifier, [0, 0x14d, 4]);
+        assert_eq!(resolved.identity.stdout_path, "/serial@feb50000:1500000");
+
+        let mut tree = FdtTree::from_bytes(&host_dtb).unwrap();
+        install_mmio_serial(
+            &mut tree,
+            resolved.profile,
+            GuestSerialFdtInterrupt::GicSpi,
+            Some(&resolved.identity),
+        )
+        .unwrap();
+        let guest_fdt = Fdt::from_bytes(&tree.finish()).unwrap();
+        let guest_serial = guest_fdt.get_by_path("/serial@feb50000").unwrap();
+        assert!(
+            guest_serial
+                .as_node()
+                .compatibles()
+                .any(|compatible| compatible == "ns16550a")
+        );
+        assert_eq!(
+            guest_serial
+                .as_node()
+                .get_property("reg-shift")
+                .unwrap()
+                .get_u32(),
+            Some(2)
+        );
+        assert_eq!(
+            guest_serial
+                .as_node()
+                .get_property("reg-io-width")
+                .unwrap()
+                .get_u32(),
+            Some(4)
+        );
+        assert!(guest_fdt.get_by_path("/vuart-clock").is_none());
     }
 }

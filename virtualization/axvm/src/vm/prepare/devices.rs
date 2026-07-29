@@ -76,7 +76,7 @@ fn register_serial_device(
 
     let irq = interrupt_fabric.resolve_irq(config.irq_id, InterruptTriggerMode::LevelTriggered)?;
     let backend = resources.config.serial_backend();
-    let serial = crate::machine::current_machine_profile(1).serial;
+    let serial = resources.config.serial_profile();
     let (profile_base, profile_length) = match serial.transport {
         GuestSerialTransport::Port { base, length } => (usize::from(base), usize::from(length)),
         GuestSerialTransport::Mmio { base, length, .. } => (base, length),
@@ -98,8 +98,17 @@ fn register_serial_device(
                 base,
                 length,
                 register_shift,
+                register_width,
             },
-        ) => build_16550_mmio(base, length, register_shift, serial.irq, backend, irq),
+        ) => build_16550_mmio(
+            base,
+            length,
+            register_shift,
+            register_width,
+            serial.irq,
+            backend,
+            irq,
+        ),
         (GuestSerialModel::Pl011, GuestSerialTransport::Mmio { base, length, .. }) => {
             build_pl011_mmio(base, length, serial.irq, backend, irq)
         }

@@ -20,7 +20,7 @@ use axdevice::{
     DeviceBuildContext, DeviceBundle, DeviceFactory, DeviceFactoryRegistry, DeviceManagerError,
     DeviceManagerResult, DeviceRegistration, MmioDeviceAdapter,
 };
-use axdevice_base::{IrqError, IrqLineId, IrqResult, IrqSink};
+use axdevice_base::{InterruptTriggerMode, IrqError, IrqLineId, IrqResult, IrqSink};
 use axvm_types::{EmulatedDeviceConfig, EmulatedDeviceType, VMInterruptMode};
 use riscv_vplic::{
     PLIC_CONTEXT_CLAIM_COMPLETE_OFFSET, PLIC_CONTEXT_CTRL_OFFSET, PLIC_CONTEXT_STRIDE, VPlicGlobal,
@@ -28,32 +28,62 @@ use riscv_vplic::{
 
 use crate::{AxVmError, AxVmResult, ax_err, ax_err_type, irq::InterruptFabric};
 
+const GUEST_SUPERVISOR_EXTERNAL_IRQ: usize = 9;
+
 struct RiscvPlicIrqSink {
+    vm_id: usize,
+    target_vcpu_id: usize,
     vplic: Arc<VPlicGlobal>,
 }
 
 impl IrqSink for RiscvPlicIrqSink {
     fn set_level(&self, line: IrqLineId, asserted: bool) -> IrqResult {
-        let result = if asserted {
-            self.vplic.set_pending(line.0)
-        } else {
-            self.vplic.clear_pending(line.0)
-        };
-        result.map_err(|error| IrqError::Backend {
-            line,
-            operation: "set vPLIC line level",
-            detail: alloc::format!("{error}"),
-        })
+        let should_dispatch = self
+            .vplic
+            .set_irq_line_level(line.0, asserted)
+            .map_err(|error| IrqError::Backend {
+                line,
+                operation: "set vPLIC line level",
+                detail: alloc::format!("{error}"),
+            })?;
+        if !should_dispatch {
+            return Ok(());
+        }
+        self.dispatch(line, InterruptTriggerMode::LevelTriggered)
     }
 
     fn pulse(&self, line: IrqLineId) -> IrqResult {
+        let was_pending = self
+            .vplic
+            .is_pending(line.0)
+            .map_err(|error| IrqError::Backend {
+                line,
+                operation: "inspect vPLIC line before pulse",
+                detail: alloc::format!("{error}"),
+            })?;
         self.vplic
             .set_pending(line.0)
             .map_err(|error| IrqError::Backend {
                 line,
                 operation: "pulse vPLIC line",
                 detail: alloc::format!("{error}"),
-            })
+            })?;
+        if was_pending {
+            return Ok(());
+        }
+        self.dispatch(line, InterruptTriggerMode::EdgeTriggered)
+    }
+}
+
+impl RiscvPlicIrqSink {
+    fn dispatch(&self, line: IrqLineId, trigger: InterruptTriggerMode) -> IrqResult {
+        crate::irq::dispatch_runtime_interrupt(
+            self.vm_id,
+            self.target_vcpu_id,
+            line,
+            GUEST_SUPERVISOR_EXTERNAL_IRQ,
+            trigger,
+        )
     }
 }
 
@@ -123,6 +153,7 @@ fn validate_vplic_config(config: &EmulatedDeviceConfig) -> AxVmResult<usize> {
 }
 
 pub(crate) fn configure(
+    vm_id: usize,
     factories: &mut DeviceFactoryRegistry,
     mode: VMInterruptMode,
     configs: &[EmulatedDeviceConfig],
@@ -152,5 +183,12 @@ pub(crate) fn configure(
         vplic: vplic.clone(),
     }))?;
 
-    InterruptFabric::with_sink(mode, Arc::new(RiscvPlicIrqSink { vplic }))
+    InterruptFabric::with_sink(
+        mode,
+        Arc::new(RiscvPlicIrqSink {
+            vm_id,
+            target_vcpu_id: 0,
+            vplic,
+        }),
+    )
 }

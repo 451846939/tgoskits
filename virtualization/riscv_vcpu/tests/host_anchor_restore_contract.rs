@@ -5,6 +5,7 @@
 
 const TRAP_ASM: &str = include_str!("../src/trap.S");
 const TRAP_RUST: &str = include_str!("../src/trap.rs");
+const VCPU_RUST: &str = include_str!("../src/vcpu.rs");
 
 fn section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     source
@@ -84,5 +85,23 @@ fn host_anchor_offsets_come_from_the_typed_register_image() {
     assert!(
         !exit.contains("call ") && !exit.contains("tail "),
         "the VM-exit window must not call helpers before host anchors are live"
+    );
+}
+
+#[test]
+fn mmio_decode_uses_the_trap_snapshot_instead_of_a_live_htinst_csr() {
+    let decode = section(
+        VCPU_RUST,
+        "fn decode_instr_at(",
+        "/// Handle a guest page fault.",
+    );
+
+    assert!(
+        decode.contains("self.regs.trap_csrs.htinst"),
+        "MMIO decode must use the htinst value captured with the guest trap"
+    );
+    assert!(
+        !decode.contains("riscv_h::register::htinst::read()"),
+        "a host interrupt can overwrite the live htinst CSR before MMIO decode"
     );
 }

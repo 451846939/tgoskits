@@ -12,11 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use alloc::vec::Vec;
+
 #[cfg(not(test))]
 use ax_kspin::SpinNoIrq as Mutex;
 #[cfg(test)]
 use ax_kspin::SpinRaw as Mutex;
 use axdevice_base::AccessWidth;
+use axvm_types::{GuestPhysAddr, GuestPhysAddrRange};
 
 use crate::{VgicError, VgicResult, interrupt::VgicInt, registers::GICD_SIZE, vgicd::Vgicd};
 
@@ -24,6 +27,8 @@ use crate::{VgicError, VgicResult, interrupt::VgicInt, registers::GICD_SIZE, vgi
 ///
 /// Manages virtual interrupt distribution for guest VMs.
 pub struct Vgic {
+    base: GuestPhysAddr,
+    size: usize,
     vgicd: Mutex<Vgicd>,
 }
 
@@ -34,11 +39,25 @@ impl Default for Vgic {
 }
 
 impl Vgic {
+    /// Exclusive upper bound of the interrupt IDs implemented by this distributor.
+    pub const MAX_INTID_EXCLUSIVE: usize = crate::consts::SPI_ID_MAX;
+
     /// Creates a new VGIC instance.
     pub fn new() -> Vgic {
+        Self::new_at(GuestPhysAddr::from(0x0800_0000), GICD_SIZE)
+    }
+
+    /// Creates a VGIC distributor at machine-selected firmware resources.
+    pub fn new_at(base: GuestPhysAddr, size: usize) -> Vgic {
         Vgic {
+            base,
+            size,
             vgicd: Mutex::new(Vgicd::new()),
         }
+    }
+
+    pub(crate) fn configured_range(&self) -> GuestPhysAddrRange {
+        GuestPhysAddrRange::from_start_size(self.base, self.size)
     }
 
     pub(crate) fn handle_read(&self, offset: usize, width: AccessWidth) -> VgicResult<usize> {
@@ -85,6 +104,34 @@ impl Vgic {
     /// Fetches interrupt information for the given IRQ number.
     pub fn fetch_irq(&self, irq: u32) -> VgicInt {
         self.vgicd.lock().fetch_irq(irq)
+    }
+
+    /// Returns whether the guest enabled one distributor interrupt.
+    ///
+    /// Interrupt IDs outside the emulated distributor range are treated as
+    /// disabled rather than indexing beyond the controller state.
+    pub fn irq_enabled(&self, irq: u32) -> bool {
+        self.vgicd.lock().irq_enabled(irq)
+    }
+
+    /// Returns the raw GICD_IROUTER affinity programmed for an interrupt.
+    pub fn irq_route(&self, irq: u32) -> VgicResult<u64> {
+        self.vgicd.lock().irq_route(irq)
+    }
+
+    /// Updates one wired device interrupt input.
+    ///
+    /// Returns `true` only for a newly asserted, guest-enabled line that needs
+    /// an initial delivery. The asserted state remains controller-owned until
+    /// the device lowers the line, allowing the architecture adapter to
+    /// redeliver a level interrupt after guest EOI.
+    pub fn set_irq_line_level(&self, irq: u32, asserted: bool) -> VgicResult<bool> {
+        self.vgicd.lock().set_irq_line_level(irq, asserted)
+    }
+
+    /// Returns guest-enabled device inputs that remain physically asserted.
+    pub fn asserted_enabled_irqs(&self) -> Vec<u32> {
+        self.vgicd.lock().asserted_enabled_irqs()
     }
 
     /// Placeholder method for unused operations.

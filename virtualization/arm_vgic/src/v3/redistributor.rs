@@ -168,6 +168,7 @@ impl RedistributorState {
 /// Virtual GIC redistributor frames for all vCPUs in one VM.
 pub struct VirtualRedistributor {
     base: GuestPhysAddr,
+    window_size: usize,
     states: SpinRaw<Vec<RedistributorState>>,
 }
 
@@ -177,13 +178,43 @@ impl VirtualRedistributor {
         let cpu_count = cpu_count.max(1);
         Self {
             base,
+            window_size: cpu_count * REDISTRIBUTOR_FRAME_SIZE,
             states: SpinRaw::new(alloc::vec![RedistributorState::new(); cpu_count]),
         }
     }
 
+    /// Creates redistributor frames inside a larger firmware-described window.
+    pub fn new_in_window(
+        base: GuestPhysAddr,
+        cpu_count: usize,
+        window_size: usize,
+    ) -> DeviceResult<Self> {
+        let cpu_count = cpu_count.max(1);
+        let required_size = cpu_count
+            .checked_mul(REDISTRIBUTOR_FRAME_SIZE)
+            .ok_or_else(|| DeviceError::InvalidInput {
+                operation: "initialize virtual GIC redistributor",
+                detail: alloc::format!("{cpu_count} redistributor frames overflow usize"),
+            })?;
+        if window_size < required_size {
+            return Err(DeviceError::InvalidInput {
+                operation: "initialize virtual GIC redistributor",
+                detail: alloc::format!(
+                    "firmware window {window_size:#x} is smaller than required size \
+                     {required_size:#x}"
+                ),
+            });
+        }
+        Ok(Self {
+            base,
+            window_size,
+            states: SpinRaw::new(alloc::vec![RedistributorState::new(); cpu_count]),
+        })
+    }
+
     /// Returns the full MMIO range size.
     pub fn size(&self) -> usize {
-        self.states.lock().len() * REDISTRIBUTOR_FRAME_SIZE
+        self.window_size
     }
 
     fn decode(&self, addr: GuestPhysAddr) -> DeviceResult<(usize, usize)> {
@@ -320,6 +351,19 @@ mod tests {
                 .unwrap()
                 & (1 << 4),
             0
+        );
+    }
+
+    #[test]
+    fn firmware_window_can_cover_more_than_the_guest_cpu_frames() {
+        let redistributor =
+            VirtualRedistributor::new_in_window(GuestPhysAddr::from(0xfe68_0000), 1, 0x10_0000)
+                .unwrap();
+
+        assert_eq!(redistributor.size(), 0x10_0000);
+        assert_eq!(
+            redistributor.address_range(),
+            GuestPhysAddrRange::from_start_size(GuestPhysAddr::from(0xfe68_0000), 0x10_0000)
         );
     }
 

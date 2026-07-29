@@ -78,9 +78,9 @@ fn guest_virtual_timer_irq_handler(
         );
         return IrqReturn::Unhandled;
     }
-    if let Err(err) = crate::manager::inject_current_vcpu_interrupt(GUEST_VIRTUAL_TIMER_IRQ) {
+    if let Err(err) = crate::manager::dispatch_current_vcpu_interrupt(GUEST_VIRTUAL_TIMER_IRQ) {
         warn!(
-            "failed to inject AArch64 guest virtual timer PPI on CPU {}: {err:?}",
+            "failed to dispatch AArch64 guest virtual timer PPI on CPU {}: {err:?}",
             ctx.cpu.0
         );
     }
@@ -195,6 +195,14 @@ fn inject_interrupt_gic_v3(vector: usize) {
     }
 
     debug!("Virtual interrupt {vector} injected successfully in LR{free_lr}");
+}
+
+pub(crate) fn virtual_interrupt_inactive(vector: usize) -> bool {
+    let lr_num = ICH_VTR_EL2.read(ICH_VTR_EL2::LISTREGS) as usize + 1;
+    (0..lr_num).all(|index| {
+        let lr = ich_lr_el2_get(index);
+        lr.read(ICH_LR_EL2::VINTID) != vector as u64 || lr.read(ICH_LR_EL2::STATE) == 0
+    })
 }
 
 pub(crate) fn read_gicd_iidr() -> u32 {

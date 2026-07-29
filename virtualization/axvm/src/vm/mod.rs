@@ -23,7 +23,7 @@ use core::{
 use ax_cpumask::CpuMask;
 use ax_kspin::SpinNoIrq as Mutex;
 use ax_memory_addr::align_up_4k;
-use axaddrspace::{AddrSpace, NestedPageTableOps};
+use axaddrspace::AddrSpace;
 use axdevice::{AxVmDevices, DeviceManagerError, FwCfg, FwCfgPlatformConfig};
 use axdevice_base::AccessWidth;
 use axvm_types::{
@@ -183,18 +183,21 @@ impl VmRuntimeHandle {
     }
 
     pub(crate) fn queue_interrupt(&self, vcpu_id: usize, vector: usize) -> AxVmResult<usize> {
-        let task = self
-            .vcpu_task_list
-            .lock()
-            .get(&vcpu_id)
-            .cloned()
-            .ok_or_else(|| ax_err_type!(NotFound, format!("vCPU {vcpu_id} task not found")))?;
+        let cpu_id = self.vcpu_cpu_id(vcpu_id)?;
         self.pending_interrupts
             .lock()
             .entry(vcpu_id)
             .or_default()
             .push(PendingInterrupt::Normal(vector));
-        Ok(task.cpu_id() as usize)
+        Ok(cpu_id)
+    }
+
+    pub(crate) fn vcpu_cpu_id(&self, vcpu_id: usize) -> AxVmResult<usize> {
+        self.vcpu_task_list
+            .lock()
+            .get(&vcpu_id)
+            .map(|task| task.cpu_id() as usize)
+            .ok_or_else(|| ax_err_type!(NotFound, format!("vCPU {vcpu_id} task not found")))
     }
 
     #[expect(
@@ -905,7 +908,7 @@ impl AxVM {
         handled: bool,
     ) {
         let root = resources.address_space.page_table_root();
-        match resources.address_space.page_table().query(addr) {
+        match axaddrspace::NestedPageTableOps::query(resources.address_space.page_table(), addr) {
             Ok((hpa, flags, size)) => {
                 if handled {
                     debug!(

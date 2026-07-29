@@ -73,13 +73,22 @@ pub(super) fn patch_runtime_fdt(
     vm: &crate::AxVMRef,
     crate_config: &axvmconfig::GuestConfig,
 ) -> AxVmResult<alloc::vec::Vec<u8>> {
-    let initrd = vm.with_config(|config| {
-        super::fdt::initrd_start_size_from_image_config(config.image_config.ramdisk.as_ref())
+    let (initrd, serial_profile, serial_identity, gic_profile) = vm.with_config(|config| {
+        (
+            super::fdt::initrd_start_size_from_image_config(config.image_config.ramdisk.as_ref()),
+            config.serial_profile(),
+            config.serial_fdt_identity().cloned(),
+            config.gic_profile().cloned(),
+        )
     });
-    super::fdt::core::patch_guest_fdt_for_runtime(
+    super::fdt::core::create::patch_guest_fdt_for_runtime(
         fdt_bytes,
         &vm.memory_regions(),
         crate_config,
+        serial_profile,
+        serial_identity.as_ref(),
+        gic_profile.as_ref(),
+        None,
         initrd,
         true,
     )

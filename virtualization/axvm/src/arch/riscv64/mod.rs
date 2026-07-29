@@ -42,6 +42,11 @@ pub(crate) enum RiscvDeferredRunWork {
 }
 
 impl CpuUpOps for Riscv64Arch {
+    fn set_vcpu_on_args(vcpu: &crate::vm::AxVCpuRef<Self::VCpu>, vcpu_id: usize, arg: usize) {
+        vcpu.set_gpr(RiscvGprIndex::A0 as usize, vcpu_id);
+        vcpu.set_gpr(RiscvGprIndex::A1 as usize, arg);
+    }
+
     fn set_cpu_up_success(vcpu: &crate::vm::AxVCpuRef<Self::VCpu>) {
         vcpu.set_gpr(RiscvGprIndex::A0 as usize, 0);
     }
@@ -62,7 +67,7 @@ impl ArchOps for Riscv64Arch {
     }
 
     fn before_first_run(vm: &crate::AxVMRef, vcpu: &crate::vm::AxVCpuRef<Self::VCpu>) {
-        if vm.interrupt_mode() != VMInterruptMode::Passthrough {
+        if vm.interrupt_mode() != VMInterruptMode::Passthrough || vcpu.id() != 0 {
             return;
         }
         let Some(cpu_id) = vcpu.phys_cpu_set().and_then(first_cpu_in_mask) else {
@@ -80,7 +85,14 @@ impl ArchOps for Riscv64Arch {
                 .map(|interrupt| interrupt.source)
                 .collect::<Vec<_>>()
         });
-        crate::irq::set_riscv_virtual_irq_targets(cpu_id, &irq_sources);
+        ax_crate_interface::call_interface!(
+            crate::irq::RiscvPlatformIrqInjectorIf::set_virtual_irq_targets(
+                vm.id(),
+                vcpu.id(),
+                cpu_id,
+                &irq_sources
+            )
+        );
     }
 
     fn vcpu_affinities(
@@ -95,11 +107,6 @@ impl ArchOps for Riscv64Arch {
             }
         }
         vcpus
-    }
-
-    fn set_vcpu_on_args(vcpu: &crate::vm::AxVCpuRef<Self::VCpu>, vcpu_id: usize, arg: usize) {
-        vcpu.set_gpr(RiscvGprIndex::A0 as usize, vcpu_id);
-        vcpu.set_gpr(RiscvGprIndex::A1 as usize, arg);
     }
 
     fn after_external_interrupt(
@@ -218,6 +225,12 @@ impl ArchOps for Riscv64Arch {
             waits_for_event: false,
             stop_reason: None,
         })
+    }
+
+    fn on_last_vcpu_exit(vm_id: usize) {
+        ax_crate_interface::call_interface!(
+            crate::irq::RiscvPlatformIrqInjectorIf::clear_virtual_irq_targets(vm_id)
+        );
     }
 }
 
@@ -455,24 +468,24 @@ impl RiscvVplicHostIf for RiscvVplicHostIfImpl {
 }
 
 fn register_platform_irq_injector() {
-    crate::irq::register_riscv_virtual_irq_injector(inject_virtual_irq);
+    ax_crate_interface::call_interface!(
+        crate::irq::RiscvPlatformIrqInjectorIf::register_virtual_irq_injector(inject_virtual_irq)
+    );
 }
 
 fn first_cpu_in_mask(mask: usize) -> Option<usize> {
     (mask != 0).then_some(mask.trailing_zeros() as usize)
 }
 
-fn inject_virtual_irq(irq_id: usize) -> bool {
-    let Some(vm_id) = crate::current_vm_id() else {
-        trace!("skip RISC-V virtual IRQ {irq_id}: no current VM context");
-        return false;
-    };
-
-    debug!("injecting RISC-V virtual IRQ id: {irq_id}");
+fn inject_virtual_irq(vm_id: usize, vcpu_id: usize, irq_id: usize) -> bool {
+    debug!("injecting RISC-V virtual IRQ {irq_id} into VM[{vm_id}] VCpu[{vcpu_id}]");
 
     let Some(injected) = crate::manager::with_vm(vm_id, |vm| {
         if let Err(err) = vm.pulse_interrupt(irq_id) {
-            warn!("failed to inject RISC-V virtual IRQ {irq_id}: {err:?}");
+            warn!(
+                "failed to inject RISC-V virtual IRQ {irq_id} into VM[{vm_id}] VCpu[{vcpu_id}]: \
+                 {err:?}"
+            );
             return false;
         }
         true

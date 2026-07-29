@@ -80,6 +80,12 @@ pub(crate) fn inject_interrupt(vm_id: VMId, vcpu_id: usize, vector: usize) -> Ax
     crate::runtime::vcpus::queue_interrupt(vm_id, vcpu_id, vector)
 }
 
+/// Wake and kick a target vCPU whose architecture backend already published
+/// pending interrupt state.
+pub fn notify_vm_vcpu(vm_id: VMId, vcpu_id: usize) -> AxVmResult {
+    crate::runtime::vcpus::notify_vcpu(vm_id, vcpu_id)
+}
+
 /// Inject a virtual interrupt into a VM's vCPU.
 #[expect(
     dead_code,
@@ -96,7 +102,7 @@ pub(crate) fn inject_vm_vcpu_interrupt(vm_id: VMId, vcpu_id: usize, vector: usiz
         return task.vcpu.inject_interrupt(vector);
     }
 
-    crate::runtime::vcpus::queue_interrupt(vm_id, vcpu_id, vector)
+    inject_interrupt(vm_id, vcpu_id, vector)
 }
 
 /// Return the current VM ID from the vCPU currently executing on this CPU.
@@ -107,6 +113,22 @@ pub fn current_vm_id() -> Option<VMId> {
 /// Return the current vCPU ID from the vCPU currently executing on this CPU.
 pub fn current_vcpu_id() -> Option<usize> {
     with_current_vcpu::<ArchVCpu, _>(|vcpu| vcpu.map(|vcpu| vcpu.id()))
+}
+
+/// Publish an interrupt for the vCPU currently executing on this CPU.
+///
+/// Unlike [`inject_current_vcpu_interrupt`], this path does not access
+/// CPU-local virtual interrupt-controller state from the host IRQ handler.
+/// It publishes the interrupt to the target runtime first, then wakes and
+/// kicks the target vCPU. The vCPU owner drains the interrupt immediately
+/// before the next guest entry.
+pub fn dispatch_current_vcpu_interrupt(vector: usize) -> AxVmResult {
+    let (vm_id, vcpu_id) =
+        with_current_vcpu::<ArchVCpu, _>(|vcpu| vcpu.map(|vcpu| (vcpu.vm_id(), vcpu.id())))
+            .ok_or_else(|| {
+                AxVmError::resource_unavailable("current vCPU", "current vCPU is not set")
+            })?;
+    crate::runtime::vcpus::queue_interrupt(vm_id, vcpu_id, vector)
 }
 
 /// Inject a virtual interrupt into the vCPU currently executing on this CPU.

@@ -2,6 +2,16 @@
 
 use crate::AxVmResult;
 
+/// Selects the smallest capability across a default and every target CPU.
+pub(crate) fn minimum_cpu_capability(
+    default: usize,
+    cpu_capabilities: impl IntoIterator<Item = usize>,
+) -> usize {
+    cpu_capabilities
+        .into_iter()
+        .fold(default, |minimum, capability| minimum.min(capability))
+}
+
 /// Architecture selection for fixed guest machine resources.
 pub(crate) trait MachinePlatform {
     const MACHINE_ARCHITECTURE: crate::machine::MachineArchitecture;
@@ -64,4 +74,19 @@ pub(crate) trait HostTimePlatform {
     }
 
     fn register_timer_callback() {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn minimum_cpu_capability_uses_the_weakest_heterogeneous_cpu() {
+        assert_eq!(minimum_cpu_capability(48, [48, 44]), 44);
+    }
+
+    #[test]
+    fn minimum_cpu_capability_keeps_the_default_without_targets() {
+        assert_eq!(minimum_cpu_capability(39, []), 39);
+    }
 }

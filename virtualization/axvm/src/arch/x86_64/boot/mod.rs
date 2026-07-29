@@ -318,8 +318,23 @@ fn load_linux_layout(
         loader.vm.clone(),
     )?;
     load_vm_image_from_memory(&boot_stub, layout.boot_stub.start.into(), loader.vm.clone())?;
+    let io_apic_address = loader.vm.with_config(|config| {
+        config
+            .emu_devices()
+            .iter()
+            .find(|device| device.emu_type == EmulatedDeviceType::X86IoApic)
+            .map(|device| device.base_gpa)
+    });
+    let io_apic_address = io_apic_address
+        .ok_or_else(|| ax_err_type!(InvalidData, "x86 machine profile has no I/O APIC"))?;
+    let io_apic_address = u32::try_from(io_apic_address).map_err(|_| {
+        ax_err_type!(
+            InvalidData,
+            format!("x86 I/O APIC address {io_apic_address:#x} does not fit the MP table")
+        )
+    })?;
     load_vm_image_from_memory(
-        &mptable::build(),
+        &mptable::build(io_apic_address),
         mptable::MP_TABLE_GPA.into(),
         loader.vm.clone(),
     )?;

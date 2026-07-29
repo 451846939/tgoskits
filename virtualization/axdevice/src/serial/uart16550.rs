@@ -163,11 +163,7 @@ impl Uart16550 {
                 REG_LSR => state.line_status(),
                 REG_MSR => MSR_DCD | MSR_DSR | MSR_CTS,
                 REG_SCR => state.scr,
-                _ => {
-                    return Err(DeviceError::OutOfRange {
-                        addr: register as u64,
-                    });
-                }
+                _ => 0,
             };
             (value, state.irq_asserted())
         };
@@ -217,11 +213,7 @@ impl Uart16550 {
                 REG_MCR => state.mcr = byte,
                 REG_LSR | REG_MSR => {}
                 REG_SCR => state.scr = byte,
-                _ => {
-                    return Err(DeviceError::OutOfRange {
-                        addr: register as u64,
-                    });
-                }
+                _ => {}
             }
             (output, state.irq_asserted())
         };

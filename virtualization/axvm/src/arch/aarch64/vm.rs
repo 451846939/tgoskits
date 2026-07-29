@@ -1,6 +1,6 @@
 //! AArch64 VM resource creation and initialization.
 
-use alloc::sync::Arc;
+use alloc::{format, sync::Arc, vec::Vec};
 
 use arm_vcpu::{ArmVcpuCreateConfig, ArmVcpuSetupConfig};
 use axdevice_base::DeviceRegistry as _;
@@ -8,7 +8,9 @@ use axvm_types::{NestedPagingConfig, VmArchVcpuOps};
 
 use super::{Aarch64Arch, npt};
 use crate::{
-    AxVmResult, ax_err,
+    AxVmResult,
+    architecture::minimum_cpu_capability,
+    ax_err, ax_err_type,
     config::AxVMConfig,
     vm::{
         AxVM, AxVMResources,
@@ -23,21 +25,50 @@ use crate::{
     },
 };
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Stage2AddressWidth {
+    guest_bits: usize,
+    host_bits: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Aarch64Stage2Capability {
+    levels: usize,
+    address_width: Stage2AddressWidth,
+}
+
+impl Aarch64Stage2Capability {
+    fn nested_paging_config(self, root_paddr: ax_memory_addr::PhysAddr) -> NestedPagingConfig {
+        NestedPagingConfig::new(
+            root_paddr,
+            self.levels,
+            self.address_width.guest_bits,
+            self.address_width.host_bits,
+        )
+    }
+}
+
 impl Aarch64Arch {
     pub(crate) fn create_vm_resources(config: AxVMConfig) -> AxVmResult<AxVMResources> {
         let placements = config.phys_cpu_ls.get_vcpu_affinities_pcpu_ids();
-        let levels = guest_page_table_levels(&placements)?;
-        let page_table = npt::NestedPageTable::new(levels)?;
+        let stage2_capability = stage2_capability(&placements)?;
+        let page_table = npt::NestedPageTable::new(stage2_capability.levels)?;
         AxVMResources::from_page_table(config, page_table, |root_paddr| {
-            nested_paging_config(root_paddr, levels, &placements)
+            Ok(stage2_capability.nested_paging_config(root_paddr))
         })
     }
 
     pub(crate) fn init_vm(vm: &AxVM, request: VmInitRequest<'_>) -> AxVmResult {
         match request {
             VmInitRequest::Default => {
-                let factories = default_device_factories()?;
-                let interrupt_fabric = super::irq::interrupt_fabric(vm.id(), vm.interrupt_mode())?;
+                let mut factories = default_device_factories()?;
+                let emulated_devices = vm.with_config(|config| config.emu_devices().clone());
+                let interrupt_fabric = super::irq::configure(
+                    &mut factories,
+                    vm,
+                    vm.interrupt_mode(),
+                    &emulated_devices,
+                )?;
                 init_vm_with(vm, &factories, interrupt_fabric)
             }
             VmInitRequest::Provided {
@@ -100,49 +131,62 @@ fn register_virtual_timers(devices: &mut axdevice::AxVmDevices) -> AxVmResult {
     Ok(())
 }
 
-fn guest_page_table_levels(vcpu_mappings: &[(usize, Option<usize>, usize)]) -> AxVmResult<usize> {
-    let mut selected = usize::MAX;
-    for cpu_id in crate::architecture::ops::target_phys_cpu_ids(vcpu_mappings) {
-        let levels = crate::percpu::cpu_max_guest_page_table_levels(cpu_id)
-            .unwrap_or_else(arm_vcpu::max_guest_page_table_levels);
-        if levels == 0 {
+fn stage2_capability(
+    vcpu_mappings: &[(usize, Option<usize>, usize)],
+) -> AxVmResult<Aarch64Stage2Capability> {
+    let cpu_ids = crate::architecture::ops::target_phys_cpu_ids(vcpu_mappings);
+    if cpu_ids.is_empty() {
+        return ax_err!(
+            InvalidInput,
+            "AArch64 VM requires at least one target physical CPU"
+        );
+    }
+
+    let mut cpu_levels = Vec::with_capacity(cpu_ids.len());
+    let mut cpu_address_bits = Vec::with_capacity(cpu_ids.len());
+    for cpu_id in cpu_ids {
+        let target_levels =
+            crate::percpu::cpu_max_guest_page_table_levels(cpu_id).ok_or_else(|| {
+                ax_err_type!(
+                    BadState,
+                    format!(
+                        "stage-2 page-table capability is unavailable for physical CPU {cpu_id}"
+                    )
+                )
+            })?;
+        let address_bits = crate::percpu::cpu_guest_phys_addr_bits(cpu_id).ok_or_else(|| {
+            ax_err_type!(
+                BadState,
+                format!("stage-2 address width is unavailable for physical CPU {cpu_id}")
+            )
+        })?;
+
+        if target_levels == 0 {
             return ax_err!(
                 Unsupported,
-                "AArch64 nested paging is not enabled on target CPU"
+                format!("AArch64 nested paging is not enabled on physical CPU {cpu_id}")
             );
         }
-        selected = selected.min(levels);
+        cpu_levels.push(target_levels);
+        cpu_address_bits.push(address_bits);
     }
-    if selected == usize::MAX {
-        selected = arm_vcpu::max_guest_page_table_levels();
-    }
-    match selected {
-        3 | 4 => Ok(selected),
-        _ => ax_err!(Unsupported, "unsupported AArch64 stage-2 page-table levels"),
-    }
-}
+    let levels = minimum_cpu_capability(usize::MAX, cpu_levels);
 
-fn nested_paging_config(
-    root_paddr: ax_memory_addr::PhysAddr,
-    levels: usize,
-    vcpu_mappings: &[(usize, Option<usize>, usize)],
-) -> AxVmResult<NestedPagingConfig> {
-    let mut pa_bits = usize::MAX;
-    for cpu_id in crate::architecture::ops::target_phys_cpu_ids(vcpu_mappings) {
-        let bits =
-            crate::percpu::cpu_guest_phys_addr_bits(cpu_id).unwrap_or_else(arm_vcpu::pa_bits);
-        pa_bits = pa_bits.min(bits);
-    }
-    if pa_bits == usize::MAX {
-        pa_bits = arm_vcpu::pa_bits();
-    }
-
-    let gpa_bits = match levels {
+    let page_table_bits = match levels {
         3 => 39,
         4 => 48,
-        _ => return ax_err!(InvalidInput, "unsupported AArch64 stage-2 levels"),
+        _ => {
+            return ax_err!(Unsupported, "unsupported AArch64 stage-2 page-table levels");
+        }
     };
-    Ok(NestedPagingConfig::new(
-        root_paddr, levels, gpa_bits, pa_bits,
-    ))
+    let host_bits = minimum_cpu_capability(usize::MAX, cpu_address_bits);
+    let address_width = Stage2AddressWidth {
+        guest_bits: page_table_bits.min(host_bits),
+        host_bits,
+    };
+
+    Ok(Aarch64Stage2Capability {
+        levels,
+        address_width,
+    })
 }

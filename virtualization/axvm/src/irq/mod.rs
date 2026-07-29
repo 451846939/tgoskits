@@ -28,32 +28,14 @@ use crate::{
 /// Host platform hook for registering the RISC-V physical IRQ injector.
 #[ax_crate_interface::def_interface]
 pub trait RiscvPlatformIrqInjectorIf {
-    /// Registers a callback that forwards a physical IRQ line into the current guest.
-    fn register_virtual_irq_injector(injector: fn(usize) -> bool);
+    /// Registers a callback that forwards a physical IRQ line to an explicit guest target.
+    fn register_virtual_irq_injector(injector: fn(usize, usize, usize) -> bool);
 
     /// Routes physical PLIC IRQs that may be forwarded to a guest toward the vCPU CPU.
-    fn set_virtual_irq_targets(cpu_id: usize, irq_sources: &[u32]);
-}
+    fn set_virtual_irq_targets(vm_id: usize, vcpu_id: usize, cpu_id: usize, irq_sources: &[u32]);
 
-#[expect(
-    dead_code,
-    reason = "the RISC-V architecture backend is not compiled for this target"
-)]
-pub(crate) fn register_riscv_virtual_irq_injector(injector: fn(usize) -> bool) {
-    ax_crate_interface::call_interface!(RiscvPlatformIrqInjectorIf::register_virtual_irq_injector(
-        injector
-    ));
-}
-
-#[expect(
-    dead_code,
-    reason = "the RISC-V architecture backend is not compiled for this target"
-)]
-pub(crate) fn set_riscv_virtual_irq_targets(cpu_id: usize, irq_sources: &[u32]) {
-    ax_crate_interface::call_interface!(RiscvPlatformIrqInjectorIf::set_virtual_irq_targets(
-        cpu_id,
-        irq_sources
-    ));
+    /// Releases physical PLIC IRQ routes owned by one VM.
+    fn clear_virtual_irq_targets(vm_id: usize);
 }
 
 /// Resolves device interrupt lines against one VM's interrupt backend.

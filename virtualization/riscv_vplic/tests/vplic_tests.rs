@@ -162,7 +162,8 @@ fn test_claim_and_complete_move_irq_between_pending_and_active() {
             1 << irq_id,
         )
         .unwrap();
-    vplic.set_pending(irq_id).unwrap();
+    assert!(vplic.set_irq_line_level(irq_id, true).unwrap());
+    assert!(!vplic.set_irq_line_level(irq_id, true).unwrap());
 
     let claim_addr = addr
         + PLIC_CONTEXT_CTRL_OFFSET
@@ -175,9 +176,8 @@ fn test_claim_and_complete_move_irq_between_pending_and_active() {
     assert!(!vplic.is_pending(irq_id).unwrap());
     assert!(vplic.active_irqs.lock().get(irq_id));
 
-    // The UART still holds its level line high while the first delivery is
-    // active, so polling the virtual device latches the same source again.
-    vplic.set_pending(irq_id).unwrap();
+    // The UART still holds its level line high, so completion must repend it
+    // without requiring another device poll.
     vplic
         .handle_write(claim_addr, AccessWidth::Dword, irq_id)
         .unwrap();
@@ -189,7 +189,7 @@ fn test_claim_and_complete_move_irq_between_pending_and_active() {
     );
     assert!(vplic.active_irqs.lock().get(irq_id));
 
-    vplic.clear_pending(irq_id).unwrap();
+    assert!(!vplic.set_irq_line_level(irq_id, false).unwrap());
     vplic
         .handle_write(claim_addr, AccessWidth::Dword, irq_id)
         .unwrap();

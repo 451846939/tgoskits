@@ -205,9 +205,10 @@ impl AxVmDevices {
                     #[cfg(target_arch = "aarch64")]
                     {
                         #[allow(clippy::arc_with_non_send_sync)]
-                        this.register(
-                            MmioDeviceAdapter::from_arc(Arc::new(Vgic::new())) as Arc<dyn Device>
-                        )?;
+                        this.register(MmioDeviceAdapter::from_arc(Arc::new(Vgic::new_at(
+                            config.base_gpa.into(),
+                            config.length,
+                        ))) as Arc<dyn Device>)?;
                     }
                     #[cfg(not(target_arch = "aarch64"))]
                     {
@@ -231,11 +232,11 @@ impl AxVmDevices {
                                     config.name
                                 ),
                             })?;
-                        if config.length != expected_length {
+                        if config.length < expected_length {
                             return Err(DeviceManagerError::InvalidConfig {
                                 operation: "initialize virtual GIC redistributor",
                                 detail: format!(
-                                    "device '{}' length {:#x} does not match {} vCPU frame(s) \
+                                    "device '{}' length {:#x} is smaller than {} vCPU frame(s) \
                                      ({expected_length:#x})",
                                     config.name, config.length, cpu_num
                                 ),
@@ -244,10 +245,11 @@ impl AxVmDevices {
 
                         #[allow(clippy::arc_with_non_send_sync)]
                         this.register(MmioDeviceAdapter::from_arc(Arc::new(
-                            arm_vgic::v3::VirtualRedistributor::new(
+                            arm_vgic::v3::VirtualRedistributor::new_in_window(
                                 config.base_gpa.into(),
                                 cpu_num,
-                            ),
+                                config.length,
+                            )?,
                         )) as Arc<dyn Device>)?;
                         info!(
                             "Virtual GIC redistributor initialized with base GPA {:#x}, length \
