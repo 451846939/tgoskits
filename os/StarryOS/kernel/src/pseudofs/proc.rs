@@ -910,9 +910,7 @@ impl SimpleDirOps for ThreadFdDir {
             Ok(None) => return Box::new(iter::empty()),
             Err(error) => panic!("procfs fd directory has an invalid user extension: {error}"),
         };
-        let fd_table = task
-            .as_thread()
-            .with_scope(|scope| FD_TABLE.scope_cell(scope).clone());
+        let fd_table = task.as_thread().clone_scope_item(&FD_TABLE);
         let ids = fd_table
             .read()
             .ids()
@@ -925,9 +923,7 @@ impl SimpleDirOps for ThreadFdDir {
         let fs = self.fs.clone();
         let task = require_proc_task(&self.task)?;
         let fd = name.parse::<u32>().map_err(|_| VfsError::NotFound)?;
-        let fd_table = task
-            .as_thread()
-            .with_scope(|scope| FD_TABLE.scope_cell(scope).clone());
+        let fd_table = task.as_thread().clone_scope_item(&FD_TABLE);
         let path = fd_table
             .read()
             .get(fd as _)
@@ -1425,9 +1421,7 @@ impl SimpleDirOps for ThreadDir {
                 let task = self.task;
                 SimpleFile::new_regular(fs, move || {
                     let task = require_proc_task(&task)?;
-                    let ctx_arc = task
-                        .as_thread()
-                        .with_scope(|scope| FS_CONTEXT.scope_cell(scope).clone());
+                    let ctx_arc = task.as_thread().clone_scope_item(&FS_CONTEXT);
                     let ctx = ctx_arc.lock();
                     Ok(crate::pseudofs::proc_mountinfo::render_mounts(&ctx))
                 })
@@ -1437,9 +1431,7 @@ impl SimpleDirOps for ThreadDir {
                 let task = self.task;
                 SimpleFile::new_regular(fs, move || {
                     let task = require_proc_task(&task)?;
-                    let ctx_arc = task
-                        .as_thread()
-                        .with_scope(|scope| FS_CONTEXT.scope_cell(scope).clone());
+                    let ctx_arc = task.as_thread().clone_scope_item(&FS_CONTEXT);
                     let ctx = ctx_arc.lock();
                     Ok(crate::pseudofs::proc_mountinfo::render_mountinfo(&ctx))
                 })
