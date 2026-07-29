@@ -24,7 +24,7 @@ fn crate_uses_typed_errors_and_workspace_dependencies() {
 
 #[test]
 fn public_errors_preserve_parse_and_boot_context() {
-    let parse_error = axvmconfig::AxVMCrateConfig::from_toml("[base").unwrap_err();
+    let parse_error = axvmconfig::GuestConfig::from_toml("[base").unwrap_err();
     assert!(matches!(parse_error, AxVmConfigError::TomlParse { .. }));
     assert!(parse_error.to_string().contains("VM TOML configuration"));
 

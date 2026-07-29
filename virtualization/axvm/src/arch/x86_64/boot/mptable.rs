@@ -231,6 +231,23 @@ mod tests {
     }
 
     #[test]
+    fn com1_is_identity_routed_to_ioapic_gsi4() {
+        let entry = config_entries()
+            .into_iter()
+            .find(|entry| {
+                entry.len() == 8 && entry[0] == 3 && entry[4] == BUS_ID_ISA && entry[5] == 4
+            })
+            .expect("MP table must describe the machine-owned COM1 interrupt");
+
+        assert_eq!(
+            u16::from_le_bytes([entry[2], entry[3]]),
+            MP_IRQ_FLAGS_CONFORMING
+        );
+        assert_eq!(entry[6], IO_APIC_ID);
+        assert_eq!(entry[7], 4);
+    }
+
+    #[test]
     fn q35_dev3_inta_uses_swizzled_gsi19() {
         assert_eq!(pci_intx_gsi(3, 0), 19);
     }

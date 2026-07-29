@@ -29,13 +29,22 @@ pub fn ipi_irq() -> IrqId {
 /// # Warn
 ///
 /// Make sure called in an interrupt context or hypervisor VM exit handler.
-pub fn handle_irq(vector: usize) -> bool {
+pub fn handle_irq_id(vector: usize) -> Option<IrqId> {
     prepare_irq_context(TrapVector(vector));
     let guard = ax_kernel_guard::NoPreempt::new();
-    let handled = handle(TrapVector(vector)).is_some();
+    let irq = handle(TrapVector(vector));
 
     drop(guard); // rescheduling may occur when preemption is re-enabled.
-    handled
+    irq
+}
+
+/// Handles an IRQ and reports whether the platform acknowledged one.
+///
+/// # Warn
+///
+/// Make sure called in an interrupt context or hypervisor VM exit handler.
+pub fn handle_irq(vector: usize) -> bool {
+    handle_irq_id(vector).is_some()
 }
 
 /// Installs the default ArceOS IRQ dispatcher into `ax-cpu`'s runtime hook.

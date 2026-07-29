@@ -54,6 +54,9 @@ pub enum AxVmError {
         resource: &'static str,
         detail: String,
     },
+    /// A physical device is permanently owned by the host.
+    #[error("physical device {path} is a host-owned device")]
+    HostOwnedDevice { path: String },
     /// The requested operation is not implemented by this host or backend.
     #[error("unsupported VM operation {operation}: {detail}")]
     Unsupported {

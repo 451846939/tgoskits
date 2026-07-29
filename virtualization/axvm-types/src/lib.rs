@@ -514,35 +514,6 @@ pub enum VmVcpuState {
     Blocked = 5,
 }
 
-/// A part of `AxVMConfig`, which represents guest VM type.
-#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
-pub enum VMType {
-    /// Host VM, used for boot from Linux like Jailhouse do, named "type1.5".
-    VMTHostVM = 0,
-    /// Guest RTOS, generally a simple guest OS with most of the resource passthrough.
-    #[default]
-    VMTRTOS   = 1,
-    /// Guest Linux, generally a full-featured guest OS with complicated device emulation requirements.
-    VMTLinux  = 2,
-}
-
-impl From<usize> for VMType {
-    fn from(value: usize) -> Self {
-        match value {
-            0 => Self::VMTHostVM,
-            1 => Self::VMTRTOS,
-            2 => Self::VMTLinux,
-            _ => Self::default(),
-        }
-    }
-}
-
-impl From<VMType> for usize {
-    fn from(value: VMType) -> Self {
-        value as usize
-    }
-}
-
 /// Guest physical address space population policy.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum AddressSpacePolicy {
@@ -715,6 +686,8 @@ pub enum EmulatedDeviceType {
     X86Pit              = 0x24,
     /// LoongArch virtual PCH-PIC device.
     LoongArchPchPic     = 0x25,
+    /// ARM virtual GIC redistributor device.
+    ArmGicRedistributor = 0x26,
 
     // 0x30: PPPT (PLIC Partial Passthrough) devices.
     /// RISC-V PLIC Partial Passthrough Global device.
@@ -887,6 +860,7 @@ impl Display for EmulatedDeviceType {
             EmulatedDeviceType::X86IoApic => write!(f, "x86 io apic"),
             EmulatedDeviceType::X86Pit => write!(f, "x86 pit"),
             EmulatedDeviceType::LoongArchPchPic => write!(f, "loongarch pch pic"),
+            EmulatedDeviceType::ArmGicRedistributor => write!(f, "arm gic redistributor"),
             EmulatedDeviceType::PPPTGlobal => write!(f, "plic partial passthrough global"),
             // EmulatedDeviceType::IOMMU => write!(f, "iommu"),
             // EmulatedDeviceType::ICCSRE => write!(f, "interrupt icc sre"),
@@ -903,7 +877,7 @@ impl Display for EmulatedDeviceType {
 
 impl EmulatedDeviceType {
     /// All known emulated device types.
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         EmulatedDeviceType::Dummy,
         EmulatedDeviceType::InterruptController,
         EmulatedDeviceType::Console,
@@ -915,6 +889,7 @@ impl EmulatedDeviceType {
         EmulatedDeviceType::X86IoApic,
         EmulatedDeviceType::X86Pit,
         EmulatedDeviceType::LoongArchPchPic,
+        EmulatedDeviceType::ArmGicRedistributor,
         EmulatedDeviceType::PPPTGlobal,
         EmulatedDeviceType::VirtioBlk,
         EmulatedDeviceType::VirtioNet,
@@ -936,6 +911,7 @@ impl EmulatedDeviceType {
                 | EmulatedDeviceType::GPPTRedistributor
                 | EmulatedDeviceType::X86IoApic
                 | EmulatedDeviceType::X86Pit
+                | EmulatedDeviceType::ArmGicRedistributor
                 | EmulatedDeviceType::VirtioBlk
                 | EmulatedDeviceType::VirtioNet
                 // | EmulatedDeviceType::GICR
@@ -957,6 +933,7 @@ impl EmulatedDeviceType {
             0x23 => Some(EmulatedDeviceType::X86IoApic),
             0x24 => Some(EmulatedDeviceType::X86Pit),
             0x25 => Some(EmulatedDeviceType::LoongArchPchPic),
+            0x26 => Some(EmulatedDeviceType::ArmGicRedistributor),
             0x30 => Some(EmulatedDeviceType::PPPTGlobal),
             0xE1 => Some(EmulatedDeviceType::VirtioBlk),
             0xE2 => Some(EmulatedDeviceType::VirtioNet),

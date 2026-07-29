@@ -1,7 +1,12 @@
 //! LoongArch64 implementations of AxVM platform capability hooks.
 
 use super::LoongArch64Arch;
-use crate::architecture::{GuestBootPlatform, HostTimePlatform};
+use crate::architecture::{GuestBootPlatform, HostTimePlatform, MachinePlatform};
+
+impl MachinePlatform for LoongArch64Arch {
+    const MACHINE_ARCHITECTURE: crate::machine::MachineArchitecture =
+        crate::machine::MachineArchitecture::LoongArch64;
+}
 
 impl GuestBootPlatform for LoongArch64Arch {
     fn init_guest_boot_resources() {
@@ -10,7 +15,7 @@ impl GuestBootPlatform for LoongArch64Arch {
 
     fn prepare_guest_boot(
         vm_config: &mut crate::config::AxVMConfig,
-        vm_create_config: &mut axvmconfig::AxVMCrateConfig,
+        vm_create_config: &mut axvmconfig::GuestConfig,
         _provider: &dyn crate::boot::BootImageProvider,
     ) -> crate::AxVmResult<Option<crate::boot::fdt::GuestDtbImage>> {
         if vm_create_config.kernel.effective_boot_protocol() != axvmconfig::VMBootProtocol::Uefi {

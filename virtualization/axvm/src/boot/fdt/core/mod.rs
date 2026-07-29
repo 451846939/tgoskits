@@ -2,7 +2,7 @@
 
 use alloc::{format, vec::Vec};
 
-use axvmconfig::{AxVMCrateConfig, VMBootProtocol};
+use axvmconfig::{GuestConfig, VMBootProtocol};
 
 use crate::{
     AxVmResult, ax_err, ax_err_type,
@@ -12,9 +12,11 @@ use crate::{
 
 pub(crate) mod create;
 mod device;
+mod interrupt;
 mod parser;
 mod policy;
 mod print;
+pub(crate) mod serial;
 pub(crate) mod tree;
 
 #[cfg(test)]
@@ -22,11 +24,11 @@ mod tree_tests;
 
 pub use create::{patch_guest_fdt_for_runtime, update_fdt};
 pub use parser::*;
-pub use policy::GuestFdtPolicy;
+pub use policy::{DecodedInterrupt, GuestFdtPolicy};
 
 pub fn prepare_dtb_guest(
     vm_config: &mut AxVMConfig,
-    vm_create_config: &mut AxVMCrateConfig,
+    vm_create_config: &mut GuestConfig,
     provider: &dyn BootImageProvider,
 ) -> AxVmResult<Option<GuestDtbImage>> {
     if vm_create_config.kernel.effective_boot_protocol() == VMBootProtocol::Uefi {
@@ -44,7 +46,7 @@ pub(crate) fn selected_guest_fdt_policy() -> GuestFdtPolicy {
     super::guest_fdt_policy()
 }
 
-fn skip_guest_dtb(vm_config: &mut AxVMConfig, vm_create_config: &mut AxVMCrateConfig) {
+fn skip_guest_dtb(vm_config: &mut AxVMConfig, vm_create_config: &mut GuestConfig) {
     info!(
         "VM[{}] uses UEFI boot protocol, skipping guest DTB handling",
         vm_config.id()
@@ -55,7 +57,7 @@ fn skip_guest_dtb(vm_config: &mut AxVMConfig, vm_create_config: &mut AxVMCrateCo
 
 fn build_guest_dtb(
     vm_config: &mut AxVMConfig,
-    vm_create_config: &mut AxVMCrateConfig,
+    vm_create_config: &mut GuestConfig,
     provider: &dyn BootImageProvider,
     host_fdt_bytes: Option<&'static [u8]>,
 ) -> AxVmResult<Option<GuestDtbImage>> {
@@ -106,7 +108,7 @@ fn parse_host_fdt(host_fdt_bytes: &'static [u8]) -> AxVmResult<fdt_edit::Fdt> {
 
 fn enrich_guest_config(
     vm_config: &mut AxVMConfig,
-    vm_create_config: &mut AxVMCrateConfig,
+    vm_create_config: &mut GuestConfig,
     guest_dtb: Option<&GuestDtbImage>,
 ) -> AxVmResult {
     let Some(dtb) = guest_dtb.map(GuestDtbImage::as_bytes) else {
@@ -119,7 +121,7 @@ fn enrich_guest_config(
     parse_vm_interrupt(vm_config, dtb)
 }
 
-fn clear_unresolved_dtb_config(vm_config: &mut AxVMConfig, vm_create_config: &mut AxVMCrateConfig) {
+fn clear_unresolved_dtb_config(vm_config: &mut AxVMConfig, vm_create_config: &mut GuestConfig) {
     error!(
         "VM[{}] DTB not found in memory, skipping...",
         vm_config.id()
@@ -146,7 +148,7 @@ fn clear_unresolved_dtb_config(vm_config: &mut AxVMConfig, vm_create_config: &mu
 
 fn get_developer_provided_dtb(
     vm_config: &AxVMConfig,
-    crate_config: &AxVMCrateConfig,
+    crate_config: &GuestConfig,
     provider: &dyn BootImageProvider,
 ) -> AxVmResult<Option<Vec<u8>>> {
     match crate_config.kernel.image_location.as_deref() {

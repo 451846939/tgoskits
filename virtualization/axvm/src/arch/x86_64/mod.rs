@@ -70,13 +70,12 @@ impl ArchOps for X86_64Arch {
     }
 
     fn after_external_interrupt(
-        vm: &crate::AxVMRef,
-        vcpu: &crate::vm::AxVCpuRef<Self::VCpu>,
+        _vm: &crate::AxVMRef,
+        _vcpu: &crate::vm::AxVCpuRef<Self::VCpu>,
         vector: usize,
     ) {
         crate::host::arceos::dispatch_host_irq(vector);
         crate::check_timer_events();
-        irq::inject_pending_serial_irq(vm, vcpu);
     }
 
     fn on_last_vcpu_exit(vm_id: usize) {
@@ -261,14 +260,6 @@ impl X86VlapicHostOps for AxvmX86HostOps {
         crate::timer::cancel_timer(token);
     }
 
-    fn write_bytes(bytes: &[u8]) {
-        ax_std::os::arceos::modules::ax_hal::console::write_bytes(bytes);
-    }
-
-    fn read_bytes(bytes: &mut [u8]) -> usize {
-        ax_std::os::arceos::modules::ax_hal::console::read_bytes(bytes)
-    }
-
     fn current_vm_id() -> X86VmId {
         with_current_vcpu::<AxvmX86Vcpu, _>(|vcpu| {
             vcpu.expect("current x86 vCPU is not set").vm_id()
@@ -450,13 +441,7 @@ pub(crate) fn register_arch_device(
     devices: &mut axdevice::AxVmDevices,
 ) -> AxVmResult {
     match config.emu_type {
-        EmulatedDeviceType::Console => {
-            let serial = Arc::new(axdevice::X86SerialPortDevice::<AxvmX86HostOps>::new());
-            devices
-                .add_x86_serial_dev(serial)
-                .map_err(|error| AxVmError::device("register x86 serial device", error))?;
-            info!("x86 16550 serial initialized for ports 0x3f8..=0x3ff");
-        }
+        EmulatedDeviceType::Console => {}
         EmulatedDeviceType::X86IoApic => {
             let ioapic = Arc::new(axdevice::X86IoApicDevice::new(
                 x86_vlapic::X86GuestPhysAddr::from_usize(config.base_gpa),

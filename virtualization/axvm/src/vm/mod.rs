@@ -228,13 +228,6 @@ impl VmRuntimeHandle {
     ///
     /// The dispatcher releases its queue lock before this method notifies
     /// waiters or invokes the host IPI boundary.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "architecture interrupt routers dispatch in later modules"
-        )
-    )]
     pub(crate) fn dispatch_vcpu_interrupt(
         &self,
         vcpu_id: usize,

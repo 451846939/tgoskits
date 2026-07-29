@@ -545,4 +545,38 @@ mod tests {
             }]
         );
     }
+
+    #[test]
+    fn held_level_reasserts_after_guest_clear() {
+        let pic = LoongArchPchPic::new(GuestPhysAddr::from_usize(0x1000), 0x1000);
+        pic.handle_write(
+            GuestPhysAddr::from_usize(0x1000 + PCH_PIC_INT_MASK_LO),
+            AccessWidth::Dword,
+            !(1u32 << 2) as usize,
+        )
+        .unwrap();
+        assert_eq!(pic.set_irq_level(2, true), Some(2));
+
+        pic.handle_write(
+            GuestPhysAddr::from_usize(0x1000 + PCH_PIC_INT_CLEAR_LO),
+            AccessWidth::Dword,
+            (1u32 << 2) as usize,
+        )
+        .unwrap();
+        let mut events = Vec::new();
+        pic.drain_output_events(|event| events.push(event));
+        assert_eq!(
+            events,
+            vec![PchPicOutputEvent {
+                vector: 2,
+                asserted: false
+            }]
+        );
+
+        // Polling the UART while its receive condition remains true raises the
+        // same virtual line and the PCH-PIC routes it again.
+        assert_eq!(pic.set_irq_level(2, true), Some(2));
+        assert_eq!(pic.pending_vector(2), None);
+        assert_eq!(pic.set_irq_level(2, false), Some(2));
+    }
 }

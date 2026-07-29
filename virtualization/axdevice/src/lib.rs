@@ -23,6 +23,8 @@
 //! The module is structured into two main parts: `config` and `device`, which manage the configuration and handling of AxVm devices respectively.
 
 extern crate alloc;
+#[cfg(test)]
+extern crate std;
 #[macro_use]
 extern crate log;
 
@@ -36,6 +38,7 @@ mod fw_cfg;
 mod loongarch_pch_pic;
 mod range_alloc;
 mod registration;
+mod serial;
 #[cfg(target_arch = "x86_64")]
 mod x86;
 
@@ -60,11 +63,12 @@ pub use fw_cfg::{
 #[cfg(target_arch = "loongarch64")]
 pub use loongarch_pch_pic::{LoongArchPchPic, PchPicOutputEvent};
 pub use registration::{DeviceBundle, DeviceRegistration, PollableDeviceOps};
-#[cfg(target_arch = "x86_64")]
-pub use x86::{
-    X86IoApicDevice, X86IoApicDeviceOps, X86PitDevice, X86PitDeviceOps, X86SerialDeviceOps,
-    X86SerialPortDevice,
+pub use serial::{
+    NullSerialBackend, Pl011, SerialBackend, Uart16550, build_16550_mmio, build_16550_port,
+    build_pl011_mmio,
 };
+#[cfg(target_arch = "x86_64")]
+pub use x86::{X86IoApicDevice, X86IoApicDeviceOps, X86PitDevice, X86PitDeviceOps};
 #[cfg(target_arch = "x86_64")]
 pub use x86_vlapic::IoApicInterrupt;
 // pub use virtio_dev::*;

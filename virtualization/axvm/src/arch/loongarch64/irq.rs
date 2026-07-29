@@ -1,6 +1,62 @@
 //! LoongArch platform IRQ routing used by AxVM.
 
+use alloc::sync::Arc;
+
+use axdevice_base::{InterruptTriggerMode, IrqError, IrqLineId, IrqResult, IrqSink};
+use axvm_types::VMInterruptMode;
+
 const EIOINTC_IRQ: usize = 3;
+
+struct LoongArchPchPicIrqSink {
+    vm_id: usize,
+}
+
+impl IrqSink for LoongArchPchPicIrqSink {
+    fn set_level(&self, line: IrqLineId, asserted: bool) -> IrqResult {
+        let vm = crate::get_vm_by_id(self.vm_id).ok_or_else(|| IrqError::Backend {
+            line,
+            operation: "route LoongArch virtual IRQ",
+            detail: alloc::format!("VM[{}] is not registered", self.vm_id),
+        })?;
+        let devices = vm.get_devices().map_err(|error| IrqError::Backend {
+            line,
+            operation: "route LoongArch virtual IRQ",
+            detail: alloc::format!("{error}"),
+        })?;
+        let Some(vector) = devices.loongarch_pch_pic_set_irq_level(line.0, asserted) else {
+            return Err(IrqError::Unsupported {
+                line,
+                operation: "route LoongArch virtual IRQ",
+                detail: "the VM has no virtual PCH-PIC".into(),
+            });
+        };
+        if !asserted {
+            return Ok(());
+        }
+        let Some(vector) = vector else {
+            return Ok(());
+        };
+        crate::irq::dispatch_runtime_interrupt(
+            self.vm_id,
+            0,
+            line,
+            vector,
+            InterruptTriggerMode::LevelTriggered,
+        )
+    }
+
+    fn pulse(&self, line: IrqLineId) -> IrqResult {
+        self.set_level(line, true)?;
+        self.set_level(line, false)
+    }
+}
+
+pub(crate) fn interrupt_fabric(
+    vm_id: usize,
+    mode: VMInterruptMode,
+) -> crate::AxVmResult<crate::InterruptFabric> {
+    crate::InterruptFabric::with_sink(mode, Arc::new(LoongArchPchPicIrqSink { vm_id }))
+}
 
 /// Register the platform IRQ injector for LoongArch dynamic hypervisor builds.
 pub(crate) fn register_platform_irq_injector() {

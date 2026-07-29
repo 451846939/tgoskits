@@ -4,11 +4,11 @@ use alloc::sync::Arc;
 
 use arm_vcpu::{ArmVcpuCreateConfig, ArmVcpuSetupConfig};
 use axdevice_base::DeviceRegistry as _;
-use axvm_types::{NestedPagingConfig, VMInterruptMode, VmArchVcpuOps};
+use axvm_types::{NestedPagingConfig, VmArchVcpuOps};
 
 use super::{Aarch64Arch, npt};
 use crate::{
-    AxVmError, AxVmResult, ax_err,
+    AxVmResult, ax_err,
     config::AxVMConfig,
     vm::{
         AxVM, AxVMResources,
@@ -37,7 +37,7 @@ impl Aarch64Arch {
         match request {
             VmInitRequest::Default => {
                 let factories = default_device_factories()?;
-                let interrupt_fabric = crate::InterruptFabric::new(vm.interrupt_mode());
+                let interrupt_fabric = super::irq::interrupt_fabric(vm.id(), vm.interrupt_mode())?;
                 init_vm_with(vm, &factories, interrupt_fabric)
             }
             VmInitRequest::Provided {
@@ -67,7 +67,7 @@ fn init_vm_with(
             })
         })?;
         let mut devices = PreparedDevices::build_common(resources, factories, interrupt_fabric)?;
-        register_arch_devices(vm, resources.config(), &mut devices.devices)?;
+        register_arch_devices(&mut devices.devices)?;
         devices.register_special_devices(vm)?;
         validate_guest_dtb(resources)?;
 
@@ -80,48 +80,17 @@ fn init_vm_with(
 }
 
 fn build_vcpu_setup_config(
-    config: &AxVMConfig,
+    _config: &AxVMConfig,
     _memory_regions: &[crate::vm::VMMemoryRegion],
 ) -> AxVmResult<<super::AxvmArmVcpu as VmArchVcpuOps>::SetupConfig> {
-    let passthrough = config.interrupt_mode() == VMInterruptMode::Passthrough;
     Ok(ArmVcpuSetupConfig {
-        passthrough_interrupt: passthrough,
-        passthrough_timer: passthrough,
+        passthrough_interrupt: false,
+        passthrough_timer: false,
     })
 }
 
-fn register_arch_devices(
-    vm: &AxVM,
-    config: &AxVMConfig,
-    devices: &mut axdevice::AxVmDevices,
-) -> AxVmResult {
-    if config.interrupt_mode() == VMInterruptMode::Passthrough {
-        assign_passthrough_spis(vm, config, devices)?;
-    } else {
-        register_virtual_timers(devices)?;
-    }
-    Ok(())
-}
-
-fn assign_passthrough_spis(
-    vm: &AxVM,
-    config: &AxVMConfig,
-    devices: &axdevice::AxVmDevices,
-) -> AxVmResult {
-    let cpu_id = vm.id() - 1; // FIXME: get the real CPU id.
-    let Some(gicd) = devices
-        .devices()
-        .find_map(|device| device.as_any().downcast_ref::<arm_vgic::v3::vgicd::VGicD>())
-    else {
-        warn!("Failed to assign SPIs: No VGicD found in device list");
-        return Ok(());
-    };
-
-    for spi in config.pass_through_spis() {
-        gicd.assign_irq(*spi + 32, cpu_id, (0, 0, 0, cpu_id as _))
-            .map_err(|error| AxVmError::interrupt("assign passthrough SPI", error))?;
-    }
-    Ok(())
+fn register_arch_devices(devices: &mut axdevice::AxVmDevices) -> AxVmResult {
+    register_virtual_timers(devices)
 }
 
 fn register_virtual_timers(devices: &mut axdevice::AxVmDevices) -> AxVmResult {

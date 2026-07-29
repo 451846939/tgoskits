@@ -2,13 +2,18 @@
 
 use crate::AxVmResult;
 
+/// Architecture selection for fixed guest machine resources.
+pub(crate) trait MachinePlatform {
+    const MACHINE_ARCHITECTURE: crate::machine::MachineArchitecture;
+}
+
 /// Guest firmware preparation performed before common VM memory loading.
 pub(crate) trait GuestBootPlatform {
     fn init_guest_boot_resources() {}
 
     fn prepare_guest_boot(
         _vm_config: &mut crate::config::AxVMConfig,
-        _vm_create_config: &mut axvmconfig::AxVMCrateConfig,
+        _vm_create_config: &mut axvmconfig::GuestConfig,
         _provider: &dyn crate::boot::BootImageProvider,
     ) -> AxVmResult<Option<crate::boot::fdt::GuestDtbImage>> {
         Ok(None)
@@ -18,7 +23,7 @@ pub(crate) trait GuestBootPlatform {
 /// Architecture-specific guest image planning layered over common byte loading.
 pub(crate) trait BootImagePlatform {
     fn default_boot_firmware_load_gpa(
-        _config: &axvmconfig::AxVMCrateConfig,
+        _config: &axvmconfig::GuestConfig,
     ) -> Option<axvm_types::GuestPhysAddr> {
         None
     }
@@ -45,7 +50,7 @@ pub(crate) trait BootImagePlatform {
     }
 
     fn is_x86_linux_image_config(
-        _config: &axvmconfig::AxVMCrateConfig,
+        _config: &axvmconfig::GuestConfig,
         _provider: &dyn crate::boot::BootImageProvider,
     ) -> bool {
         false

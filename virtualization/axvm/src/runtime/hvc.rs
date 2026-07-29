@@ -343,11 +343,13 @@ impl HyperCall {
     fn operation_error(&self, operation: &'static str, error: AxVmError) -> HyperCallError {
         let detail = format!("{operation}: {error}");
         match error {
-            AxVmError::InvalidInput { .. } => HyperCallError::InvalidParameter {
-                code: self.code,
-                parameter: "arguments",
-                detail,
-            },
+            AxVmError::InvalidInput { .. } | AxVmError::HostOwnedDevice { .. } => {
+                HyperCallError::InvalidParameter {
+                    code: self.code,
+                    parameter: "arguments",
+                    detail,
+                }
+            }
             AxVmError::InvalidState { .. } | AxVmError::InvalidTransition { .. } => {
                 HyperCallError::InvalidState {
                     code: self.code,

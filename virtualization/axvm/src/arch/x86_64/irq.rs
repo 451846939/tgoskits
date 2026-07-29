@@ -1,6 +1,8 @@
+use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use ax_kspin::SpinRaw as Mutex;
+use axdevice_base::{IrqError, IrqLineId, IrqResult, IrqSink};
 use axvm_types::VmArchVcpuOps;
 
 use crate::{
@@ -14,6 +16,7 @@ const IOAPIC_GSI_COUNT: usize = 24;
 const INVALID_RAW_IRQ: usize = usize::MAX;
 
 const PIT_TIMER_GSI: usize = 0;
+#[cfg(test)]
 const COM1_GSI: usize = 4;
 type IoApicForwardingActivator = fn();
 type IoApicForwardingActivatorSlot = Mutex<Option<IoApicForwardingActivator>>;
@@ -33,6 +36,51 @@ static IOAPIC_HOST_IRQS: [AtomicUsize; IOAPIC_GSI_COUNT] =
     [const { AtomicUsize::new(INVALID_RAW_IRQ) }; IOAPIC_GSI_COUNT];
 static IOAPIC_IRQ_ACTIVATORS: [IoApicForwardingActivatorSlot; IOAPIC_GSI_COUNT] =
     [const { Mutex::new(None) }; IOAPIC_GSI_COUNT];
+
+struct X86IoApicIrqSink {
+    vm_id: usize,
+}
+
+impl IrqSink for X86IoApicIrqSink {
+    fn set_level(&self, line: IrqLineId, asserted: bool) -> IrqResult {
+        let vm = crate::get_vm_by_id(self.vm_id).ok_or_else(|| IrqError::Backend {
+            line,
+            operation: "route x86 virtual IRQ",
+            detail: alloc::format!("VM[{}] is not registered", self.vm_id),
+        })?;
+        let devices = vm.get_devices().map_err(|error| IrqError::Backend {
+            line,
+            operation: "route x86 virtual IRQ",
+            detail: alloc::format!("{error}"),
+        })?;
+        let Some(interrupt) = devices.x86_ioapic_set_gsi_level(line.0, asserted) else {
+            return Ok(());
+        };
+        crate::irq::dispatch_runtime_interrupt(
+            self.vm_id,
+            0,
+            line,
+            interrupt.vector as usize,
+            if interrupt.level_triggered {
+                InterruptTriggerMode::LevelTriggered
+            } else {
+                InterruptTriggerMode::EdgeTriggered
+            },
+        )
+    }
+
+    fn pulse(&self, line: IrqLineId) -> IrqResult {
+        self.set_level(line, true)?;
+        self.set_level(line, false)
+    }
+}
+
+pub(crate) fn interrupt_fabric(
+    vm_id: usize,
+    mode: VMInterruptMode,
+) -> crate::AxVmResult<crate::InterruptFabric> {
+    crate::InterruptFabric::with_sink(mode, Arc::new(X86IoApicIrqSink { vm_id }))
+}
 
 fn should_register_ioapic_gsi_hook(gsi: usize) -> bool {
     gsi < IOAPIC_GSI_COUNT && gsi != PIT_TIMER_GSI
@@ -90,10 +138,6 @@ pub fn register_ioapic_irq_forwarding_activator(
 }
 
 pub fn inject_due_pit_irq0(vm: &VMRef, vcpu: &VCpuRef) {
-    if vm.interrupt_mode() != VMInterruptMode::Passthrough {
-        return;
-    }
-
     let now_ns = ax_std::os::arceos::modules::ax_hal::time::monotonic_time_nanos();
     let Ok(devices) = vm.get_devices() else {
         return;
@@ -119,41 +163,7 @@ pub fn inject_due_pit_irq0(vm: &VMRef, vcpu: &VCpuRef) {
         .unwrap();
 }
 
-pub fn inject_pending_serial_irq(vm: &VMRef, vcpu: &VCpuRef) {
-    if vm.interrupt_mode() != VMInterruptMode::Passthrough {
-        return;
-    }
-
-    let Ok(devices) = vm.get_devices() else {
-        return;
-    };
-    if !devices.x86_serial_poll_irq() {
-        return;
-    }
-
-    let Some(irq) = devices.x86_ioapic_assert_gsi(COM1_GSI) else {
-        trace!("x86 COM1 RX pending but vIOAPIC GSI4 is not ready");
-        return;
-    };
-
-    trace!("Injecting x86 COM1 RX IRQ vector {:#x}", irq.vector);
-    vcpu.get_arch_vcpu()
-        .inject_interrupt_with_trigger(
-            irq.vector as _,
-            if irq.level_triggered {
-                InterruptTriggerMode::LevelTriggered
-            } else {
-                InterruptTriggerMode::EdgeTriggered
-            },
-        )
-        .unwrap();
-}
-
 pub fn inject_pending_ioapic_irq_after_eoi(vm: &VMRef, vcpu: &VCpuRef, vector: u8) {
-    if vm.interrupt_mode() != VMInterruptMode::Passthrough {
-        return;
-    }
-
     let Ok(devices) = vm.get_devices() else {
         return;
     };

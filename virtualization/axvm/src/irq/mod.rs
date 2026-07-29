@@ -20,7 +20,10 @@ use axdevice::{DeviceManagerResult, IrqResolver};
 use axdevice_base::{InterruptTriggerMode, IrqError, IrqLine, IrqLineId, IrqResult, IrqSink};
 use axvm_types::VMInterruptMode;
 
-use crate::{AxVmResult, ax_err};
+use crate::{
+    AxVmResult, ax_err,
+    irq::model::{PendingVcpuInterrupt, VirtualInterruptId},
+};
 
 /// Host platform hook for registering the RISC-V physical IRQ injector.
 #[ax_crate_interface::def_interface]
@@ -157,6 +160,39 @@ impl IrqResolver for InterruptFabric {
             self.sink_for_line(line)?.clone(),
         ))
     }
+}
+
+pub(crate) fn dispatch_runtime_interrupt(
+    vm_id: usize,
+    vcpu_id: usize,
+    source_line: IrqLineId,
+    interrupt_id: usize,
+    trigger: InterruptTriggerMode,
+) -> IrqResult {
+    let vm = crate::get_vm_by_id(vm_id).ok_or_else(|| IrqError::Backend {
+        line: source_line,
+        operation: "dispatch virtual interrupt",
+        detail: alloc::format!("VM[{vm_id}] is not registered"),
+    })?;
+    let interrupt_id = u32::try_from(interrupt_id).map_err(|_| IrqError::InvalidLine {
+        line: source_line,
+        operation: "dispatch virtual interrupt",
+        detail: alloc::format!("interrupt ID {interrupt_id} does not fit u32"),
+    })?;
+    vm.with_runtime(|runtime| {
+        runtime.dispatch_vcpu_interrupt(
+            vcpu_id,
+            PendingVcpuInterrupt {
+                id: VirtualInterruptId(interrupt_id),
+                trigger,
+            },
+        )
+    })
+    .map_err(|error| IrqError::Backend {
+        line: source_line,
+        operation: "dispatch virtual interrupt",
+        detail: alloc::format!("{error}"),
+    })
 }
 
 pub(crate) mod model;

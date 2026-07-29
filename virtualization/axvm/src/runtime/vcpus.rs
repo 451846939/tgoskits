@@ -311,7 +311,9 @@ fn vcpu_run() {
     mark_vcpu_running(&vm);
 
     loop {
-        CurrentArch::before_vcpu_run(&vm, &vcpu);
+        if vcpu_id == 0 {
+            poll_vm_devices(&vm);
+        }
 
         match CurrentArch::run_vcpu(&vm, &vcpu) {
             Ok(VcpuRunAction {
@@ -372,7 +374,25 @@ fn vcpu_run() {
 
             break;
         }
+
+        // AxVM may run on ArceOS's cooperative FIFO scheduler. Yield after
+        // every completed VM exit so host services such as the management
+        // console and virtual serial input can make progress alongside a
+        // continuously runnable guest.
+        crate::host::task::yield_now();
     }
 
     info!("VM[{}] VCpu[{}] exiting...", vm_id, vcpu_id);
+}
+
+pub(super) fn poll_vm_devices(vm: &VMRef) {
+    let Ok(devices) = vm.get_devices() else {
+        return;
+    };
+    let now_ns = ax_std::os::arceos::modules::ax_hal::time::monotonic_time_nanos();
+    for device in devices.iter_pollable_dev() {
+        if let Err(error) = device.poll(now_ns) {
+            warn!("VM[{}] failed to poll virtual device: {error}", vm.id());
+        }
+    }
 }

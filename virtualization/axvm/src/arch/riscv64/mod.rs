@@ -73,7 +73,13 @@ impl ArchOps for Riscv64Arch {
             );
             return;
         };
-        let irq_sources = vm.with_config(|config| config.pass_through_irqs().to_vec());
+        let irq_sources = vm.with_config(|config| {
+            config
+                .pass_through_irqs()
+                .iter()
+                .map(|interrupt| interrupt.source)
+                .collect::<Vec<_>>()
+        });
         crate::irq::set_riscv_virtual_irq_targets(cpu_id, &irq_sources);
     }
 

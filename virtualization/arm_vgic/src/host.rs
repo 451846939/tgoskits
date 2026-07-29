@@ -71,10 +71,6 @@ pub(crate) fn host_cpu_num() -> usize {
     ax_crate_interface::call_interface!(ArmVgicHostIf::host_cpu_num())
 }
 
-pub(crate) fn current_vcpu_id() -> usize {
-    ax_crate_interface::call_interface!(ArmVgicHostIf::current_vcpu_id())
-}
-
 pub(crate) fn current_time_nanos() -> u64 {
     ax_crate_interface::call_interface!(ArmVgicHostIf::current_time_nanos())
 }

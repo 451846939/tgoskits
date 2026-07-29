@@ -16,7 +16,7 @@ use alloc::{string::String, vec::Vec};
 use core::ptr::NonNull;
 
 use ax_memory_addr::MemoryAddr;
-use axvmconfig::AxVMCrateConfig;
+use axvmconfig::GuestConfig;
 use fdt_edit::{Fdt, Node, NodeId};
 
 use super::tree::{FdtTree, GuestMemorySpec};
@@ -28,7 +28,7 @@ use crate::{
 pub fn create_guest_fdt(
     fdt: &Fdt,
     passthrough_device_names: &[String],
-    crate_config: &AxVMCrateConfig,
+    crate_config: &GuestConfig,
 ) -> AxVmResult<Vec<u8>> {
     let phys_cpu_ids = crate_config
         .base
@@ -130,7 +130,7 @@ pub(crate) fn need_cpu_node(
 
 fn guest_memory_specs(
     new_memory: &[VMMemoryRegion],
-    crate_config: &AxVMCrateConfig,
+    crate_config: &GuestConfig,
 ) -> Vec<GuestMemorySpec> {
     let configured_region_count = if crate_config.kernel.configured_memory_region_count == 0 {
         crate_config.kernel.memory_regions.len()
@@ -178,7 +178,7 @@ pub fn update_fdt(
     fdt_src: NonNull<u8>,
     dtb_size: usize,
     vm: AxVMRef,
-    crate_config: &AxVMCrateConfig,
+    crate_config: &GuestConfig,
 ) -> AxVmResult {
     let patch_runtime = super::selected_guest_fdt_policy().patch_runtime;
     // SAFETY: `fdt_src` originates from `GuestDtbImage::as_bytes`, and the
@@ -203,7 +203,7 @@ fn load_patched_fdt(vm: AxVMRef, new_fdt_bytes: Vec<u8>) -> AxVmResult {
 pub fn patch_guest_fdt_for_runtime(
     fdt_bytes: &[u8],
     memory_regions: &[VMMemoryRegion],
-    crate_config: &AxVMCrateConfig,
+    crate_config: &GuestConfig,
     initrd_start_size: Option<(u64, u64)>,
     create_chosen: bool,
 ) -> AxVmResult<Vec<u8>> {
@@ -216,6 +216,8 @@ pub fn patch_guest_fdt_for_runtime(
     {
         tree.patch_chosen(initrd_start_size)?;
     }
+    super::interrupt::install_machine_interrupt_controller(&mut tree, crate_config.base.cpu_num)?;
+    super::serial::install_machine_serial(&mut tree)?;
     Ok(tree.finish())
 }
 
@@ -254,7 +256,7 @@ pub(crate) fn calculate_dtb_load_addr(vm: AxVMRef, fdt_size: usize) -> AxVmResul
 
 #[cfg(test)]
 mod tests {
-    use axvmconfig::AxVMCrateConfig;
+    use axvmconfig::GuestConfig;
     use fdt_edit::{Fdt, Node, Property};
     use fdt_raw::RegInfo;
 
@@ -353,7 +355,7 @@ mod tests {
     fn runtime_patch_can_leave_missing_chosen_for_host_copy() {
         let fdt = Fdt::new();
         let dtb = fdt.encode().as_ref().to_vec();
-        let cfg = AxVMCrateConfig::default();
+        let cfg = GuestConfig::default();
 
         let patched = super::patch_guest_fdt_for_runtime(&dtb, &[], &cfg, None, false).unwrap();
         let reparsed = Fdt::from_bytes(&patched).unwrap();
@@ -369,7 +371,7 @@ mod tests {
     #[test]
     fn generated_fdt_filters_cpu_nodes_by_unit_address() {
         let fdt = test_fdt("cpu@0=200\ncpu@100=0\ncpu@101=100");
-        let cfg = AxVMCrateConfig {
+        let cfg = GuestConfig {
             base: axvmconfig::VMBaseConfig {
                 phys_cpu_ids: Some(alloc::vec![0x100]),
                 ..Default::default()

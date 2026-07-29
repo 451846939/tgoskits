@@ -47,7 +47,7 @@ pub(super) fn initrd_start_size_from_image_config(
 pub(super) fn update_cpu_node(
     fdt: &Fdt,
     host_fdt: Option<&Fdt>,
-    crate_config: &axvmconfig::AxVMCrateConfig,
+    crate_config: &axvmconfig::GuestConfig,
 ) -> AxVmResult<Vec<u8>> {
     let Some(host_fdt) = host_fdt else {
         return Ok(fdt.encode().as_ref().to_vec());
@@ -92,7 +92,7 @@ pub(super) fn update_cpu_node(
 
 pub fn handle_fdt_operations(
     vm_config: &mut AxVMConfig,
-    vm_create_config: &mut axvmconfig::AxVMCrateConfig,
+    vm_create_config: &mut axvmconfig::GuestConfig,
     provider: &dyn BootImageProvider,
 ) -> AxVmResult<Option<GuestDtbImage>> {
     core::prepare_dtb_guest(vm_config, vm_create_config, provider)

@@ -29,7 +29,7 @@ pub struct ImageLoader<'a>(ImageLoaderCore<'a>);
 impl<'a> ImageLoader<'a> {
     pub fn new(
         main_memory: crate::VMMemoryRegion,
-        config: axvmconfig::AxVMCrateConfig,
+        config: axvmconfig::GuestConfig,
         vm: crate::AxVMRef,
         provider: &'a dyn BootImageProvider,
     ) -> Self {
@@ -48,9 +48,7 @@ impl<'a> ImageLoader<'a> {
 }
 
 impl BootImagePlatform for X86_64Arch {
-    fn default_boot_firmware_load_gpa(
-        config: &axvmconfig::AxVMCrateConfig,
-    ) -> Option<GuestPhysAddr> {
+    fn default_boot_firmware_load_gpa(config: &axvmconfig::GuestConfig) -> Option<GuestPhysAddr> {
         const BUILT_IN_BIOS_LOAD_GPA: usize = 0x8000;
 
         (config.kernel.boot_firmware_path().is_none()
@@ -108,7 +106,7 @@ impl BootImagePlatform for X86_64Arch {
     }
 
     fn is_x86_linux_image_config(
-        config: &axvmconfig::AxVMCrateConfig,
+        config: &axvmconfig::GuestConfig,
         provider: &dyn BootImageProvider,
     ) -> bool {
         if !should_direct_boot_linux(config) {
@@ -362,13 +360,8 @@ fn build_boot_params(
             builder.add_ram_range(linux::X86LinuxRange::new(memory.gpa, memory.size));
         }
     }
-    for device in &loader.config.devices.passthrough_devices {
-        builder.add_reserved_range(linux::X86LinuxRange::new(device.base_gpa, device.length));
-    }
-    for address in &loader.config.devices.passthrough_addresses {
-        builder.add_reserved_range(linux::X86LinuxRange::new(address.base_gpa, address.length));
-    }
-    for device in &loader.config.devices.emu_devices {
+    let machine = crate::machine::current_machine_profile(loader.config.base.cpu_num);
+    for device in &machine.emulated_devices {
         if matches!(device.emu_type, EmulatedDeviceType::X86IoApic) {
             builder.add_reserved_range(linux::X86LinuxRange::new(device.base_gpa, device.length));
         }
@@ -416,11 +409,11 @@ fn load_multiboot_info(
     )
 }
 
-fn should_direct_boot_linux(config: &axvmconfig::AxVMCrateConfig) -> bool {
+fn should_direct_boot_linux(config: &axvmconfig::GuestConfig) -> bool {
     !config.kernel.enable_bios && config.kernel.effective_boot_protocol() == VMBootProtocol::Direct
 }
 
-fn should_patch_multiboot_info(config: &axvmconfig::AxVMCrateConfig) -> bool {
+fn should_patch_multiboot_info(config: &axvmconfig::GuestConfig) -> bool {
     config.kernel.effective_boot_protocol() == VMBootProtocol::Multiboot
 }
 
@@ -517,14 +510,14 @@ mod tests {
 
     #[test]
     fn legacy_bios_config_uses_multiboot_patch() {
-        let mut config = axvmconfig::AxVMCrateConfig::default();
+        let mut config = axvmconfig::GuestConfig::default();
         config.kernel.enable_bios = true;
         assert!(should_patch_multiboot_info(&config));
     }
 
     #[test]
     fn uefi_config_skips_multiboot_patch() {
-        let mut config = axvmconfig::AxVMCrateConfig::default();
+        let mut config = axvmconfig::GuestConfig::default();
         config.kernel.enable_bios = true;
         config.kernel.boot_protocol = Some(VMBootProtocol::Uefi);
         assert!(!should_patch_multiboot_info(&config));
@@ -532,7 +525,7 @@ mod tests {
 
     #[test]
     fn linux_direct_boot_requires_direct_protocol_without_bios() {
-        let mut config = axvmconfig::AxVMCrateConfig::default();
+        let mut config = axvmconfig::GuestConfig::default();
         assert!(should_direct_boot_linux(&config));
 
         config.kernel.enable_bios = true;

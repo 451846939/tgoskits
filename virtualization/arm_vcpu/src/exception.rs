@@ -86,6 +86,11 @@ core::arch::global_asm!(
 /// syndrome register (ESR), and system control registers.
 pub fn handle_exception_sync(ctx: &mut TrapFrame) -> ArmVcpuResult<ArmVmExit> {
     match exception_class() {
+        Some(ESR_EL2::EC::Value::TrappedWFIorWFE) => {
+            let next_pc = ctx.exception_pc() + exception_next_instruction_step();
+            ctx.set_exception_pc(next_pc);
+            Ok(ArmVmExit::WaitForInterrupt)
+        }
         Some(ESR_EL2::EC::Value::DataAbortLowerEL) => {
             let elr = ctx.exception_pc();
             let val = elr + exception_next_instruction_step();

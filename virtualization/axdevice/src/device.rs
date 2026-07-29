@@ -39,7 +39,7 @@ use crate::{
 #[cfg(target_arch = "loongarch64")]
 use crate::{LoongArchPchPic, PchPicOutputEvent};
 #[cfg(target_arch = "x86_64")]
-use crate::{X86IoApicDeviceOps, X86PitDeviceOps, X86SerialDeviceOps};
+use crate::{X86IoApicDeviceOps, X86PitDeviceOps};
 
 #[inline]
 #[allow(dead_code)]
@@ -84,9 +84,6 @@ pub struct AxVmDevices {
     /// x86 PIT — kept for type-specific access.
     #[cfg(target_arch = "x86_64")]
     x86_pit: Option<Arc<dyn X86PitDeviceOps>>,
-    /// x86 16550 serial port — kept for type-specific access.
-    #[cfg(target_arch = "x86_64")]
-    x86_serial: Option<Arc<dyn X86SerialDeviceOps>>,
     /// LoongArch PCH-PIC — kept for type-specific access.
     #[cfg(target_arch = "loongarch64")]
     loongarch_pch_pic: Option<Arc<LoongArchPchPic>>,
@@ -110,8 +107,6 @@ impl AxVmDevices {
             x86_ioapic: None,
             #[cfg(target_arch = "x86_64")]
             x86_pit: None,
-            #[cfg(target_arch = "x86_64")]
-            x86_serial: None,
             #[cfg(target_arch = "loongarch64")]
             loongarch_pch_pic: None,
             fw_cfg: None,
@@ -172,6 +167,7 @@ impl AxVmDevices {
         matches!(
             device_type,
             EmulatedDeviceType::InterruptController
+                | EmulatedDeviceType::ArmGicRedistributor
                 | EmulatedDeviceType::Console
                 | EmulatedDeviceType::IVCChannel
                 | EmulatedDeviceType::GPPTRedistributor
@@ -212,6 +208,52 @@ impl AxVmDevices {
                         this.register(
                             MmioDeviceAdapter::from_arc(Arc::new(Vgic::new())) as Arc<dyn Device>
                         )?;
+                    }
+                    #[cfg(not(target_arch = "aarch64"))]
+                    {
+                        warn!(
+                            "emu type: {} is not supported on this platform",
+                            config.emu_type
+                        );
+                    }
+                }
+                EmulatedDeviceType::ArmGicRedistributor => {
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        let cpu_num = Self::config_argument(config, 0, "one argument (cpu_num)")?;
+                        let expected_length = cpu_num
+                            .max(1)
+                            .checked_mul(arm_vgic::v3::REDISTRIBUTOR_FRAME_SIZE)
+                            .ok_or_else(|| DeviceManagerError::InvalidConfig {
+                                operation: "initialize virtual GIC redistributor",
+                                detail: format!(
+                                    "device '{}' redistributor range length overflows",
+                                    config.name
+                                ),
+                            })?;
+                        if config.length != expected_length {
+                            return Err(DeviceManagerError::InvalidConfig {
+                                operation: "initialize virtual GIC redistributor",
+                                detail: format!(
+                                    "device '{}' length {:#x} does not match {} vCPU frame(s) \
+                                     ({expected_length:#x})",
+                                    config.name, config.length, cpu_num
+                                ),
+                            });
+                        }
+
+                        #[allow(clippy::arc_with_non_send_sync)]
+                        this.register(MmioDeviceAdapter::from_arc(Arc::new(
+                            arm_vgic::v3::VirtualRedistributor::new(
+                                config.base_gpa.into(),
+                                cpu_num,
+                            ),
+                        )) as Arc<dyn Device>)?;
+                        info!(
+                            "Virtual GIC redistributor initialized with base GPA {:#x}, length \
+                             {:#x}, vCPUs {}",
+                            config.base_gpa, config.length, cpu_num
+                        );
                     }
                     #[cfg(not(target_arch = "aarch64"))]
                     {
@@ -887,6 +929,14 @@ impl AxVmDevices {
             .and_then(|ioapic| ioapic.assert_gsi(gsi))
     }
 
+    /// Update an x86 IOAPIC input line and return an interrupt to inject.
+    #[cfg(target_arch = "x86_64")]
+    pub fn x86_ioapic_set_gsi_level(&self, gsi: usize, asserted: bool) -> Option<IoApicInterrupt> {
+        self.x86_ioapic
+            .as_ref()
+            .and_then(|ioapic| ioapic.set_gsi_level(gsi, asserted))
+    }
+
     /// Broadcast an x86 local APIC EOI to the virtual IOAPIC.
     #[cfg(target_arch = "x86_64")]
     pub fn x86_ioapic_end_of_interrupt(&self, vector: u8) -> Option<IoApicEoi> {
@@ -901,14 +951,6 @@ impl AxVmDevices {
         self.x86_pit
             .as_ref()
             .is_some_and(|pit| pit.consume_irq0_if_due(now_ns))
-    }
-
-    /// Poll x86 COM1 and return whether it has a pending RX interrupt.
-    #[cfg(target_arch = "x86_64")]
-    pub fn x86_serial_poll_irq(&self) -> bool {
-        self.x86_serial
-            .as_ref()
-            .is_some_and(|serial| serial.poll_irq())
     }
 
     /// Add an x86 IOAPIC device to the generic registry and x86 runtime handle.
@@ -933,17 +975,6 @@ impl AxVmDevices {
         Ok(())
     }
 
-    /// Add an x86 COM1 device to the generic registry and x86 runtime handle.
-    #[cfg(target_arch = "x86_64")]
-    pub fn add_x86_serial_dev<D>(&mut self, dev: Arc<D>) -> DeviceManagerResult
-    where
-        D: Device + X86SerialDeviceOps + 'static,
-    {
-        self.register(dev.clone() as Arc<dyn Device>)?;
-        self.x86_serial = Some(dev);
-        Ok(())
-    }
-
     /// Add a QEMU fw_cfg MMIO device to the device list.
     pub fn add_fw_cfg_dev(&mut self, dev: Arc<FwCfg>) -> DeviceManagerResult {
         self.register(
@@ -961,12 +992,22 @@ impl AxVmDevices {
             .cloned()
     }
 
+    /// Updates a LoongArch PCH-PIC input and returns the routed EIOINTC vector.
+    #[cfg(target_arch = "loongarch64")]
+    pub fn loongarch_pch_pic_set_irq_level(
+        &self,
+        irq: usize,
+        asserted: bool,
+    ) -> Option<Option<usize>> {
+        self.loongarch_pch_pic
+            .as_ref()
+            .map(|pch_pic| pch_pic.set_irq_level(irq, asserted))
+    }
+
     /// Assert a LoongArch PCH-PIC input and return the routed EIOINTC vector.
     #[cfg(target_arch = "loongarch64")]
     pub fn loongarch_pch_pic_assert_irq(&self, irq: usize) -> Option<Option<usize>> {
-        self.loongarch_pch_pic
-            .as_ref()
-            .map(|pch_pic| pch_pic.set_irq_level(irq, true))
+        self.loongarch_pch_pic_set_irq_level(irq, true)
     }
 
     /// Drains LoongArch PCH-PIC output-line events generated by MMIO writes.

@@ -132,6 +132,156 @@ fn runtime_vcpu_loop_only_consumes_scheduler_actions() {
 }
 
 #[test]
+fn aarch64_enables_the_virtual_gic_interface_before_first_guest_entry() {
+    let architecture = include_str!("../src/arch/aarch64/mod.rs");
+    let gic = include_str!("../src/arch/aarch64/gic.rs");
+
+    assert!(
+        architecture.contains("fn before_first_run(")
+            && architecture.contains("gic::reset_virtual_interface"),
+        "AArch64 must enable a clean virtual CPU interface before Linux configures ICC_* registers"
+    );
+    assert!(gic.contains("ICH_HCR_EL2.set(0)"));
+    assert!(gic.contains("ICH_HCR_EL2.modify(ICH_HCR_EL2::EN::SET)"));
+}
+
+#[test]
+fn aarch64_device_passthrough_still_uses_the_virtual_gic() {
+    let architecture = include_str!("../src/arch/aarch64/mod.rs");
+    let irq = include_str!("../src/arch/aarch64/irq.rs");
+    let vm = include_str!("../src/arch/aarch64/vm.rs");
+
+    assert!(
+        vm.contains("passthrough_interrupt: false") && vm.contains("passthrough_timer: false"),
+        "AArch64 device passthrough must not expose host IRQ or timer controller state"
+    );
+    assert!(
+        !vm.contains(".assign_irq(") && !vm.contains("assign_passthrough_spis"),
+        "AArch64 must not directly assign host GIC interrupts to a guest"
+    );
+    assert!(
+        irq.contains("fn passthrough_irq_handler(")
+            && irq.contains("PASSTHROUGH_IRQ_PENDING[intid].store(true")
+            && irq.contains("fn drain_passthrough_irqs(")
+            && irq.contains("vcpu.inject_interrupt_with_trigger(intid, trigger)"),
+        "physical device IRQs must be latched by the host action and injected on the target vCPU"
+    );
+    assert!(
+        architecture.contains("irq::drain_passthrough_irqs(vm, vcpu)")
+            && architecture.contains("irq::release_passthrough_irq_routes(vm_id)"),
+        "AArch64 must drain and release VM-owned physical IRQ routes through lifecycle hooks"
+    );
+}
+
+#[test]
+fn aarch64_preserves_host_irq_identity_and_reinjects_the_guest_virtual_timer() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let axhal_irq =
+        std::fs::read_to_string(manifest_dir.join("../../os/arceos/modules/axhal/src/irq.rs"))
+            .expect("ArceOS IRQ facade must be readable");
+    let architecture = include_str!("../src/arch/aarch64/mod.rs");
+    let gic = include_str!("../src/arch/aarch64/gic.rs");
+
+    assert!(
+        axhal_irq.contains("pub fn handle_irq_id(vector: usize) -> Option<IrqId>"),
+        "the ArceOS IRQ facade must preserve the platform IRQ identity"
+    );
+    assert!(
+        gic.contains("handle_irq_id(0)") && gic.contains(".map(|irq| irq.hwirq.0 as usize)"),
+        "the AArch64 host adapter must report the acknowledged GIC INTID"
+    );
+    assert!(
+        architecture.contains("const GUEST_VIRTUAL_TIMER_IRQ: usize = 27;")
+            && architecture.contains("fn after_external_interrupt(")
+            && architecture.contains("vector == GUEST_VIRTUAL_TIMER_IRQ")
+            && architecture.contains("vcpu.inject_interrupt(vector)"),
+        "CNTV PPI 27 must be reinjected through the guest virtual GIC"
+    );
+    assert!(
+        architecture.contains("fn register_platform_irq_injector()")
+            && architecture.contains("gic::register_guest_virtual_timer_irq_on_current_cpu")
+            && gic.contains("resolve_percpu_irq(HwIrq(GUEST_VIRTUAL_TIMER_IRQ as u32))")
+            && gic.contains("CpuMask::from_cpu(CpuId(cpu_id))")
+            && gic.contains("IrqScope::PerCpu")
+            && gic.contains("ShareMode::Shared")
+            && gic.contains("set_enable(ctx.irq, false)")
+            && gic.contains("inject_current_vcpu_interrupt(GUEST_VIRTUAL_TIMER_IRQ)")
+            && gic.contains("rearm_guest_virtual_timer_irq_if_inactive")
+            && architecture.contains("gic::rearm_guest_virtual_timer_irq_if_inactive"),
+        "CNTV PPI 27 must be registered, masked while forwarded, and rearmed only after the guest \
+         timer signal is inactive"
+    );
+}
+
+#[test]
+fn aarch64_traps_guest_wfi_without_losing_an_already_pending_virtual_irq() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let arm_vcpu_root = manifest_dir.join("../arm_vcpu/src");
+    let vcpu = std::fs::read_to_string(arm_vcpu_root.join("vcpu.rs"))
+        .expect("AArch64 vCPU implementation must be readable");
+    let exception = std::fs::read_to_string(arm_vcpu_root.join("exception.rs"))
+        .expect("AArch64 exception implementation must be readable");
+    let exit_types = std::fs::read_to_string(arm_vcpu_root.join("types.rs"))
+        .expect("AArch64 exit types must be readable");
+    let architecture = include_str!("../src/arch/aarch64/mod.rs");
+
+    assert!(
+        vcpu.contains("HCR_EL2::TWI::SET"),
+        "guest WFI must trap to EL2 so a pending virtual IRQ cannot strand the host CPU"
+    );
+    assert!(
+        exception.contains("ESR_EL2::EC::Value::TrappedWFIorWFE")
+            && exception.contains("ArmVmExit::WaitForInterrupt"),
+        "the AArch64 vCPU core must advance and report a trapped WFI"
+    );
+    assert!(exit_types.contains("WaitForInterrupt"));
+    assert!(
+        architecture.contains("ArmVmExit::WaitForInterrupt => Ok(BoundVcpuExit::Continue)"),
+        "AxVM must re-enter the vCPU so an already-pending virtual IRQ completes WFI"
+    );
+}
+
+#[test]
+fn aarch64_keeps_the_guest_timer_ppi_inside_the_current_vcpu_scope() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let operations = std::fs::read_to_string(manifest_dir.join("src/architecture/ops.rs"))
+        .expect("architecture operations must be readable");
+    let runtime = std::fs::read_to_string(manifest_dir.join("src/runtime/vcpus.rs"))
+        .expect("vCPU runtime must be readable");
+    let architecture = include_str!("../src/arch/aarch64/mod.rs");
+
+    let current_scope = operations
+        .find("let run_result = vcpu.with_current_cpu_set")
+        .expect("vCPU execution must publish the current vCPU");
+    let before_entry = operations[current_scope..]
+        .find("Self::before_vcpu_run(vm, vcpu);")
+        .expect("the architecture must prepare every guest entry")
+        + current_scope;
+    let guest_entry = operations[current_scope..]
+        .find("let exit = vcpu.run();")
+        .expect("the architecture must enter the guest")
+        + current_scope;
+    let after_exit = operations[current_scope..]
+        .find("Self::after_vcpu_run(vm, vcpu);")
+        .expect("the architecture must finish every guest exit")
+        + current_scope;
+
+    assert!(
+        before_entry < guest_entry && guest_entry < after_exit,
+        "guest entry/exit hooks must run in order inside the current-vCPU publication scope"
+    );
+    assert!(
+        !runtime.contains("CurrentArch::before_vcpu_run"),
+        "the guest-entry hook must not run before the current vCPU is published"
+    );
+    assert!(
+        architecture.contains("fn after_vcpu_run(")
+            && architecture.contains("gic::mask_guest_virtual_timer_irq"),
+        "AArch64 must mask the physical CNTV PPI before leaving the current-vCPU scope"
+    );
+}
+
+#[test]
 fn production_sources_keep_architecture_cfg_inside_arch_module() {
     let source_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let violations = find_target_arch_cfg_outside_arch(&source_root, &source_root);

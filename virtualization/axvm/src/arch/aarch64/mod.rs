@@ -33,6 +33,7 @@ pub(crate) mod fdt;
 mod gic;
 mod images;
 mod ipi;
+mod irq;
 mod npt;
 #[path = "../../architecture/sysreg.rs"]
 mod sysreg;
@@ -45,6 +46,8 @@ use ipi::SendIpiExit;
 use sysreg::{SysRegReadExit, SysRegWriteExit};
 
 pub(crate) struct Aarch64Arch;
+
+const GUEST_VIRTUAL_TIMER_IRQ: usize = 27;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Aarch64DeferredRunWork {
@@ -69,6 +72,61 @@ impl ArchOps for Aarch64Arch {
             addr.as_usize(),
             size,
         );
+    }
+
+    fn register_platform_irq_injector() {
+        gic::register_guest_virtual_timer_irq_on_current_cpu();
+    }
+
+    fn before_first_run(vm: &crate::AxVMRef, vcpu: &crate::vm::AxVCpuRef<Self::VCpu>) {
+        vcpu.with_current_cpu_set(|| {
+            gic::register_guest_virtual_timer_irq_on_current_cpu();
+            gic::reset_virtual_interface();
+        });
+        if vcpu.id() == 0 {
+            let routes = vm.with_config(|config| config.pass_through_irqs().to_vec());
+            let target_cpu_id = ax_std::os::arceos::modules::ax_hal::percpu::this_cpu_id();
+            if let Err(error) =
+                irq::prepare_passthrough_irq_routes(vm.id(), vcpu.id(), target_cpu_id, &routes)
+            {
+                warn!(
+                    "failed to prepare AArch64 physical IRQ routes for VM[{}]: {error:?}",
+                    vm.id()
+                );
+            }
+        }
+        irq::enable_passthrough_irq_routes(vm.id(), vcpu.id());
+    }
+
+    fn before_vcpu_run(vm: &crate::AxVMRef, vcpu: &crate::vm::AxVCpuRef<Self::VCpu>) {
+        gic::register_guest_virtual_timer_irq_on_current_cpu();
+        gic::rearm_guest_virtual_timer_irq_if_inactive();
+        irq::drain_passthrough_irqs(vm, vcpu);
+    }
+
+    fn after_vcpu_run(_vm: &crate::AxVMRef, _vcpu: &crate::vm::AxVCpuRef<Self::VCpu>) {
+        gic::mask_guest_virtual_timer_irq();
+    }
+
+    fn after_external_interrupt(
+        _vm: &crate::AxVMRef,
+        vcpu: &crate::vm::AxVCpuRef<Self::VCpu>,
+        vector: usize,
+    ) {
+        if vector == GUEST_VIRTUAL_TIMER_IRQ
+            && let Err(err) = vcpu.with_current_cpu_set(|| vcpu.inject_interrupt(vector))
+        {
+            warn!(
+                "VM[{}] VCpu[{}] failed to inject virtual timer IRQ {vector}: {err:?}",
+                vcpu.vm_id(),
+                vcpu.id()
+            );
+        }
+        crate::check_timer_events();
+    }
+
+    fn on_last_vcpu_exit(vm_id: usize) {
+        irq::release_passthrough_irq_routes(vm_id);
     }
 
     fn handle_vcpu_exit_bound(
@@ -128,6 +186,10 @@ impl ArchOps for Aarch64Arch {
                     },
                 ))
             }
+            // Keep the vCPU bound and re-enter immediately. An interrupt may
+            // already be pending in a virtual GIC list register, so putting the
+            // task to sleep here could lose the wakeup that completed WFI.
+            ArmVmExit::WaitForInterrupt => Ok(BoundVcpuExit::Continue),
             ArmVmExit::CpuDown { state } => {
                 warn!(
                     "VM[{}] run VCpu[{}] CpuDown state {state:#x}",
@@ -210,7 +272,7 @@ impl ArmHostOps for AxvmArmHostOps {
     }
 
     fn fetch_pending_host_irq() -> Option<usize> {
-        Some(gic::fetch_irq())
+        gic::fetch_irq()
     }
 
     fn handle_current_host_irq() {

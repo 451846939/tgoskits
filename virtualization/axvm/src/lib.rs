@@ -31,6 +31,7 @@ mod host;
 pub mod irq;
 pub mod layout;
 pub mod lifecycle;
+pub mod machine;
 mod manager;
 mod npt;
 mod percpu;
@@ -46,6 +47,7 @@ pub mod config;
 
 pub use arch::platform::*;
 pub use ax_cpumask::CpuMask;
+pub use axdevice::SerialBackend;
 /// Compatibility export for legacy/common normalized VM events.
 ///
 /// Architecture-local raw exits are handled by `arch::CurrentArch` through

@@ -254,8 +254,10 @@ impl<H: ArmHostOps> ArmVcpu<H> {
             self.guest_system_regs.vtcr_el2 = vtcr_for_config(levels, gpa_bits, pa_bits);
         }
 
-        let mut hcr_el2 =
-            HCR_EL2::VM::Enable + HCR_EL2::TSC::EnableTrapEl1SmcToEl2 + HCR_EL2::RW::EL1IsAarch64;
+        let mut hcr_el2 = HCR_EL2::VM::Enable
+            + HCR_EL2::TSC::EnableTrapEl1SmcToEl2
+            + HCR_EL2::TWI::SET
+            + HCR_EL2::RW::EL1IsAarch64;
 
         if !config.passthrough_interrupt {
             // Set HCR_EL2.IMO will trap IRQs to EL2 while enabling virtual IRQs.

@@ -140,6 +140,16 @@ impl AxvmRuntime {
         crate::runtime::start();
     }
 
+    /// Start all initialized default VMs without waiting for completion.
+    pub fn launch_default_vms(&self) -> Vec<VMId> {
+        crate::runtime::launch_all()
+    }
+
+    /// Wait until all running VMs have stopped.
+    pub fn wait_for_all_vms() {
+        crate::runtime::wait_for_all();
+    }
+
     /// Run an operation with a VM selected from the runtime registry.
     pub fn with_vm<T>(vm_id: VMId, f: impl FnOnce(AxVMRef) -> T) -> Option<T> {
         crate::get_vm_by_id(vm_id).map(f)
@@ -163,6 +173,11 @@ impl AxvmRuntime {
     /// Reset a VM selected from the runtime registry.
     pub fn reset_vm(vm_id: VMId) -> AxVmResult {
         crate::runtime::reset_vm(vm_id)
+    }
+
+    /// Wake the primary vCPU of a VM.
+    pub fn notify_vm(vm_id: VMId) -> AxVmResult {
+        crate::runtime::notify_vm(vm_id)
     }
 
     /// Remove a VM selected from the runtime registry.

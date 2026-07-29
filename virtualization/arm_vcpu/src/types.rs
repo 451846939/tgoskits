@@ -242,6 +242,8 @@ pub enum ArmVmExit {
         /// Host or placeholder vector reported by the host adapter.
         vector: u64,
     },
+    /// A guest WFI or WFE instruction was trapped.
+    WaitForInterrupt,
     /// A guest PSCI CPU_OFF call was trapped.
     CpuDown {
         /// Guest-provided target state.

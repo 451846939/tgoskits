@@ -175,10 +175,28 @@ fn test_claim_and_complete_move_irq_between_pending_and_active() {
     assert!(!vplic.is_pending(irq_id).unwrap());
     assert!(vplic.active_irqs.lock().get(irq_id));
 
+    // The UART still holds its level line high while the first delivery is
+    // active, so polling the virtual device latches the same source again.
+    vplic.set_pending(irq_id).unwrap();
     vplic
         .handle_write(claim_addr, AccessWidth::Dword, irq_id)
         .unwrap();
     assert!(!vplic.active_irqs.lock().get(irq_id));
+    assert!(vplic.is_pending(irq_id).unwrap());
+    assert_eq!(
+        vplic.handle_read(claim_addr, AccessWidth::Dword).unwrap(),
+        irq_id
+    );
+    assert!(vplic.active_irqs.lock().get(irq_id));
+
+    vplic.clear_pending(irq_id).unwrap();
+    vplic
+        .handle_write(claim_addr, AccessWidth::Dword, irq_id)
+        .unwrap();
+    assert_eq!(
+        vplic.handle_read(claim_addr, AccessWidth::Dword).unwrap(),
+        0
+    );
 }
 
 #[test]

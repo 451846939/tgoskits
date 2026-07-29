@@ -37,6 +37,8 @@ pub(crate) trait ArchOps {
 
     fn before_vcpu_run(_vm: &crate::AxVMRef, _vcpu: &crate::vm::AxVCpuRef<Self::VCpu>) {}
 
+    fn after_vcpu_run(_vm: &crate::AxVMRef, _vcpu: &crate::vm::AxVCpuRef<Self::VCpu>) {}
+
     fn inject_pending_interrupt(
         _vm: &crate::AxVMRef,
         vcpu: &crate::vm::AxVCpuRef<Self::VCpu>,
@@ -136,7 +138,10 @@ pub(crate) trait ArchOps {
 
                 drain_and_inject_dispatched_interrupts::<Self>(vm, vcpu_id, vcpu);
 
-                let exit = vcpu.run()?;
+                Self::before_vcpu_run(vm, vcpu);
+                let exit = vcpu.run();
+                Self::after_vcpu_run(vm, vcpu);
+                let exit = exit?;
                 trace!("{exit:#x?}");
                 match Self::handle_vcpu_exit_bound(vm, vcpu, exit)? {
                     BoundVcpuExit::Continue => continue,

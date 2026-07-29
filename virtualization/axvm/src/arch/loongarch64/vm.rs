@@ -44,7 +44,7 @@ impl LoongArch64Arch {
         match request {
             VmInitRequest::Default => {
                 let factories = default_device_factories()?;
-                let interrupt_fabric = crate::InterruptFabric::new(vm.interrupt_mode());
+                let interrupt_fabric = super::irq::interrupt_fabric(vm.id(), vm.interrupt_mode())?;
                 init_vm_with(vm, &factories, interrupt_fabric)
             }
             VmInitRequest::Provided {

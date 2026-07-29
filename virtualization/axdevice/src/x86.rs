@@ -5,8 +5,8 @@ use core::{any::Any, marker::PhantomData};
 
 use axdevice_base::{AccessWidth, BusAccess, BusKind, BusResponse, Device, DeviceError, Resource};
 use x86_vlapic::{
-    EmulatedIoApic, EmulatedPit, EmulatedSerialPort, IoApicEoi, IoApicInterrupt, X86AccessWidth,
-    X86GuestPhysAddr, X86GuestPhysAddrRange, X86Port, X86PortRange, X86VlapicHostOps,
+    EmulatedIoApic, EmulatedPit, IoApicEoi, IoApicInterrupt, X86AccessWidth, X86GuestPhysAddr,
+    X86GuestPhysAddrRange, X86Port, X86PortRange, X86VlapicHostOps,
 };
 
 /// Type-specific IOAPIC capability used by the x86 interrupt runtime.
@@ -17,6 +17,9 @@ pub trait X86IoApicDeviceOps: Send + Sync {
     /// Assert an IOAPIC GSI and return an interrupt to inject if one is unmasked.
     fn assert_gsi(&self, gsi: usize) -> Option<IoApicInterrupt>;
 
+    /// Set an IOAPIC input level and return a newly routable interrupt.
+    fn set_gsi_level(&self, gsi: usize, asserted: bool) -> Option<IoApicInterrupt>;
+
     /// Broadcast a local APIC EOI to the IOAPIC.
     fn end_of_interrupt(&self, vector: u8) -> Option<IoApicEoi>;
 }
@@ -25,12 +28,6 @@ pub trait X86IoApicDeviceOps: Send + Sync {
 pub trait X86PitDeviceOps: Send + Sync {
     /// Consume a pending PIT IRQ0 tick if the deadline is due.
     fn consume_irq0_if_due(&self, now_ns: u64) -> bool;
-}
-
-/// Type-specific COM1 capability used by the x86 interrupt runtime.
-pub trait X86SerialDeviceOps: Send + Sync {
-    /// Poll host input and return whether COM1 should assert an IRQ.
-    fn poll_irq(&self) -> bool;
 }
 
 /// Unified-device adapter for [`EmulatedIoApic`].
@@ -65,6 +62,10 @@ impl X86IoApicDeviceOps for X86IoApicDevice {
 
     fn assert_gsi(&self, gsi: usize) -> Option<IoApicInterrupt> {
         self.inner.assert_gsi(gsi)
+    }
+
+    fn set_gsi_level(&self, gsi: usize, asserted: bool) -> Option<IoApicInterrupt> {
+        self.inner.set_gsi_level(gsi, asserted)
     }
 
     fn end_of_interrupt(&self, vector: u8) -> Option<IoApicEoi> {
@@ -147,83 +148,6 @@ impl<H: X86VlapicHostOps> X86PitDeviceOps for X86PitDevice<H> {
 }
 
 impl<H: X86VlapicHostOps + 'static> Device for X86PitDevice<H> {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn resources(&self) -> &[Resource] {
-        &self.resources
-    }
-
-    fn handle(&self, access: &BusAccess) -> Result<BusResponse, DeviceError> {
-        if access.kind != BusKind::Port {
-            return Err(DeviceError::OutOfRange { addr: access.addr });
-        }
-        let port = X86Port::new(
-            u16::try_from(access.addr)
-                .map_err(|_| DeviceError::OutOfRange { addr: access.addr })?,
-        );
-        let width = x86_access_width(access.width);
-        if access.is_read {
-            self.inner
-                .handle_read(port, width)
-                .map(|value| BusResponse::Read {
-                    value: value as u64,
-                })
-                .map_err(|_| DeviceError::Internal)
-        } else {
-            self.inner
-                .handle_write(port, width, access.data as usize)
-                .map(|_| BusResponse::Write)
-                .map_err(|_| DeviceError::Internal)
-        }
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
-/// Unified-device adapter for [`EmulatedSerialPort`].
-pub struct X86SerialPortDevice<H: X86VlapicHostOps> {
-    inner: EmulatedSerialPort<H>,
-    name: String,
-    resources: Box<[Resource]>,
-    _host: PhantomData<fn() -> H>,
-}
-
-impl<H: X86VlapicHostOps> X86SerialPortDevice<H> {
-    /// Creates a COM1 adapter.
-    pub fn new() -> Self {
-        let inner = EmulatedSerialPort::<H>::new();
-        let resources = port_resources(inner.address_range());
-        Self {
-            inner,
-            name: String::from("x86-serial-com1"),
-            resources,
-            _host: PhantomData,
-        }
-    }
-
-    /// Returns the wrapped OS-neutral COM1 core.
-    pub const fn inner(&self) -> &EmulatedSerialPort<H> {
-        &self.inner
-    }
-}
-
-impl<H: X86VlapicHostOps> Default for X86SerialPortDevice<H> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<H: X86VlapicHostOps> X86SerialDeviceOps for X86SerialPortDevice<H> {
-    fn poll_irq(&self) -> bool {
-        self.inner.poll_irq()
-    }
-}
-
-impl<H: X86VlapicHostOps + 'static> Device for X86SerialPortDevice<H> {
     fn name(&self) -> &str {
         &self.name
     }

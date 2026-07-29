@@ -15,7 +15,7 @@
 use axdevice_base::{AccessWidth, BaseDeviceOps, DeviceAddrRange, DeviceResult, EmuDeviceType};
 use axvm_types::GuestPhysAddrRange;
 
-use crate::vgic::Vgic;
+use crate::{VgicError, vgic::Vgic};
 
 impl BaseDeviceOps<GuestPhysAddrRange> for Vgic {
     /// Gets the emulator type of the current device.
@@ -57,27 +57,18 @@ impl BaseDeviceOps<GuestPhysAddrRange> for Vgic {
         addr: <GuestPhysAddrRange as DeviceAddrRange>::Addr,
         width: AccessWidth,
     ) -> DeviceResult<usize> {
-        // Perform bitwise operation to ensure the address is aligned to byte boundaries
-        let addr = addr.as_usize() & 0xfff;
+        let range = self.address_range();
+        if !range.contains(addr) {
+            return Err(VgicError::InvalidAccess {
+                operation: "read",
+                offset: addr.as_usize(),
+                width,
+            }
+            .into());
+        }
+        let addr = addr.as_usize() - range.start.as_usize();
 
-        // Match different read operations based on the width parameter
-        let value = match width {
-            AccessWidth::Byte => {
-                // Handle 1-byte read
-                self.handle_read8(addr)?
-            }
-            AccessWidth::Word => {
-                // Handle 2-byte read
-                self.handle_read16(addr)?
-            }
-            AccessWidth::Dword => {
-                // Handle 4-byte read
-                self.handle_read32(addr)?
-            }
-            // Return success for unsupported widths without performing any operation
-            _ => 0,
-        };
-        Ok(value)
+        Ok(Vgic::handle_read(self, addr, width)?)
     }
     /// Handles write operations of different widths.
     ///
@@ -95,28 +86,118 @@ impl BaseDeviceOps<GuestPhysAddrRange> for Vgic {
         width: AccessWidth,
         val: usize,
     ) -> DeviceResult {
-        // Convert the physical address to a `usize` and apply a mask to ensure proper alignment
-        let addr = addr.as_usize() & 0xfff;
-
-        // Depending on the width parameter, perform the corresponding write operation
-        match width {
-            AccessWidth::Byte => {
-                // Handle 8-bit write operation
-                self.handle_write8(addr, val);
-                Ok(())
+        let range = self.address_range();
+        if !range.contains(addr) {
+            return Err(VgicError::InvalidAccess {
+                operation: "write",
+                offset: addr.as_usize(),
+                width,
             }
-            AccessWidth::Word => {
-                // Handle 16-bit write operation
-                self.handle_write16(addr, val);
-                Ok(())
-            }
-            AccessWidth::Dword => {
-                // Handle 32-bit write operation
-                self.handle_write32(addr, val);
-                Ok(())
-            }
-            // For other width values, do nothing
-            _ => Ok(()),
+            .into());
         }
+        let addr = addr.as_usize() - range.start.as_usize();
+
+        Vgic::handle_write(self, addr, width, val)?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axdevice_base::{AccessWidth, BaseDeviceOps};
+    use axvm_types::{GuestPhysAddr, GuestPhysAddrRange};
+
+    use crate::Vgic;
+
+    const GICD_BASE: usize = 0x0800_0000;
+
+    fn read(vgic: &Vgic, offset: usize, width: AccessWidth) -> usize {
+        <Vgic as BaseDeviceOps<GuestPhysAddrRange>>::handle_read(
+            vgic,
+            GuestPhysAddr::from(GICD_BASE + offset),
+            width,
+        )
+        .unwrap()
+    }
+
+    fn write(vgic: &Vgic, offset: usize, width: AccessWidth, value: usize) {
+        <Vgic as BaseDeviceOps<GuestPhysAddrRange>>::handle_write(
+            vgic,
+            GuestPhysAddr::from(GICD_BASE + offset),
+            width,
+            value,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn full_distributor_window_reaches_gicv3_identity_registers() {
+        let vgic = Vgic::new();
+        let value = read(&vgic, 0xffe8, AccessWidth::Dword);
+
+        assert_eq!(value & 0xf0, 0x30);
+    }
+
+    #[test]
+    fn spi_distributor_registers_keep_guest_owned_state() {
+        let vgic = Vgic::new();
+        let spi_33_bit = 1 << 1;
+
+        write(&vgic, 0x0084, AccessWidth::Dword, spi_33_bit);
+        assert_eq!(read(&vgic, 0x0084, AccessWidth::Dword), spi_33_bit);
+
+        write(&vgic, 0x0104, AccessWidth::Dword, spi_33_bit);
+        assert_eq!(read(&vgic, 0x0104, AccessWidth::Dword), spi_33_bit);
+        assert_eq!(read(&vgic, 0x0184, AccessWidth::Dword), spi_33_bit);
+        write(&vgic, 0x0184, AccessWidth::Dword, spi_33_bit);
+        assert_eq!(read(&vgic, 0x0104, AccessWidth::Dword), 0);
+
+        write(&vgic, 0x0204, AccessWidth::Dword, spi_33_bit);
+        assert_eq!(read(&vgic, 0x0284, AccessWidth::Dword), spi_33_bit);
+        write(&vgic, 0x0284, AccessWidth::Dword, spi_33_bit);
+        assert_eq!(read(&vgic, 0x0204, AccessWidth::Dword), 0);
+
+        write(&vgic, 0x0304, AccessWidth::Dword, spi_33_bit);
+        assert_eq!(read(&vgic, 0x0384, AccessWidth::Dword), spi_33_bit);
+        write(&vgic, 0x0384, AccessWidth::Dword, spi_33_bit);
+        assert_eq!(read(&vgic, 0x0304, AccessWidth::Dword), 0);
+
+        write(&vgic, 0x0421, AccessWidth::Byte, 0xa0);
+        assert_eq!(read(&vgic, 0x0421, AccessWidth::Byte), 0xa0);
+
+        write(&vgic, 0x0c08, AccessWidth::Dword, 0b10 << 2);
+        assert_eq!(read(&vgic, 0x0c08, AccessWidth::Dword), 0b10 << 2);
+    }
+
+    #[test]
+    fn irouter_supports_full_width_guest_affinity_routes() {
+        let vgic = Vgic::new();
+        let spi_33_irouter = 0x6000 + 33 * 8;
+        let route = 0x0000_0001_0000_0002usize;
+
+        write(&vgic, spi_33_irouter, AccessWidth::Qword, route);
+
+        assert_eq!(read(&vgic, spi_33_irouter, AccessWidth::Qword), route);
+    }
+
+    #[test]
+    fn private_interrupt_distributor_registers_are_raz_wi() {
+        let vgic = Vgic::new();
+
+        write(&vgic, 0x0080, AccessWidth::Dword, u32::MAX as usize);
+        write(&vgic, 0x0100, AccessWidth::Dword, u32::MAX as usize);
+        write(&vgic, 0x0200, AccessWidth::Dword, u32::MAX as usize);
+        write(&vgic, 0x0300, AccessWidth::Dword, u32::MAX as usize);
+        write(&vgic, 0x0400, AccessWidth::Dword, u32::MAX as usize);
+        write(&vgic, 0x0c00, AccessWidth::Dword, u32::MAX as usize);
+        write(&vgic, 0x6000, AccessWidth::Qword, usize::MAX);
+
+        assert_eq!(read(&vgic, 0x0080, AccessWidth::Dword), 0);
+        assert_eq!(read(&vgic, 0x0100, AccessWidth::Dword), 0);
+        assert_eq!(read(&vgic, 0x0200, AccessWidth::Dword), 0);
+        assert_eq!(read(&vgic, 0x0300, AccessWidth::Dword), 0);
+        assert_eq!(read(&vgic, 0x0400, AccessWidth::Dword), 0);
+        assert_eq!(read(&vgic, 0x0c00, AccessWidth::Dword), 0);
+        assert_eq!(read(&vgic, 0x6000, AccessWidth::Qword), 0);
     }
 }

@@ -1048,12 +1048,18 @@ fn build_coma_aml(serial: &FwCfgSerialConfig) -> Vec<u8> {
     body.extend(aml_name_decl("_UID", aml_int(0)));
     body.extend(aml_name_decl("_CCA", aml_int(1)));
     body.extend(aml_name_decl("_CRS", serial_crs_aml(serial)));
-    body.extend_from_slice(&[
-        0x08, 0x5f, 0x44, 0x53, 0x44, 0x12, 0x32, 0x02, 0x11, 0x13, 0x0a, 0x10, 0x14, 0xd8, 0xff,
-        0xda, 0xba, 0x6e, 0x8c, 0x4d, 0x8a, 0x91, 0xbc, 0x9b, 0xbf, 0x4a, 0xa3, 0x01, 0x12, 0x1b,
-        0x01, 0x12, 0x18, 0x02, 0x0d, 0x63, 0x6c, 0x6f, 0x63, 0x6b, 0x2d, 0x66, 0x72, 0x65, 0x71,
-        0x75, 0x65, 0x6e, 0x63, 0x79, 0x00, 0x0c, 0x00, 0xe1, 0xf5, 0x05,
+    let device_properties_uuid = aml_buffer(&[
+        0x14, 0xd8, 0xff, 0xda, 0xba, 0x6e, 0x8c, 0x4d, 0x8a, 0x91, 0xbc, 0x9b, 0xbf, 0x4a, 0xa3,
+        0x01,
     ]);
+    let serial_properties = aml_package(&[aml_package(&[
+        aml_string("clock-frequency"),
+        aml_int(serial.clock_hz as u64),
+    ])]);
+    body.extend(aml_name_decl(
+        "_DSD",
+        aml_package(&[device_properties_uuid, serial_properties]),
+    ));
     body
 }
 
@@ -1489,5 +1495,67 @@ mod tests {
     #[test]
     fn dma_rejects_buffer_address_overflow() {
         assert!(validate_dma_buffer(GuestPhysAddr::from_usize(usize::MAX), 2).is_err());
+    }
+
+    #[test]
+    fn loongarch_spcr_uses_machine_serial_resources() {
+        let serial = FwCfgSerialConfig {
+            base: 0x1fe0_01e0,
+            size: 0x100,
+            irq: 66,
+            clock_hz: 100_000_000,
+            baud: 115_200,
+        };
+        let mut table = Vec::new();
+        build_spcr(&mut table, &serial);
+
+        assert_eq!(&table[..4], b"SPCR");
+        assert_eq!(
+            u64::from_le_bytes(table[44..52].try_into().unwrap()),
+            serial.base
+        );
+        assert_eq!(
+            u32::from_le_bytes(table[54..58].try_into().unwrap()),
+            u32::from(serial.irq)
+        );
+        assert_eq!(
+            u32::from_le_bytes(table[80..84].try_into().unwrap()),
+            serial.clock_hz
+        );
+        assert_eq!(
+            u32::from_le_bytes(table[84..88].try_into().unwrap()),
+            serial.baud
+        );
+    }
+
+    #[test]
+    fn loongarch_dsdt_uses_machine_serial_resources() {
+        let mut platform = FwCfgPlatformConfig::default();
+        platform.serial = FwCfgSerialConfig {
+            base: 0x1234_5678_9abc_def0,
+            size: 0x234,
+            irq: 77,
+            clock_hz: 48_000_000,
+            baud: 230_400,
+        };
+        let aml = build_loongarch_dsdt_aml(&platform);
+
+        assert!(aml.windows(4).any(|window| window == b"COMA"));
+        assert!(
+            aml.windows(8)
+                .any(|window| window == platform.serial.base.to_le_bytes())
+        );
+        assert!(
+            aml.windows(8)
+                .any(|window| window == platform.serial.size.to_le_bytes())
+        );
+        assert!(
+            aml.windows(4)
+                .any(|window| window == u32::from(platform.serial.irq).to_le_bytes())
+        );
+        assert!(
+            aml.windows(4)
+                .any(|window| window == platform.serial.clock_hz.to_le_bytes())
+        );
     }
 }

@@ -95,7 +95,7 @@ pub(crate) fn init_guest_boot_resources() {
 
 pub(crate) fn prepare_guest_boot(
     vm_config: &mut crate::config::AxVMConfig,
-    vm_create_config: &mut axvmconfig::AxVMCrateConfig,
+    vm_create_config: &mut axvmconfig::GuestConfig,
     provider: &dyn crate::boot::BootImageProvider,
 ) -> AxVmResult<Option<crate::boot::fdt::GuestDtbImage>> {
     CurrentArch::prepare_guest_boot(vm_config, vm_create_config, provider)
@@ -116,14 +116,14 @@ pub(crate) fn load_images_from_filesystem(
 }
 
 pub(crate) fn is_x86_linux_image_config(
-    config: &axvmconfig::AxVMCrateConfig,
+    config: &axvmconfig::GuestConfig,
     provider: &dyn crate::boot::BootImageProvider,
 ) -> bool {
     CurrentArch::is_x86_linux_image_config(config, provider)
 }
 
 pub(crate) fn default_boot_firmware_load_gpa(
-    config: &axvmconfig::AxVMCrateConfig,
+    config: &axvmconfig::GuestConfig,
 ) -> Option<axvm_types::GuestPhysAddr> {
     CurrentArch::default_boot_firmware_load_gpa(config)
 }

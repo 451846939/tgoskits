@@ -14,12 +14,14 @@
 
 //! Runtime configuration structures for an AxVM instance.
 
-use alloc::{string::String, vec::Vec};
+use alloc::{string::String, sync::Arc, vec::Vec};
 
+use axdevice::{NullSerialBackend, SerialBackend};
+use axvm_types::InterruptTriggerMode;
 pub use axvm_types::{
     AddressSpacePolicy, EmulatedDeviceConfig, GuestPhysAddr, PassThroughAddressConfig,
     PassThroughDeviceConfig, PassThroughPortConfig, ReservedAddressConfig, VMBootProtocol,
-    VMInterruptMode, VMType, VmMemConfig, VmMemMappingType,
+    VMInterruptMode, VmMemConfig, VmMemMappingType,
 };
 
 use crate::arch::{ArchOps, CurrentArch};
@@ -68,13 +70,20 @@ pub struct VMImageConfig {
     pub ramdisk: Option<RamdiskInfo>,
 }
 
+/// Physical interrupt source forwarded through a guest's virtual controller.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PassthroughInterrupt {
+    /// Architecture-local physical interrupt source number.
+    pub source: u32,
+    /// Trigger mode declared by firmware for the physical device.
+    pub trigger: InterruptTriggerMode,
+}
+
 /// Runtime configuration for one VM.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct AxVMConfig {
     id: usize,
     name: String,
-    #[allow(dead_code)]
-    vm_type: VMType,
     pub(crate) phys_cpu_ls: PhysCpuList,
     /// vCPU configuration.
     pub cpu_config: AxVCpuConfig,
@@ -90,8 +99,9 @@ pub struct AxVMConfig {
     memory_regions: Vec<VmMemConfig>,
     boot_policy: GuestBootPolicy,
     // Physical interrupt sources forwarded to the guest in passthrough mode.
-    passthrough_irq_list: Vec<u32>,
+    passthrough_irq_list: Vec<PassthroughInterrupt>,
     interrupt_mode: VMInterruptMode,
+    serial_backend: Arc<dyn SerialBackend>,
 }
 
 /// Parameters used to build an [`AxVMConfig`].
@@ -99,7 +109,6 @@ pub struct AxVMConfig {
 pub struct AxVMConfigParams {
     pub id: usize,
     pub name: String,
-    pub vm_type: VMType,
     pub phys_cpu_ls: PhysCpuList,
     pub cpu_config: AxVCpuConfig,
     pub image_config: VMImageConfig,
@@ -113,6 +122,8 @@ pub struct AxVMConfigParams {
     pub memory_regions: Vec<VmMemConfig>,
     pub boot_policy: GuestBootPolicy,
     pub interrupt_mode: VMInterruptMode,
+    /// App-owned byte stream used by the mandatory virtual serial device.
+    pub serial_backend: Option<Arc<dyn SerialBackend>>,
 }
 
 impl AxVMConfig {
@@ -120,7 +131,6 @@ impl AxVMConfig {
         Self {
             id: params.id,
             name: params.name,
-            vm_type: params.vm_type,
             phys_cpu_ls: params.phys_cpu_ls,
             cpu_config: params.cpu_config,
             image_config: params.image_config,
@@ -135,6 +145,9 @@ impl AxVMConfig {
             boot_policy: params.boot_policy,
             passthrough_irq_list: Vec::new(),
             interrupt_mode: params.interrupt_mode,
+            serial_backend: params
+                .serial_backend
+                .unwrap_or_else(|| Arc::new(NullSerialBackend)),
         }
     }
 
@@ -198,6 +211,18 @@ impl AxVMConfig {
     /// Returns the list of excluded devices.
     pub fn excluded_devices(&self) -> &Vec<Vec<String>> {
         &self.excluded_devices
+    }
+
+    /// Adds one physical-device path to the passthrough exclusion set.
+    pub fn exclude_device_path(&mut self, path: String) {
+        if !self
+            .excluded_devices
+            .iter()
+            .flatten()
+            .any(|excluded| excluded == &path)
+        {
+            self.excluded_devices.push(alloc::vec![path]);
+        }
     }
 
     /// Returns the list of passthrough address configurations.
@@ -270,31 +295,33 @@ impl AxVMConfig {
         self.pass_through_devices.clear();
     }
 
-    /// Adds a passthrough SPI to the VM configuration.
-    pub fn add_pass_through_spi(&mut self, spi: u32) {
-        self.add_pass_through_irq(spi);
-    }
-
     /// Adds a physical interrupt source forwarded to the guest.
-    pub fn add_pass_through_irq(&mut self, irq: u32) {
-        if !self.passthrough_irq_list.contains(&irq) {
-            self.passthrough_irq_list.push(irq);
+    pub fn add_pass_through_irq(&mut self, source: u32, trigger: InterruptTriggerMode) {
+        let route = PassthroughInterrupt { source, trigger };
+        if let Some(existing) = self
+            .passthrough_irq_list
+            .iter_mut()
+            .find(|existing| existing.source == source)
+        {
+            *existing = route;
+        } else {
+            self.passthrough_irq_list.push(route);
         }
     }
 
-    /// Returns the list of passthrough SPIs.
-    pub fn pass_through_spis(&self) -> &Vec<u32> {
-        &self.passthrough_irq_list
-    }
-
     /// Returns the physical interrupt sources forwarded to the guest.
-    pub fn pass_through_irqs(&self) -> &Vec<u32> {
+    pub fn pass_through_irqs(&self) -> &[PassthroughInterrupt] {
         &self.passthrough_irq_list
     }
 
     /// Returns the interrupt mode of the VM.
     pub fn interrupt_mode(&self) -> VMInterruptMode {
         self.interrupt_mode
+    }
+
+    /// Returns the byte stream attached to the mandatory virtual serial port.
+    pub fn serial_backend(&self) -> Arc<dyn SerialBackend> {
+        self.serial_backend.clone()
     }
 
     /// Relocate the guest kernel image while preserving the configured
@@ -319,6 +346,12 @@ impl AxVMConfig {
         self.image_config.kernel_load_gpa = kernel_load_gpa;
         self.cpu_config.bsp_entry = GuestPhysAddr::from(new_load + bsp_offset);
         self.cpu_config.ap_entry = GuestPhysAddr::from(new_load + ap_offset);
+    }
+}
+
+impl Default for AxVMConfig {
+    fn default() -> Self {
+        Self::new(AxVMConfigParams::default())
     }
 }
 

@@ -608,6 +608,8 @@ fn owned_overlap_allowed(existing: &PlannedRegion, new: &PlannedRegion) -> bool 
         (existing.kind, new.kind),
         (VmRegionKind::Memory, VmRegionKind::BootDescription)
             | (VmRegionKind::BootDescription, VmRegionKind::Memory)
+            | (VmRegionKind::Reserved, VmRegionKind::EmulatedDevice)
+            | (VmRegionKind::EmulatedDevice, VmRegionKind::Reserved)
     ) && (existing.contains(new) || new.contains(existing))
 }
 
@@ -745,6 +747,38 @@ mod tests {
         let owned_regions = layout.owned_regions().collect::<Vec<_>>();
         assert_eq!(owned_regions.len(), 1);
         assert_eq!(owned_regions[0].kind, VmRegionKind::Reserved);
+    }
+
+    #[test]
+    fn reserved_host_device_range_can_contain_an_emulated_device() {
+        let owned = [GuestOwnedRegion::new(
+            0x8000,
+            0x1000,
+            VmRegionKind::Reserved,
+        )];
+        let emulated = [Resource::MmioRange {
+            base: 0x8080,
+            size: 0x100,
+        }];
+
+        let layout = build_address_layout(
+            AddressSpacePolicy::Passthrough,
+            GUEST_BASE,
+            GUEST_SIZE,
+            &[],
+            &[],
+            &owned,
+            &emulated,
+        )
+        .unwrap();
+
+        assert!(layout.mappings().iter().all(|mapping| {
+            !ranges_overlap(mapping.gpa.as_usize(), mapping.size, 0x8000, 0x1000)
+        }));
+        let owned_regions = layout.owned_regions().collect::<Vec<_>>();
+        assert_eq!(owned_regions.len(), 2);
+        assert_eq!(owned_regions[0].kind, VmRegionKind::Reserved);
+        assert_eq!(owned_regions[1].kind, VmRegionKind::EmulatedDevice);
     }
 
     #[test]
