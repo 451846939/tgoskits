@@ -31,6 +31,6 @@ aarch64_sysreg = { workspace = true }
 bitmaps = {version = "3.2", default-features = false}
 log = "0.4"
 ax-memory-addr = { workspace = true }
-spin = { workspace = true, features = ["mutex", "spin_mutex"] }
+spin = { workspace = true }
 tock-registers = "0.10"
 thiserror = { workspace = true }

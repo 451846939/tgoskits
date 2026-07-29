@@ -14,9 +14,9 @@
 
 #[cfg(not(test))]
 use ax_kspin::SpinNoIrq as Mutex;
-use axdevice_base::AccessWidth;
 #[cfg(test)]
-use spin::Mutex;
+use ax_kspin::SpinRaw as Mutex;
+use axdevice_base::AccessWidth;
 
 use crate::{VgicError, VgicResult, interrupt::VgicInt, registers::GICD_SIZE, vgicd::Vgicd};
 
