@@ -22,6 +22,7 @@ mod scheduler_identity;
 mod scheduler_task;
 mod seccomp;
 mod signal;
+mod signal_publication;
 mod stat;
 mod thread;
 mod tid;
