@@ -4,11 +4,19 @@ use core::ffi::{c_char, c_void};
 use ax_errno::{AxError, AxResult, LinuxError};
 use ax_fs_ng::vfs::is_mount_busy as fs_is_mount_busy;
 use ax_task::current;
+use axfs_ng_vfs::NodePermission;
 
 use crate::{
     file::{Directory, FD_TABLE, File, FileLike},
     mm::vm_load_string,
-    pseudofs::{MemoryFs, overlay::OverlayOptions},
+    pseudofs::{
+        MemoryFs,
+        dev::{
+            new_devptsfs,
+            tty::{DevPtsMount, DevPtsOptions},
+        },
+        overlay::OverlayOptions,
+    },
     task::{AsThread, tasks},
 };
 
@@ -39,6 +47,47 @@ const MOUNT_OPTION_FLAGS: i32 =
 
 const PROPAGATION_FLAGS: i32 = MS_SHARED | MS_PRIVATE | MS_SLAVE | MS_UNBINDABLE;
 const VALID_UMOUNT_FLAGS: i32 = MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW;
+
+fn parse_devpts_mode(value: &str) -> AxResult<NodePermission> {
+    let mode = u16::from_str_radix(value, 8).map_err(|_| AxError::InvalidInput)?;
+    NodePermission::from_bits(mode).ok_or(AxError::InvalidInput)
+}
+
+enum DevPtsInstanceKind {
+    Legacy,
+    New,
+}
+
+fn parse_devpts_options(data: *const c_void) -> AxResult<DevPtsMount> {
+    let mut options = DevPtsOptions::mounted();
+    let mut instance = DevPtsInstanceKind::Legacy;
+    if data.is_null() {
+        return Ok(DevPtsMount::Legacy(options));
+    }
+
+    for item in vm_load_string(data.cast())?.split(',') {
+        if item.is_empty() {
+            continue;
+        }
+        if item == "newinstance" {
+            instance = DevPtsInstanceKind::New;
+            continue;
+        }
+        let (key, value) = item.split_once('=').ok_or(AxError::InvalidInput)?;
+        match key {
+            "mode" => options.slave_mode = parse_devpts_mode(value)?,
+            "gid" => {
+                options.slave_gid = value.parse().map_err(|_| AxError::InvalidInput)?;
+            }
+            "ptmxmode" => options.ptmx_mode = parse_devpts_mode(value)?,
+            _ => return Err(AxError::InvalidInput),
+        }
+    }
+    Ok(match instance {
+        DevPtsInstanceKind::Legacy => DevPtsMount::Legacy(options),
+        DevPtsInstanceKind::New => DevPtsMount::NewInstance(options),
+    })
+}
 
 fn parse_overlay_options(
     data: *const c_void,
@@ -209,10 +258,19 @@ pub fn sys_mount(
     }
 
     match fs_type.as_str() {
-        "proc" | "sysfs" | "devtmpfs" | "devpts" | "tmpfs" => {
+        "proc" | "sysfs" | "devtmpfs" | "tmpfs" => {
             let fs = MemoryFs::new();
             let target = ax_fs_ng::vfs::current_fs_context().lock().resolve(target)?;
             let mp = target.mount_with_source(&fs, mount_source(&source))?;
+            if (flags & MS_RDONLY) != 0 {
+                mp.set_readonly(true);
+            }
+            mp.set_mount_flags((flags & MOUNT_OPTION_FLAGS) as u32);
+        }
+        "devpts" => {
+            let fs = new_devptsfs(parse_devpts_options(data)?);
+            let target = ax_fs_ng::vfs::current_fs_context().lock().resolve(target)?;
+            let mp = target.mount(&fs)?;
             if (flags & MS_RDONLY) != 0 {
                 mp.set_readonly(true);
             }

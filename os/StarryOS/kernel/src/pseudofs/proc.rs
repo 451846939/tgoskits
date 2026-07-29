@@ -637,7 +637,6 @@ fn usb_endpoint_type_label(ty: u8) -> &'static str {
         _ => "Unk.",
     }
 }
-
 pub fn new_procfs() -> Filesystem {
     SimpleFs::new_with("proc".into(), 0x9fa0, builder)
 }

@@ -606,12 +606,12 @@ pub(crate) fn clone_validation_rules_hold_for_test() -> bool {
     }
     .validate()
     .is_err();
-    let newcgroup_rejected = CloneArgs {
+    let newcgroup_allowed = CloneArgs {
         flags: CloneFlags::NEWCGROUP,
         ..Default::default()
     }
     .validate()
-    .is_err();
+    .is_ok();
     // Empty flags + no exit signal is the minimal valid configuration.
     let minimal_valid = CloneArgs {
         flags: CloneFlags::empty(),
@@ -637,7 +637,7 @@ pub(crate) fn clone_validation_rules_hold_for_test() -> bool {
         && thread_without_vm_sighand_rejected
         && vfork_with_thread_rejected
         && pidfd_with_detached_rejected
-        && newcgroup_rejected
+        && newcgroup_allowed
         && minimal_valid
         && thread_valid
 }
