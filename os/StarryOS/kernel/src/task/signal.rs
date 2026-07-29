@@ -532,7 +532,6 @@ pub fn send_signal_to_thread(tgid: Option<Pid>, tid: Pid, sig: Option<SignalInfo
         if thread.signal().send_signal(sig) {
             task.interrupt();
         }
-        thread.signal().wake_sigwait(signo);
         // Always wake signalfd waiters — even blocked signals should be
         // visible via signalfd in an epoll event loop.
         thread.wake_signalfd();
@@ -588,18 +587,6 @@ pub fn send_signal_to_process(pid: Pid, sig: Option<SignalInfo>) -> AxResult<()>
             // `block_on_user` can return its typed Interrupted outcome.
             if let Ok(task) = get_task(tid) {
                 task.interrupt();
-            }
-        } else {
-            // All threads have this signal blocked — the signal is now pending
-            // at the process level.  Only wake threads that are sleeping
-            // in rt_sigtimedwait/sigwaitinfo waiting for this specific signal:
-            // those are the only threads that can dequeue a blocked signal.
-            // Waking other threads (e.g. ones blocked in waitpid) would cause
-            // spurious EINTR.
-            for tid in proc_data.proc.threads() {
-                if let Ok(task) = get_task(tid) {
-                    task.as_thread().signal().wake_sigwait(signo);
-                }
             }
         }
         // Wake signalfd waiters on every thread: even blocked process-level
