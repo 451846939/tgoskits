@@ -1389,7 +1389,6 @@ dependencies = [
 name = "axdevice"
 version = "0.5.5"
 dependencies = [
- "arm_vgic",
  "ax-kspin",
  "ax-memory-addr",
  "axdevice_base",

@@ -24,8 +24,11 @@ use ax_cpumask::CpuMask;
 use ax_kspin::SpinNoIrq as Mutex;
 use ax_memory_addr::align_up_4k;
 use axaddrspace::{AddrSpace, NestedPageTableOps};
-use axdevice::{AxVmDevices, DeviceManagerError, FwCfg, FwCfgPlatformConfig};
-use axdevice_base::AccessWidth;
+use axdevice::{
+    DeviceRuntime, FwCfgPayloadConfig, FwCfgPlatformConfig, RuntimeAccessPorts, StopAccessPort,
+    TimerAccessPort, WakeAccessPort,
+};
+use axdevice_base::{AccessWidth, DeviceAccess, DeviceId, DeviceResult, DmaGrant};
 use axvm_types::{
     GuestPhysAddr, HostPhysAddr, HostVirtAddr, MappingFlags, NestedPagingConfig, VmVcpuState,
 };
@@ -58,6 +61,42 @@ type VCpu = AxVCpu<crate::arch::ArchVCpu>;
 pub(crate) type AxVCpuRef<A = crate::arch::ArchVCpu> = Arc<AxVCpu<A>>;
 /// A reference to a VM.
 pub type AxVMRef = Arc<AxVM>;
+
+struct VmDmaAccess<'a> {
+    vm: &'a AxVM,
+}
+
+impl DeviceAccess for VmDmaAccess<'_> {
+    fn device_id(&self) -> DeviceId {
+        DeviceId::new(0)
+    }
+    fn read_guest_memory(
+        &mut self,
+        _grant: &DmaGrant,
+        addr: GuestPhysAddr,
+        data: &mut [u8],
+    ) -> DeviceResult {
+        self.vm
+            .read_from_guest(addr, data)
+            .map_err(|error| axdevice_base::DeviceError::Backend {
+                operation: "read guest memory for DMA",
+                detail: alloc::format!("{error}"),
+            })
+    }
+    fn write_guest_memory(
+        &mut self,
+        _grant: &DmaGrant,
+        addr: GuestPhysAddr,
+        data: &[u8],
+    ) -> DeviceResult {
+        self.vm
+            .write_to_guest(addr, data)
+            .map_err(|error| axdevice_base::DeviceError::Backend {
+                operation: "write guest memory for DMA",
+                detail: alloc::format!("{error}"),
+            })
+    }
+}
 
 /// Architecture-independent vCPU runtime metadata.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -121,7 +160,7 @@ pub(crate) struct AxVMResources {
     config: AxVMConfig,
     phys_cpu_ls: PhysCpuList,
     vcpu_list: Option<Box<[AxVCpuRef]>>,
-    devices: Option<Arc<AxVmDevices>>,
+    devices: Option<Arc<DeviceRuntime>>,
     interrupt_fabric: Option<InterruptFabric>,
     address_layout: Option<VmAddressLayout>,
     boot_description: GuestBootDescription,
@@ -352,7 +391,7 @@ impl AxVMResources {
             .ok_or_else(|| ax_err_type!(BadState, "VM vCPU resources are not prepared"))
     }
 
-    fn devices(&self) -> AxVmResult<Arc<AxVmDevices>> {
+    fn devices(&self) -> AxVmResult<Arc<DeviceRuntime>> {
         self.devices
             .clone()
             .ok_or_else(|| ax_err_type!(BadState, "VM devices are not prepared"))
@@ -365,6 +404,11 @@ impl AxVMResources {
     }
 
     fn reset_transient_resources(&mut self) -> AxVmResult {
+        if let Some(devices) = self.devices.take() {
+            devices
+                .reset_lifecycle_devices()
+                .map_err(|error| AxVmError::device("reset device lifecycle", error))?;
+        }
         let memory_regions = self.memory_regions.clone();
         self.address_space.clear();
         for region in &memory_regions {
@@ -383,14 +427,14 @@ impl AxVMResources {
                 })?;
         }
         self.vcpu_list = None;
-        self.devices = None;
         self.interrupt_fabric = None;
         self.address_layout = None;
         Ok(())
     }
 }
 
-struct PendingFwCfg {
+#[allow(dead_code)]
+struct PendingFwCfgPayload {
     base: GuestPhysAddr,
     size: usize,
     kernel: &'static [u8],
@@ -408,6 +452,93 @@ pub struct FwCfgDeviceConfig {
     pub cmdline: Option<String>,
     pub cpu_num: u16,
     pub platform: FwCfgPlatformConfig,
+}
+
+#[derive(Clone)]
+struct AxVmDeviceAccessPorts {
+    vm_id: usize,
+}
+
+impl AxVmDeviceAccessPorts {
+    const fn new(vm_id: usize) -> Self {
+        Self { vm_id }
+    }
+
+    fn into_ports(self) -> RuntimeAccessPorts {
+        let this = Arc::new(self);
+        RuntimeAccessPorts::new()
+            .with_timer(this.clone())
+            .with_wake(this.clone())
+            .with_stop(this)
+    }
+
+    fn vm(&self, operation: &'static str) -> axdevice::DeviceManagerResult<AxVMRef> {
+        crate::get_vm_by_id(self.vm_id).ok_or_else(|| {
+            axdevice::DeviceManagerError::ResourceNotFound {
+                operation,
+                resource: format!("VM[{}]", self.vm_id),
+            }
+        })
+    }
+}
+
+impl TimerAccessPort for AxVmDeviceAccessPorts {
+    fn schedule_timer(
+        &self,
+        device_id: DeviceId,
+        deadline_ns: u64,
+    ) -> axdevice::DeviceManagerResult {
+        let vm_id = self.vm_id;
+        trace!(
+            "VM[{vm_id}] device {device_id:?} scheduled access-scoped timer at {deadline_ns:#x} ns"
+        );
+        crate::timer::register_timer(
+            deadline_ns,
+            Box::new(move |_| crate::runtime::vcpus::notify_all_vcpus(vm_id)),
+        );
+        Ok(())
+    }
+}
+
+impl WakeAccessPort for AxVmDeviceAccessPorts {
+    fn wake_vcpu(&self, device_id: DeviceId, vcpu_id: usize) -> axdevice::DeviceManagerResult {
+        let vm = self.vm("wake vCPU from device access")?;
+        if vm.vcpu(vcpu_id).is_none() {
+            return Err(axdevice::DeviceManagerError::InvalidInput {
+                operation: "wake vCPU from device access",
+                detail: format!(
+                    "device {device_id:?} requested nonexistent VM[{}] vCPU {}",
+                    self.vm_id, vcpu_id
+                ),
+            });
+        }
+        vm.with_runtime(|runtime| {
+            runtime.notify_all();
+            Ok(())
+        })
+        .map_err(|error| axdevice::DeviceManagerError::InvalidState {
+            operation: "wake vCPU from device access",
+            detail: format!("{error}"),
+        })
+    }
+}
+
+impl StopAccessPort for AxVmDeviceAccessPorts {
+    fn request_vm_stop(&self, device_id: DeviceId, reason: &str) -> axdevice::DeviceManagerResult {
+        let vm = self.vm("request VM stop from device access")?;
+        vm.stop(StopReason::Fault(format!(
+            "device {device_id:?} requested VM stop: {reason}"
+        )))
+        .map_err(|error| axdevice::DeviceManagerError::InvalidState {
+            operation: "request VM stop from device access",
+            detail: format!("{error}"),
+        })?;
+        if let Ok(()) = vm.with_runtime(|runtime| {
+            runtime.notify_all();
+            Ok(())
+        }) {}
+        Ok(())
+    }
 }
 
 /// Represents a memory region in a virtual machine.
@@ -447,7 +578,7 @@ pub struct AxVM {
     id: usize,
     name: String,
     machine: Mutex<Machine<AxVMResources, Arc<VmRuntimeHandle>>>,
-    pending_fw_cfg: Mutex<Option<PendingFwCfg>>,
+    pending_fw_cfg_payload: Mutex<Option<PendingFwCfgPayload>>,
 }
 
 impl AxVM {
@@ -467,7 +598,7 @@ impl AxVM {
             id,
             name,
             machine: Mutex::new(Machine::Ready(resources)),
-            pending_fw_cfg: Mutex::new(None),
+            pending_fw_cfg_payload: Mutex::new(None),
         });
 
         info!("VM created: id={}", result.id());
@@ -699,12 +830,34 @@ impl AxVM {
 
     /// Pauses a running VM.
     pub fn pause(&self) -> AxVmResult {
-        self.machine.lock().pause()
+        let mut machine = self.machine.lock();
+        if machine.status() != VmStatus::Running {
+            return machine.pause();
+        }
+        let devices = machine
+            .resources()
+            .expect("running VM must retain resources")
+            .devices()?;
+        devices
+            .suspend_lifecycle_devices()
+            .map_err(|error| AxVmError::device("suspend device lifecycle", error))?;
+        machine.pause()
     }
 
     /// Resumes a paused VM.
     pub fn resume(&self) -> AxVmResult {
-        self.machine.lock().resume()
+        let mut machine = self.machine.lock();
+        if machine.status() != VmStatus::Paused {
+            return machine.resume();
+        }
+        let devices = machine
+            .resources()
+            .expect("paused VM must retain resources")
+            .devices()?;
+        devices
+            .resume_lifecycle_devices()
+            .map_err(|error| AxVmError::device("resume device lifecycle", error))?;
+        machine.resume()
     }
 
     /// Requests a stop. Running vCPUs observe the Stopping state and exit.
@@ -787,7 +940,7 @@ impl AxVM {
     }
 
     /// Returns this VM's emulated devices.
-    pub fn get_devices(&self) -> AxVmResult<Arc<AxVmDevices>> {
+    pub fn get_devices(&self) -> AxVmResult<Arc<DeviceRuntime>> {
         self.with_resources(|resources| resources.devices())
     }
 
@@ -805,14 +958,14 @@ impl AxVM {
 
     /// Queue a QEMU fw_cfg device that will be attached during VM initialization.
     pub fn add_fw_cfg_device(&self, config: FwCfgDeviceConfig) -> AxVmResult {
-        let mut pending = self.pending_fw_cfg.lock();
+        let mut pending = self.pending_fw_cfg_payload.lock();
         if pending.is_some() {
             return ax_err!(
                 AlreadyExists,
                 format!("VM[{}] fw_cfg device already exists", self.id())
             );
         }
-        *pending = Some(PendingFwCfg {
+        *pending = Some(PendingFwCfgPayload {
             base: config.base,
             size: config.size,
             kernel: config.kernel,
@@ -832,25 +985,25 @@ impl AxVM {
         Ok(())
     }
 
-    fn add_special_emulated_devices(&self, devices: &mut AxVmDevices) -> AxVmResult {
-        if let Some(pending) = self.pending_fw_cfg.lock().take() {
-            debug!(
-                "VM[{}] adding fw_cfg MMIO device at [{:#x},{:#x})",
-                self.id(),
-                pending.base.as_usize(),
-                pending.base.as_usize() + pending.size
-            );
-            devices.add_fw_cfg_dev(Arc::new(FwCfg::new(
-                pending.base,
-                pending.size,
-                pending.kernel,
-                pending.initrd,
-                pending.cmdline.as_deref(),
-                pending.cpu_num,
-                pending.platform,
-            )))?;
-        }
-        Ok(())
+    #[allow(dead_code)]
+    pub(crate) fn fw_cfg_payload(&self) -> Option<FwCfgPayloadConfig> {
+        self.pending_fw_cfg_payload
+            .lock()
+            .as_ref()
+            .map(|pending| FwCfgPayloadConfig {
+                base: pending.base,
+                size: pending.size,
+                kernel: pending.kernel,
+                initrd: pending.initrd,
+                cmdline: pending.cmdline.clone(),
+                cpu_num: pending.cpu_num,
+                platform: pending.platform.clone(),
+            })
+    }
+
+    /// Builds the runtime ports used by access-scoped device grants.
+    pub(crate) fn device_access_ports(&self) -> RuntimeAccessPorts {
+        AxVmDeviceAccessPorts::new(self.id()).into_ports()
     }
 
     pub(crate) fn handle_mmio_write(
@@ -860,32 +1013,12 @@ impl AxVM {
         data: usize,
     ) -> AxVmResult {
         let devices = self.get_devices()?;
-        if let Some(fw_cfg) = devices.fw_cfg_for_dma_addr(addr) {
-            if let Some(desc_addr) = fw_cfg.write_dma_address(addr, width, data)? {
-                fw_cfg.process_dma(
-                    desc_addr,
-                    |gpa, buffer| {
-                        self.read_from_guest(gpa, buffer).map_err(|error| {
-                            DeviceManagerError::UnexpectedResponse {
-                                operation: "read guest memory for fw_cfg DMA",
-                                detail: alloc::format!("{error}"),
-                            }
-                        })
-                    },
-                    |gpa, buffer| {
-                        self.write_to_guest(gpa, buffer).map_err(|error| {
-                            DeviceManagerError::UnexpectedResponse {
-                                operation: "write guest memory for fw_cfg DMA",
-                                detail: alloc::format!("{error}"),
-                            }
-                        })
-                    },
-                )?;
-            }
-            return Ok(());
+        if devices.mmio_write_needs_guest_memory(addr, width) {
+            let mut memory = VmDmaAccess { vm: self };
+            devices.handle_mmio_write_with_memory(addr, width, data, &mut memory)?;
+        } else {
+            devices.handle_mmio_write(addr, width, data)?;
         }
-
-        devices.handle_mmio_write(addr, width, data)?;
         Ok(())
     }
 
@@ -1324,14 +1457,24 @@ impl AxVM {
         }
         self.machine.lock().destroy_with(|resources| {
             if let Some(mut resources) = resources {
-                Self::cleanup_resource_set(vm_id, &mut resources);
+                Self::cleanup_resource_set(vm_id, &mut resources)?;
             }
             Ok(())
         })
     }
 
-    fn cleanup_resource_set(vm_id: usize, resources: &mut AxVMResources) {
+    fn cleanup_resource_set(vm_id: usize, resources: &mut AxVMResources) -> AxVmResult {
         info!("Cleaning up VM[{vm_id}] resources...");
+
+        if let Some(devices) = resources.devices.take() {
+            devices.reset_lifecycle_devices().map_err(|error| {
+                AxVmError::device("reset device lifecycle during destroy", error)
+            })?;
+            debug!(
+                "VM[{vm_id}] devices cleanup: {} device(s)",
+                devices.devices().count()
+            );
+        }
 
         let regions_to_cleanup = resources.memory_regions.clone();
         for region in &regions_to_cleanup {
@@ -1371,16 +1514,11 @@ impl AxVM {
         resources.memory_regions.clear();
         resources.address_space.clear();
 
-        if let Some(devices) = resources.devices.take() {
-            debug!(
-                "VM[{vm_id}] devices cleanup: {} device(s)",
-                devices.devices().count()
-            );
-        }
         resources.vcpu_list = None;
         resources.interrupt_fabric = None;
 
         info!("VM[{vm_id}] resources cleanup completed");
+        Ok(())
     }
 }
 
