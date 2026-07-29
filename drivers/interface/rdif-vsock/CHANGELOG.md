@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Added task-context send-capacity reporting so socket readiness can honor
+  virtio-vsock peer credit.
+
 ## [0.1.2](https://github.com/rcore-os/tgoskits/compare/rdif-vsock-v0.1.1...rdif-vsock-v0.1.2) - 2026-06-12
 
 ### Other
