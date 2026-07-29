@@ -7,7 +7,6 @@ use core::{
 use ax_errno::{AxError, AxResult, LinuxError};
 use ax_fs_ng::vfs::is_mount_busy as fs_is_mount_busy;
 use ax_sync::Mutex;
-use ax_task::current;
 use axfs_ng_vfs::{Filesystem, MetadataUpdate, Mountpoint, NodePermission};
 use axpoll::{IoEvents, Pollable};
 use linux_raw_sys::general::{
@@ -28,7 +27,7 @@ use crate::{
         },
         overlay::OverlayOptions,
     },
-    task::{AsThread, tasks},
+    task::{current_user_task, tasks},
 };
 
 const MNT_FORCE: i32 = 1;
@@ -177,11 +176,13 @@ fn is_mount_busy(mp: &Arc<axfs_ng_vfs::Mountpoint>) -> bool {
     if fs_is_mount_busy(mp) {
         return true;
     }
-    for task in tasks() {
-        let Some(thread) = task.try_as_thread() else {
-            continue;
-        };
-        let fd_table = thread.with_scope(|scope| FD_TABLE.scope_cell(scope).clone());
+    let Ok(tasks) = tasks() else {
+        return true;
+    };
+    for task in tasks {
+        let fd_table = task
+            .as_thread()
+            .with_scope(|scope| FD_TABLE.scope_cell(scope).clone());
         let table = fd_table.read();
         if table.ids().any(|id| {
             table
@@ -294,7 +295,7 @@ pub fn sys_fsopen(fs_name: *const c_char, flags: u32) -> AxResult<isize> {
     if flags & !FSOPEN_CLOEXEC != 0 {
         return Err(AxError::InvalidInput);
     }
-    if !current().as_thread().cred().has_cap_sys_admin() {
+    if !current_user_task().as_thread().cred().has_cap_sys_admin() {
         return Err(AxError::OperationNotPermitted);
     }
 
@@ -316,7 +317,7 @@ pub fn sys_fsconfig(
     value: *const c_void,
     aux: i32,
 ) -> AxResult<isize> {
-    if !current().as_thread().cred().has_cap_sys_admin() {
+    if !current_user_task().as_thread().cred().has_cap_sys_admin() {
         return Err(AxError::OperationNotPermitted);
     }
     let context = MountContext::from_fd(fs_fd)?;
@@ -417,7 +418,7 @@ pub fn sys_fsmount(fs_fd: i32, flags: u32, mount_attributes: u32) -> AxResult<is
         // systemd retries without MOUNT_ATTR_NOSYMFOLLOW on EINVAL.
         return Err(AxError::InvalidInput);
     }
-    if !current().as_thread().cred().has_cap_sys_admin() {
+    if !current_user_task().as_thread().cred().has_cap_sys_admin() {
         return Err(AxError::OperationNotPermitted);
     }
 
@@ -458,7 +459,7 @@ pub fn sys_move_mount(
     if flags != MOVE_MOUNT_F_EMPTY_PATH || !vm_load_string(from_path)?.is_empty() {
         return Err(AxError::InvalidInput);
     }
-    if !current().as_thread().cred().has_cap_sys_admin() {
+    if !current_user_task().as_thread().cred().has_cap_sys_admin() {
         return Err(AxError::OperationNotPermitted);
     }
 
@@ -499,7 +500,7 @@ pub fn sys_mount_setattr(
     if size != MOUNT_ATTR_SIZE_VER0 || flags != AT_EMPTY_PATH {
         return Err(AxError::InvalidInput);
     }
-    if !current().as_thread().cred().has_cap_sys_admin() {
+    if !current_user_task().as_thread().cred().has_cap_sys_admin() {
         return Err(AxError::OperationNotPermitted);
     }
     if !vm_load_string(path)?.is_empty() {
@@ -595,7 +596,7 @@ pub fn sys_mount(
     };
     debug!("sys_mount <= source: {source:?}, target: {target:?}, fs_type: {fs_type:?}");
 
-    if !current().as_thread().cred().has_cap_sys_admin() {
+    if !current_user_task().as_thread().cred().has_cap_sys_admin() {
         return Err(AxError::OperationNotPermitted);
     }
 
@@ -704,7 +705,7 @@ pub fn sys_mount(
         }
         "cgroup2" => {
             let (cgroup_root, cgroup_root_pin) = {
-                let task = current();
+                let task = current_user_task();
                 let nsproxy = task.as_thread().proc_data.nsproxy.lock();
                 let namespace = nsproxy.cgroup_ns.lock();
                 (namespace.root(), namespace.pin_root())
@@ -796,7 +797,7 @@ pub fn sys_umount2(target: *const c_char, flags: i32) -> AxResult<isize> {
         fs_context.lock().resolve(target)?
     };
 
-    if !current().as_thread().cred().has_cap_sys_admin() {
+    if !current_user_task().as_thread().cred().has_cap_sys_admin() {
         return Err(AxError::OperationNotPermitted);
     }
 
@@ -861,7 +862,7 @@ pub fn sys_pivot_root(new_root: *const c_char, put_old: *const c_char) -> AxResu
         new_root, put_old
     );
 
-    if !current().as_thread().cred().has_cap_sys_admin() {
+    if !current_user_task().as_thread().cred().has_cap_sys_admin() {
         return Err(AxError::OperationNotPermitted);
     }
 
