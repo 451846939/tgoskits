@@ -477,6 +477,7 @@ pub(crate) fn init_percpu_irq(cpu_id: usize) {
             .expect("failed to register IPI IRQ handler");
     }
 
+    #[cfg(not(feature = "multitask"))]
     init_timer();
 }
 
