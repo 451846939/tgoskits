@@ -5,8 +5,8 @@ use axvm_types::{
     EmulatedDeviceConfig, EmulatedDeviceType, MappingFlags, NestedPagingConfig, VmArchVcpuOps,
 };
 use x86_vcpu::{
-    X86GuestMemoryRegion, X86GuestPhysAddr, X86HostVirtAddr, X86VcpuCreateConfig,
-    X86VcpuSetupConfig,
+    X86_LOCAL_APIC_GPA, X86_LOCAL_APIC_SIZE, X86GuestMemoryRegion, X86GuestPhysAddr,
+    X86HostVirtAddr, X86VcpuCreateConfig, X86VcpuSetupConfig,
 };
 
 use super::{
@@ -97,7 +97,7 @@ fn init_vm_with(
             validate_guest_dtb(resources)?;
 
             let mut owned_regions = guest_owned_regions(resources);
-            append_arch_owned_regions(&mut owned_regions)?;
+            append_arch_owned_regions(&mut owned_regions);
             map_guest_address_space(vm, resources, devices.devices(), &owned_regions)?;
             map_arch_address_space(resources)?;
             vcpus.setup(resources, build_vcpu_setup_config)?;
@@ -155,16 +155,12 @@ fn arch_extra_device_configs(config: &AxVMConfig) -> alloc::vec::Vec<EmulatedDev
         .collect()
 }
 
-fn append_arch_owned_regions(regions: &mut alloc::vec::Vec<GuestOwnedRegion>) -> AxVmResult {
-    if x86_requires_apic_access_page()? {
-        let gpa = x86_apic_access_page_gpa()?;
-        regions.push(GuestOwnedRegion::new(
-            gpa.as_usize(),
-            PAGE_SIZE_4K,
-            crate::layout::VmRegionKind::Reserved,
-        ));
-    }
-    Ok(())
+fn append_arch_owned_regions(regions: &mut alloc::vec::Vec<GuestOwnedRegion>) {
+    regions.push(GuestOwnedRegion::new(
+        X86_LOCAL_APIC_GPA,
+        X86_LOCAL_APIC_SIZE,
+        crate::layout::VmRegionKind::Reserved,
+    ));
 }
 
 fn map_arch_address_space(resources: &mut AxVMResources) -> AxVmResult {
@@ -187,4 +183,50 @@ fn guest_page_table_levels(vcpu_mappings: &[(usize, Option<usize>, usize)]) -> u
     crate::architecture::minimum_target_cpu_capability(4, vcpu_mappings, |cpu_id| {
         crate::percpu::cpu_max_guest_page_table_levels(cpu_id).unwrap_or(4)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn svm_reserves_the_local_apic_trap_region() {
+        let mut regions = alloc::vec::Vec::new();
+
+        append_arch_owned_regions(&mut regions);
+
+        assert_eq!(
+            regions,
+            [GuestOwnedRegion::new(
+                X86_LOCAL_APIC_GPA,
+                X86_LOCAL_APIC_SIZE,
+                crate::layout::VmRegionKind::Reserved,
+            )]
+        );
+
+        let layout = crate::layout::build_address_layout(
+            axvm_types::AddressSpacePolicy::Passthrough,
+            0,
+            0x1_0000_0000,
+            &[],
+            &[],
+            &regions,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            layout
+                .mappings()
+                .iter()
+                .map(|mapping| (mapping.gpa.as_usize(), mapping.size))
+                .collect::<alloc::vec::Vec<_>>(),
+            [
+                (0, X86_LOCAL_APIC_GPA),
+                (
+                    X86_LOCAL_APIC_GPA + X86_LOCAL_APIC_SIZE,
+                    0x1_0000_0000 - X86_LOCAL_APIC_GPA - X86_LOCAL_APIC_SIZE,
+                ),
+            ]
+        );
+    }
 }

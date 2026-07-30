@@ -107,6 +107,9 @@ CPU 上，规划器必须对这些 CPU 的真实能力取最小支持位宽，�
 
 因此虚拟串口的陷入区总是 stage-2 hole；相同地址上的宿主 UART 不可能透传。
 显式选择 host-owned UART 必须返回 `host-owned device` 错误，不能静默忽略。
+x86 的 local APIC window `0xfee0_0000/0x1000` 同样由架构层永久保留：VMX 在该
+hole 上安装 APIC-access backing page，SVM 保持未映射并通过 nested page fault
+进入软件 vLAPIC，任何客户机类型都不能把宿主 LAPIC 恒等映射给客户机。
 
 ## 设备 runtime
 

@@ -64,6 +64,12 @@ macro_rules! x86_err_type {
 /// Maximum number of x86 host I/O port ranges configured for one vCPU.
 pub const X86_MAX_PASSTHROUGH_PORT_RANGES: usize = 16;
 
+/// Guest physical base address of the architectural local APIC window.
+pub const X86_LOCAL_APIC_GPA: usize = 0xfee0_0000;
+
+/// Size of the architectural local APIC window.
+pub const X86_LOCAL_APIC_SIZE: usize = 0x1000;
+
 /// x86 vCPU creation configuration.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct X86VcpuCreateConfig;

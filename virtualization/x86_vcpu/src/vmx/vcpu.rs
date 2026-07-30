@@ -40,11 +40,11 @@ use super::{
     },
 };
 use crate::{
-    X86AccessFlags, X86AccessWidth, X86GuestMemoryRegion, X86GuestPhysAddr, X86GuestVirtAddr,
-    X86HostOps, X86HostPhysAddr, X86MsrAddr, X86NestedPageFaultInfo, X86NestedPagingConfig,
-    X86Port, X86VcpuCreateConfig, X86VcpuError, X86VcpuResult, X86VcpuSetupConfig, X86VmExit, host,
-    msr::Msr, regs::GeneralRegisters, restore_host_interrupt_flag, x86_real_mode_entry_state,
-    xstate::XState,
+    X86_LOCAL_APIC_GPA, X86_LOCAL_APIC_SIZE, X86AccessFlags, X86AccessWidth, X86GuestMemoryRegion,
+    X86GuestPhysAddr, X86GuestVirtAddr, X86HostOps, X86HostPhysAddr, X86MsrAddr,
+    X86NestedPageFaultInfo, X86NestedPagingConfig, X86Port, X86VcpuCreateConfig, X86VcpuError,
+    X86VcpuResult, X86VcpuSetupConfig, X86VmExit, host, msr::Msr, regs::GeneralRegisters,
+    restore_host_interrupt_flag, x86_real_mode_entry_state, xstate::XState,
 };
 
 const VMX_PREEMPTION_TIMER_SET_VALUE: u32 = 100_000;
@@ -58,8 +58,6 @@ const X86_COM1_PORT_COUNT: u32 = 8;
 const X2APIC_MSR_BASE: u32 = 0x800;
 const X2APIC_MSR_END: u32 = 0x8ff;
 const X2APIC_EOI_MSR: u32 = X2APIC_MSR_BASE + 0xb;
-pub const X86_APIC_ACCESS_GPA: usize = 0xfee0_0000;
-const X86_LOCAL_APIC_SIZE: usize = 0x1000;
 const X86_LOCAL_APIC_EOI_OFFSET: usize = 0xb0;
 const X86_IOAPIC_BASE: usize = 0xfec0_0000;
 const X86_IOAPIC_SIZE: usize = 0x1000;
@@ -993,7 +991,7 @@ impl<H: X86HostOps> VmxVcpu<H> {
         };
 
         let reg = apic_access_exit_info.offset as usize;
-        let addr = X86GuestPhysAddr::from(X86_APIC_ACCESS_GPA + reg);
+        let addr = X86GuestPhysAddr::from(X86_LOCAL_APIC_GPA + reg);
         let mut exit_reason = X86VmExit::Nothing;
         if write {
             let value = self.decode_apic_mmio_write_value(exit_info)?;
@@ -1072,7 +1070,7 @@ impl<H: X86HostOps> VmxVcpu<H> {
         // or a genuine missing memory mapping.
         let addr_usize = addr.as_usize();
         let local_apic =
-            (X86_APIC_ACCESS_GPA..X86_APIC_ACCESS_GPA + X86_LOCAL_APIC_SIZE).contains(&addr_usize);
+            (X86_LOCAL_APIC_GPA..X86_LOCAL_APIC_GPA + X86_LOCAL_APIC_SIZE).contains(&addr_usize);
         let ioapic = (X86_IOAPIC_BASE..X86_IOAPIC_BASE + X86_IOAPIC_SIZE).contains(&addr_usize);
         if !local_apic && !ioapic {
             return None;
@@ -1161,7 +1159,7 @@ impl<H: X86HostOps> VmxVcpu<H> {
             });
         }
 
-        let offset = addr.as_usize() - X86_APIC_ACCESS_GPA;
+        let offset = addr.as_usize() - X86_LOCAL_APIC_GPA;
         if offset == X86_LOCAL_APIC_EOI_OFFSET {
             return Some(X86VmExit::InterruptEnd {
                 vector: self.vlapic.handle_eoi(),
