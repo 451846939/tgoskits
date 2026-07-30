@@ -132,7 +132,7 @@ impl CachedFileShared {
 pub struct CachedFile {
     inner: Location,
     shared: Arc<CachedFileShared>,
-    readahead: Arc<Mutex<ReadAheadState>>,
+    readahead: Arc<PiMutex<ReadAheadState>>,
     in_memory: bool,
 }
 
@@ -179,7 +179,7 @@ impl CachedFile {
             return Ok(Self {
                 inner: location,
                 shared,
-                readahead: Arc::new(Mutex::new(ReadAheadState::new())),
+                readahead: Arc::new(PiMutex::new(ReadAheadState::new())),
                 in_memory,
             });
         }
@@ -233,7 +233,7 @@ impl CachedFile {
         Ok(Self {
             inner: location,
             shared,
-            readahead: Arc::new(Mutex::new(ReadAheadState::new())),
+            readahead: Arc::new(PiMutex::new(ReadAheadState::new())),
             in_memory,
         })
     }
