@@ -17,7 +17,8 @@ mod tests {
     use std::sync::Mutex;
 
     use axdevice_base::{
-        AccessWidth, InterruptTriggerMode, IrqLine, IrqLineId, IrqResult, IrqSink,
+        AccessWidth, ControllerInputId, InterruptControllerId, InterruptTriggerMode, IrqLine,
+        IrqResult, WiredIrqInput, WiredIrqSink,
     };
 
     use super::{Pl011, SerialBackend, Uart16550};
@@ -54,19 +55,26 @@ mod tests {
         levels: Mutex<Vec<bool>>,
     }
 
-    impl IrqSink for TestIrqSink {
-        fn set_level(&self, _line: IrqLineId, asserted: bool) -> IrqResult {
+    impl WiredIrqSink for TestIrqSink {
+        fn set_level(&self, _input: ControllerInputId, asserted: bool) -> IrqResult {
             self.levels.lock().unwrap().push(asserted);
             Ok(())
         }
 
-        fn pulse(&self, _line: IrqLineId) -> IrqResult {
+        fn pulse(&self, _input: ControllerInputId) -> IrqResult {
             Ok(())
         }
     }
 
     fn level_irq(sink: Arc<TestIrqSink>, line: usize) -> IrqLine {
-        IrqLine::new(IrqLineId(line), InterruptTriggerMode::LevelTriggered, sink)
+        WiredIrqInput::new(
+            InterruptControllerId::new(0),
+            ControllerInputId::new(line),
+            InterruptTriggerMode::LevelTriggered,
+            sink,
+        )
+        .connect()
+        .unwrap()
     }
 
     #[test]
@@ -79,7 +87,11 @@ mod tests {
         backend.push_input(b"ab");
         uart.poll().unwrap();
         uart.poll().unwrap();
-        assert_eq!(sink.levels.lock().unwrap().as_slice(), [false, true, true]);
+        assert_eq!(
+            sink.levels.lock().unwrap().as_slice(),
+            [true],
+            "the controller input observes electrical transitions, not repeated level samples"
+        );
         assert_eq!(uart.read(5, AccessWidth::Byte).unwrap() & 1, 1);
         assert_eq!(uart.read(0, AccessWidth::Byte).unwrap(), b'a' as u64);
         assert_eq!(uart.read(0, AccessWidth::Byte).unwrap(), b'b' as u64);
@@ -97,12 +109,16 @@ mod tests {
 
         backend.push_input(b"x");
         uart.poll().unwrap();
-        assert_eq!(sink.levels.lock().unwrap().last(), Some(&false));
+        assert!(
+            sink.levels.lock().unwrap().is_empty(),
+            "a source that starts deasserted must not emit a redundant low transition"
+        );
 
         uart.write(1, AccessWidth::Byte, 1).unwrap();
         assert_eq!(sink.levels.lock().unwrap().last(), Some(&true));
         uart.write(2, AccessWidth::Byte, 1 << 1).unwrap();
         assert_eq!(sink.levels.lock().unwrap().last(), Some(&false));
+        assert_eq!(sink.levels.lock().unwrap().as_slice(), [true, false]);
     }
 
     #[test]

@@ -1,17 +1,17 @@
 use alloc::vec::Vec;
 
-use axdevice::{FwCfgInterruptConfig, FwCfgPciConfig};
-use axvmconfig::GuestConfig;
-
 use super::{
     FirmwareDevices, FlashDevice, GedDevice, GuestPlatform, InterruptTopology, IrqMmioDevice,
     MemoryRegion, MmioRegion, PciHost, SerialDevice,
+    acpi::{LoongArchFwCfgInterruptConfig, LoongArchFwCfgPciConfig, LoongArchFwCfgSerialConfig},
 };
 
 pub struct GuestPlatformBuilder {
     ram_regions: Vec<MemoryRegion>,
-    fw_cfg: MmioRegion,
+    fw_cfg: Option<MmioRegion>,
+    serial: Option<SerialDevice>,
     pci: Option<PciHost>,
+    interrupt: Option<InterruptTopology>,
     firmware_devices: Option<FirmwareDevices>,
     irq_routes: Vec<GuestIrqRoute>,
 }
@@ -23,11 +23,13 @@ pub struct GuestIrqRoute {
 }
 
 impl GuestPlatformBuilder {
-    pub fn new(ram_regions: Vec<MemoryRegion>, config: &GuestConfig) -> Self {
+    pub fn new(ram_regions: Vec<MemoryRegion>, fw_cfg: Option<MmioRegion>) -> Self {
         Self {
             ram_regions,
-            fw_cfg: fw_cfg_region(config),
+            fw_cfg,
+            serial: None,
             pci: None,
+            interrupt: None,
             firmware_devices: None,
             irq_routes: Vec::new(),
         }
@@ -45,14 +47,16 @@ impl GuestPlatformBuilder {
 
     pub fn build(self) -> GuestPlatform {
         let defaults = QemuVirtDefaults::new();
+        let serial = self.serial.unwrap_or(defaults.serial);
         let pci = self.pci.unwrap_or(defaults.pci);
+        let interrupt = self.interrupt.unwrap_or(defaults.interrupt);
 
         GuestPlatform {
             ram_regions: self.ram_regions,
-            serial: defaults.serial,
+            serial,
             pci,
-            interrupt: defaults.interrupt,
-            fw_cfg: self.fw_cfg,
+            interrupt,
+            fw_cfg: self.fw_cfg.unwrap_or(defaults.fw_cfg),
             firmware_devices: self.firmware_devices.unwrap_or(defaults.firmware_devices),
             irq_routes: if self.irq_routes.is_empty() {
                 defaults.irq_routes
@@ -63,8 +67,14 @@ impl GuestPlatformBuilder {
     }
 
     fn apply_host_resources(&mut self, resources: HostResources) {
+        if let Some(serial) = resources.serial {
+            self.serial = Some(serial);
+        }
         if let Some(pci) = resources.pci {
             self.pci = Some(pci);
+        }
+        if let Some(interrupt) = resources.interrupt {
+            self.interrupt = Some(interrupt);
         }
         if let Some(firmware_devices) = resources.firmware_devices {
             self.firmware_devices = Some(firmware_devices);
@@ -74,7 +84,9 @@ impl GuestPlatformBuilder {
 }
 
 struct HostResources {
+    serial: Option<SerialDevice>,
     pci: Option<PciHost>,
+    interrupt: Option<InterruptTopology>,
     firmware_devices: Option<FirmwareDevices>,
     irq_routes: Vec<GuestIrqRoute>,
 }
@@ -83,6 +95,36 @@ fn host_acpi_resources(
     acpi: &ax_driver::probe::acpi::System,
 ) -> axvm_types::VmBackendResult<HostResources> {
     let defaults = QemuVirtDefaults::new();
+    let interrupt = acpi
+        .routing()
+        .pch_pics()
+        .first()
+        .map(|pch_pic| InterruptTopology {
+            eiointc_irq: defaults.interrupt.eiointc_irq,
+            pch_pic: MmioRegion {
+                base: pch_pic.address,
+                size: effective_pch_pic_size(pch_pic.mmio_size),
+            },
+            pch_pic_gsi_base: 0,
+            pch_msi: defaults.interrupt.pch_msi,
+            pch_msi_start: defaults.interrupt.pch_msi_start,
+            pch_msi_count: defaults.interrupt.pch_msi_count,
+            acpi_gsi_base: pch_pic.gsi_base,
+            acpi_msi_start: pch_pic.gsi_base,
+            acpi_msi_count: defaults.interrupt.acpi_msi_count,
+        });
+
+    let serial = acpi
+        .serial_console_memory_range()
+        .map(|range| SerialDevice {
+            mmio: MmioRegion {
+                base: range.base,
+                size: range.size,
+            },
+            irq: defaults.serial.irq,
+            clock_hz: defaults.serial.clock_hz,
+            baud: defaults.serial.baud,
+        });
 
     let pci = acpi.pci_ecam_regions().first().map(|ecam| PciHost {
         ecam: MmioRegion {
@@ -95,14 +137,24 @@ fn host_acpi_resources(
         intx_base: defaults.pci.intx_base,
     });
 
-    let irq_routes = guest_irq_routes(&pci);
+    let irq_routes = guest_irq_routes(
+        interrupt.as_ref().unwrap_or(&defaults.interrupt),
+        &serial,
+        &pci,
+    );
     let firmware_devices = Some(find_firmware_devices(acpi, defaults.firmware_devices));
 
     Ok(HostResources {
+        serial,
         pci,
+        interrupt,
         firmware_devices,
         irq_routes,
     })
+}
+
+fn effective_pch_pic_size(size: u16) -> u64 {
+    if size == 0 { 0x1000 } else { u64::from(size) }
 }
 
 fn find_firmware_devices(
@@ -144,31 +196,26 @@ fn defaults_rtc_irq() -> u32 {
     6
 }
 
-fn guest_irq_routes(pci: &Option<PciHost>) -> Vec<GuestIrqRoute> {
+fn guest_irq_routes(
+    interrupt: &InterruptTopology,
+    serial: &Option<SerialDevice>,
+    pci: &Option<PciHost>,
+) -> Vec<GuestIrqRoute> {
     let defaults = QemuVirtDefaults::new();
+    let serial = serial.unwrap_or(defaults.serial);
     let pci = pci.unwrap_or(defaults.pci);
 
-    (0..4)
-        .map(|idx| GuestIrqRoute {
-            physical_irq: pci.intx_base as usize + idx,
-            guest_vector: pci.intx_base as usize + idx,
-        })
-        .collect()
-}
+    let mut routes = Vec::from([GuestIrqRoute {
+        physical_irq: serial.irq as usize,
+        guest_vector: serial.irq as usize,
+    }]);
+    routes.extend((0..4).map(|idx| GuestIrqRoute {
+        physical_irq: pci.intx_base as usize + idx,
+        guest_vector: pci.intx_base as usize + idx,
+    }));
 
-fn fw_cfg_region(config: &GuestConfig) -> MmioRegion {
-    if let Some(fw_cfg) = crate::machine::current_machine_profile(config.base.cpu_num)
-        .emulated_devices
-        .into_iter()
-        .find(|device| device.emu_type == axvm_types::EmulatedDeviceType::FwCfg)
-    {
-        return MmioRegion {
-            base: fw_cfg.base_gpa as u64,
-            size: fw_cfg.length as u64,
-        };
-    }
-
-    QemuVirtDefaults::new().fw_cfg
+    let _ = interrupt;
+    routes
 }
 
 struct QemuVirtDefaults {
@@ -182,66 +229,50 @@ struct QemuVirtDefaults {
 
 impl QemuVirtDefaults {
     fn new() -> Self {
-        let machine = crate::machine::current_machine_profile(1);
-        let serial_profile = machine.serial;
-        let crate::machine::GuestSerialTransport::Mmio {
-            base: serial_base,
-            length: serial_size,
-            ..
-        } = serial_profile.transport
-        else {
-            unreachable!("LoongArch machine serial must be MMIO");
-        };
-        let fw_cfg = machine
-            .emulated_devices
-            .iter()
-            .find(|device| device.emu_type == axvm_types::EmulatedDeviceType::FwCfg)
-            .expect("LoongArch machine must contain fw_cfg");
-        let pch_pic = machine
-            .emulated_devices
-            .iter()
-            .find(|device| device.emu_type == axvm_types::EmulatedDeviceType::LoongArchPchPic)
-            .expect("LoongArch machine must contain a PCH-PIC");
         let serial = SerialDevice {
             mmio: MmioRegion {
-                base: serial_base as u64,
-                size: serial_size as u64,
+                base: LoongArchFwCfgSerialConfig::default().base,
+                size: LoongArchFwCfgSerialConfig::default().size,
             },
-            irq: serial_profile.irq as u32,
-            clock_hz: serial_profile.clock_hz,
-            baud: 115_200,
+            irq: 2,
+            clock_hz: LoongArchFwCfgSerialConfig::default().clock_hz,
+            baud: LoongArchFwCfgSerialConfig::default().baud,
         };
         let pci = PciHost {
             ecam: MmioRegion {
-                base: FwCfgPciConfig::default().ecam_base,
-                size: FwCfgPciConfig::default().ecam_size,
+                base: LoongArchFwCfgPciConfig::default().ecam_base,
+                size: LoongArchFwCfgPciConfig::default().ecam_size,
             },
             mmio: MmioRegion {
-                base: FwCfgPciConfig::default().mmio_base,
-                size: FwCfgPciConfig::default().mmio_size,
+                base: LoongArchFwCfgPciConfig::default().mmio_base,
+                size: LoongArchFwCfgPciConfig::default().mmio_size,
             },
-            io_base: FwCfgPciConfig::default().io_base,
-            io_size: u64::from(FwCfgPciConfig::default().io_size),
+            io_base: LoongArchFwCfgPciConfig::default().io_base,
+            io_size: u64::from(LoongArchFwCfgPciConfig::default().io_size),
             intx_base: 16,
         };
         let interrupt = InterruptTopology {
-            eiointc_irq: FwCfgInterruptConfig::default().eiointc_irq as u32,
+            eiointc_irq: LoongArchFwCfgInterruptConfig::default().eiointc_irq as u32,
             pch_pic: MmioRegion {
-                base: pch_pic.base_gpa as u64,
-                size: pch_pic.length as u64,
+                base: LoongArchFwCfgInterruptConfig::default().pch_pic_base,
+                size: u64::from(LoongArchFwCfgInterruptConfig::default().pch_pic_size),
             },
             pch_pic_gsi_base: 0,
             pch_msi: MmioRegion {
-                base: FwCfgInterruptConfig::default().pch_msi_base,
+                base: LoongArchFwCfgInterruptConfig::default().pch_msi_base,
                 size: 0x8,
             },
             pch_msi_start: 0x20,
             pch_msi_count: 0xe0,
-            acpi_gsi_base: u32::from(FwCfgInterruptConfig::default().pch_pic_gsi_base),
-            acpi_msi_start: FwCfgInterruptConfig::default().pch_msi_start,
-            acpi_msi_count: FwCfgInterruptConfig::default().pch_msi_count,
+            acpi_gsi_base: u32::from(LoongArchFwCfgInterruptConfig::default().pch_pic_gsi_base),
+            acpi_msi_start: LoongArchFwCfgInterruptConfig::default().pch_msi_start,
+            acpi_msi_count: LoongArchFwCfgInterruptConfig::default().pch_msi_count,
         };
         let irq_routes = Vec::from([
+            GuestIrqRoute {
+                physical_irq: serial.irq as usize,
+                guest_vector: serial.irq as usize,
+            },
             GuestIrqRoute {
                 physical_irq: pci.intx_base as usize,
                 guest_vector: pci.intx_base as usize,
@@ -264,8 +295,8 @@ impl QemuVirtDefaults {
             pci,
             interrupt,
             fw_cfg: MmioRegion {
-                base: fw_cfg.base_gpa as u64,
-                size: fw_cfg.length as u64,
+                base: 0x1e02_0000,
+                size: 0x18,
             },
             firmware_devices: FirmwareDevices {
                 rtc: IrqMmioDevice {

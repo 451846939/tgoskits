@@ -1,6 +1,6 @@
 use std::{fs, path::Path};
 
-use arm_vgic::VgicError;
+use arm_vgic::{RegisterRegion, VgicError};
 use axdevice_base::{AccessWidth, DeviceError};
 
 #[test]
@@ -14,9 +14,11 @@ fn crate_uses_typed_errors_without_errno_contracts() {
 #[test]
 fn invalid_vgic_access_converts_to_device_input_error() {
     let error = VgicError::InvalidAccess {
+        region: RegisterRegion::Distributor,
         operation: "read",
         offset: 0x80,
         width: AccessWidth::Qword,
+        detail: "test access".into(),
     };
     let device: DeviceError = error.into();
 
@@ -24,15 +26,11 @@ fn invalid_vgic_access_converts_to_device_input_error() {
     assert!(device.to_string().contains("0x80"));
 }
 
-#[cfg(feature = "vgicv3")]
 #[test]
 fn vgic_rejects_out_of_range_irq_without_panicking() {
     assert!(matches!(
-        arm_vgic::v3::vgicd::VGicD::validate_irq(1024),
-        Err(VgicError::InvalidIrq {
-            irq: 1024,
-            max: 1024,
-        })
+        arm_vgic::IntId::new(arm_vgic::LPI_INTID_MAX + 1),
+        Err(VgicError::InvalidIntId { .. })
     ));
 }
 

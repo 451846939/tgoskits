@@ -17,8 +17,8 @@ use core::marker::PhantomData;
 use aarch64_cpu::registers::*;
 
 use crate::{
-    ArmGuestPhysAddr, ArmHostOps, ArmNestedPagingConfig, ArmSysRegAddr, ArmVcpuResult, ArmVmExit,
-    TrapFrame,
+    ArmGuestPhysAddr, ArmHostOps, ArmNestedPagingConfig, ArmSysRegAddr, ArmVcpuResult,
+    ArmVirtualTimerState, ArmVmExit, TrapFrame,
     context_frame::GuestSystemRegisters,
     exception::{TrapKind, handle_exception_sync},
     exception_utils::exception_class_value,
@@ -119,14 +119,13 @@ pub struct ArmVcpuCreateConfig {
     pub dtb_addr: usize,
 }
 
-/// Configuration for setting up a new [`ArmVcpu`].
-#[derive(Clone, Debug, Default)]
-pub struct ArmVcpuSetupConfig {
-    /// Should the hypervisor passthrough interrupts to the guest?
-    pub passthrough_interrupt: bool,
-    /// Should the hypervisor passthrough timers to the guest?
-    pub passthrough_timer: bool,
-}
+/// Fixed EL2 setup policy for a new [`ArmVcpu`].
+///
+/// Physical interrupts and timers are always trapped. A physical device may
+/// back a virtual interrupt, but it must still pass through the VM-owned
+/// virtual interrupt controller rather than bypassing vCPU state.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ArmVcpuSetupConfig;
 
 impl<H: ArmHostOps> ArmVcpu<H> {
     /// Creates a new architecture-specific vCPU.
@@ -144,8 +143,8 @@ impl<H: ArmHostOps> ArmVcpu<H> {
     }
 
     /// Completes architecture-specific setup.
-    pub fn setup(&mut self, config: ArmVcpuSetupConfig) -> ArmVcpuResult {
-        self.init_hv(config);
+    pub fn setup(&mut self, _config: ArmVcpuSetupConfig) -> ArmVcpuResult {
+        self.init_hv();
         Ok(())
     }
 
@@ -167,6 +166,11 @@ impl<H: ArmHostOps> ArmVcpu<H> {
         };
         self.guest_system_regs.vtcr_el2 = vtcr_for_config(config.levels, config.gpa_bits, pa_bits);
         Ok(())
+    }
+
+    /// Returns the architectural virtual timer state saved at the last VM exit.
+    pub fn virtual_timer_state(&self) -> ArmVirtualTimerState {
+        self.guest_system_regs.virtual_timer_state()
     }
 
     /// Runs the vCPU until a VM exit.
@@ -220,18 +224,18 @@ impl<H: ArmHostOps> ArmVcpu<H> {
 
 // Private function
 impl<H: ArmHostOps> ArmVcpu<H> {
-    fn init_hv(&mut self, config: ArmVcpuSetupConfig) {
+    fn init_hv(&mut self) {
         self.ctx.spsr = (SPSR_EL1::M::EL1h
             + SPSR_EL1::I::Masked
             + SPSR_EL1::F::Masked
             + SPSR_EL1::A::Masked
             + SPSR_EL1::D::Masked)
             .value;
-        self.init_vm_context(config);
+        self.init_vm_context();
     }
 
     /// Init guest context. Also set some el2 register value.
-    fn init_vm_context(&mut self, config: ArmVcpuSetupConfig) {
+    fn init_vm_context(&mut self) {
         // CNTHCTL_EL2.modify(CNTHCTL_EL2::EL1PCEN::SET + CNTHCTL_EL2::EL1PCTEN::SET);
         // Set CNTVOFF_EL2 to the current physical counter so the guest's
         // virtual counter (CNTVCT_EL0 = CNTPCT_EL0 - CNTVOFF_EL2) starts near zero.
@@ -239,11 +243,8 @@ impl<H: ArmHostOps> ArmVcpu<H> {
         unsafe { core::arch::asm!("mrs {0}, CNTPCT_EL0", out(reg) cntpct) };
         self.guest_system_regs.cntvoff_el2 = cntpct;
         self.guest_system_regs.cntkctl_el1 = 0;
-        self.guest_system_regs.cnthctl_el2 = if config.passthrough_timer {
-            (CNTHCTL_EL2::EL1PCEN::SET + CNTHCTL_EL2::EL1PCTEN::SET).into()
-        } else {
-            (CNTHCTL_EL2::EL1PCEN::CLEAR + CNTHCTL_EL2::EL1PCTEN::CLEAR).into()
-        };
+        self.guest_system_regs.cnthctl_el2 =
+            (CNTHCTL_EL2::EL1PCEN::CLEAR + CNTHCTL_EL2::EL1PCTEN::CLEAR).into();
 
         self.guest_system_regs.sctlr_el1 = 0x30C50830;
         self.guest_system_regs.pmcr_el0 = 0;
@@ -255,19 +256,12 @@ impl<H: ArmHostOps> ArmVcpu<H> {
             self.guest_system_regs.vtcr_el2 = vtcr_for_config(levels, gpa_bits, pa_bits);
         }
 
-        let mut hcr_el2 = HCR_EL2::VM::Enable
+        let hcr_el2 = HCR_EL2::VM::Enable
             + HCR_EL2::TSC::EnableTrapEl1SmcToEl2
             + HCR_EL2::TWI::SET
-            + HCR_EL2::RW::EL1IsAarch64;
-
-        if !config.passthrough_interrupt {
-            // Set HCR_EL2.IMO will trap IRQs to EL2 while enabling virtual IRQs.
-            //
-            // We must choose one of the two:
-            // - Enable virtual IRQs and trap physical IRQs to EL2.
-            // - Disable virtual IRQs and pass through physical IRQs to EL1.
-            hcr_el2 += HCR_EL2::IMO::EnableVirtualIRQ + HCR_EL2::FMO::EnableVirtualFIQ;
-        }
+            + HCR_EL2::RW::EL1IsAarch64
+            + HCR_EL2::IMO::EnableVirtualIRQ
+            + HCR_EL2::FMO::EnableVirtualFIQ;
 
         self.guest_system_regs.hcr_el2 = hcr_el2.into();
 
@@ -389,7 +383,7 @@ impl<H: ArmHostOps> ArmVcpu<H> {
         let result = match exit_reason {
             TrapKind::Synchronous => handle_exception_sync(&mut self.ctx),
             TrapKind::Irq => Ok(ArmVmExit::ExternalInterrupt {
-                vector: H::fetch_pending_host_irq().unwrap_or(0) as u64,
+                token: H::fetch_pending_host_irq(),
             }),
             _ => panic!("Unhandled exception {:?}", exit_reason),
         };
@@ -427,53 +421,53 @@ impl<H: ArmHostOps> ArmVcpu<H> {
         value: u64,
         reg: usize,
     ) -> ArmVcpuResult<Option<ArmVmExit>> {
-        const SYSREG_ICC_SGI1R_EL1: ArmSysRegAddr = ArmSysRegAddr::new(0x3A_3016); // ICC_SGI1R_EL1
+        const SYSREG_ICC_PMR_EL1: ArmSysRegAddr = ArmSysRegAddr::new(0x30_100c);
+        const SYSREG_ICC_SGI1R_EL1: ArmSysRegAddr = ArmSysRegAddr::new(0x3a_3016);
+        const SYSREG_ICC_DIR_EL1: ArmSysRegAddr = ArmSysRegAddr::new(0x32_3016);
+        const SYSREG_ICC_RPR_EL1: ArmSysRegAddr = ArmSysRegAddr::new(0x36_3016);
+        const SYSREG_ICC_CTLR_EL1: ArmSysRegAddr = ArmSysRegAddr::new(0x38_3018);
 
         match (addr, write) {
             (SYSREG_ICC_SGI1R_EL1, true) => {
                 debug!("arm_vcpu ICC_SGI1R_EL1 write: {value:#x}");
-
-                // TODO: support RangeSelector
-
-                let intid = (value >> 24) & 0b1111;
-                let irm = ((value >> 40) & 0b1) != 0;
-
-                // IRM == 1 => send to all except self
-                if irm {
-                    debug!("arm_vcpu ICC_SGI1R_EL1 write: irm == 1, send to all except self");
-
-                    return Ok(Some(ArmVmExit::SendIPI {
-                        target_cpu: 0,
-                        target_cpu_aux: 0,
-                        send_to_all: true,
-                        send_to_self: false,
-                        vector: intid,
-                    }));
-                }
-
-                let aff3 = (value >> 48) & 0xff;
-                let aff2 = (value >> 32) & 0xff;
-                let aff1 = (value >> 16) & 0xff;
-                let target_list = value & 0xffff;
-
-                debug!(
-                    "arm_vcpu ICC_SGI1R_EL1 write: aff3:{aff3:#x} aff2:{aff2:#x} aff1:{aff1:#x} \
-                     intid:{intid:#x} target_list:{target_list:#x}"
-                );
-
-                Ok(Some(ArmVmExit::SendIPI {
-                    target_cpu: (aff3 << 24) | (aff2 << 16) | (aff1 << 8),
-                    target_cpu_aux: target_list,
-                    send_to_all: false,
-                    send_to_self: false,
-                    vector: intid,
-                }))
+                Ok(Some(ArmVmExit::SendIPI { value }))
             }
             (SYSREG_ICC_SGI1R_EL1, false) => {
                 // ICC_SGI1R_EL1 is WO, we take it as RAZ.
                 self.set_gpr(reg, 0);
                 Ok(Some(ArmVmExit::Nothing))
             }
+            (SYSREG_ICC_DIR_EL1, true) => Ok(Some(ArmVmExit::DeactivateInterrupt {
+                intid: value as u32 & 0x00ff_ffff,
+            })),
+            (SYSREG_ICC_DIR_EL1, false) => {
+                self.set_gpr(reg, 0);
+                Ok(Some(ArmVmExit::Nothing))
+            }
+            (SYSREG_ICC_CTLR_EL1, false) => Ok(Some(ArmVmExit::GicCpuInterfaceRead {
+                register: crate::ArmGicCpuInterfaceRegister::Control,
+                destination: reg,
+            })),
+            (SYSREG_ICC_CTLR_EL1, true) => Ok(Some(ArmVmExit::GicCpuInterfaceWrite {
+                register: crate::ArmGicCpuInterfaceRegister::Control,
+                value,
+            })),
+            (SYSREG_ICC_PMR_EL1, false) => Ok(Some(ArmVmExit::GicCpuInterfaceRead {
+                register: crate::ArmGicCpuInterfaceRegister::PriorityMask,
+                destination: reg,
+            })),
+            (SYSREG_ICC_PMR_EL1, true) => Ok(Some(ArmVmExit::GicCpuInterfaceWrite {
+                register: crate::ArmGicCpuInterfaceRegister::PriorityMask,
+                value,
+            })),
+            (SYSREG_ICC_RPR_EL1, false) => Ok(Some(ArmVmExit::GicCpuInterfaceRead {
+                register: crate::ArmGicCpuInterfaceRegister::RunningPriority,
+                destination: reg,
+            })),
+            (SYSREG_ICC_RPR_EL1, true) => Ok(Some(ArmVmExit::GicCpuInterfaceWrite {
+                register: crate::ArmGicCpuInterfaceRegister::RunningPriority,
+                value,
+            })),
             _ => {
                 // If the system register access is not handled by the VCpu itself,
                 // we return None to let the hypervisor handle it.

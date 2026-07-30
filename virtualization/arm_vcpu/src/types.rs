@@ -190,6 +190,59 @@ impl ArmNestedPagingConfig {
     }
 }
 
+/// Saved state of the guest architectural virtual timer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ArmVirtualTimerState {
+    counter_offset: u64,
+    compare_value: u64,
+    control: u32,
+}
+
+impl ArmVirtualTimerState {
+    const ENABLE: u32 = 1 << 0;
+    const IMASK: u32 = 1 << 1;
+    const ISTATUS: u32 = 1 << 2;
+
+    /// Creates a snapshot from `CNTVOFF_EL2`, `CNTV_CVAL_EL0`, and `CNTV_CTL_EL0`.
+    pub const fn new(counter_offset: u64, compare_value: u64, control: u32) -> Self {
+        Self {
+            counter_offset,
+            compare_value,
+            control,
+        }
+    }
+
+    /// Returns whether the timer is enabled and unmasked.
+    pub const fn delivery_enabled(self) -> bool {
+        self.control & (Self::ENABLE | Self::IMASK) == Self::ENABLE
+    }
+
+    /// Returns whether the saved timer output is asserting virtual PPI 27.
+    pub const fn irq_asserted(self) -> bool {
+        self.control & (Self::ENABLE | Self::IMASK | Self::ISTATUS)
+            == (Self::ENABLE | Self::ISTATUS)
+    }
+
+    /// Returns the deadline in the host physical counter domain.
+    pub const fn physical_deadline(self) -> u64 {
+        self.compare_value.wrapping_add(self.counter_offset)
+    }
+}
+
+/// Common GICv3 CPU-interface register trapped by the vCPU core.
+///
+/// Keeping the architectural register identity typed prevents raw system
+/// register encodings from escaping into the embedding VMM.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArmGicCpuInterfaceRegister {
+    /// `ICC_CTLR_EL1`, the common CPU-interface control register.
+    Control,
+    /// `ICC_PMR_EL1`, the virtual priority-mask register.
+    PriorityMask,
+    /// `ICC_RPR_EL1`, the virtual running-priority register.
+    RunningPriority,
+}
+
 /// VM-exit reason returned by the AArch64 vCPU core.
 #[non_exhaustive]
 #[derive(Debug)]
@@ -237,10 +290,27 @@ pub enum ArmVmExit {
         /// Value written by the guest.
         value: u64,
     },
+    /// The guest read a trapped GICv3 common CPU-interface register.
+    GicCpuInterfaceRead {
+        /// Register selected by the trapped MRS instruction.
+        register: ArmGicCpuInterfaceRegister,
+        /// Destination guest general-purpose register.
+        destination: usize,
+    },
+    /// The guest wrote a trapped GICv3 common CPU-interface register.
+    GicCpuInterfaceWrite {
+        /// Register selected by the trapped MSR instruction.
+        register: ArmGicCpuInterfaceRegister,
+        /// Value written by the guest.
+        value: u64,
+    },
     /// A physical host interrupt should be handled by the embedding VMM.
     ExternalInterrupt {
-        /// Host or placeholder vector reported by the host adapter.
-        vector: u64,
+        /// Opaque acknowledgement token, or `None` for a spurious interrupt.
+        ///
+        /// The token is returned unchanged so a split-EOI host controller can
+        /// retain source information until the guest deactivates the interrupt.
+        token: Option<usize>,
     },
     /// A guest WFI or WFE instruction was trapped.
     WaitForInterrupt,
@@ -262,16 +332,13 @@ pub enum ArmVmExit {
     SystemDown,
     /// The guest wrote a GIC SGI system register.
     SendIPI {
-        /// Primary target selector.
-        target_cpu: u64,
-        /// Auxiliary target selector.
-        target_cpu_aux: u64,
-        /// Whether the SGI targets all other vCPUs.
-        send_to_all: bool,
-        /// Whether the SGI targets the current vCPU.
-        send_to_self: bool,
-        /// SGI interrupt ID.
-        vector: u64,
+        /// Complete `ICC_SGI1R_EL1` value, including affinity and range selector.
+        value: u64,
+    },
+    /// The guest wrote `ICC_DIR_EL1` while deactivation trapping was enabled.
+    DeactivateInterrupt {
+        /// Guest-visible INTID carried by `ICC_DIR_EL1`.
+        intid: u32,
     },
     /// The vCPU handled the event internally.
     Nothing,

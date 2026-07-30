@@ -33,7 +33,7 @@ pub(crate) fn install_machine_interrupt_controller(
             let redistributor = machine
                 .emulated_devices
                 .iter()
-                .find(|device| device.emu_type == EmulatedDeviceType::ArmGicRedistributor);
+                .find(|device| device.emu_type == EmulatedDeviceType::GPPTRedistributor);
             let (Some(distributor), Some(redistributor)) = (distributor, redistributor) else {
                 return Ok(());
             };

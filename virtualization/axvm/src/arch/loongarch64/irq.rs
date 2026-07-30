@@ -1,61 +1,124 @@
 //! LoongArch platform IRQ routing used by AxVM.
 
-use alloc::sync::Arc;
+use alloc::{collections::BTreeMap, sync::Arc};
 
-use axdevice_base::{InterruptTriggerMode, IrqError, IrqLineId, IrqResult, IrqSink};
-use axvm_types::VMInterruptMode;
+use ax_kspin::SpinNoIrq;
+use axdevice_base::{
+    ControllerInputId, InterruptControllerId, InterruptEndpoint, IrqError, IrqResult,
+    VirtualInterruptController, WiredIrqInput, WiredIrqSink,
+};
+use axvm_types::InterruptTriggerMode;
 
 const EIOINTC_IRQ: usize = 3;
+const PCH_PIC_INPUT_COUNT: usize = 64;
 
 struct LoongArchPchPicIrqSink {
     vm_id: usize,
+    pic: Arc<axdevice::LoongArchPchPic>,
 }
 
-impl IrqSink for LoongArchPchPicIrqSink {
-    fn set_level(&self, line: IrqLineId, asserted: bool) -> IrqResult {
-        let vm = crate::get_vm_by_id(self.vm_id).ok_or_else(|| IrqError::Backend {
-            line,
-            operation: "route LoongArch virtual IRQ",
-            detail: alloc::format!("VM[{}] is not registered", self.vm_id),
-        })?;
-        let devices = vm.get_devices().map_err(|error| IrqError::Backend {
-            line,
-            operation: "route LoongArch virtual IRQ",
-            detail: alloc::format!("{error}"),
-        })?;
-        let Some(vector) = devices.loongarch_pch_pic_set_irq_level(line.0, asserted) else {
-            return Err(IrqError::Unsupported {
-                line,
-                operation: "route LoongArch virtual IRQ",
-                detail: "the VM has no virtual PCH-PIC".into(),
-            });
-        };
+impl LoongArchPchPicIrqSink {
+    fn endpoint(input: ControllerInputId) -> InterruptEndpoint {
+        InterruptEndpoint::Wired {
+            controller: InterruptControllerId::new(0),
+            input,
+        }
+    }
+}
+
+impl WiredIrqSink for LoongArchPchPicIrqSink {
+    fn set_level(&self, input: ControllerInputId, asserted: bool) -> IrqResult {
+        let vector = self.pic.set_irq_level(input.value(), asserted);
         if !asserted {
             return Ok(());
         }
         let Some(vector) = vector else {
             return Ok(());
         };
-        crate::irq::dispatch_runtime_interrupt(
-            self.vm_id,
-            0,
-            line,
-            vector,
-            InterruptTriggerMode::LevelTriggered,
-        )
+        crate::runtime::vcpus::queue_interrupt(self.vm_id, 0, vector).map_err(|error| {
+            IrqError::Backend {
+                endpoint: Self::endpoint(input),
+                operation: "queue LoongArch PCH-PIC output",
+                detail: alloc::format!("{error}"),
+            }
+        })
     }
 
-    fn pulse(&self, line: IrqLineId) -> IrqResult {
-        self.set_level(line, true)?;
-        self.set_level(line, false)
+    fn pulse(&self, input: ControllerInputId) -> IrqResult {
+        self.set_level(input, true)?;
+        self.set_level(input, false)
     }
 }
 
-pub(crate) fn interrupt_fabric(
+/// Minimal adapter that lets DeviceRuntime resolve sources against the single
+/// guest-visible PCH-PIC instance.
+pub(crate) struct LoongArchInterruptDomain {
+    sink: Arc<LoongArchPchPicIrqSink>,
+    inputs: SpinNoIrq<BTreeMap<usize, (InterruptTriggerMode, WiredIrqInput)>>,
+}
+
+impl LoongArchInterruptDomain {
+    pub(crate) fn new(vm_id: usize, pic: Arc<axdevice::LoongArchPchPic>) -> Arc<Self> {
+        Arc::new(Self {
+            sink: Arc::new(LoongArchPchPicIrqSink { vm_id, pic }),
+            inputs: SpinNoIrq::new(BTreeMap::new()),
+        })
+    }
+}
+
+impl VirtualInterruptController for LoongArchInterruptDomain {
+    fn id(&self) -> InterruptControllerId {
+        InterruptControllerId::new(0)
+    }
+
+    fn wired_input(
+        &self,
+        input: ControllerInputId,
+        trigger: InterruptTriggerMode,
+    ) -> IrqResult<WiredIrqInput> {
+        if input.value() >= PCH_PIC_INPUT_COUNT {
+            return Err(IrqError::InvalidInput {
+                endpoint: InterruptEndpoint::Wired {
+                    controller: self.id(),
+                    input,
+                },
+                operation: "open LoongArch PCH-PIC input",
+                detail: alloc::format!(
+                    "input {} is outside 0..{PCH_PIC_INPUT_COUNT}",
+                    input.value()
+                ),
+            });
+        }
+        let mut inputs = self.inputs.lock();
+        if let Some((registered_trigger, registered)) = inputs.get(&input.value()) {
+            if *registered_trigger != trigger {
+                return Err(IrqError::InvalidInput {
+                    endpoint: InterruptEndpoint::Wired {
+                        controller: self.id(),
+                        input,
+                    },
+                    operation: "open LoongArch PCH-PIC input",
+                    detail: alloc::format!(
+                        "input {} is already registered as {registered_trigger:?}",
+                        input.value()
+                    ),
+                });
+            }
+            return Ok(registered.clone());
+        }
+
+        let sink: Arc<dyn WiredIrqSink> = self.sink.clone();
+        let registered = WiredIrqInput::new(self.id(), input, trigger, sink);
+        inputs.insert(input.value(), (trigger, registered.clone()));
+        Ok(registered)
+    }
+}
+
+pub(crate) fn create_interrupt_domain(
     vm_id: usize,
-    mode: VMInterruptMode,
-) -> crate::AxVmResult<crate::InterruptFabric> {
-    crate::InterruptFabric::with_sink(mode, Arc::new(LoongArchPchPicIrqSink { vm_id }))
+    pic: Arc<axdevice::LoongArchPchPic>,
+) -> Arc<LoongArchInterruptDomain> {
+    LoongArchInterruptDomain::new(vm_id, pic)
 }
 
 /// Register the platform IRQ injector for LoongArch dynamic hypervisor builds.
@@ -110,9 +173,14 @@ fn set_irq_enabled(raw_irq: usize, enabled: bool) {
 }
 
 fn inject_platform_irq(vm_id: usize, vcpu_id: usize, vector: usize, physical_irq: usize) {
-    if let Err(err) =
-        crate::runtime::vcpus::queue_external_interrupt(vm_id, vcpu_id, vector, physical_irq)
-    {
+    if let Err(err) = crate::runtime::vcpus::queue_pending_interrupt(
+        vm_id,
+        vcpu_id,
+        crate::vm::PendingInterrupt::External {
+            vector,
+            physical_irq,
+        },
+    ) {
         warn!(
             "failed to queue LoongArch platform IRQ {vector:#x}/physical {physical_irq:#x} for \
              VM[{vm_id}] VCpu[{vcpu_id}]: {err:?}"

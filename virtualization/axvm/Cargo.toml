@@ -12,7 +12,7 @@ license = "Apache-2.0"
 [features]
 fs = ["ax-std/fs"]
 host-fs = ["ax-std/fs"]
-host-test = ["ax-kspin/host-test", "ax-kernel-guard/host-test"]
+host-test = ["ax-kspin/host-test", "ax-kernel-guard/host-test", "axdevice/host-test"]
 sstc = ["riscv_vcpu/sstc"]
 tls = ["ax-hal/tls", "ax-std/tls", "cpu-local/tls"]
 
@@ -67,6 +67,7 @@ x86 = "0.52"
 x86_vcpu = { workspace = true }
 x86_vlapic = { workspace = true }
 [target.'cfg(target_arch = "riscv64")'.dependencies]
+ax-plat = { workspace = true }
 riscv_vcpu = { workspace = true }
 riscv_vplic = { workspace = true }
 [target.'cfg(target_arch = "loongarch64")'.dependencies]
@@ -75,8 +76,9 @@ ax-plat = { workspace = true }
 loongarch_vcpu = { workspace = true }
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 aarch64-cpu-ext = "0.1"
+aarch64_sysreg = { workspace = true }
 arm_vcpu = { workspace = true }
-arm_vgic = { workspace = true, features = ["vgicv3"] }
+arm_vgic = { workspace = true }
 arm-gic-driver = { workspace = true, features = ["rdif"] }
 rdif-intc.workspace = true
 rdrive.workspace = true

@@ -380,6 +380,7 @@ impl HyperCall {
                 operation,
             },
             AxVmError::InvalidConfig { .. }
+            | AxVmError::LifecycleRollback { .. }
             | AxVmError::Boot { .. }
             | AxVmError::Memory { .. }
             | AxVmError::Device { .. }

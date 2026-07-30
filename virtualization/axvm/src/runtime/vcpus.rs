@@ -19,20 +19,10 @@ use crate::{
     arch::{ArchOps, CurrentArch, VcpuRunAction},
     ax_err_type,
     runtime::{VCpuRef, VMRef, sub_running_vm_count},
-    vm::VmRuntimeHandle,
+    vm::{PendingInterrupt, VmRuntimeHandle},
 };
 
 const KERNEL_STACK_SIZE: usize = 0x40000; // 256 KiB
-
-/// Blocks the current thread until it is explicitly woken up, using the wait queue
-/// associated with the VCpus of the specified VM.
-///
-/// # Arguments
-///
-/// * `vm_id` - The ID of the VM whose VCpu wait queue is used to block the current thread.
-fn wait(vm_vcpus: &VmRuntimeHandle) {
-    vm_vcpus.wait();
-}
 
 /// Blocks the current thread until the provided condition is met, using the wait queue
 /// associated with the VCpus of the specified VM.
@@ -84,6 +74,14 @@ pub(crate) fn notify_all_vcpus(vm_id: usize) {
 }
 
 pub(crate) fn queue_interrupt(vm_id: usize, vcpu_id: usize, vector: usize) -> AxVmResult {
+    queue_pending_interrupt(vm_id, vcpu_id, PendingInterrupt::Normal(vector))
+}
+
+pub(crate) fn queue_pending_interrupt(
+    vm_id: usize,
+    vcpu_id: usize,
+    interrupt: PendingInterrupt,
+) -> AxVmResult {
     let vm = crate::get_vm_by_id(vm_id)
         .ok_or_else(|| ax_err_type!(NotFound, format!("VM[{vm_id}] not found")))?;
     if !matches!(vm.status(), VmStatus::Running | VmStatus::Paused) {
@@ -93,7 +91,7 @@ pub(crate) fn queue_interrupt(vm_id: usize, vcpu_id: usize, vector: usize) -> Ax
         ));
     }
 
-    let cpu_id = vm.with_runtime(|runtime| runtime.queue_interrupt(vcpu_id, vector))?;
+    let cpu_id = vm.with_runtime(|runtime| runtime.queue_pending_interrupt(vcpu_id, interrupt))?;
     vm.with_runtime(|runtime| {
         runtime.notify_all();
         Ok(())
@@ -117,35 +115,6 @@ pub(crate) fn notify_vcpu(vm_id: usize, vcpu_id: usize) -> AxVmResult {
     let runtime = vm.with_runtime(|runtime| Ok(runtime.clone()))?;
     let cpu_id = runtime.vcpu_cpu_id(vcpu_id)?;
     runtime.notify_all();
-    crate::host::task::send_ipi(cpu_id);
-    Ok(())
-}
-
-#[expect(
-    dead_code,
-    reason = "only the LoongArch IRQ backend queues physical interrupts"
-)]
-pub(crate) fn queue_external_interrupt(
-    vm_id: usize,
-    vcpu_id: usize,
-    vector: usize,
-    physical_irq: usize,
-) -> AxVmResult {
-    let vm = crate::get_vm_by_id(vm_id)
-        .ok_or_else(|| ax_err_type!(NotFound, format!("VM[{vm_id}] not found")))?;
-    if !matches!(vm.status(), VmStatus::Running | VmStatus::Paused) {
-        return Err(ax_err_type!(
-            BadState,
-            format!("VM[{vm_id}] is not accepting interrupts")
-        ));
-    }
-
-    let cpu_id =
-        vm.with_runtime(|runtime| runtime.queue_external_interrupt(vcpu_id, vector, physical_irq))?;
-    vm.with_runtime(|runtime| {
-        runtime.notify_all();
-        Ok(())
-    })?;
     crate::host::task::send_ipi(cpu_id);
     Ok(())
 }
@@ -183,10 +152,7 @@ pub(crate) fn inject_pending_interrupts<A: ArchOps>(
 /// It will join all VCpu tasks to ensure they are fully cleaned up.
 pub(crate) fn cleanup_vm_vcpus(vm_id: usize) {
     if let Some(vm) = crate::get_vm_by_id(vm_id)
-        && let Err(err) = vm.with_runtime(|runtime| {
-            runtime.join_all_vcpu_tasks(vm_id);
-            Ok(())
-        })
+        && let Err(err) = vm.with_runtime(|runtime| runtime.join_all_vcpu_tasks(vm_id))
     {
         warn!("VM[{vm_id}] vCPU runtime cleanup skipped: {err:?}");
     }
@@ -297,7 +263,7 @@ fn vcpu_run() {
             Ok(VcpuRunAction {
                 waits_for_event: true,
                 ..
-            }) => wait(&runtime),
+            }) => CurrentArch::wait_for_vcpu_event(&vm, &vcpu, &runtime),
             Ok(VcpuRunAction { .. }) => {}
             Err(err) => {
                 error!("VM[{vm_id}] run VCpu[{vcpu_id}] get error {err:?}");
@@ -330,12 +296,16 @@ fn vcpu_run() {
             if runtime.mark_vcpu_exiting() {
                 info!("VM[{vm_id}] VCpu[{vcpu_id}] last VCpu exiting, decreasing running VM count");
 
+                if let Err(err) = CurrentArch::on_last_vcpu_exit(&vm) {
+                    warn!("VM[{vm_id}] architecture device cleanup failed: {err:?}");
+                    runtime.record_lifecycle_error(err);
+                }
                 if let Err(err) = vm.finish_stop() {
                     warn!("VM[{vm_id}] finish stop failed: {err:?}");
+                    runtime.record_lifecycle_error(err);
+                } else {
+                    info!("VM[{}] state changed to Stopped", vm_id);
                 }
-                info!("VM[{}] state changed to Stopped", vm_id);
-
-                CurrentArch::on_last_vcpu_exit(vm_id);
 
                 sub_running_vm_count(1);
                 crate::host::task::wait_queue_wake(&super::VMM, 1);

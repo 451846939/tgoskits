@@ -436,9 +436,7 @@ version = "0.5.4"
 dependencies = [
  "aarch64-cpu 11.2.0",
  "aarch64_sysreg",
- "ax-crate-interface",
  "ax-kspin",
- "ax-memory-addr",
  "axdevice_base",
  "axvm-types",
  "bitmaps",
@@ -1365,6 +1363,7 @@ dependencies = [
  "quote",
  "raw-cpuid 11.6.0",
  "regex",
+ "regex-automata",
  "reqwest",
  "rustc-demangle",
  "schemars",
@@ -1388,7 +1387,6 @@ dependencies = [
 name = "axdevice"
 version = "0.5.5"
 dependencies = [
- "arm_vgic",
  "ax-kspin",
  "ax-memory-addr",
  "axdevice_base",
@@ -1624,6 +1622,7 @@ name = "axvm"
 version = "0.5.24"
 dependencies = [
  "aarch64-cpu-ext",
+ "aarch64_sysreg",
  "arm-gic-driver",
  "arm_vcpu",
  "arm_vgic",
@@ -7028,14 +7027,10 @@ dependencies = [
 name = "riscv_vplic"
 version = "0.4.21"
 dependencies = [
- "ax-crate-interface",
  "ax-kspin",
- "ax-memory-addr",
  "axdevice_base",
  "axvm-types",
  "bitmaps",
- "log",
- "riscv-h",
  "thiserror 2.0.19",
 ]
 

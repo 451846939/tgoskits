@@ -16,6 +16,8 @@ use core::{arch::asm, fmt::Formatter};
 
 use aarch64_cpu::registers::*;
 
+use crate::ArmVirtualTimerState;
+
 /// A struct representing the AArch64 CPU context frame.
 ///
 /// This context frame includes
@@ -227,6 +229,10 @@ struct GuestTimerRegisters {
 }
 
 impl GuestSystemRegisters {
+    pub(crate) const fn virtual_timer_state(&self) -> ArmVirtualTimerState {
+        ArmVirtualTimerState::new(self.cntvoff_el2, self.cntv_cval_el0, self.cntv_ctl_el0)
+    }
+
     /// Resets the VM context by setting all registers to zero.
     ///
     /// This method allows the `GuestSystemRegisters` instance to be reused by resetting

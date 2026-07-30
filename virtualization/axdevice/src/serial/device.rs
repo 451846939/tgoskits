@@ -1,11 +1,10 @@
 //! Unified bus adapters for virtual UART cores.
 
 use alloc::{boxed::Box, sync::Arc};
-use core::any::Any;
 
 use axdevice_base::{
-    AccessWidth, BusAccess, BusKind, BusResponse, Device, DeviceError, InterruptTriggerMode,
-    IrqLine, Resource,
+    AccessWidth, BusAccess, BusKind, BusResponse, Device, DeviceAccess, DeviceError,
+    InterruptTriggerMode, IrqLine, Resource,
 };
 
 use crate::{
@@ -48,7 +47,11 @@ impl Device for Uart16550PortDevice {
         &self.resources
     }
 
-    fn handle(&self, access: &BusAccess) -> Result<BusResponse, DeviceError> {
+    fn access(
+        &self,
+        access: &BusAccess,
+        _context: &mut dyn DeviceAccess,
+    ) -> Result<BusResponse, DeviceError> {
         if access.kind != BusKind::Port {
             return Err(DeviceError::OutOfRange { addr: access.addr });
         }
@@ -56,11 +59,13 @@ impl Device for Uart16550PortDevice {
             .ok()
             .and_then(|port| port.checked_sub(self.base))
             .ok_or(DeviceError::OutOfRange { addr: access.addr })? as usize;
-        handle_16550(&self.core, offset, AccessWidth::Byte, access)
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
+        if access.width != AccessWidth::Byte {
+            return Err(DeviceError::InvalidWidth {
+                expected: AccessWidth::Byte,
+                actual: access.width,
+            });
+        }
+        handle_16550(&self.core, offset, access)
     }
 }
 
@@ -74,7 +79,6 @@ struct Uart16550MmioDevice {
     core: Uart16550,
     base: u64,
     register_shift: u8,
-    register_width: AccessWidth,
     resources: Box<[Resource]>,
 }
 
@@ -83,7 +87,6 @@ impl Uart16550MmioDevice {
         base: usize,
         length: usize,
         register_shift: u8,
-        register_width: AccessWidth,
         irq_id: usize,
         backend: Arc<dyn SerialBackend>,
         irq: IrqLine,
@@ -92,7 +95,6 @@ impl Uart16550MmioDevice {
             core: Uart16550::new(backend, irq),
             base: base as u64,
             register_shift,
-            register_width,
             resources: alloc::vec![
                 Resource::MmioRange {
                     base: base as u64,
@@ -114,7 +116,11 @@ impl Device for Uart16550MmioDevice {
         &self.resources
     }
 
-    fn handle(&self, access: &BusAccess) -> Result<BusResponse, DeviceError> {
+    fn access(
+        &self,
+        access: &BusAccess,
+        _context: &mut dyn DeviceAccess,
+    ) -> Result<BusResponse, DeviceError> {
         if access.kind != BusKind::Mmio {
             return Err(DeviceError::OutOfRange { addr: access.addr });
         }
@@ -124,11 +130,7 @@ impl Device for Uart16550MmioDevice {
             .ok_or(DeviceError::OutOfRange { addr: access.addr })?;
         let register = usize::try_from(offset >> self.register_shift)
             .map_err(|_| DeviceError::OutOfRange { addr: access.addr })?;
-        handle_16550(&self.core, register, self.register_width, access)
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
+        handle_16550(&self.core, register, access)
     }
 }
 
@@ -176,7 +178,11 @@ impl Device for Pl011MmioDevice {
         &self.resources
     }
 
-    fn handle(&self, access: &BusAccess) -> Result<BusResponse, DeviceError> {
+    fn access(
+        &self,
+        access: &BusAccess,
+        _context: &mut dyn DeviceAccess,
+    ) -> Result<BusResponse, DeviceError> {
         if access.kind != BusKind::Mmio {
             return Err(DeviceError::OutOfRange { addr: access.addr });
         }
@@ -194,10 +200,6 @@ impl Device for Pl011MmioDevice {
             self.core.write(offset, access.width, access.data)?;
             Ok(BusResponse::Write)
         }
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 
@@ -225,7 +227,6 @@ pub fn build_16550_mmio(
     base: usize,
     length: usize,
     register_shift: u8,
-    register_width: AccessWidth,
     irq_id: usize,
     backend: Arc<dyn SerialBackend>,
     irq: IrqLine,
@@ -234,7 +235,6 @@ pub fn build_16550_mmio(
         base,
         length,
         register_shift,
-        register_width,
         irq_id,
         backend,
         irq,
@@ -266,15 +266,10 @@ where
 fn handle_16550(
     core: &Uart16550,
     register: usize,
-    register_width: AccessWidth,
     access: &BusAccess,
 ) -> Result<BusResponse, DeviceError> {
-    if access.width != register_width {
-        return Err(DeviceError::InvalidWidth {
-            expected: register_width,
-            actual: access.width,
-        });
-    }
+    // QEMU's serial-mm adapter uses the access address only to select the
+    // register and always transfers the low byte to the 16550 core.
     if access.is_read {
         core.read(register, AccessWidth::Byte)
             .map(|value| BusResponse::Read { value })
@@ -303,7 +298,9 @@ mod tests {
     use alloc::{sync::Arc, vec::Vec};
     use std::sync::Mutex;
 
-    use axdevice_base::{IrqLineId, IrqResult, IrqSink};
+    use axdevice_base::{
+        ControllerInputId, InterruptControllerId, IrqResult, WiredIrqInput, WiredIrqSink,
+    };
 
     use super::*;
 
@@ -324,42 +321,44 @@ mod tests {
 
     struct NoopIrqSink;
 
-    impl IrqSink for NoopIrqSink {
-        fn set_level(&self, _line: IrqLineId, _asserted: bool) -> IrqResult {
+    impl WiredIrqSink for NoopIrqSink {
+        fn set_level(&self, _input: ControllerInputId, _asserted: bool) -> IrqResult {
             Ok(())
         }
 
-        fn pulse(&self, _line: IrqLineId) -> IrqResult {
+        fn pulse(&self, _input: ControllerInputId) -> IrqResult {
             Ok(())
         }
+    }
+
+    fn level_irq(line: usize) -> IrqLine {
+        WiredIrqInput::new(
+            InterruptControllerId::new(0),
+            ControllerInputId::new(line),
+            InterruptTriggerMode::LevelTriggered,
+            Arc::new(NoopIrqSink),
+        )
+        .connect()
+        .unwrap()
     }
 
     #[test]
     fn mmio_16550_accepts_dword_access_for_four_byte_registers() {
         let backend = Arc::new(RecordingBackend::default());
-        let irq = IrqLine::new(
-            IrqLineId(365),
-            InterruptTriggerMode::LevelTriggered,
-            Arc::new(NoopIrqSink),
-        );
-        let device = Uart16550MmioDevice::new(
-            0xfeb5_0000,
-            0x100,
-            2,
-            AccessWidth::Dword,
-            365,
-            backend.clone(),
-            irq,
-        );
+        let irq = level_irq(365);
+        let device = Uart16550MmioDevice::new(0xfeb5_0000, 0x100, 2, 365, backend.clone(), irq);
 
         let response = device
-            .handle(&BusAccess {
-                kind: BusKind::Mmio,
-                is_read: false,
-                addr: 0xfeb5_0000,
-                width: AccessWidth::Dword,
-                data: b'A' as u64,
-            })
+            .access(
+                &BusAccess {
+                    kind: BusKind::Mmio,
+                    is_read: false,
+                    addr: 0xfeb5_0000,
+                    width: AccessWidth::Dword,
+                    data: b'A' as u64,
+                },
+                &mut axdevice_base::NoopDeviceAccess::new(axdevice_base::DeviceId::new(0)),
+            )
             .unwrap();
 
         assert!(matches!(response, BusResponse::Write));
@@ -367,39 +366,111 @@ mod tests {
     }
 
     #[test]
-    fn mmio_16550_ignores_unimplemented_registers_inside_its_window() {
-        let irq = IrqLine::new(
-            IrqLineId(365),
-            InterruptTriggerMode::LevelTriggered,
-            Arc::new(NoopIrqSink),
-        );
+    fn mmio_16550_accepts_byte_access_for_dword_register_map() {
+        let irq = level_irq(365);
         let device = Uart16550MmioDevice::new(
             0xfeb5_0000,
             0x100,
             2,
+            365,
+            Arc::new(RecordingBackend::default()),
+            irq,
+        );
+        let mut context = axdevice_base::NoopDeviceAccess::new(axdevice_base::DeviceId::new(0));
+
+        device
+            .access(
+                &BusAccess {
+                    kind: BusKind::Mmio,
+                    is_read: false,
+                    addr: 0xfeb5_0004,
+                    width: AccessWidth::Byte,
+                    data: 1,
+                },
+                &mut context,
+            )
+            .unwrap();
+        let response = device
+            .access(
+                &BusAccess {
+                    kind: BusKind::Mmio,
+                    is_read: true,
+                    addr: 0xfeb5_0004,
+                    width: AccessWidth::Byte,
+                    data: 0,
+                },
+                &mut context,
+            )
+            .unwrap();
+
+        assert!(matches!(response, BusResponse::Read { value: 1 }));
+    }
+
+    #[test]
+    fn mmio_16550_uses_the_low_byte_for_every_bus_width() {
+        let backend = Arc::new(RecordingBackend::default());
+        let irq = level_irq(365);
+        let device = Uart16550MmioDevice::new(0xfeb5_0000, 0x100, 2, 365, backend.clone(), irq);
+        let mut context = axdevice_base::NoopDeviceAccess::new(axdevice_base::DeviceId::new(0));
+
+        for width in [
+            AccessWidth::Byte,
+            AccessWidth::Word,
             AccessWidth::Dword,
+            AccessWidth::Qword,
+        ] {
+            device
+                .access(
+                    &BusAccess {
+                        kind: BusKind::Mmio,
+                        is_read: false,
+                        addr: 0xfeb5_0000,
+                        width,
+                        data: 0xfeed_0000_0000_005a,
+                    },
+                    &mut context,
+                )
+                .unwrap();
+        }
+
+        assert_eq!(backend.output.lock().unwrap().as_slice(), b"ZZZZ");
+    }
+
+    #[test]
+    fn mmio_16550_ignores_unimplemented_registers_inside_its_window() {
+        let irq = level_irq(365);
+        let device = Uart16550MmioDevice::new(
+            0xfeb5_0000,
+            0x100,
+            2,
             365,
             Arc::new(RecordingBackend::default()),
             irq,
         );
 
         let write = device
-            .handle(&BusAccess {
-                kind: BusKind::Mmio,
-                is_read: false,
-                addr: 0xfeb5_0088,
-                width: AccessWidth::Dword,
-                data: 1,
-            })
+            .access(
+                &BusAccess {
+                    kind: BusKind::Mmio,
+                    is_read: false,
+                    addr: 0xfeb5_0088,
+                    width: AccessWidth::Dword,
+                    data: 1,
+                },
+                &mut axdevice_base::NoopDeviceAccess::new(axdevice_base::DeviceId::new(0)),
+            )
             .unwrap();
         let read = device
-            .handle(&BusAccess {
-                kind: BusKind::Mmio,
-                is_read: true,
-                addr: 0xfeb5_0088,
-                width: AccessWidth::Dword,
-                data: 0,
-            })
+            .access(
+                &BusAccess {
+                    kind: BusKind::Mmio,
+                    is_read: true,
+                    addr: 0xfeb5_0088,
+                    width: AccessWidth::Dword,
+                    data: 0,
+                },
+                &mut axdevice_base::NoopDeviceAccess::new(axdevice_base::DeviceId::new(0)),
+            )
             .unwrap();
 
         assert!(matches!(write, BusResponse::Write));

@@ -851,6 +851,55 @@ impl HypervisorInterface {
         (self.gich().VTR.read(gich::VTR::ListRegs) + 1) as usize
     }
 
+    /// Returns the number of implemented priority bits.
+    pub fn priority_bits(&self) -> u8 {
+        (self.gich().VTR.read(gich::VTR::PRIbits) + 1) as u8
+    }
+
+    /// Returns the raw GICH_HCR value for vCPU context save.
+    pub fn hcr_raw(&self) -> u32 {
+        self.gich().HCR.get()
+    }
+
+    /// Restores a raw GICH_HCR value for vCPU context load.
+    pub fn set_hcr_raw(&self, value: u32) {
+        self.gich().HCR.set(value);
+    }
+
+    /// Returns the raw GICH_VMCR value for vCPU context save.
+    pub fn vmcr_raw(&self) -> u32 {
+        self.gich().VMCR.get()
+    }
+
+    /// Restores a raw GICH_VMCR value for vCPU context load.
+    pub fn set_vmcr_raw(&self, value: u32) {
+        self.gich().VMCR.set(value);
+    }
+
+    /// Returns the raw GICH_APR value for vCPU context save.
+    pub fn apr_raw(&self) -> u32 {
+        self.gich().APR.get()
+    }
+
+    /// Restores the raw GICH_APR value for vCPU context load.
+    pub fn set_apr_raw(&self, value: u32) {
+        self.gich().APR.set(value);
+    }
+
+    /// Returns one raw GICH_LR value after validating the hardware index.
+    pub fn list_register_raw(&self, index: usize) -> Option<u32> {
+        (index < self.get_list_register_count()).then(|| self.gich().LR[index].get())
+    }
+
+    /// Restores one raw GICH_LR value after validating the hardware index.
+    pub fn set_list_register_raw(&self, index: usize, value: u32) -> Result<(), &'static str> {
+        if index >= self.get_list_register_count() {
+            return Err("list register index exceeds the implemented GICH range");
+        }
+        self.gich().LR[index].set(value);
+        Ok(())
+    }
+
     /// Get EOI status registers
     pub fn get_eoi_status(&self) -> (u32, u32) {
         (self.gich().EISR0.get(), self.gich().EISR1.get())

@@ -14,7 +14,8 @@ memory_regions = [
     [0x8000_0000, 0x4000_0000, 0x7, 1],
 ]
 
-# PL011 and the virtual interrupt controller are supplied by the machine profile.
+# The virtual UART and interrupt controller are supplied by the machine profile.
+# Firmware-backed machines select PL011 or 16550 from the host console identity.
 [devices]
 passthrough = []
 disabled = []

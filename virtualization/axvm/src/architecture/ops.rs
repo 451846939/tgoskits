@@ -31,9 +31,32 @@ pub(crate) trait ArchOps {
 
     fn before_first_run(_vm: &crate::AxVMRef, _vcpu: &crate::vm::AxVCpuRef<Self::VCpu>) {}
 
-    fn before_vcpu_run(_vm: &crate::AxVMRef, _vcpu: &crate::vm::AxVCpuRef<Self::VCpu>) {}
+    /// Activates architecture-owned device bindings before the VM becomes runnable.
+    fn activate_devices(_vm: &crate::AxVM) -> AxVmResult {
+        Ok(())
+    }
+
+    /// Rolls back architecture-owned device bindings after a failed start.
+    fn deactivate_devices(_vm: &crate::AxVM) -> AxVmResult {
+        Ok(())
+    }
+
+    fn before_vcpu_run(
+        _vm: &crate::AxVMRef,
+        _vcpu: &crate::vm::AxVCpuRef<Self::VCpu>,
+    ) -> AxVmResult {
+        Ok(())
+    }
 
     fn after_vcpu_run(_vm: &crate::AxVMRef, _vcpu: &crate::vm::AxVCpuRef<Self::VCpu>) {}
+
+    fn wait_for_vcpu_event(
+        _vm: &crate::AxVMRef,
+        _vcpu: &crate::vm::AxVCpuRef<Self::VCpu>,
+        runtime: &crate::vm::VmRuntimeHandle,
+    ) {
+        runtime.wait();
+    }
 
     fn inject_pending_interrupt(
         _vm: &crate::AxVMRef,
@@ -91,7 +114,13 @@ pub(crate) trait ArchOps {
         crate::check_timer_events();
     }
 
-    fn on_last_vcpu_exit(_vm_id: usize) {}
+    /// Releases architecture runtime state after the VM's last vCPU exits.
+    ///
+    /// The VM reference is required for architecture state that is published
+    /// through VM-local device services rather than indexed in global tables.
+    fn on_last_vcpu_exit(_vm: &crate::AxVMRef) -> AxVmResult {
+        Ok(())
+    }
 
     fn after_mmio_write(_vm: &crate::AxVMRef) {}
 
@@ -134,7 +163,7 @@ pub(crate) trait ArchOps {
 
                 drain_and_inject_dispatched_interrupts::<Self>(vm, vcpu_id, vcpu);
 
-                Self::before_vcpu_run(vm, vcpu);
+                Self::before_vcpu_run(vm, vcpu)?;
                 let exit = vcpu.run();
                 Self::after_vcpu_run(vm, vcpu);
                 let exit = exit?;

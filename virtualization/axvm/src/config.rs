@@ -414,7 +414,7 @@ impl AxVMConfig {
         let redistributor = self
             .emu_devices
             .iter_mut()
-            .find(|device| device.emu_type == EmulatedDeviceType::ArmGicRedistributor)
+            .find(|device| device.emu_type == EmulatedDeviceType::GPPTRedistributor)
             .ok_or_else(|| {
                 crate::AxVmError::invalid_config("AArch64 machine profile has no redistributor")
             })?;
@@ -694,7 +694,7 @@ mod tests {
         let redistributor = config
             .emu_devices()
             .iter()
-            .find(|device| device.emu_type == EmulatedDeviceType::ArmGicRedistributor)
+            .find(|device| device.emu_type == EmulatedDeviceType::GPPTRedistributor)
             .unwrap();
         assert_eq!(
             (redistributor.base_gpa, redistributor.length),

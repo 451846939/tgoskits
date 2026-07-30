@@ -79,12 +79,22 @@ disabled = [
 
 machine profile 根据编译目标创建客户机平台设备。配置不能覆盖这些资源。
 
-| 架构 | 虚拟串口 | 固定资源 |
+| 架构 | 虚拟串口 | 资源来源 |
 | --- | --- | --- |
 | x86_64 | 16550 COM1 | PIO `0x3f8..=0x3ff`，GSI 4 |
-| AArch64 | PL011 | MMIO `0x0900_0000/0x1000`，INTID 33，24 MHz |
+| AArch64 | PL011 或 16550 | 复用 host FDT `stdout-path` 的地址、跨度、IRQ 与节点身份；QEMU `virt` 回退为 PL011 `0x0900_0000/0x1000`、INTID 33、24 MHz |
 | RISC-V | NS16550 | MMIO `0x1000_0000/0x100`，PLIC source 10，3.6864 MHz |
 | LoongArch | NS16550 | MMIO `0x1fe0_01e0/0x100`，PCH-PIC line 2，100 MHz |
+
+在 AArch64 固件平台上，machine 根据 host FDT 控制台节点的 compatible 选择模型：
+`arm,pl011` 创建虚拟 PL011，`ns16550(a)` 或 DW APB UART 创建虚拟 16550。虚拟节点
+保留 host 的节点路径、phandle、`reg`、`interrupt-parent`、interrupt specifier、
+`reg-shift` 和 `reg-io-width`；原硬件时钟依赖替换为虚拟 fixed-clock，波特率不是
+可配置的客户机硬件资源。
+
+stage-2 GPA 位宽同样由 machine plan 决定。若一个 VM 的 vCPU 可以运行在多个物理
+CPU 上，规划器必须对这些 CPU 的真实能力取最小支持位宽，不能按启动 CPU 的能力
+扩大地址空间。
 
 地址规划顺序固定为：
 
@@ -98,6 +108,14 @@ machine profile 根据编译目标创建客户机平台设备。配置不能覆�
 因此虚拟串口的陷入区总是 stage-2 hole；相同地址上的宿主 UART 不可能透传。
 显式选择 host-owned UART 必须返回 `host-owned device` 错误，不能静默忽略。
 
+## 设备 runtime
+
+普通设备遵循统一的 `factory -> DeviceBundle -> DeviceRuntime` 构建路径。架构层只创建
+中断控制器、bootstrap factory 和不可变 machine plan；factory 只能构造 bundle，
+不能在构建过程中直接修改 runtime。bundle 注册资源、typed service、grant 和
+interrupt endpoint 是一个事务，任一步失败都必须完整回滚。拓扑 seal 后不能再增加
+资源或服务，也不保留按具体设备扩张的 legacy fallback 字段。
+
 ## 串口与中断所有权
 
 `axdevice` 拥有协议状态机：
@@ -106,17 +124,34 @@ machine profile 根据编译目标创建客户机平台设备。配置不能覆�
 - x86 使用 PIO adapter；RISC-V 与 LoongArch 使用 machine profile 指定的 MMIO layout。
 - PL011 使用独立的寄存器模型，负责 FIFO、FR、CR、IMSC、RIS/MIS、ICR 和 PrimeCell ID。
 - `SerialBackend` 只传递字节，不读取宿主硬件，也不知道 shell 状态。
-- UART 只持有 `IrqLine`，并根据当前未屏蔽中断条件断言或撤销 level IRQ。
+- UART 只持有控制器签发的 `WiredIrqInput`，并根据当前未屏蔽中断条件断言或撤销
+  level IRQ。
 
 虚拟中断控制器拥有 pending/active/routing 状态。UART 保持中断条件时，客户机 EOI
 之后控制器必须再次投递；UART 不直接向 vCPU 写入架构 IRQ 编号。
 
 固件描述与 machine profile 使用同一组资源常量：
 
-- AArch64 FDT 设置 PL011 节点和 `/chosen/stdout-path`。
+- AArch64 FDT 按 host compatible 设置 PL011 或 16550 节点、fixed-clock 和
+  `/chosen/stdout-path`。
 - RISC-V FDT 设置 `ns16550a`、时钟和 PLIC source。
 - LoongArch FDT、SPCR 与 DSDT 使用同一个 `GuestPlatform.serial`。
 - x86 MP table/ACPI 保持 COM1 与 GSI 4 的平台约定。
+
+物理设备直通不等于 IRQ 直达。AArch64 SPI 由 vGIC 作为 backing source 分阶段管理：
+
+1. prepare 只 claim host IRQ，VM start 前不接管设备；
+2. start 激活固定的 host INTID 到同号 guest INTID binding；
+3. host top half 只完成 acknowledge/priority drop，并把 pending 写入 vGIC 状态；
+4. guest EOI/DIR 后，vGIC 在锁外完成 host deactivate 和 level resample；
+5. VM stop/teardown 撤销 binding，并拒绝 stale generation 的迟到事件。
+
+guest 始终只看到虚拟控制器，不能访问 host GIC 寄存器或修改物理 trigger/route。
+缺少 deferred-deactivate 能力的平台返回 `Unsupported`，不采用 mask 延迟模拟。
+
+跨层 channel 不保存 IRQ 事件或 pending 状态。hard IRQ 路径只向每 VM 预分配的原子
+vCPU 位图发布 kick，并唤醒 `IrqNotify` worker；VM 查找、runtime notify/IPI 和其他
+可能获取普通锁的工作都在 task context 执行。
 
 ## 宿主控制台复用
 
@@ -166,6 +201,8 @@ flowchart LR
 - 四种 machine profile 的串口资源与 host-owned UART 地址规划测试。
 - 16550/PL011 FIFO、状态、屏蔽、清除及 level IRQ 测试。
 - AArch64/RISC-V/LoongArch FDT 与 LoongArch ACPI 串口资源测试。
+- controller-owned shared level/edge、enable gate、EOI/DIR、物理 deactivate/resample、
+  teardown 和 stale generation 测试。
 - 控制台前台路由、转义、停止/删除、并发输出和多 VM 行前缀测试。
 - 四架构 Axvisor QEMU smoke；LoongArch 使用仓库规定的 LVZ 容器。
 

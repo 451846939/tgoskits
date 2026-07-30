@@ -12,6 +12,21 @@ pub(crate) fn minimum_cpu_capability(
         .fold(default, |minimum, capability| minimum.min(capability))
 }
 
+/// Selects the smallest capability supported by every CPU on which a VM's
+/// vCPUs may run.
+pub(crate) fn minimum_target_cpu_capability(
+    default: usize,
+    vcpu_mappings: &[(usize, Option<usize>, usize)],
+    mut capability_for_cpu: impl FnMut(usize) -> usize,
+) -> usize {
+    minimum_cpu_capability(
+        default,
+        crate::architecture::ops::target_phys_cpu_ids(vcpu_mappings)
+            .into_iter()
+            .map(&mut capability_for_cpu),
+    )
+}
+
 /// Architecture selection for fixed guest machine resources.
 pub(crate) trait MachinePlatform {
     const MACHINE_ARCHITECTURE: crate::machine::MachineArchitecture;
@@ -88,5 +103,20 @@ mod tests {
     #[test]
     fn minimum_cpu_capability_keeps_the_default_without_targets() {
         assert_eq!(minimum_cpu_capability(39, []), 39);
+    }
+
+    #[test]
+    fn target_cpu_capability_includes_every_cpu_in_vcpu_affinity_masks() {
+        let mappings = [
+            (0, Some((1 << 0) | (1 << 2)), 0),
+            (1, None, 1),
+            (2, Some((1 << 2) | (1 << 3)), 0),
+        ];
+        let capabilities = [48, 44, 42, 39];
+
+        assert_eq!(
+            minimum_target_cpu_capability(52, &mappings, |cpu_id| capabilities[cpu_id]),
+            39
+        );
     }
 }

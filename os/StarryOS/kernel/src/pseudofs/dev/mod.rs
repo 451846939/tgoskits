@@ -54,7 +54,6 @@ use core::{
 use ax_errno::AxError;
 use ax_sync::Mutex;
 use axfs_ng_vfs::{DeviceId, Filesystem, NodeFlags, NodeType, VfsResult};
-#[cfg(feature = "sg2002")]
 use spin::Once;
 
 #[cfg(feature = "sg2002")]
@@ -68,6 +67,7 @@ use crate::pseudofs::{Device, DeviceOps, DirMaker, DirMapping, SimpleDir, Simple
 const RANDOM_SEED_STEP: u64 = 0x9e37_79b9_7f4a_7c15;
 
 static RANDOM_SEED_COUNTER: AtomicU64 = AtomicU64::new(0xa076_1d64_78bd_642f);
+static INITIAL_PTS_INSTANCE: Once<Arc<tty::PtsInstance>> = Once::new();
 
 #[cfg(any(feature = "sg2002", feature = "k230-kpu"))]
 pub(super) struct IrqRegistration {
@@ -108,6 +108,28 @@ pub(super) fn request_shared_disabled(
 
 pub(crate) fn new_devfs() -> Filesystem {
     SimpleFs::new_with("devfs".into(), 0x01021994, builder)
+}
+
+pub(crate) fn new_devptsfs(mount: tty::DevPtsMount) -> Filesystem {
+    SimpleFs::new_with("devpts".into(), 0x00001cd1, move |fs| {
+        devpts_builder(fs, mount)
+    })
+}
+
+fn devpts_builder(fs: Arc<SimpleFs>, mount: tty::DevPtsMount) -> DirMaker {
+    let instance = match mount {
+        tty::DevPtsMount::Legacy(options) => initial_pts_instance(options),
+        tty::DevPtsMount::NewInstance(options) => tty::PtsInstance::new(options),
+    };
+    SimpleDir::new_maker(fs.clone(), Arc::new(tty::PtsDir::new(fs, instance)))
+}
+
+fn initial_pts_instance(options: tty::DevPtsOptions) -> Arc<tty::PtsInstance> {
+    let instance = INITIAL_PTS_INSTANCE
+        .call_once(|| tty::PtsInstance::new(options))
+        .clone();
+    instance.update_options(options);
+    instance
 }
 
 struct Null;
@@ -396,6 +418,7 @@ impl DeviceOps for CpuDmaLatency {
 
 fn builder(fs: Arc<SimpleFs>) -> DirMaker {
     let mut root = DirMapping::new();
+    let pts_instance = initial_pts_instance(tty::DevPtsOptions::root());
     root.add(
         "null",
         Device::new(
@@ -517,12 +540,15 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             fs.clone(),
             NodeType::CharacterDevice,
             DeviceId::new(5, 2),
-            Arc::new(tty::Ptmx(fs.clone())),
+            Arc::new(tty::Ptmx::new(fs.clone(), pts_instance.clone())),
         ),
     );
     root.add(
         "pts",
-        SimpleDir::new_maker(fs.clone(), Arc::new(tty::PtsDir)),
+        SimpleDir::new_maker(
+            fs.clone(),
+            Arc::new(tty::PtsDir::new(fs.clone(), pts_instance)),
+        ),
     );
     #[cfg(feature = "dev-log")]
     root.add(

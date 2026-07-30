@@ -86,25 +86,6 @@ pub fn notify_vm_vcpu(vm_id: VMId, vcpu_id: usize) -> AxVmResult {
     crate::runtime::vcpus::notify_vcpu(vm_id, vcpu_id)
 }
 
-/// Inject a virtual interrupt into a VM's vCPU.
-#[expect(
-    dead_code,
-    reason = "only the LoongArch IRQ backend injects external VM interrupts"
-)]
-pub(crate) fn inject_vm_vcpu_interrupt(vm_id: VMId, vcpu_id: usize, vector: usize) -> AxVmResult {
-    use crate::AsVCpuTask;
-
-    let current = crate::host::task::current_task();
-    if let Some(task) = current.try_as_vcpu_task()
-        && task.vm().id() == vm_id
-        && task.vcpu.id() == vcpu_id
-    {
-        return task.vcpu.inject_interrupt(vector);
-    }
-
-    inject_interrupt(vm_id, vcpu_id, vector)
-}
-
 /// Return the current VM ID from the vCPU currently executing on this CPU.
 pub fn current_vm_id() -> Option<VMId> {
     with_current_vcpu::<ArchVCpu, _>(|vcpu| vcpu.map(|vcpu| vcpu.vm_id()))

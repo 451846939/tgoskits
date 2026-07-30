@@ -1,124 +1,60 @@
 //! Device construction for VM preparation.
 
-use axdevice::{
-    AxVmDeviceConfig, AxVmDevices, DeviceBuildContext, DeviceFactoryRegistry, IrqResolver,
-    build_16550_mmio, build_16550_port, build_pl011_mmio,
-};
-use axdevice_base::InterruptTriggerMode;
-use axvm_types::EmulatedDeviceType;
+use alloc::vec::Vec;
 
-use super::super::{AxVM, AxVMResources};
-use crate::{
-    AxVmResult,
-    irq::InterruptFabric,
-    machine::{GuestSerialModel, GuestSerialTransport},
-};
+use axdevice::{DeviceBuildContext, DeviceFactoryRegistry, DeviceRuntime, RuntimeAccessPorts};
+use axdevice_base::VirtualInterruptController;
+use axvm_types::EmulatedDeviceConfig;
+
+use super::super::AxVMResources;
+use crate::AxVmResult;
 
 pub(crate) struct PreparedDevices {
-    pub(crate) devices: AxVmDevices,
+    pub(crate) devices: DeviceRuntime,
 }
 
 impl PreparedDevices {
+    #[allow(dead_code)]
     pub(crate) fn build_common(
         resources: &AxVMResources,
         factories: &DeviceFactoryRegistry,
-        interrupt_fabric: &InterruptFabric,
+        interrupt_controller: &dyn VirtualInterruptController,
+        access_ports: RuntimeAccessPorts,
     ) -> AxVmResult<Self> {
-        let build_context = DeviceBuildContext::new(interrupt_fabric);
-        let emu_configs = resources
-            .config
-            .emu_devices()
-            .iter()
-            .filter(|config| config.emu_type != EmulatedDeviceType::Console)
-            .cloned()
-            .collect();
-        let mut devices = AxVmDevices::build_with_factories(
-            AxVmDeviceConfig { emu_configs },
+        Self::build_common_with_extra(
+            resources,
+            factories,
+            interrupt_controller,
+            &[],
+            access_ports,
+        )
+    }
+
+    pub(crate) fn build_common_with_extra(
+        resources: &AxVMResources,
+        factories: &DeviceFactoryRegistry,
+        interrupt_controller: &dyn VirtualInterruptController,
+        extra_configs: &[EmulatedDeviceConfig],
+        access_ports: RuntimeAccessPorts,
+    ) -> AxVmResult<Self> {
+        let build_context = DeviceBuildContext::new(interrupt_controller);
+        let mut configs: Vec<EmulatedDeviceConfig> = resources.config.emu_devices().to_vec();
+        configs.extend_from_slice(extra_configs);
+        let devices = DeviceRuntime::build_with_factories_and_ports(
+            &configs,
             factories,
             &build_context,
+            access_ports,
         )?;
-        register_serial_device(resources, interrupt_fabric, &mut devices)?;
 
         Ok(Self { devices })
     }
 
-    pub(crate) fn register_special_devices(&mut self, vm: &AxVM) -> AxVmResult {
-        vm.add_special_emulated_devices(&mut self.devices)
-    }
-
-    pub(crate) const fn devices(&self) -> &AxVmDevices {
+    pub(crate) const fn devices(&self) -> &DeviceRuntime {
         &self.devices
     }
 
-    pub(crate) fn into_inner(self) -> AxVmDevices {
+    pub(crate) fn into_inner(self) -> DeviceRuntime {
         self.devices
     }
-}
-
-fn register_serial_device(
-    resources: &AxVMResources,
-    interrupt_fabric: &InterruptFabric,
-    devices: &mut AxVmDevices,
-) -> AxVmResult {
-    let mut serial_configs = resources
-        .config
-        .emu_devices()
-        .iter()
-        .filter(|config| config.emu_type == EmulatedDeviceType::Console);
-    let config = serial_configs
-        .next()
-        .ok_or_else(|| crate::AxVmError::invalid_config("machine profile has no serial device"))?;
-    if serial_configs.next().is_some() {
-        return Err(crate::AxVmError::invalid_config(
-            "machine profile has more than one serial device",
-        ));
-    }
-
-    let irq = interrupt_fabric.resolve_irq(config.irq_id, InterruptTriggerMode::LevelTriggered)?;
-    let backend = resources.config.serial_backend();
-    let serial = resources.config.serial_profile();
-    let (profile_base, profile_length) = match serial.transport {
-        GuestSerialTransport::Port { base, length } => (usize::from(base), usize::from(length)),
-        GuestSerialTransport::Mmio { base, length, .. } => (base, length),
-    };
-    if (config.base_gpa, config.length, config.irq_id) != (profile_base, profile_length, serial.irq)
-    {
-        return Err(crate::AxVmError::invalid_config(
-            "serial descriptor does not match the machine profile",
-        ));
-    }
-
-    let bundle = match (serial.model, serial.transport) {
-        (GuestSerialModel::Uart16550, GuestSerialTransport::Port { base, length }) => {
-            build_16550_port(base, length, serial.irq, backend, irq)
-        }
-        (
-            GuestSerialModel::Uart16550,
-            GuestSerialTransport::Mmio {
-                base,
-                length,
-                register_shift,
-                register_width,
-            },
-        ) => build_16550_mmio(
-            base,
-            length,
-            register_shift,
-            register_width,
-            serial.irq,
-            backend,
-            irq,
-        ),
-        (GuestSerialModel::Pl011, GuestSerialTransport::Mmio { base, length, .. }) => {
-            build_pl011_mmio(base, length, serial.irq, backend, irq)
-        }
-        (GuestSerialModel::Pl011, GuestSerialTransport::Port { .. }) => {
-            return Err(crate::AxVmError::invalid_config(
-                "PL011 machine serial cannot use port I/O",
-            ));
-        }
-    };
-
-    devices.register_bundle(bundle)?;
-    Ok(())
 }

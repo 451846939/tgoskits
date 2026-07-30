@@ -39,6 +39,15 @@ pub enum AxVmError {
         to: VmStatus,
         operation: &'static str,
     },
+    /// A lifecycle operation failed and its compensating cleanup also failed.
+    #[error(
+        "VM lifecycle operation {operation} failed: {primary}; rollback also failed: {rollback}"
+    )]
+    LifecycleRollback {
+        operation: &'static str,
+        primary: String,
+        rollback: String,
+    },
     /// No registered VM has the requested identifier.
     #[error("VM {vm_id} was not found")]
     VmNotFound { vm_id: VMId },
@@ -114,6 +123,18 @@ impl AxVmError {
             from,
             to,
             operation,
+        }
+    }
+
+    pub(crate) fn lifecycle_rollback(
+        operation: &'static str,
+        primary: impl Display,
+        rollback: impl Display,
+    ) -> Self {
+        Self::LifecycleRollback {
+            operation,
+            primary: format!("{primary}"),
+            rollback: format!("{rollback}"),
         }
     }
 
@@ -313,6 +334,9 @@ impl From<RegistryError> for AxVmError {
             }
             RegistryError::InvalidResource { .. } => {
                 Self::invalid_input("register virtual device", error)
+            }
+            RegistryError::InvalidState { .. } => {
+                Self::invalid_state("register virtual device", error)
             }
             RegistryError::BusKindNotSupported { .. } | RegistryError::ArchNotSupported { .. } => {
                 Self::unsupported("register virtual device", error)

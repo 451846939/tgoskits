@@ -1,13 +1,19 @@
-//! AxVM-facing adapters for OS-neutral x86 virtual interrupt-controller devices.
+//! Reusable x86 device package for OS-neutral x86 virtual devices.
+//!
+//! This module intentionally lives outside the architecture-neutral runtime
+//! core: it is compiled only for x86_64 targets and exposes narrow typed
+//! services consumed by AxVM's x86 architecture layer.
 
 use alloc::{boxed::Box, string::String};
-use core::{any::Any, marker::PhantomData};
+use core::marker::PhantomData;
 
 use axdevice_base::{AccessWidth, BusAccess, BusKind, BusResponse, Device, DeviceError, Resource};
 use x86_vlapic::{
     EmulatedIoApic, EmulatedPit, IoApicEoi, IoApicInterrupt, X86AccessWidth, X86GuestPhysAddr,
     X86GuestPhysAddrRange, X86Port, X86PortRange, X86VlapicHostOps,
 };
+
+use crate::{ServiceCardinality, ServiceKey};
 
 /// Type-specific IOAPIC capability used by the x86 interrupt runtime.
 pub trait X86IoApicDeviceOps: Send + Sync {
@@ -17,7 +23,7 @@ pub trait X86IoApicDeviceOps: Send + Sync {
     /// Assert an IOAPIC GSI and return an interrupt to inject if one is unmasked.
     fn assert_gsi(&self, gsi: usize) -> Option<IoApicInterrupt>;
 
-    /// Set an IOAPIC input level and return a newly routable interrupt.
+    /// Updates the electrical level of an IOAPIC GSI.
     fn set_gsi_level(&self, gsi: usize, asserted: bool) -> Option<IoApicInterrupt>;
 
     /// Broadcast a local APIC EOI to the IOAPIC.
@@ -28,6 +34,52 @@ pub trait X86IoApicDeviceOps: Send + Sync {
 pub trait X86PitDeviceOps: Send + Sync {
     /// Consume a pending PIT IRQ0 tick if the deadline is due.
     fn consume_irq0_if_due(&self, now_ns: u64) -> bool;
+}
+
+/// x86 interrupt-controller operations needed by the VM interrupt runtime.
+///
+/// This is an adapter boundary rather than the IOAPIC device type itself:
+/// synthetic and forwarded sources only need to resolve a GSI, assert it, and
+/// process guest EOIs.
+pub trait X86InterruptDomainOps: Send + Sync {
+    /// Returns the guest vector currently programmed for a GSI.
+    fn vector_for_gsi(&self, gsi: usize) -> Option<u8>;
+
+    /// Asserts a GSI and returns an interrupt to inject when it is unmasked.
+    fn assert_gsi(&self, gsi: usize) -> Option<IoApicInterrupt>;
+
+    /// Processes a guest local-APIC EOI.
+    fn end_of_interrupt(&self, vector: u8) -> Option<IoApicEoi>;
+}
+
+/// Typed service key for the VM's x86 virtual I/O APIC.
+pub struct X86IoApicServiceKey;
+
+impl ServiceKey for X86IoApicServiceKey {
+    type Service = dyn X86IoApicDeviceOps;
+
+    const NAME: &'static str = "x86-ioapic";
+    const CARDINALITY: ServiceCardinality = ServiceCardinality::Single;
+}
+
+/// Typed service key for the VM's x86 interrupt-domain adapter.
+pub struct X86InterruptDomainKey;
+
+impl ServiceKey for X86InterruptDomainKey {
+    type Service = dyn X86InterruptDomainOps;
+
+    const NAME: &'static str = "x86-interrupt-domain";
+    const CARDINALITY: ServiceCardinality = ServiceCardinality::Single;
+}
+
+/// Typed service key for the VM's x86 virtual PIT.
+pub struct X86PitServiceKey;
+
+impl ServiceKey for X86PitServiceKey {
+    type Service = dyn X86PitDeviceOps;
+
+    const NAME: &'static str = "x86-pit";
+    const CARDINALITY: ServiceCardinality = ServiceCardinality::Single;
 }
 
 /// Unified-device adapter for [`EmulatedIoApic`].
@@ -82,7 +134,11 @@ impl Device for X86IoApicDevice {
         &self.resources
     }
 
-    fn handle(&self, access: &BusAccess) -> Result<BusResponse, DeviceError> {
+    fn access(
+        &self,
+        access: &BusAccess,
+        _context: &mut dyn axdevice_base::DeviceAccess,
+    ) -> Result<BusResponse, DeviceError> {
         if access.kind != BusKind::Mmio {
             return Err(DeviceError::OutOfRange { addr: access.addr });
         }
@@ -101,10 +157,6 @@ impl Device for X86IoApicDevice {
                 .map(|_| BusResponse::Write)
                 .map_err(|_| DeviceError::Internal)
         }
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 
@@ -156,7 +208,11 @@ impl<H: X86VlapicHostOps + 'static> Device for X86PitDevice<H> {
         &self.resources
     }
 
-    fn handle(&self, access: &BusAccess) -> Result<BusResponse, DeviceError> {
+    fn access(
+        &self,
+        access: &BusAccess,
+        _context: &mut dyn axdevice_base::DeviceAccess,
+    ) -> Result<BusResponse, DeviceError> {
         if access.kind != BusKind::Port {
             return Err(DeviceError::OutOfRange { addr: access.addr });
         }
@@ -178,10 +234,6 @@ impl<H: X86VlapicHostOps + 'static> Device for X86PitDevice<H> {
                 .map(|_| BusResponse::Write)
                 .map_err(|_| DeviceError::Internal)
         }
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 

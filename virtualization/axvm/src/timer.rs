@@ -36,6 +36,7 @@ impl VmTimerEvent {
 
 impl TimerEvent for VmTimerEvent {
     fn callback(self, now: TimeValue) {
+        trace!("handle VM timer event token {}", self.token);
         (self.callback)(now);
     }
 }

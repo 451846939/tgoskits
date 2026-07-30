@@ -33,8 +33,6 @@ mod banner;
 mod config;
 mod guest_console;
 mod manager;
-#[cfg(target_arch = "riscv64")]
-mod platform_irq;
 mod shell;
 
 /// Axvisor kernel entry point.

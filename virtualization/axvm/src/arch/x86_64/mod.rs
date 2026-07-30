@@ -3,9 +3,24 @@
 //! This module owns the AxVM/ArceOS glue for the OS-neutral `x86_vcpu` and
 //! `x86_vlapic` cores.
 
-use alloc::{boxed::Box, sync::Arc};
-use core::{arch::asm, time::Duration};
+use alloc::{boxed::Box, collections::BTreeMap, sync::Arc};
+use core::{
+    arch::asm,
+    sync::atomic::{AtomicUsize, Ordering},
+    time::Duration,
+};
 
+use ax_kspin::SpinRaw;
+use axdevice::{
+    DeviceBuildContext, DeviceBundle, DeviceFactory, DeviceFactoryRegistry, DeviceManagerError,
+    DeviceManagerResult, DeviceRegistration, ServiceCardinality, ServiceKey,
+    VirtualInterruptControllerKey, X86InterruptDomainKey, X86InterruptDomainOps,
+    X86IoApicDeviceOps, X86IoApicServiceKey, X86PitDeviceOps, X86PitServiceKey,
+};
+use axdevice_base::{
+    ControllerInputId, InterruptControllerId, InterruptEndpoint, IrqError, IrqResult,
+    VirtualInterruptController, WiredIrqInput, WiredIrqSink,
+};
 use axvm_types::{
     AccessWidth, EmulatedDeviceConfig, EmulatedDeviceType, GuestPhysAddr, InterruptTriggerMode,
     MappingFlags, NestedPagingConfig, Port, SysRegAddr, VCpuId, VMId, VmArchPerCpuOps,
@@ -25,6 +40,7 @@ use super::{ArchOps, BoundVcpuExit, HypercallExit, MmioReadExit, MmioWriteExit, 
 use crate::{
     AxVmError, AxVmResult, StopReason,
     host::{HostMemory, default_host},
+    irq::deferred::DeferredVcpuKick,
     manager,
     vcpu::with_current_vcpu,
 };
@@ -61,12 +77,15 @@ impl ArchOps for X86_64Arch {
     }
 
     fn before_first_run(vm: &crate::AxVMRef, vcpu: &crate::vm::AxVCpuRef<Self::VCpu>) {
+        irq::start_deferred_irq_delivery(vm);
         irq::enable_ioapic_irq_forwarding(vm, vcpu);
     }
 
-    fn before_vcpu_run(vm: &crate::AxVMRef, vcpu: &crate::vm::AxVCpuRef<Self::VCpu>) {
+    fn before_vcpu_run(vm: &crate::AxVMRef, vcpu: &crate::vm::AxVCpuRef<Self::VCpu>) -> AxVmResult {
+        irq::drain_pending_wired_irqs(vm, vcpu);
         irq::drain_pending_ioapic_irqs(vm, vcpu);
         irq::activate_ready_ioapic_forwarding_routes(vm);
+        Ok(())
     }
 
     fn after_external_interrupt(
@@ -78,8 +97,10 @@ impl ArchOps for X86_64Arch {
         crate::check_timer_events();
     }
 
-    fn on_last_vcpu_exit(vm_id: usize) {
-        irq::disable_ioapic_irq_forwarding_for_vm(vm_id);
+    fn on_last_vcpu_exit(vm: &crate::AxVMRef) -> AxVmResult {
+        irq::disable_ioapic_irq_forwarding_for_vm(vm);
+        irq::stop_deferred_irq_delivery(vm);
+        Ok(())
     }
 
     fn handle_vcpu_exit_bound(
@@ -436,35 +457,322 @@ impl VmArchPerCpuOps for AxvmX86PerCpu {
     }
 }
 
-pub(crate) fn register_arch_device(
-    config: &EmulatedDeviceConfig,
-    devices: &mut axdevice::AxVmDevices,
-) -> AxVmResult {
-    match config.emu_type {
-        EmulatedDeviceType::Console => {}
-        EmulatedDeviceType::X86IoApic => {
-            let ioapic = Arc::new(axdevice::X86IoApicDevice::new(
-                x86_vlapic::X86GuestPhysAddr::from_usize(config.base_gpa),
-                Some(config.length),
-            ));
-            devices
-                .add_x86_ioapic_dev(ioapic)
-                .map_err(|error| AxVmError::device("register x86 I/O APIC", error))?;
-            info!(
-                "x86 IO APIC initialized with base GPA {:#x} and length {:#x}",
-                config.base_gpa, config.length
-            );
-        }
-        EmulatedDeviceType::X86Pit => {
-            let pit = Arc::new(axdevice::X86PitDevice::<AxvmX86HostOps>::new());
-            devices
-                .add_x86_pit_dev(pit)
-                .map_err(|error| AxVmError::device("register x86 PIT", error))?;
-            info!("x86 PIT initialized for ports 0x40..=0x43 and 0x61");
-        }
-        _ => {}
+/// Pre-creates the canonical x86 interrupt controller and registers factories
+/// that expose that same instance through the device runtime.
+pub(crate) fn register_device_factories(
+    vm_id: usize,
+    configs: &[EmulatedDeviceConfig],
+    factories: &mut DeviceFactoryRegistry,
+) -> AxVmResult<Arc<X86InterruptDomain>> {
+    let machine =
+        crate::machine::machine_profile_for(crate::machine::MachineArchitecture::X86_64, 1);
+    let expected_ioapic = unique_x86_machine_device(
+        &machine.emulated_devices,
+        EmulatedDeviceType::X86IoApic,
+        "virtual IOAPIC",
+    )?;
+    let expected_pit = unique_x86_machine_device(
+        &machine.emulated_devices,
+        EmulatedDeviceType::X86Pit,
+        "virtual PIT",
+    )?;
+    let ioapic_config =
+        unique_x86_machine_device(configs, EmulatedDeviceType::X86IoApic, "virtual IOAPIC")?;
+    let pit_config = unique_x86_machine_device(configs, EmulatedDeviceType::X86Pit, "virtual PIT")?;
+    validate_x86_machine_device(
+        expected_ioapic,
+        ioapic_config,
+        "validate x86 virtual IOAPIC machine descriptor",
+    )?;
+    validate_x86_machine_device(
+        expected_pit,
+        pit_config,
+        "validate x86 virtual PIT machine descriptor",
+    )?;
+
+    let ioapic = Arc::new(axdevice::X86IoApicDevice::new(
+        x86_vlapic::X86GuestPhysAddr::from_usize(ioapic_config.base_gpa),
+        Some(ioapic_config.length),
+    ));
+    let service: Arc<dyn X86IoApicDeviceOps> = ioapic.clone();
+    let domain = Arc::new(X86InterruptDomain::new(vm_id, service));
+    factories.register(Arc::new(X86IoApicFactory {
+        expected: ioapic_config.clone(),
+        ioapic,
+        domain: domain.clone(),
+    }))?;
+    factories.register(Arc::new(X86PitFactory {
+        expected: pit_config.clone(),
+    }))?;
+    factories.register(Arc::new(port::HostPortPassthroughDeviceFactory))?;
+    Ok(domain)
+}
+
+struct X86IoApicFactory {
+    expected: EmulatedDeviceConfig,
+    ioapic: Arc<axdevice::X86IoApicDevice>,
+    domain: Arc<X86InterruptDomain>,
+}
+
+fn unique_x86_machine_device<'a>(
+    configs: &'a [EmulatedDeviceConfig],
+    device_type: EmulatedDeviceType,
+    resource: &'static str,
+) -> AxVmResult<&'a EmulatedDeviceConfig> {
+    let mut matches = configs
+        .iter()
+        .filter(|config| config.emu_type == device_type);
+    let config = matches.next().ok_or_else(|| {
+        AxVmError::resource_unavailable("x86 machine device", alloc::format!("missing {resource}"))
+    })?;
+    if matches.next().is_some() {
+        return Err(AxVmError::resource_conflict(
+            "x86 machine device",
+            alloc::format!("more than one {resource} descriptor is configured"),
+        ));
     }
-    Ok(())
+    Ok(config)
+}
+
+fn validate_x86_machine_device(
+    expected: &EmulatedDeviceConfig,
+    actual: &EmulatedDeviceConfig,
+    operation: &'static str,
+) -> DeviceManagerResult {
+    if expected.name == actual.name
+        && expected.base_gpa == actual.base_gpa
+        && expected.length == actual.length
+        && expected.irq_id == actual.irq_id
+        && expected.emu_type == actual.emu_type
+        && expected.cfg_list == actual.cfg_list
+    {
+        return Ok(());
+    }
+    Err(DeviceManagerError::InvalidConfig {
+        operation,
+        detail: alloc::format!(
+            "descriptor for '{}' does not match the immutable x86 machine profile",
+            actual.name
+        ),
+    })
+}
+
+/// Adapts the IOAPIC device capability to the x86 interrupt-runtime boundary.
+///
+/// Guest-visible IOAPIC operations are exposed through the public interrupt
+/// domain service, while host IRQ forwarding state stays in this concrete
+/// VM-owned domain.
+pub(super) struct X86InterruptDomain {
+    wired: Arc<X86WiredState>,
+    inputs: SpinRaw<BTreeMap<usize, (InterruptTriggerMode, WiredIrqInput)>>,
+    forwarding: SpinRaw<irq::X86IoApicForwardingState>,
+    forwarding_hooks: SpinRaw<alloc::vec::Vec<host_irq::IrqHandle>>,
+}
+
+struct X86WiredState {
+    ioapic: Arc<dyn X86IoApicDeviceOps>,
+    pending: AtomicUsize,
+    pending_level: AtomicUsize,
+    kick: Arc<DeferredVcpuKick>,
+}
+
+/// Private key for the concrete VM-owned x86 forwarding domain.
+///
+/// The public `X86InterruptDomainKey` exposes only injection operations. This
+/// key is intentionally architecture-private because hook ownership and
+/// teardown are runtime implementation details.
+pub(super) struct X86InterruptDomainRuntimeKey;
+
+impl ServiceKey for X86InterruptDomainRuntimeKey {
+    type Service = X86InterruptDomain;
+
+    const NAME: &'static str = "x86-interrupt-domain-runtime";
+    const CARDINALITY: ServiceCardinality = ServiceCardinality::Single;
+}
+
+impl X86InterruptDomain {
+    fn new(vm_id: usize, ioapic: Arc<dyn X86IoApicDeviceOps>) -> Self {
+        Self {
+            wired: Arc::new(X86WiredState {
+                ioapic,
+                pending: AtomicUsize::new(0),
+                pending_level: AtomicUsize::new(0),
+                kick: DeferredVcpuKick::new(vm_id),
+            }),
+            inputs: SpinRaw::new(BTreeMap::new()),
+            forwarding: SpinRaw::new(irq::X86IoApicForwardingState::new()),
+            forwarding_hooks: SpinRaw::new(alloc::vec::Vec::new()),
+        }
+    }
+
+    fn start_kick_worker(&self) {
+        self.wired.kick.start();
+    }
+
+    fn stop_kick_worker(&self) {
+        self.wired.kick.stop();
+    }
+
+    fn take_pending_wired_gsis(&self) -> (usize, usize) {
+        let pending = self.wired.pending.swap(0, Ordering::AcqRel);
+        let pending_level = self
+            .wired
+            .pending_level
+            .fetch_and(!pending, Ordering::AcqRel);
+        (pending, pending_level & pending)
+    }
+
+    pub(super) fn add_forwarding_hook(&self, hook: host_irq::IrqHandle) {
+        self.forwarding_hooks.lock().push(hook);
+    }
+
+    pub(super) fn take_forwarding_hooks(&self) -> alloc::vec::Vec<host_irq::IrqHandle> {
+        core::mem::take(&mut *self.forwarding_hooks.lock())
+    }
+}
+
+impl X86InterruptDomainOps for X86InterruptDomain {
+    fn vector_for_gsi(&self, gsi: usize) -> Option<u8> {
+        self.wired.ioapic.vector_for_gsi(gsi)
+    }
+
+    fn assert_gsi(&self, gsi: usize) -> Option<x86_vlapic::IoApicInterrupt> {
+        self.wired.ioapic.assert_gsi(gsi)
+    }
+
+    fn end_of_interrupt(&self, vector: u8) -> Option<x86_vlapic::IoApicEoi> {
+        self.wired.ioapic.end_of_interrupt(vector)
+    }
+}
+
+impl VirtualInterruptController for X86InterruptDomain {
+    fn id(&self) -> InterruptControllerId {
+        InterruptControllerId::new(0)
+    }
+
+    fn wired_input(
+        &self,
+        input: ControllerInputId,
+        trigger: InterruptTriggerMode,
+    ) -> IrqResult<WiredIrqInput> {
+        let gsi = input.value();
+        if gsi >= irq::IOAPIC_GSI_COUNT {
+            return Err(IrqError::InvalidInput {
+                endpoint: InterruptEndpoint::Wired {
+                    controller: self.id(),
+                    input,
+                },
+                operation: "open x86 IOAPIC input",
+                detail: alloc::format!("GSI {gsi} is outside 0..{}", irq::IOAPIC_GSI_COUNT),
+            });
+        }
+        let mut inputs = self.inputs.lock();
+        if let Some((registered_trigger, registered)) = inputs.get(&gsi) {
+            if *registered_trigger != trigger {
+                return Err(IrqError::InvalidInput {
+                    endpoint: InterruptEndpoint::Wired {
+                        controller: self.id(),
+                        input,
+                    },
+                    operation: "open x86 IOAPIC input",
+                    detail: alloc::format!(
+                        "GSI {gsi} is already registered as {registered_trigger:?}"
+                    ),
+                });
+            }
+            return Ok(registered.clone());
+        }
+        let sink: Arc<dyn WiredIrqSink> = self.wired.clone();
+        let registered = WiredIrqInput::new(self.id(), input, trigger, sink);
+        inputs.insert(gsi, (trigger, registered.clone()));
+        Ok(registered)
+    }
+}
+
+impl X86WiredState {
+    fn publish(
+        &self,
+        input: ControllerInputId,
+        interrupt: x86_vlapic::IoApicInterrupt,
+    ) -> IrqResult {
+        let bit = 1usize << input.value();
+        if interrupt.level_triggered {
+            self.pending_level.fetch_or(bit, Ordering::Release);
+        }
+        self.pending.fetch_or(bit, Ordering::Release);
+        self.kick
+            .publish_from_irq(0)
+            .map_err(|error| IrqError::Backend {
+                endpoint: InterruptEndpoint::Wired {
+                    controller: InterruptControllerId::new(0),
+                    input,
+                },
+                operation: "publish x86 IOAPIC vCPU kick",
+                detail: alloc::format!("{error}"),
+            })
+    }
+}
+
+impl WiredIrqSink for X86WiredState {
+    fn set_level(&self, input: ControllerInputId, asserted: bool) -> IrqResult {
+        if let Some(interrupt) = self.ioapic.set_gsi_level(input.value(), asserted) {
+            self.publish(input, interrupt)?;
+        }
+        Ok(())
+    }
+
+    fn pulse(&self, input: ControllerInputId) -> IrqResult {
+        if let Some(interrupt) = self.ioapic.assert_gsi(input.value()) {
+            self.publish(input, interrupt)?;
+        }
+        Ok(())
+    }
+}
+
+impl DeviceFactory for X86IoApicFactory {
+    fn device_type(&self) -> EmulatedDeviceType {
+        EmulatedDeviceType::X86IoApic
+    }
+
+    fn build(
+        &self,
+        config: &EmulatedDeviceConfig,
+        _context: &DeviceBuildContext<'_>,
+    ) -> DeviceManagerResult<DeviceBundle> {
+        validate_x86_machine_device(&self.expected, config, "build x86 virtual IOAPIC")?;
+        let service: Arc<dyn X86IoApicDeviceOps> = self.ioapic.clone();
+        let domain: Arc<dyn X86InterruptDomainOps> = self.domain.clone();
+        let controller: Arc<dyn VirtualInterruptController> = self.domain.clone();
+        let bundle =
+            DeviceBundle::from_registration(DeviceRegistration::Device(self.ioapic.clone()))
+                .with_service::<X86IoApicServiceKey>(service)?;
+        bundle
+            .with_service::<X86InterruptDomainKey>(domain)?
+            .with_service::<X86InterruptDomainRuntimeKey>(self.domain.clone())?
+            .with_service::<VirtualInterruptControllerKey>(controller)
+    }
+}
+
+struct X86PitFactory {
+    expected: EmulatedDeviceConfig,
+}
+
+impl DeviceFactory for X86PitFactory {
+    fn device_type(&self) -> EmulatedDeviceType {
+        EmulatedDeviceType::X86Pit
+    }
+
+    fn build(
+        &self,
+        config: &EmulatedDeviceConfig,
+        _context: &DeviceBuildContext<'_>,
+    ) -> DeviceManagerResult<DeviceBundle> {
+        validate_x86_machine_device(&self.expected, config, "build x86 virtual PIT")?;
+        let pit = Arc::new(axdevice::X86PitDevice::<AxvmX86HostOps>::new());
+        let service: Arc<dyn X86PitDeviceOps> = pit.clone();
+        DeviceBundle::from_registration(DeviceRegistration::Device(pit))
+            .with_service::<X86PitServiceKey>(service)
+    }
 }
 
 pub(crate) fn x86_apic_access_page_addr() -> AxVmResult<axvm_types::HostPhysAddr> {
@@ -614,8 +922,9 @@ fn restore_host_interrupt_flag(host_rflags: u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use axdevice::{DeviceRuntime, X86InterruptDomainKey, X86IoApicServiceKey, X86PitServiceKey};
 
+    use super::*;
     fn assert_x86_exit_type<T: VmArchVcpuOps<Exit = X86VmExit>>() {}
 
     #[test]
@@ -674,6 +983,66 @@ mod tests {
             X86Port::new(QEMU_EXIT_PORT),
             X86AccessWidth::Dword,
             QEMU_EXIT_MAGIC
+        ));
+    }
+
+    #[test]
+    fn x86_platform_devices_are_built_by_registered_factories() {
+        let mut factories = DeviceFactoryRegistry::new();
+        let configs = alloc::vec![
+            EmulatedDeviceConfig {
+                name: "ioapic".into(),
+                base_gpa: 0xfec0_0000,
+                length: 0x1000,
+                emu_type: EmulatedDeviceType::X86IoApic,
+                ..Default::default()
+            },
+            EmulatedDeviceConfig {
+                name: "pit".into(),
+                base_gpa: 0x40,
+                length: 0x22,
+                emu_type: EmulatedDeviceType::X86Pit,
+                ..Default::default()
+            },
+        ];
+        let controller = register_device_factories(1, &configs, &mut factories).unwrap();
+        let context = DeviceBuildContext::new(controller.as_ref());
+        let devices = DeviceRuntime::build_with_factories(&configs, &factories, &context).unwrap();
+
+        assert_eq!(devices.devices().count(), 2);
+        assert!(devices.services().require::<X86IoApicServiceKey>().is_ok());
+        assert!(
+            devices
+                .services()
+                .require::<X86InterruptDomainKey>()
+                .is_ok()
+        );
+        assert!(devices.services().require::<X86PitServiceKey>().is_ok());
+    }
+
+    #[test]
+    fn x86_pit_factory_rejects_a_modified_machine_descriptor() {
+        let mut configs =
+            crate::machine::machine_profile_for(crate::machine::MachineArchitecture::X86_64, 1)
+                .emulated_devices;
+        configs.retain(|config| config.emu_type != EmulatedDeviceType::Console);
+
+        let mut factories = DeviceFactoryRegistry::new();
+        let controller = register_device_factories(1, &configs, &mut factories).unwrap();
+        let pit = configs
+            .iter_mut()
+            .find(|config| config.emu_type == EmulatedDeviceType::X86Pit)
+            .unwrap();
+        pit.base_gpa += 1;
+
+        let context = DeviceBuildContext::new(controller.as_ref());
+        let result = DeviceRuntime::build_with_factories(&configs, &factories, &context);
+        assert!(matches!(
+            result,
+            Err(axdevice::DeviceManagerError::InvalidConfig {
+                operation: "build x86 virtual PIT",
+                ..
+            })
         ));
     }
 }

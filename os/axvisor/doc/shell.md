@@ -165,7 +165,11 @@ fn file_type_to_char(ty: FileType) -> char {
   - 不带参数：启动所有虚拟机
   - 指定VM ID：启动特定虚拟机
   - 支持 `--detach` 后台模式运行
-  - 支持 `--console` 连接到控制台(计划实现)
+  - 支持 `--console` 启动并连接到指定虚拟机的虚拟串口
+- **vm console**: 连接到运行中虚拟机的虚拟串口
+  - `Ctrl-A c` 在客户机控制台与 Axvisor shell 之间切换
+  - `Ctrl-A a` 向客户机发送原始 `Ctrl-A`
+  - `Ctrl-A h` 显示控制台快捷键帮助
 - **vm stop**: 停止虚拟机
   - 必须指定VM ID
   - 支持 `--force` 强制停止
@@ -232,7 +236,7 @@ let state = if vm.running() {
 - `--stats` / `-s`: (vm show) 显示统计信息
 - `--force` / `-f`: (vm stop/delete/restart) 强制操作(无需确认)
 - `--graceful` / `-g`: (vm stop) 优雅关闭
-- `--console` / `-c`: (vm start) 连接到控制台(计划实现)
+- `--console` / `-c`: (vm start) 启动并连接到指定虚拟机的虚拟串口
 - `--watch` / `-w`: (vm status) 实时监控(已移除,功能未实现)
 - `--keep-data`: (vm delete) 保留VM数据(功能未实现)
 

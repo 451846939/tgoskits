@@ -37,7 +37,7 @@ use sbi_spec::{hsm, legacy, pmu, rfnc, srst};
 
 use crate::{
     EID_HVC, RiscvVcpuCreateConfig,
-    consts::traps::irq::{S_EXT, is_supervisor_external},
+    consts::traps::irq::{S_EXT, S_SOFT, is_supervisor_external},
     guest_mem,
     host::RiscvHostOps,
     registers::hgatp_value,
@@ -73,6 +73,7 @@ fn instr_is_pseudo(ins: u32) -> bool {
 pub struct RiscvVcpu<H: RiscvHostOps> {
     regs: VmCpuRegisters,
     sbi: RISCVVCpuSbi,
+    bound: bool,
     _host: PhantomData<fn() -> H>,
 }
 
@@ -118,6 +119,7 @@ impl<H: RiscvHostOps> Default for RiscvVcpu<H> {
         Self {
             regs: VmCpuRegisters::default(),
             sbi: RISCVVCpuSbi::default(),
+            bound: false,
             _host: PhantomData,
         }
     }
@@ -140,6 +142,7 @@ impl<H: RiscvHostOps> RiscvVcpu<H> {
         Ok(Self {
             regs,
             sbi: RISCVVCpuSbi::default(),
+            bound: false,
             _host: PhantomData,
         })
     }
@@ -272,6 +275,7 @@ impl<H: RiscvHostOps> RiscvVcpu<H> {
             core::arch::riscv64::hfence_gvma_all();
         }
         self.sbi.pmu.backend_bind();
+        self.bound = true;
         Ok(())
     }
 
@@ -310,6 +314,7 @@ impl<H: RiscvHostOps> RiscvVcpu<H> {
             core::arch::asm!("csrw hgatp, x0");
             core::arch::riscv64::hfence_gvma_all();
         }
+        self.bound = false;
         Ok(())
     }
 
@@ -341,6 +346,28 @@ impl<H: RiscvHostOps> RiscvVcpu<H> {
             hvip::set_vseip();
         }
         self.regs.virtual_hs_csrs.hvip |= hvip::read().bits();
+        Ok(())
+    }
+
+    /// Synchronizes controller-derived VSEIP state for the bound vCPU.
+    ///
+    /// The virtual PLIC remains the owner of pending and delivery state. This
+    /// method only reflects its derived line value into the currently bound
+    /// hardware context and the vCPU's saved CSR image.
+    pub fn sync_bound_vseip(&mut self, asserted: bool) -> RiscvVcpuResult {
+        if !self.bound {
+            return Err(RiscvVcpuError::BadState);
+        }
+        let mut saved = hvip::Hvip::from_bits(self.regs.virtual_hs_csrs.hvip);
+        saved.set_vseip(asserted);
+        self.regs.virtual_hs_csrs.hvip = saved.bits();
+        unsafe {
+            if asserted {
+                hvip::set_vseip();
+            } else {
+                hvip::clear_vseip();
+            }
+        }
         Ok(())
     }
 
@@ -739,6 +766,14 @@ impl<H: RiscvHostOps> RiscvVcpu<H> {
                 }
 
                 Ok(RiscvVmExit::Nothing)
+            }
+            Trap::Interrupt(Interrupt::SupervisorSoft) => {
+                // Host IPIs and scheduler wakeups use SSIP. Route them through
+                // the host IRQ path so it can acknowledge SSIP before the vCPU
+                // resumes instead of treating the interrupt as a guest trap.
+                Ok(RiscvVmExit::ExternalInterrupt {
+                    vector: S_SOFT as _,
+                })
             }
             Trap::Interrupt(Interrupt::SupervisorExternal) => {
                 // 9 == Interrupt::SupervisorExternal

@@ -64,7 +64,6 @@ pub(crate) use host::{
     paging::HostPagingHandler,
     task::{AxTaskExt, AxTaskRef, TaskInner, WaitQueue, WaitQueueHandle as HostWaitQueueHandle},
 };
-pub use irq::InterruptFabric;
 pub use lifecycle::{StopReason, VmStatus};
 pub use manager::{
     AxvmRuntime, current_vcpu_id, current_vm_id, dispatch_current_vcpu_interrupt, get_vm_by_id,

@@ -1,263 +1,447 @@
 //! AArch64 GIC host operations for the ArceOS-backed AxVM runtime.
 
-use core::sync::atomic::{AtomicUsize, Ordering};
+use alloc::{collections::BTreeMap, sync::Arc};
 
-use arm_gic_driver::v3::{
-    ICH_ELRSR_EL2, ICH_HCR_EL2, ICH_LR_EL2, ICH_VTR_EL2, ReadWriteable, Readable, Writeable,
-    ich_lr_el2_get, ich_lr_el2_write,
+use arm_gic_driver::v3::Trigger;
+use arm_vgic::{
+    CpuInterfaceState, GicV3Backend, GicV3BackendError, GicV3HardwareCapabilities, GicVcpuId,
+    HostGicVersion, PhysicalInterruptBinding, PhysicalIrqId, VgicBackendCapabilities, VgicCore,
 };
-use ax_memory_addr::{PhysAddr, VirtAddr};
-use spin::Once;
+use ax_kspin::SpinNoIrq;
+use axdevice_base::InterruptTrigger;
 
-use super::GUEST_VIRTUAL_TIMER_IRQ;
-use crate::host::{HostMemory, default_host};
+mod cpu_interface;
+mod physical;
 
-static GUEST_VIRTUAL_TIMER_IRQ_ID: Once<ax_std::os::arceos::modules::ax_hal::irq::IrqId> =
-    Once::new();
-static GUEST_VIRTUAL_TIMER_IRQ_REGISTERED_CPUS: AtomicUsize = AtomicUsize::new(0);
+pub(crate) use physical::AssignedSpiRoutes;
 
-fn with_gic<T>(f: impl FnOnce(&mut rdif_intc::Intc) -> T) -> T {
-    let mut gic = rdrive::get_one::<rdif_intc::Intc>()
-        .expect("failed to get GIC driver")
+pub(super) fn try_with_gic<T>(
+    operation: &'static str,
+    f: impl FnOnce(&mut rdif_intc::Intc) -> T,
+) -> Result<T, GicV3BackendError> {
+    // `rdrive` device locks are control-plane locks, not hard-IRQ-safe locks.
+    // Callers may use this helper only while discovering or reconfiguring the
+    // host controller. vCPU load/save and IRQ acknowledge/deactivate use the
+    // cached CPU-interface capability in `cpu_interface` instead.
+    let registered = rdrive::get_one::<rdif_intc::Intc>().ok_or_else(|| {
+        GicV3BackendError::new(
+            operation,
+            "no host interrupt-controller driver is registered",
+        )
+    })?;
+    let mut gic = registered
         .lock()
-        .expect("failed to lock GIC driver");
-    f(&mut gic)
+        .map_err(|_| GicV3BackendError::new(operation, "the host GIC driver lock is poisoned"))?;
+    Ok(f(&mut gic))
 }
 
-pub(crate) fn reset_virtual_interface() {
-    ICH_HCR_EL2.set(0);
-    let lr_num = ICH_VTR_EL2.read(ICH_VTR_EL2::LISTREGS) as usize + 1;
-    for index in 0..lr_num {
-        ich_lr_el2_write(index, ICH_LR_EL2::STATE::Invalid);
-    }
-    ICH_HCR_EL2.modify(ICH_HCR_EL2::EN::SET);
+#[derive(Clone, Copy, Debug)]
+struct PhysicalSpiSnapshot {
+    enabled: bool,
+    trigger: Trigger,
+    target: PhysicalSpiTarget,
 }
 
-fn guest_virtual_timer_irq_id() -> ax_std::os::arceos::modules::ax_hal::irq::IrqId {
-    use ax_std::os::arceos::modules::ax_hal::irq::{HwIrq, resolve_percpu_irq};
-
-    *GUEST_VIRTUAL_TIMER_IRQ_ID.call_once(|| {
-        resolve_percpu_irq(HwIrq(GUEST_VIRTUAL_TIMER_IRQ as u32))
-            .expect("failed to resolve the AArch64 guest virtual timer PPI")
-    })
+#[derive(Clone, Copy, Debug)]
+enum PhysicalSpiTarget {
+    V2(arm_gic_driver::v2::TargetList),
+    V3(Option<arm_gic_driver::v3::Affinity>),
 }
 
-pub(crate) fn register_guest_virtual_timer_irq_on_current_cpu() {
-    use ax_std::os::arceos::modules::ax_hal::irq::{
-        self, CpuId, CpuMask, IrqRequest, IrqScope, ShareMode,
-    };
-
-    let _guard = ax_kernel_guard::NoPreempt::new();
-    let cpu_id = ax_std::os::arceos::modules::ax_hal::percpu::this_cpu_id();
-    let cpu_bit = 1usize
-        .checked_shl(cpu_id as u32)
-        .expect("AArch64 guest timer PPI CPU id exceeds the registration bitmap");
-    if GUEST_VIRTUAL_TIMER_IRQ_REGISTERED_CPUS.fetch_or(cpu_bit, Ordering::AcqRel) & cpu_bit != 0 {
-        return;
-    }
-
-    let cpus = CpuMask::from_cpu(CpuId(cpu_id));
-    let request = IrqRequest::new_concurrent(guest_virtual_timer_irq_handler)
-        .scope(IrqScope::PerCpu { cpus })
-        .share_mode(ShareMode::Shared);
-    if let Err(err) = irq::request_irq(guest_virtual_timer_irq_id(), request) {
-        GUEST_VIRTUAL_TIMER_IRQ_REGISTERED_CPUS.fetch_and(!cpu_bit, Ordering::AcqRel);
-        panic!("failed to register the AArch64 guest virtual timer PPI on CPU {cpu_id}: {err:?}");
-    }
+/// Checked bridge from the VM-local controller to the current host GIC.
+pub(crate) struct AxvmVgicBackend {
+    capabilities: VgicBackendCapabilities,
+    physical_spis: SpinNoIrq<BTreeMap<PhysicalIrqId, PhysicalSpiSnapshot>>,
 }
 
-fn guest_virtual_timer_irq_handler(
-    ctx: ax_std::os::arceos::modules::ax_hal::irq::IrqContext,
-) -> ax_std::os::arceos::modules::ax_hal::irq::IrqReturn {
-    use ax_std::os::arceos::modules::ax_hal::irq::{IrqReturn, set_enable};
-
-    if let Err(err) = set_enable(ctx.irq, false) {
-        warn!(
-            "failed to mask AArch64 guest virtual timer PPI {:?} on CPU {}: {err:?}",
-            ctx.irq, ctx.cpu.0
-        );
-        return IrqReturn::Unhandled;
-    }
-    if let Err(err) = crate::manager::dispatch_current_vcpu_interrupt(GUEST_VIRTUAL_TIMER_IRQ) {
-        warn!(
-            "failed to dispatch AArch64 guest virtual timer PPI on CPU {}: {err:?}",
-            ctx.cpu.0
-        );
-    }
-
-    IrqReturn::Handled
-}
-
-pub(crate) fn mask_guest_virtual_timer_irq() {
-    use ax_std::os::arceos::modules::ax_hal::irq::set_enable;
-
-    if let Err(err) = set_enable(guest_virtual_timer_irq_id(), false) {
-        warn!("failed to mask the AArch64 guest virtual timer PPI after VM exit: {err:?}");
-    }
-}
-
-pub(crate) fn rearm_guest_virtual_timer_irq_if_inactive() {
-    use ax_std::os::arceos::modules::ax_hal::irq::set_enable;
-
-    if guest_virtual_timer_signal_asserted() {
-        if let Err(err) = crate::manager::inject_current_vcpu_interrupt(GUEST_VIRTUAL_TIMER_IRQ) {
-            warn!("failed to reinject the asserted AArch64 guest virtual timer PPI: {err:?}");
-        }
-    } else if let Err(err) = set_enable(guest_virtual_timer_irq_id(), true) {
-        warn!("failed to rearm the AArch64 guest virtual timer PPI: {err:?}");
-    }
-}
-
-fn guest_virtual_timer_signal_asserted() -> bool {
-    const ENABLE: u64 = 1 << 0;
-    const IMASK: u64 = 1 << 1;
-    const ISTATUS: u64 = 1 << 2;
-
-    let cntv_ctl: u64;
-    // SAFETY: CNTV_CTL_EL0 is an architected per-CPU timer status register.
-    // Reading it has no memory, interrupt-controller, or timer state side
-    // effects, and this function runs while the guest vCPU is CPU-pinned.
-    unsafe {
-        core::arch::asm!("mrs {value}, CNTV_CTL_EL0", value = out(reg) cntv_ctl);
-    }
-    cntv_ctl & ENABLE != 0 && cntv_ctl & IMASK == 0 && cntv_ctl & ISTATUS != 0
-}
-
-pub(crate) fn inject_interrupt(irq: usize) {
-    debug!("Injecting virtual interrupt: {irq}");
-
-    with_gic(|gic| {
-        if let Some(gic) = gic.typed_mut::<arm_gic_driver::v2::Gic>() {
-            use arm_gic_driver::{
-                IntId,
-                v2::{VirtualInterruptConfig, VirtualInterruptState},
-            };
-
-            let gich = gic.hypervisor_interface().expect("failed to get GICH");
-            gich.enable();
-            gich.set_virtual_interrupt(
-                0,
-                VirtualInterruptConfig::software(
-                    unsafe { IntId::raw(irq as _) },
-                    None,
-                    0,
-                    VirtualInterruptState::Pending,
-                    false,
-                    true,
-                ),
-            );
-            return;
-        }
-
-        if gic.typed_mut::<arm_gic_driver::v3::Gic>().is_some() {
-            inject_interrupt_gic_v3(irq);
-            return;
-        }
-
-        panic!("no GIC driver found");
-    });
-}
-
-fn inject_interrupt_gic_v3(vector: usize) {
-    debug!("Injecting virtual interrupt: vector={vector}");
-    let elsr = ICH_ELRSR_EL2.read(ICH_ELRSR_EL2::STATUS);
-    let lr_num = ICH_VTR_EL2.read(ICH_VTR_EL2::LISTREGS) as usize + 1;
-
-    let mut free_lr = None;
-    for i in 0..lr_num {
-        if (1 << i) & elsr > 0 {
-            free_lr.get_or_insert(i);
-            continue;
-        }
-
-        let lr_val = ich_lr_el2_get(i);
-        if lr_val.read(ICH_LR_EL2::VINTID) == vector as u64
-            && lr_val.matches_any(&[ICH_LR_EL2::STATE::Pending, ICH_LR_EL2::STATE::Active])
-        {
-            debug!("Virtual interrupt {vector} already pending/active in LR{i}, skipping");
-            return;
-        }
-    }
-
-    let free_lr = free_lr
-        .or_else(|| {
-            (0..lr_num).find(|&i| ich_lr_el2_get(i).matches_all(ICH_LR_EL2::STATE::Invalid))
+impl AxvmVgicBackend {
+    /// Discovers immutable host CPU-interface capabilities once.
+    pub(crate) fn new() -> Result<Self, GicV3BackendError> {
+        Ok(Self {
+            capabilities: cpu_interface::capabilities()?,
+            physical_spis: SpinNoIrq::new(BTreeMap::new()),
         })
-        .unwrap_or_else(|| panic!("no free list register to inject IRQ {vector}"));
-
-    ich_lr_el2_write(
-        free_lr,
-        ICH_LR_EL2::VINTID.val(vector as u64) + ICH_LR_EL2::STATE::Pending + ICH_LR_EL2::GROUP::SET,
-    );
-    if !ICH_HCR_EL2.is_set(ICH_HCR_EL2::EN) {
-        warn!("Virtual interrupt interface not enabled, enabling now");
-        ICH_HCR_EL2.modify(ICH_HCR_EL2::EN::SET);
     }
 
-    debug!("Virtual interrupt {vector} injected successfully in LR{free_lr}");
+    fn physical_intid(
+        &self,
+        binding: PhysicalInterruptBinding,
+        operation: &'static str,
+    ) -> Result<arm_gic_driver::IntId, GicV3BackendError> {
+        let raw = u32::try_from(binding.host().raw()).map_err(|_| {
+            GicV3BackendError::new(
+                operation,
+                alloc::format!("host IRQ {} does not fit a GIC INTID", binding.host().raw()),
+            )
+        })?;
+        if raw != binding.guest().raw() {
+            return Err(GicV3BackendError::new(
+                operation,
+                alloc::format!(
+                    "identity forwarding requires guest INTID {} to equal host INTID {raw}",
+                    binding.guest().raw()
+                ),
+            ));
+        }
+        arm_gic_driver::checked_intid(raw, 1020).map_err(|_| {
+            GicV3BackendError::new(
+                operation,
+                alloc::format!("host INTID {raw} is outside the assignable GIC range"),
+            )
+        })
+    }
 }
 
-pub(crate) fn virtual_interrupt_inactive(vector: usize) -> bool {
-    let lr_num = ICH_VTR_EL2.read(ICH_VTR_EL2::LISTREGS) as usize + 1;
-    (0..lr_num).all(|index| {
-        let lr = ich_lr_el2_get(index);
-        lr.read(ICH_LR_EL2::VINTID) != vector as u64 || lr.read(ICH_LR_EL2::STATE) == 0
+impl GicV3Backend for AxvmVgicBackend {
+    fn capabilities(&self) -> VgicBackendCapabilities {
+        self.capabilities
+    }
+
+    fn load_cpu_interface(
+        &self,
+        vcpu: GicVcpuId,
+        state: &CpuInterfaceState,
+    ) -> Result<(), GicV3BackendError> {
+        cpu_interface::load(self.capabilities, vcpu, state)
+    }
+
+    fn save_cpu_interface(
+        &self,
+        vcpu: GicVcpuId,
+        state: &mut CpuInterfaceState,
+    ) -> Result<(), GicV3BackendError> {
+        cpu_interface::save(self.capabilities, vcpu, state)
+    }
+
+    fn bind_physical_interrupt(
+        &self,
+        binding: PhysicalInterruptBinding,
+    ) -> Result<(), GicV3BackendError> {
+        let intid = self.physical_intid(binding, "bind physical interrupt")?;
+        let snapshot = try_with_gic("bind physical interrupt", |gic| {
+            if let Some(gic) = gic.typed_mut::<arm_gic_driver::v2::Gic>() {
+                return Some(PhysicalSpiSnapshot {
+                    enabled: gic.is_irq_enable(intid),
+                    trigger: gic.get_cfg(intid),
+                    target: PhysicalSpiTarget::V2(gic.get_target_cpu(intid)),
+                });
+            }
+            if let Some(gic) = gic.typed_mut::<arm_gic_driver::v3::Gic>() {
+                return Some(PhysicalSpiSnapshot {
+                    enabled: gic.is_irq_enable(intid),
+                    trigger: gic.get_cfg(intid),
+                    target: PhysicalSpiTarget::V3(gic.get_target_cpu(intid)),
+                });
+            }
+            None
+        })?
+        .ok_or_else(|| {
+            GicV3BackendError::new(
+                "bind physical interrupt",
+                "the registered interrupt controller is neither GICv2 nor GICv3",
+            )
+        })?;
+        let target = physical_spi_target(self.capabilities.host_version(), binding)?;
+        let expected_trigger = match binding.trigger() {
+            InterruptTrigger::EdgeTriggered => Trigger::Edge,
+            InterruptTrigger::LevelTriggered => Trigger::Level,
+        };
+        let mut bindings = self.physical_spis.lock();
+        if bindings.contains_key(&binding.host()) {
+            return Err(GicV3BackendError::new(
+                "bind physical interrupt",
+                alloc::format!("host INTID {} is already bound", binding.host().raw()),
+            ));
+        }
+        bindings.insert(binding.host(), snapshot);
+        drop(bindings);
+        if let Err(error) = configure_physical_interrupt(
+            self.capabilities.host_version(),
+            intid,
+            expected_trigger,
+            target,
+        ) {
+            self.physical_spis.lock().remove(&binding.host());
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn set_physical_interrupt_enabled(
+        &self,
+        binding: PhysicalInterruptBinding,
+        enabled: bool,
+    ) -> Result<(), GicV3BackendError> {
+        let intid = self.physical_intid(binding, "set physical interrupt enable state")?;
+        if !self.physical_spis.lock().contains_key(&binding.host()) {
+            return Err(GicV3BackendError::new(
+                "set physical interrupt enable state",
+                alloc::format!("host INTID {} is not bound", binding.host().raw()),
+            ));
+        }
+        set_physical_enabled(self.capabilities.host_version(), intid, enabled)
+    }
+
+    fn deactivate_physical_interrupt(
+        &self,
+        vcpu: GicVcpuId,
+        binding: PhysicalInterruptBinding,
+    ) -> Result<(), GicV3BackendError> {
+        if vcpu != binding.target() {
+            return Err(GicV3BackendError::new(
+                "deactivate physical interrupt",
+                alloc::format!(
+                    "binding targets vCPU {}, but vCPU {} issued DIR",
+                    binding.target().raw(),
+                    vcpu.raw()
+                ),
+            ));
+        }
+        let intid = self.physical_intid(binding, "deactivate physical interrupt")?;
+        cpu_interface::deactivate_spi(intid)?;
+        instruction_sync_barrier();
+        if !physical::complete_assigned_spi(binding.host()) {
+            warn!(
+                "host INTID {} completed without an active assigned-SPI route",
+                binding.host().raw()
+            );
+        }
+        Ok(())
+    }
+
+    fn unbind_physical_interrupt(
+        &self,
+        binding: PhysicalInterruptBinding,
+    ) -> Result<(), GicV3BackendError> {
+        let intid = self.physical_intid(binding, "unbind physical interrupt")?;
+        let snapshot = self
+            .physical_spis
+            .lock()
+            .remove(&binding.host())
+            .ok_or_else(|| {
+                GicV3BackendError::new(
+                    "unbind physical interrupt",
+                    alloc::format!("host INTID {} is not bound", binding.host().raw()),
+                )
+            })?;
+        if let Err(error) =
+            restore_physical_interrupt(self.capabilities.host_version(), intid, snapshot)
+        {
+            self.physical_spis.lock().insert(binding.host(), snapshot);
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
+fn configure_physical_interrupt(
+    version: HostGicVersion,
+    intid: arm_gic_driver::IntId,
+    expected_trigger: Trigger,
+    expected_target: PhysicalSpiTarget,
+) -> Result<(), GicV3BackendError> {
+    try_with_gic("configure assigned physical interrupt", |gic| {
+        match (version, expected_target) {
+            (HostGicVersion::V2, PhysicalSpiTarget::V2(target)) => {
+                gic.typed_mut::<arm_gic_driver::v2::Gic>().map(|gic| {
+                    gic.set_irq_enable(intid, false);
+                    gic.set_cfg(intid, expected_trigger);
+                    gic.set_target_cpu(intid, target);
+                })
+            }
+            (HostGicVersion::V3, PhysicalSpiTarget::V3(target)) => {
+                gic.typed_mut::<arm_gic_driver::v3::Gic>().map(|gic| {
+                    gic.set_irq_enable(intid, false);
+                    gic.set_cfg(intid, expected_trigger);
+                    gic.set_target_cpu(intid, target);
+                })
+            }
+            _ => None,
+        }
+    })?
+    .ok_or_else(|| {
+        GicV3BackendError::new(
+            "configure assigned physical interrupt",
+            alloc::format!("the registered interrupt controller does not match {version:?}"),
+        )
     })
 }
 
-pub(crate) fn read_gicd_iidr() -> u32 {
-    with_gic(|gic| {
+fn physical_spi_target(
+    version: HostGicVersion,
+    binding: PhysicalInterruptBinding,
+) -> Result<PhysicalSpiTarget, GicV3BackendError> {
+    let affinity = binding.affinity();
+    match version {
+        HostGicVersion::V2 => {
+            if affinity.aff3() != 0
+                || affinity.aff2() != 0
+                || affinity.aff1() != 0
+                || affinity.aff0() >= 8
+            {
+                return Err(GicV3BackendError::new(
+                    "target assigned physical interrupt",
+                    alloc::format!(
+                        "GICv2 cannot route host INTID {} to affinity {affinity:?}",
+                        binding.host().raw()
+                    ),
+                ));
+            }
+            Ok(PhysicalSpiTarget::V2(arm_gic_driver::v2::TargetList::new(
+                core::iter::once(usize::from(affinity.aff0())),
+            )))
+        }
+        HostGicVersion::V3 => Ok(PhysicalSpiTarget::V3(Some(
+            arm_gic_driver::v3::Affinity::from_mpidr(affinity.mpidr()),
+        ))),
+    }
+}
+
+fn restore_physical_interrupt(
+    version: HostGicVersion,
+    intid: arm_gic_driver::IntId,
+    snapshot: PhysicalSpiSnapshot,
+) -> Result<(), GicV3BackendError> {
+    try_with_gic("restore assigned physical interrupt", |gic| {
+        match (version, snapshot.target) {
+            (HostGicVersion::V2, PhysicalSpiTarget::V2(target)) => {
+                gic.typed_mut::<arm_gic_driver::v2::Gic>().map(|gic| {
+                    gic.set_cfg(intid, snapshot.trigger);
+                    gic.set_target_cpu(intid, target);
+                    gic.set_irq_enable(intid, snapshot.enabled);
+                })
+            }
+            (HostGicVersion::V3, PhysicalSpiTarget::V3(target)) => {
+                gic.typed_mut::<arm_gic_driver::v3::Gic>().map(|gic| {
+                    gic.set_cfg(intid, snapshot.trigger);
+                    gic.set_target_cpu(intid, target);
+                    gic.set_irq_enable(intid, snapshot.enabled);
+                })
+            }
+            _ => None,
+        }
+    })?
+    .ok_or_else(|| {
+        GicV3BackendError::new(
+            "restore assigned physical interrupt",
+            alloc::format!("the registered interrupt controller does not match {version:?}"),
+        )
+    })
+}
+
+fn set_physical_enabled(
+    version: HostGicVersion,
+    intid: arm_gic_driver::IntId,
+    enabled: bool,
+) -> Result<(), GicV3BackendError> {
+    try_with_gic("set physical interrupt enable state", |gic| match version {
+        HostGicVersion::V2 => gic
+            .typed_mut::<arm_gic_driver::v2::Gic>()
+            .map(|gic| gic.set_irq_enable(intid, enabled)),
+        HostGicVersion::V3 => gic
+            .typed_mut::<arm_gic_driver::v3::Gic>()
+            .map(|gic| gic.set_irq_enable(intid, enabled)),
+    })?
+    .ok_or_else(|| {
+        GicV3BackendError::new(
+            "set physical interrupt enable state",
+            alloc::format!("the registered interrupt controller does not match {version:?}"),
+        )
+    })
+}
+
+fn instruction_sync_barrier() {
+    // SAFETY: `isb` only synchronizes preceding GIC register operations on the
+    // current CPU and does not access Rust memory.
+    unsafe { core::arch::asm!("isb", options(nostack, preserves_flags)) };
+}
+
+pub(crate) fn backend() -> Result<Arc<AxvmVgicBackend>, GicV3BackendError> {
+    AxvmVgicBackend::new().map(Arc::new)
+}
+
+pub(crate) fn register_assigned_spi_routes(
+    controller: &Arc<VgicCore>,
+) -> Result<Arc<AssignedSpiRoutes>, GicV3BackendError> {
+    AssignedSpiRoutes::register(controller)
+}
+
+pub(crate) fn host_spi_count() -> Result<usize, GicV3BackendError> {
+    let typer = try_with_gic("inspect host SPI capacity", |gic| {
         if let Some(gic) = gic.typed_mut::<arm_gic_driver::v2::Gic>() {
-            return gic.iidr_raw();
+            return Some(gic.typer_raw());
         }
-        if let Some(gic) = gic.typed_mut::<arm_gic_driver::v3::Gic>() {
-            return gic.iidr_raw();
-        }
-        panic!("no GIC driver found");
-    })
+        gic.typed_mut::<arm_gic_driver::v3::Gic>()
+            .map(|gic| gic.typer_raw())
+    })?
+    .ok_or_else(|| {
+        GicV3BackendError::new(
+            "inspect host SPI capacity",
+            "the registered interrupt controller is neither GICv2 nor GICv3",
+        )
+    })?;
+    // GICv2 and GICv3 share the GICD_TYPER.ITLinesNumber encoding. Decode
+    // that field directly: `max_intid()` has different meanings in the two
+    // host drivers and is not an SPI-count capability.
+    GicV3HardwareCapabilities::from_distributor_typer(typer)
+        .map(|capabilities| capabilities.spi_count())
+        .map_err(|error| {
+            GicV3BackendError::new("inspect host SPI capacity", alloc::format!("{error}"))
+        })
 }
 
-pub(crate) fn read_gicd_typer() -> u32 {
-    with_gic(|gic| {
-        if let Some(gic) = gic.typed_mut::<arm_gic_driver::v2::Gic>() {
-            return gic.typer_raw();
-        }
-        if let Some(gic) = gic.typed_mut::<arm_gic_driver::v3::Gic>() {
-            return gic.typer_raw();
-        }
-        panic!("no GIC driver found");
-    })
+/// Acknowledges one host Group1 IRQ and performs only the priority drop.
+///
+/// The returned token retains the GICv2 SGI source field when applicable.
+/// Physical guest-owned SPIs intentionally remain active until guest DIR.
+pub(crate) fn acknowledge_host_irq() -> Option<usize> {
+    cpu_interface::acknowledge_host_irq()
+        .inspect_err(|error| warn!("{error}"))
+        .ok()
+        .flatten()
 }
 
-pub(crate) fn host_gicd_base() -> PhysAddr {
-    with_gic(|gic| {
-        if let Some(gic) = gic.typed_mut::<arm_gic_driver::v2::Gic>() {
-            return default_host().virt_to_phys(VirtAddr::from(usize::from(gic.gicd_addr())));
-        }
-        if let Some(gic) = gic.typed_mut::<arm_gic_driver::v3::Gic>() {
-            return default_host().virt_to_phys(VirtAddr::from(usize::from(gic.gicd_addr())));
-        }
-        panic!("no GIC driver found");
-    })
+/// Returns the architectural INTID carried by one host acknowledgement token.
+pub(crate) const fn host_irq_intid(token: usize) -> u32 {
+    (token & 0x00ff_ffff) as u32
 }
 
-pub(crate) fn host_gicr_base() -> PhysAddr {
-    with_gic(|gic| {
-        if let Some(gic) = gic.typed_mut::<arm_gic_driver::v3::Gic>() {
-            return default_host().virt_to_phys(VirtAddr::from(usize::from(gic.gicr_addr())));
+/// Deactivates a previously acknowledged host IRQ token.
+pub(crate) fn deactivate_host_irq(token: usize) {
+    if let Err(error) = cpu_interface::deactivate_host_irq(token) {
+        warn!("{error}");
+    }
+}
+
+/// Dispatches an already acknowledged IRQ through the host dynamic framework.
+pub(crate) fn dispatch_acknowledged_host_irq(token: usize) {
+    let raw = host_irq_intid(token);
+    let irq = match ax_std::os::arceos::modules::ax_hal::irq::resolve_percpu_irq(
+        ax_std::os::arceos::modules::ax_hal::irq::HwIrq(raw),
+    ) {
+        Ok(irq) => irq,
+        Err(error) => {
+            warn!("Cannot resolve acknowledged host IRQ {raw}: {error:?}");
+            deactivate_host_irq(token);
+            return;
         }
-        panic!("no GICv3 driver found");
-    })
+    };
+    let outcome = ax_std::os::arceos::modules::ax_hal::irq::dispatch_irq(irq);
+    if !outcome.handled {
+        if outcome.called == 0 {
+            warn!("Unhandled acknowledged host IRQ {raw}");
+        } else {
+            debug!("Spurious acknowledged host IRQ {raw}");
+        }
+    }
+    deactivate_host_irq(token);
 }
 
-pub(crate) fn handle_current_irq() -> Option<usize> {
-    // AArch64 ArceOS platform IRQ handlers acknowledge the current IRQ
-    // internally. The raw vector argument is ignored by current GIC-backed
-    // platforms, so keep the ack/EOI ownership inside the platform handler
-    // while preserving the GIC INTID for guest-owned virtual sources.
-    ax_std::os::arceos::modules::ax_hal::irq::handle_irq_id(0).map(|irq| irq.hwirq.0 as usize)
-}
-
-pub(crate) fn fetch_irq() -> Option<usize> {
-    handle_current_irq()
+/// Routes an acknowledged host IRQ to its assigned VGIC or the host framework.
+///
+/// Both lower-EL VM exits and current-EL IRQ entries use this function so an
+/// assigned physical SPI cannot be consumed by whichever entry path happened
+/// to observe it first.
+pub(crate) fn route_acknowledged_host_irq(token: usize) -> Result<(), GicV3BackendError> {
+    physical::route_acknowledged_host_irq(token)
 }

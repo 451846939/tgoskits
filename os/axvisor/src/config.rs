@@ -167,7 +167,8 @@ pub fn init_guest_vm(raw_cfg: &str) -> Result<usize> {
     vm.prepare()
         .with_context(|| format!("prepare devices and vCPUs for VM[{vm_id}]"))?;
 
-    if !axvm::register_vm(vm) {
+    // Keep the local `Arc` for architecture-specific post-registration setup.
+    if !axvm::register_vm(vm.clone()) {
         bail!("register VM[{vm_id}]: a VM with this ID already exists");
     }
     #[cfg(target_arch = "loongarch64")]
@@ -183,7 +184,7 @@ pub fn init_guest_vm(raw_cfg: &str) -> Result<usize> {
     ))]
     if release_host_filesystem {
         #[cfg(target_arch = "x86_64")]
-        register_x86_host_fs_passthrough_irq_route();
+        register_x86_host_fs_passthrough_irq_route(&vm)?;
         HOST_FILESYSTEM_RELEASE_REQUIRED.store(true, Ordering::Release);
     }
 
@@ -273,7 +274,7 @@ pub fn host_filesystem_release_required() -> bool {
 }
 
 #[cfg(all(feature = "fs", target_arch = "x86_64"))]
-fn register_x86_host_fs_passthrough_irq_route() {
+fn register_x86_host_fs_passthrough_irq_route(vm: &axvm::AxVMRef) -> Result<()> {
     let (_, _, _, guest_gsi) = axvm::boot::x86_qemu_passthrough_block_intx();
     let info = x86_host_fs_passthrough_pci_info();
 
@@ -284,23 +285,26 @@ fn register_x86_host_fs_passthrough_irq_route() {
         }
         Ok(None) => {
             warn!("x86 host filesystem passthrough PCI INTx route was not found for {info:?}");
-            return;
+            return Ok(());
         }
         Err(err) => {
             warn!("failed to resolve x86 host filesystem passthrough PCI INTx route: {err:?}");
-            return;
+            return Ok(());
         }
     };
 
     match route {
         Ok((host_irq, trigger)) => {
             axvm::register_x86_ioapic_irq_forwarding_route_with_trigger(
-                guest_gsi, host_irq, trigger,
-            );
+                vm, guest_gsi, host_irq, trigger,
+            )
+            .context("register x86 host filesystem PCI INTx forwarding route")?;
             axvm::register_x86_ioapic_irq_forwarding_activator(
+                vm,
                 guest_gsi,
                 unmask_x86_host_fs_passthrough_intx,
-            );
+            )
+            .context("register x86 host filesystem PCI INTx forwarding activator")?;
             info!(
                 "Registered x86 host filesystem PCI INTx forwarding route: guest GSI \
                  {guest_gsi} <- host IRQ {host_irq:?}, trigger {trigger:?}"
@@ -313,6 +317,7 @@ fn register_x86_host_fs_passthrough_irq_route() {
             );
         }
     }
+    Ok(())
 }
 
 #[cfg(all(feature = "fs", target_arch = "x86_64"))]

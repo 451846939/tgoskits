@@ -5,10 +5,14 @@
 //! default virtual UART with the host-selected UART's register model, layout,
 //! address, and firmware identity before VM construction.
 
-use alloc::{string::String, vec, vec::Vec};
+use alloc::{string::String, sync::Arc, vec, vec::Vec};
 
+use axdevice::{
+    DeviceBuildContext, DeviceBundle, DeviceFactory, DeviceFactoryRegistry, DeviceManagerError,
+    DeviceManagerResult, SerialBackend, build_16550_mmio, build_16550_port, build_pl011_mmio,
+};
 use axdevice_base::AccessWidth;
-use axvm_types::{EmulatedDeviceConfig, EmulatedDeviceType};
+use axvm_types::{EmulatedDeviceConfig, EmulatedDeviceType, InterruptTriggerMode};
 
 use crate::{arch::CurrentArch, architecture::MachinePlatform};
 
@@ -244,7 +248,7 @@ fn aarch64_profile(cpu_num: usize) -> MachineProfile {
                 0x080a_0000,
                 cpu_num.saturating_mul(AARCH64_GIC_REDISTRIBUTOR_FRAME_SIZE),
                 0,
-                EmulatedDeviceType::ArmGicRedistributor,
+                EmulatedDeviceType::GPPTRedistributor,
                 vec![cpu_num],
             ),
             serial_device_config(serial),
@@ -342,6 +346,97 @@ pub fn machine_profile_for(architecture: MachineArchitecture, cpu_num: usize) ->
 /// Returns the machine profile selected by the architecture boundary.
 pub fn current_machine_profile(cpu_num: usize) -> MachineProfile {
     machine_profile_for(CurrentArch::MACHINE_ARCHITECTURE, cpu_num)
+}
+
+pub(crate) fn register_machine_device_factories(
+    vm: &crate::AxVM,
+    factories: &mut DeviceFactoryRegistry,
+) -> DeviceManagerResult {
+    let (profile, backend) =
+        vm.with_config(|config| (config.serial_profile(), config.serial_backend()));
+    factories.register(Arc::new(MachineSerialFactory::new(profile, backend)))
+}
+
+struct MachineSerialFactory {
+    profile: GuestSerialProfile,
+    expected_config: EmulatedDeviceConfig,
+    backend: Arc<dyn SerialBackend>,
+}
+
+impl MachineSerialFactory {
+    fn new(profile: GuestSerialProfile, backend: Arc<dyn SerialBackend>) -> Self {
+        Self {
+            profile,
+            expected_config: serial_device_config(profile),
+            backend,
+        }
+    }
+
+    fn validate_config(&self, config: &EmulatedDeviceConfig) -> DeviceManagerResult {
+        let expected = &self.expected_config;
+        if config.name == expected.name
+            && config.base_gpa == expected.base_gpa
+            && config.length == expected.length
+            && config.irq_id == expected.irq_id
+            && config.emu_type == expected.emu_type
+            && config.cfg_list == expected.cfg_list
+        {
+            return Ok(());
+        }
+        Err(DeviceManagerError::InvalidConfig {
+            operation: "build machine-owned virtual serial device",
+            detail: alloc::format!(
+                "descriptor for '{}' does not match the immutable machine serial profile",
+                config.name
+            ),
+        })
+    }
+}
+
+impl DeviceFactory for MachineSerialFactory {
+    fn device_type(&self) -> EmulatedDeviceType {
+        EmulatedDeviceType::Console
+    }
+
+    fn build(
+        &self,
+        config: &EmulatedDeviceConfig,
+        context: &DeviceBuildContext<'_>,
+    ) -> DeviceManagerResult<DeviceBundle> {
+        self.validate_config(config)?;
+        let irq = context.resolve_irq(self.profile.irq, InterruptTriggerMode::LevelTriggered)?;
+        let bundle = match (self.profile.model, self.profile.transport) {
+            (GuestSerialModel::Uart16550, GuestSerialTransport::Port { base, length }) => {
+                build_16550_port(base, length, self.profile.irq, self.backend.clone(), irq)
+            }
+            (
+                GuestSerialModel::Uart16550,
+                GuestSerialTransport::Mmio {
+                    base,
+                    length,
+                    register_shift,
+                    ..
+                },
+            ) => build_16550_mmio(
+                base,
+                length,
+                register_shift,
+                self.profile.irq,
+                self.backend.clone(),
+                irq,
+            ),
+            (GuestSerialModel::Pl011, GuestSerialTransport::Mmio { base, length, .. }) => {
+                build_pl011_mmio(base, length, self.profile.irq, self.backend.clone(), irq)
+            }
+            (GuestSerialModel::Pl011, GuestSerialTransport::Port { .. }) => {
+                return Err(DeviceManagerError::Unsupported {
+                    operation: "build machine-owned virtual serial device",
+                    detail: "PL011 cannot use port I/O transport".into(),
+                });
+            }
+        };
+        Ok(bundle)
+    }
 }
 
 #[cfg(test)]
