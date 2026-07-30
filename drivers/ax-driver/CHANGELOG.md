@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Defer SD/eMMC protocol initialization to the block hctx and configure every
+  migrated controller through an owned `dma-api` capability.
+- Restore the existing SD/eMMC configuration surface on top of the migrated
+  CV181x, SDHCI, DWMMC, JH7110, Phytium MCI, and K230 implementations.
+- Replace the LS2K1000 AHCI synchronous polling adapter with a single-slot
+  IRQ-driven queue that owns command and request DMA through `dma-api`.
+- Bind NVMe admin and I/O vectors independently and enable each MSI-X source
+  only after its non-reentrant handler is installed.
+- Keep the NVMe INTx acknowledgement path lock-free and ignore AHCI port status
+  outside the controller's enabled completion, error, and link event mask.
+
+### Removed
+
+- Remove unreachable BCM2835 synchronous glue and the legacy `UnsafeCell`
+  shared-driver adapter.
+
 ## [0.12.1](https://github.com/rcore-os/tgoskits/compare/ax-driver-v0.12.0...ax-driver-v0.12.1) - 2026-07-23
 
 ### Added

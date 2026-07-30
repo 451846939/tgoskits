@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Add bounded sequential page-cache readahead and runtime batch/commit/completion diagnostics.
+
+### Changed
+
+- Submit every planner-generated filesystem I/O window before blocking for its completion group.
+- Defer regular ext4 data, append, and size-change durability to the explicit sync/fsync boundary.
+- Split block lifecycle I/O and page-cache readahead, writeback, reclaim, and tests into focused modules.
+- Replace the compatibility block runtime with per-CPU bounded submission
+  channels and one pinned maintenance task per hardware queue.
+- Make filesystem reads, writes, and flushes blocking wrappers over one-shot
+  completion subscriptions.
+- Expand hardware queues only after scheduler, IPI, and local IRQ startup
+  completes on every CPU.
+- Aggregate single and grouped channel submissions into bounded hardware
+  batches while preserving partial acceptance and flush ordering.
+
+### Fixed
+
+- Quiesce hctx workers before controller shutdown and retain partially installed queues until hardware can no longer DMA into them.
+- Alternate retry suffixes with fresh per-CPU submissions and share one scheduler notification across each completion group.
+
+### Removed
+
+- Remove synchronous polling, timer repoll fallback, task-ID wakeups, and the duplicate `block_runtime` module.
+
 ## [0.8.5](https://github.com/rcore-os/tgoskits/compare/ax-fs-ng-v0.8.4...ax-fs-ng-v0.8.5) - 2026-07-23
 
 ### Added

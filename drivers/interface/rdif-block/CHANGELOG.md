@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Add runtime-owned register retry delays for controller and queue state
+  machines without permitting completion polling.
+- Allow runtimes to restore an unaccepted request suffix from an owned batch
+  without reallocating its submission container.
+- Clarify that controller shutdown must complete before queue-owned DMA memory
+  can be released.
+- Add ordered DMA-owning request batches with explicit partial acceptance and accepted-ID publication.
+- Require a separate queue commit after every non-empty batch so native drivers can publish multiple descriptors with one hardware doorbell.
+- Add `max_submit_batch` to the mandatory hardware queue limits.
+- Replace submit/poll queues with DMA-owning `BlockController`, `HardwareQueue`, and boxed hard-IRQ acknowledgement contracts.
+- Make DMA masks, alignments, segment limits, boundaries, and queue depth explicit and mandatory at both planning and submission boundaries.
+
+### Removed
+
+- Remove legacy queue handles, completion polling, cancellation/status APIs, and software-only request flags.
+
 ## [0.11.2](https://github.com/rcore-os/tgoskits/compare/rdif-block-v0.11.1...rdif-block-v0.11.2) - 2026-07-08
 
 ### Other

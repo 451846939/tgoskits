@@ -565,6 +565,82 @@ fn syscall_count_qemu_configs_stop_after_pass_marker() {
 }
 
 #[test]
+fn loongarch64_nvme_rootfs_build_keeps_serial_console() {
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("axbuild manifest should live under scripts/axbuild")
+        .to_path_buf();
+    let config_path =
+        repo.join("apps/starry/qemu/nvme/build-loongarch64-unknown-none-softfloat.toml");
+    let content = fs::read_to_string(&config_path).unwrap();
+    let config: toml::Value = toml::from_str(&content).unwrap();
+    let features = config
+        .get("features")
+        .and_then(toml::Value::as_array)
+        .expect("NVMe build config must declare features");
+
+    assert!(
+        features
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .any(|feature| feature == "ax-driver/serial"),
+        "{} must keep the LoongArch serial console enabled so NVMe test markers are observable",
+        config_path.display()
+    );
+}
+
+#[test]
+fn loongarch64_nvme_rootfs_uses_dynamic_uefi_handoff() {
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("axbuild manifest should live under scripts/axbuild")
+        .to_path_buf();
+    let config_path = repo.join("apps/starry/qemu/nvme/nvme-rootfs-rw-20m/qemu-loongarch64.toml");
+    let content = fs::read_to_string(&config_path).unwrap();
+    let config: toml::Value = toml::from_str(&content).unwrap();
+
+    assert_eq!(
+        config.get("uefi").and_then(toml::Value::as_bool),
+        Some(true),
+        "{} must boot the PIC kernel through the supported LoongArch dynamic UEFI handoff",
+        config_path.display()
+    );
+    assert_eq!(
+        config.get("to_bin").and_then(toml::Value::as_bool),
+        Some(true),
+        "{} must retain the UEFI runner's explicit BIN artifact contract",
+        config_path.display()
+    );
+}
+
+#[test]
+fn x86_64_nvme_rootfs_uses_dynamic_uefi_handoff() {
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("axbuild manifest should live under scripts/axbuild")
+        .to_path_buf();
+    let config_path = repo.join("apps/starry/qemu/nvme/nvme-rootfs-rw-20m/qemu-x86_64.toml");
+    let content = fs::read_to_string(&config_path).unwrap();
+    let config: toml::Value = toml::from_str(&content).unwrap();
+
+    assert_eq!(
+        config.get("uefi").and_then(toml::Value::as_bool),
+        Some(true),
+        "{} must boot the PIC kernel through the supported x86_64 dynamic UEFI handoff",
+        config_path.display()
+    );
+    assert_eq!(
+        config.get("to_bin").and_then(toml::Value::as_bool),
+        Some(true),
+        "{} must retain the UEFI runner's explicit BIN artifact contract",
+        config_path.display()
+    );
+}
+
+#[test]
 fn codex_cli_qemu_config_uses_injected_smoke_script() {
     let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -682,7 +758,7 @@ fn apk_package_prebuilds_use_guest_apk_from_staging_root() {
 }
 
 #[test]
-fn nix_qemu_configs_use_dedicated_managed_rootfs() {
+fn nix_qemu_configs_use_dedicated_nvme_rootfs() {
     let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
@@ -707,6 +783,11 @@ fn nix_qemu_configs_use_dedicated_managed_rootfs() {
         assert!(
             !config.contains(&format!("rootfs-{arch}-alpine.img")),
             "{} must not pass the shared Alpine base image to the Nix prebuild",
+            config_path.display()
+        );
+        assert!(
+            config.contains("\"nvme,") && !config.contains("virtio-blk"),
+            "{} must attach its Starry root disk through the IRQ-driven NVMe path",
             config_path.display()
         );
     }

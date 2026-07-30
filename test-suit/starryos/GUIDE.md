@@ -126,7 +126,8 @@ install(TARGETS mytest RUNTIME DESTINATION usr/bin/starry-test-suit)
 `system/qemu-x86_64.toml`、`system/qemu-aarch64.toml`、`system/qemu-riscv64.toml`
 需要同时覆盖常规系统回归、DRM、evdev 和 USB：
 
-- `NVMe` 主启动盘 `disk0` 使用 Alpine rootfs。
+- NVMe 主启动盘 `disk0` 使用 Alpine rootfs，统一配置
+  `max_ioqpairs=64,msix_qsize=65`，不回退到 `virtio-blk`。
 - `virtio-net` 提供基础网络。
 - `virtio-gpu`、`virtio-keyboard`、`virtio-tablet` 支持 DRM/evdev。
 - `qemu-xhci,id=xhci,msi=off,msix=off`、`usb-audio`、`usb-storage` 支持 USB 回归。
@@ -387,6 +388,26 @@ CMake `install()` 到该 upload root 的所有普通文件都会按原相对路�
 `${sessionFile:bin/<program>}`。板端下载、赋权和执行仍必须显式写在
 `shell_init_cmd` 中；ostool 不会自动执行上传的程序。upload root 为空、包含符号链接，
 或者手写 `session_files` 与 CMake install 产物同路径时会在分配板卡前报错。
+
+位于 `apps/starry/<app>/` 的重型板测仍应保留在 app 目录，不要为了复用共享文件能力
+迁入 test-suit。app 下存在 `rust/Cargo.toml` 时，`starry app board` 会复用同一套
+musl 交叉编译流水线，把静态程序安装到每次运行独立的
+`target/<target>/board-cases/app/<app>/runs/<run-id>/upload/usr/bin/`，并作为 session
+文件上传。`init.sh` 通过 `${sessionFile:usr/bin/<program>}` 显式下载、赋权和执行；
+该流程不通过 SSH，也不把程序预装到持久 rootfs。
+
+若 Starry 尚无对应板卡网卡驱动，可给 `starry app board` 增加
+`--linux-stage`。xtask 会完成同一 app 资产构建，在 `board connect` 的默认 Linux
+会话中上传资产并打印 board-visible HTTP URL，而不启动 Starry 内核。操作者应在该
+Linux 会话中下载并验证资产，写入 Starry 可见的持久 rootfs 路径并执行 `sync`；
+退出会话释放 lease 后，再运行不带 `--linux-stage` 的正常 Starry 板测。这个流程只
+改变二进制交付位置，Linux 与 Starry 必须执行同一资产；不得以另一个 shell workload
+复用成功标记。
+
+App 的 `board-<name>.toml` 默认复用
+`os/StarryOS/configs/board/<name>.toml` 作为内核 build config；只有 app 目录存在
+精确的 `build-<target>.toml` 时才覆盖。多个同架构板卡需要不同 SoC feature 时应
+省略共享覆盖，避免把某块板的 CPU、MMU 或控制器 feature 注入另一块板。
 
 运行示例：
 
