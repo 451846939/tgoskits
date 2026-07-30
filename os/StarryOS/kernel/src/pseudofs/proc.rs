@@ -1239,7 +1239,7 @@ fn render_thread_stat(
 }
 
 fn render_thread_auxv(task: &UserTaskRef) -> Vec<u8> {
-    let mut entries = task.as_thread().proc_data.auxv().clone();
+    let mut entries = task.as_thread().proc_data.auxv().to_vec();
     entries.push(AuxEntry::new(AuxType::NULL, 0));
     let mut bytes = Vec::with_capacity(entries.len() * size_of::<AuxEntry>());
     for entry in entries {
@@ -1494,7 +1494,7 @@ impl SimpleDirOps for ThreadDir {
             )
             .into(),
             "exe" => SimpleFile::new(fs, NodeType::Symlink, move || {
-                Ok(task.as_thread().proc_data.exe_path().clone())
+                Ok(task.as_thread().proc_data.exe_path().to_string())
             })
             .into(),
             "environ" => SimpleFile::new_regular(fs, move || {
@@ -1508,11 +1508,11 @@ impl SimpleDirOps for ThreadDir {
             })
             .into(),
             "root" => SimpleFile::new(fs, NodeType::Symlink, move || {
-                Ok(task.as_thread().proc_data.root_path().clone())
+                Ok(task.as_thread().proc_data.root_path().to_string())
             })
             .into(),
             "cwd" => SimpleFile::new(fs, NodeType::Symlink, move || {
-                Ok(task.as_thread().proc_data.cwd_path().clone())
+                Ok(task.as_thread().proc_data.cwd_path().to_string())
             })
             .into(),
             "fd" => SimpleDir::new_maker(
