@@ -92,14 +92,14 @@ impl_trait! {
                 };
 
                 ax_hal::mem::dma_coherent_before_make_uncached(start, size);
-                ax_mm::kernel_aspace().lock().protect(
+                crate::kernel_mapping::protect_kernel_range(
                     start,
                     size,
                     ax_hal::paging::MappingFlags::READ
                         | ax_hal::paging::MappingFlags::WRITE
                         | ax_hal::paging::MappingFlags::UNCACHED,
-                )?;
-                ax_hal::asm::flush_tlb(None);
+                )
+                .map_err(|_| AxError::BadState)?;
                 ax_hal::mem::dma_coherent_after_mapping_update();
                 Ok(())
             }
@@ -118,12 +118,12 @@ impl_trait! {
                 };
 
                 ax_hal::mem::dma_coherent_before_restore_cached(start, size);
-                ax_mm::kernel_aspace().lock().protect(
+                crate::kernel_mapping::protect_kernel_range(
                     start,
                     size,
                     ax_hal::paging::MappingFlags::READ | ax_hal::paging::MappingFlags::WRITE,
-                )?;
-                ax_hal::asm::flush_tlb(None);
+                )
+                .map_err(|_| AxError::BadState)?;
                 ax_hal::mem::dma_coherent_after_mapping_update();
                 Ok(())
             }

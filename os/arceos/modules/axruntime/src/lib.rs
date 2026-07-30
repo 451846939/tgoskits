@@ -53,6 +53,8 @@ mod mp;
 mod boot_memory;
 mod bootstrap;
 mod guard;
+#[cfg(feature = "paging")]
+mod kernel_mapping;
 mod klib;
 
 #[cfg(any(feature = "irq", test))]
