@@ -59,7 +59,7 @@ fn prepare_device_bootstrap(vm: &AxVM) -> AxVmResult<ArchDeviceBootstrap> {
     register_device_factories(&mut factories)?;
     Ok(ArchDeviceBootstrap::new(
         factories,
-        irq::configure(vm.id(), vm.interrupt_mode())?,
+        super::irq::configure(vm.id(), vm.interrupt_mode())?,
     ))
 }
 
