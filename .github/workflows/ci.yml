@@ -441,20 +441,56 @@ jobs:
             container_image: base
             limit_to_owner: ""
             main_pr_only: false
-          - name: Test axvisor aarch64 qemu
+          - name: Test axvisor aarch64 qemu (smoke)
             use_container: false
             runs_on: '["self-hosted","linux","qcs"]'
             self_hosted_owner: rcore-os
-            command: cargo xtask axvisor test qemu --arch aarch64
+            command: cargo xtask axvisor test qemu --arch aarch64 --test-case smoke
             cache_key: ""
             container_image: base
             limit_to_owner: ""
             main_pr_only: false
-          - name: Test axvisor riscv64 qemu
+          - name: Test axvisor aarch64 qemu (backtrace-panic)
             use_container: false
             runs_on: '["self-hosted","linux","qcs"]'
             self_hosted_owner: rcore-os
-            command: cargo xtask axvisor test qemu --arch riscv64
+            command: cargo xtask axvisor test qemu --arch aarch64 --test-case backtrace-panic
+            cache_key: ""
+            container_image: base
+            limit_to_owner: ""
+            main_pr_only: false
+          - name: Test axvisor aarch64 qemu (no-backtrace)
+            use_container: false
+            runs_on: '["self-hosted","linux","qcs"]'
+            self_hosted_owner: rcore-os
+            command: cargo xtask axvisor test qemu --arch aarch64 --test-case no-backtrace
+            cache_key: ""
+            container_image: base
+            limit_to_owner: ""
+            main_pr_only: false
+          - name: Test axvisor riscv64 qemu (smoke)
+            use_container: false
+            runs_on: '["self-hosted","linux","qcs"]'
+            self_hosted_owner: rcore-os
+            command: cargo xtask axvisor test qemu --arch riscv64 --test-case smoke
+            cache_key: ""
+            container_image: base
+            limit_to_owner: ""
+            main_pr_only: false
+          - name: Test axvisor riscv64 qemu (backtrace-panic)
+            use_container: false
+            runs_on: '["self-hosted","linux","qcs"]'
+            self_hosted_owner: rcore-os
+            command: cargo xtask axvisor test qemu --arch riscv64 --test-case backtrace-panic
+            cache_key: ""
+            container_image: base
+            limit_to_owner: ""
+            main_pr_only: false
+          - name: Test axvisor riscv64 qemu (no-backtrace)
+            use_container: false
+            runs_on: '["self-hosted","linux","qcs"]'
+            self_hosted_owner: rcore-os
+            command: cargo xtask axvisor test qemu --arch riscv64 --test-case no-backtrace
             cache_key: ""
             container_image: base
             limit_to_owner: ""
