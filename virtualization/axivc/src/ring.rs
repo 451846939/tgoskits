@@ -95,6 +95,14 @@ pub(crate) struct IvcMessageSlot {
     payload: UnsafeCell<[u8; IVC_SLOT_PAYLOAD_SIZE]>,
 }
 
+// SAFETY: Each SPSC ring has exactly one producer and one consumer, encoded
+// by the `IvcProducer`/`IvcConsumer` endpoint types whose `unsafe`
+// constructors carry the uniqueness contract. The UnsafeCell payload in each
+// slot is only accessed by the owning producer (before tail release) or the
+// owning consumer (after tail acquire), so cross-thread &IvcRing sharing is
+// sound as long as the endpoint contract holds.
+unsafe impl Sync for IvcRing {}
+
 impl IvcMessageSlot {
     fn clear(&self) {
         self.sequence.store(0, Ordering::Relaxed);
