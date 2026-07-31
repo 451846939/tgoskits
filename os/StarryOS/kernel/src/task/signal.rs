@@ -12,7 +12,8 @@ use starry_vm::vm_read_slice;
 
 use super::{
     ProcessData, RttimeLimitAction, Thread, current_user_task, do_exit, get_process_data,
-    get_process_group, get_task, is_zombie_pid, signal_publication::publish_before_release,
+    get_process_group, get_task, interruption::InterruptSnapshot, is_zombie_pid,
+    signal_publication::publish_before_release,
 };
 use crate::task::future::{UserWaitOutcome, block_on, block_on_user};
 
@@ -198,22 +199,40 @@ pub fn wait_existing_ptrace_stop_current(thr: &Thread, uctx: &mut UserContext) {
     if let Some(signo) = thr.proc_data.ptrace_stop_signo_for(tid) {
         notify_ptrace_waiter(thr, signo);
     }
-    wait_ptrace_resume(thr, tid, uctx);
+    wait_ptrace_resume(thr, tid, uctx, thr.interrupt_snapshot());
 }
 
-fn wait_ptrace_resume(thr: &Thread, tid: u32, uctx: &mut UserContext) {
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum PtraceStopWaitOutcome {
+    Resumed,
+    Killed,
+}
+
+fn wait_ptrace_resume(
+    thr: &Thread,
+    tid: u32,
+    uctx: &mut UserContext,
+    pre_stop_interrupts: InterruptSnapshot,
+) {
     let task = current_user_task();
-    let stale_interrupts = thr.interrupt_snapshot();
-    thr.acknowledge_interrupt(stale_interrupts);
+    // The signal that entered this ptrace stop has already interrupted the
+    // thread. Acknowledge only publications that existed before the stop was
+    // made visible to its tracer: a later SIGKILL must remain pending and wake
+    // this wait instead of being mistaken for that stale interruption.
+    thr.acknowledge_interrupt(pre_stop_interrupts);
     let wait_result = block_on_user(
         &task,
         poll_fn(|cx| {
             if thr.proc_data.ptrace_stop_signo_for(tid).is_none() {
-                Poll::Ready(())
+                Poll::Ready(PtraceStopWaitOutcome::Resumed)
+            } else if ptrace_kill_is_pending(thr) {
+                Poll::Ready(PtraceStopWaitOutcome::Killed)
             } else {
                 thr.proc_data.register_ptrace_stop_waker(cx.waker());
                 if thr.proc_data.ptrace_stop_signo_for(tid).is_none() {
-                    Poll::Ready(())
+                    Poll::Ready(PtraceStopWaitOutcome::Resumed)
+                } else if ptrace_kill_is_pending(thr) {
+                    Poll::Ready(PtraceStopWaitOutcome::Killed)
                 } else {
                     Poll::Pending
                 }
@@ -221,14 +240,23 @@ fn wait_ptrace_resume(thr: &Thread, tid: u32, uctx: &mut UserContext) {
         }),
     );
 
-    if matches!(wait_result, UserWaitOutcome::Interrupted) {
+    if matches!(
+        wait_result,
+        UserWaitOutcome::Interrupted | UserWaitOutcome::Ready(PtraceStopWaitOutcome::Killed)
+    ) {
         thr.proc_data.clear_ptrace_stop();
-    } else if matches!(wait_result, UserWaitOutcome::Ready(()))
-        && let Some(resume_uctx) = thr.proc_data.take_ptrace_stop_user_context_for(tid)
+    } else if matches!(
+        wait_result,
+        UserWaitOutcome::Ready(PtraceStopWaitOutcome::Resumed)
+    ) && let Some(resume_uctx) = thr.proc_data.take_ptrace_stop_user_context_for(tid)
     {
         *uctx = resume_uctx;
         thr.proc_data.restore_current_fp_for_ptrace(tid, uctx);
     }
+}
+
+fn ptrace_kill_is_pending(thr: &Thread) -> bool {
+    thr.signal().pending().has(Signo::SIGKILL)
 }
 
 fn ptrace_stop_current_impl(
@@ -242,6 +270,7 @@ fn ptrace_stop_current_impl(
     }
 
     let tid = thr.tid();
+    let pre_stop_interrupts = thr.interrupt_snapshot();
     while !thr.proc_data.claim_ptrace_stop(tid) {
         block_on(poll_fn(|cx| {
             if !thr.proc_data.has_ptrace_stop(tid) {
@@ -273,7 +302,7 @@ fn ptrace_stop_current_impl(
     }
     notify_ptrace_waiter(thr, signo);
 
-    wait_ptrace_resume(thr, tid, uctx);
+    wait_ptrace_resume(thr, tid, uctx, pre_stop_interrupts);
     Some(thr.proc_data.take_ptrace_resume_signo_for(tid))
 }
 
