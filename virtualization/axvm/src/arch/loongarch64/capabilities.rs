@@ -1,5 +1,9 @@
 //! LoongArch64 implementations of AxVM platform capability hooks.
 
+use alloc::sync::Arc;
+
+use ax_std::os::arceos::modules::ax_task::IrqNotify;
+
 use super::LoongArch64Arch;
 use crate::architecture::{GuestBootPlatform, HostTimePlatform, MachinePlatform};
 
@@ -32,9 +36,9 @@ impl GuestBootPlatform for LoongArch64Arch {
 impl HostTimePlatform for LoongArch64Arch {
     fn set_oneshot_timer(_deadline_ns: u64) {}
 
-    fn register_timer_callback() {
-        ax_std::os::arceos::modules::ax_task::register_timer_callback(|_| {
-            crate::check_timer_events();
+    fn register_timer_callback(notify: Arc<IrqNotify>) {
+        ax_std::os::arceos::modules::ax_task::register_timer_callback(move |_| {
+            notify.notify_irq();
         });
     }
 }

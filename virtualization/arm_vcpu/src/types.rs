@@ -190,45 +190,6 @@ impl ArmNestedPagingConfig {
     }
 }
 
-/// Saved state of the guest architectural virtual timer.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ArmVirtualTimerState {
-    counter_offset: u64,
-    compare_value: u64,
-    control: u32,
-}
-
-impl ArmVirtualTimerState {
-    const ENABLE: u32 = 1 << 0;
-    const IMASK: u32 = 1 << 1;
-    const ISTATUS: u32 = 1 << 2;
-
-    /// Creates a snapshot from `CNTVOFF_EL2`, `CNTV_CVAL_EL0`, and `CNTV_CTL_EL0`.
-    pub const fn new(counter_offset: u64, compare_value: u64, control: u32) -> Self {
-        Self {
-            counter_offset,
-            compare_value,
-            control,
-        }
-    }
-
-    /// Returns whether the timer is enabled and unmasked.
-    pub const fn delivery_enabled(self) -> bool {
-        self.control & (Self::ENABLE | Self::IMASK) == Self::ENABLE
-    }
-
-    /// Returns whether the saved timer output is asserting virtual PPI 27.
-    pub const fn irq_asserted(self) -> bool {
-        self.control & (Self::ENABLE | Self::IMASK | Self::ISTATUS)
-            == (Self::ENABLE | Self::ISTATUS)
-    }
-
-    /// Returns the deadline in the host physical counter domain.
-    pub const fn physical_deadline(self) -> u64 {
-        self.compare_value.wrapping_add(self.counter_offset)
-    }
-}
-
 /// Common GICv3 CPU-interface register trapped by the vCPU core.
 ///
 /// Keeping the architectural register identity typed prevents raw system

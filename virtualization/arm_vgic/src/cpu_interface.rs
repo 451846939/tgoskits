@@ -21,7 +21,11 @@ const ICH_VMCR_VPMR_MASK: u64 = 0xff << ICH_VMCR_VPMR_SHIFT;
 pub enum ListRegisterBacking {
     /// The hypervisor owns the complete virtual interrupt lifecycle.
     Software,
-    /// The physical GIC owns pending/active state and the LR names its source.
+    /// The controller owns a physical source that requires virtual EOI resampling.
+    ///
+    /// The host top half has already acknowledged this source, so the LR is
+    /// software-backed and this identity remains out-of-band until guest EOI
+    /// or DIR retires the physical activation.
     Physical(PhysicalIrqId),
 }
 
@@ -45,7 +49,7 @@ impl ListRegisterState {
         }
     }
 
-    /// Creates an entry backed by one ownership-checked physical interrupt.
+    /// Creates a resampled entry backed by one ownership-checked physical interrupt.
     pub const fn new_physical(
         intid: IntId,
         priority: Priority,

@@ -26,7 +26,7 @@ use crate::{
 impl LoongArch64Arch {
     pub(crate) fn create_vm_resources(config: AxVMConfig) -> AxVmResult<AxVMResources> {
         let placements = config.phys_cpu_ls.get_vcpu_affinities_pcpu_ids();
-        let levels = guest_page_table_levels(&placements);
+        let levels = guest_page_table_levels(&placements)?;
         let page_table = npt::NestedPageTable::new(levels)?;
         AxVMResources::from_page_table(config, page_table, |root_paddr| {
             let gpa_bits = match levels {
@@ -168,8 +168,21 @@ fn uses_firmware_boot(config: &AxVMConfig) -> bool {
     )
 }
 
-fn guest_page_table_levels(vcpu_mappings: &[(usize, Option<usize>, usize)]) -> usize {
-    crate::architecture::minimum_target_cpu_capability(4, vcpu_mappings, |cpu_id| {
-        crate::percpu::cpu_max_guest_page_table_levels(cpu_id).unwrap_or(4)
+fn guest_page_table_levels(vcpu_mappings: &[(usize, Option<usize>, usize)]) -> AxVmResult<usize> {
+    crate::architecture::minimum_recorded_target_cpu_capability(
+        "LoongArch nested page-table levels",
+        vcpu_mappings,
+        |cpu_id| {
+            crate::percpu::select_cpu_virtualization_capability(cpu_id, |levels, _, _| {
+                levels as u64
+            })
+        },
+    )
+    .map(|levels| levels as usize)
+    .map_err(|error| {
+        crate::architecture::unsupported_target_cpu_capability(
+            "select LoongArch target CPU capability",
+            error,
+        )
     })
 }

@@ -15,10 +15,11 @@
 use core::marker::PhantomData;
 
 use aarch64_cpu::registers::*;
+use aarch64_sysreg::SystemRegType;
 
 use crate::{
-    ArmGuestPhysAddr, ArmHostOps, ArmNestedPagingConfig, ArmSysRegAddr, ArmVcpuResult,
-    ArmVirtualTimerState, ArmVmExit, TrapFrame,
+    ArmGuestPhysAddr, ArmHostOps, ArmNestedPagingConfig, ArmSysRegAddr, ArmTimerKind,
+    ArmTimerSnapshot, ArmTimerVmConfig, ArmVcpuResult, ArmVcpuTimer, ArmVmExit, TrapFrame,
     context_frame::GuestSystemRegisters,
     exception::{TrapKind, handle_exception_sync},
     exception_utils::exception_class_value,
@@ -54,6 +55,7 @@ pub struct ArmVcpu<H: ArmHostOps> {
     ctx: TrapFrame,
     host: HostRuntimeContext,
     guest_system_regs: GuestSystemRegisters,
+    timer: ArmVcpuTimer,
     /// The MPIDR_EL1 value for the vCPU.
     mpidr: u64,
     _host: PhantomData<fn() -> H>,
@@ -91,6 +93,26 @@ pub(crate) const ARM_VCPU_HOST_TPIDR_EL0_OFFSET: usize =
 pub(crate) const ARM_VCPU_GUEST_TPIDR_EL0_OFFSET: usize =
     core::mem::offset_of!(AssemblyArmVcpu, guest_system_regs)
         + crate::context_frame::GUEST_TPIDR_EL0_OFFSET;
+pub(crate) const ARM_VCPU_TIMER_VIRTUAL_OFFSET_OFFSET: usize =
+    core::mem::offset_of!(AssemblyArmVcpu, timer) + crate::timer::TIMER_VIRTUAL_OFFSET_OFFSET;
+pub(crate) const ARM_VCPU_TIMER_VIRTUAL_COMPARE_OFFSET: usize =
+    core::mem::offset_of!(AssemblyArmVcpu, timer) + crate::timer::TIMER_VIRTUAL_COMPARE_OFFSET;
+pub(crate) const ARM_VCPU_TIMER_VIRTUAL_CONTROL_OFFSET: usize =
+    core::mem::offset_of!(AssemblyArmVcpu, timer) + crate::timer::TIMER_VIRTUAL_CONTROL_OFFSET;
+pub(crate) const ARM_VCPU_TIMER_VIRTUAL_GENERATION_OFFSET: usize =
+    core::mem::offset_of!(AssemblyArmVcpu, timer) + crate::timer::TIMER_VIRTUAL_GENERATION_OFFSET;
+pub(crate) const ARM_VCPU_TIMER_GUEST_HYPERVISOR_CONTROL_OFFSET: usize =
+    core::mem::offset_of!(AssemblyArmVcpu, timer)
+        + crate::timer::TIMER_GUEST_HYPERVISOR_CONTROL_OFFSET;
+pub(crate) const ARM_VCPU_TIMER_GUEST_KERNEL_CONTROL_OFFSET: usize =
+    core::mem::offset_of!(AssemblyArmVcpu, timer) + crate::timer::TIMER_GUEST_KERNEL_CONTROL_OFFSET;
+pub(crate) const ARM_VCPU_TIMER_HOST_HYPERVISOR_CONTROL_OFFSET: usize =
+    core::mem::offset_of!(AssemblyArmVcpu, timer)
+        + crate::timer::TIMER_HOST_HYPERVISOR_CONTROL_OFFSET;
+pub(crate) const ARM_VCPU_TIMER_HOST_KERNEL_CONTROL_OFFSET: usize =
+    core::mem::offset_of!(AssemblyArmVcpu, timer) + crate::timer::TIMER_HOST_KERNEL_CONTROL_OFFSET;
+pub(crate) const ARM_VCPU_TIMER_LOADED_OFFSET: usize =
+    core::mem::offset_of!(AssemblyArmVcpu, timer) + crate::timer::TIMER_LOADED_OFFSET;
 
 const _: () = {
     assert!(core::mem::offset_of!(AssemblyArmVcpu, ctx) == 0);
@@ -105,6 +127,10 @@ const _: () = {
         ARM_VCPU_GUEST_TPIDR_EL0_OFFSET
             >= ARM_VCPU_HOST_TPIDR_EL0_OFFSET + core::mem::size_of::<u64>()
     );
+    assert!(ARM_VCPU_TIMER_VIRTUAL_OFFSET_OFFSET.is_multiple_of(core::mem::align_of::<u64>()));
+    assert!(ARM_VCPU_TIMER_VIRTUAL_COMPARE_OFFSET.is_multiple_of(core::mem::align_of::<u64>()));
+    assert!(ARM_VCPU_TIMER_VIRTUAL_CONTROL_OFFSET.is_multiple_of(core::mem::align_of::<u32>()));
+    assert!(ARM_VCPU_TIMER_VIRTUAL_GENERATION_OFFSET.is_multiple_of(core::mem::align_of::<u64>()));
 };
 
 /// Configuration for creating a new [`ArmVcpu`].
@@ -124,8 +150,24 @@ pub struct ArmVcpuCreateConfig {
 /// Physical interrupts and timers are always trapped. A physical device may
 /// back a virtual interrupt, but it must still pass through the VM-owned
 /// virtual interrupt controller rather than bypassing vCPU state.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct ArmVcpuSetupConfig;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ArmVcpuSetupConfig {
+    timer: ArmTimerVmConfig,
+}
+
+impl ArmVcpuSetupConfig {
+    /// Creates setup state with the VM-wide timer configuration.
+    ///
+    /// Every vCPU in one VM must receive the same immutable configuration.
+    pub const fn new(timer: ArmTimerVmConfig) -> Self {
+        Self { timer }
+    }
+
+    /// Returns the VM-wide timer configuration.
+    pub const fn timer(self) -> ArmTimerVmConfig {
+        self.timer
+    }
+}
 
 impl<H: ArmHostOps> ArmVcpu<H> {
     /// Creates a new architecture-specific vCPU.
@@ -137,14 +179,15 @@ impl<H: ArmHostOps> ArmVcpu<H> {
             ctx,
             host: HostRuntimeContext::default(),
             guest_system_regs: GuestSystemRegisters::default(),
+            timer: ArmVcpuTimer::unconfigured(),
             mpidr: config.mpidr_el1,
             _host: PhantomData,
         })
     }
 
     /// Completes architecture-specific setup.
-    pub fn setup(&mut self, _config: ArmVcpuSetupConfig) -> ArmVcpuResult {
-        self.init_hv();
+    pub fn setup(&mut self, config: ArmVcpuSetupConfig) -> ArmVcpuResult {
+        self.init_hv(config);
         Ok(())
     }
 
@@ -168,9 +211,9 @@ impl<H: ArmHostOps> ArmVcpu<H> {
         Ok(())
     }
 
-    /// Returns the architectural virtual timer state saved at the last VM exit.
-    pub fn virtual_timer_state(&self) -> ArmVirtualTimerState {
-        self.guest_system_regs.virtual_timer_state()
+    /// Returns the architectural timer state saved at the last VM exit.
+    pub fn timer_snapshot(&self) -> ArmVcpuResult<ArmTimerSnapshot> {
+        self.timer.snapshot()
     }
 
     /// Runs the vCPU until a VM exit.
@@ -180,10 +223,16 @@ impl<H: ArmHostOps> ArmVcpu<H> {
         }
 
         let exit_reason = unsafe {
+            if !self.timer.is_configured() || self.timer.is_loaded() {
+                return Err(crate::ArmVcpuError::BadState);
+            }
             self.restore_vm_system_regs();
             self.run_guest()
         };
 
+        if self.timer.is_loaded() {
+            return Err(crate::ArmVcpuError::BadState);
+        }
         let trap_kind = TrapKind::try_from(exit_reason as u8).expect("Invalid TrapKind");
         let result = self.vmexit_handler(trap_kind);
 
@@ -224,27 +273,22 @@ impl<H: ArmHostOps> ArmVcpu<H> {
 
 // Private function
 impl<H: ArmHostOps> ArmVcpu<H> {
-    fn init_hv(&mut self) {
+    fn init_hv(&mut self, config: ArmVcpuSetupConfig) {
         self.ctx.spsr = (SPSR_EL1::M::EL1h
             + SPSR_EL1::I::Masked
             + SPSR_EL1::F::Masked
             + SPSR_EL1::A::Masked
             + SPSR_EL1::D::Masked)
             .value;
-        self.init_vm_context();
+        self.init_vm_context(config);
     }
 
     /// Init guest context. Also set some el2 register value.
-    fn init_vm_context(&mut self) {
+    fn init_vm_context(&mut self, config: ArmVcpuSetupConfig) {
         // CNTHCTL_EL2.modify(CNTHCTL_EL2::EL1PCEN::SET + CNTHCTL_EL2::EL1PCTEN::SET);
-        // Set CNTVOFF_EL2 to the current physical counter so the guest's
-        // virtual counter (CNTVCT_EL0 = CNTPCT_EL0 - CNTVOFF_EL2) starts near zero.
-        let cntpct: u64;
-        unsafe { core::arch::asm!("mrs {0}, CNTPCT_EL0", out(reg) cntpct) };
-        self.guest_system_regs.cntvoff_el2 = cntpct;
-        self.guest_system_regs.cntkctl_el1 = 0;
-        self.guest_system_regs.cnthctl_el2 =
+        let guest_hypervisor_control =
             (CNTHCTL_EL2::EL1PCEN::CLEAR + CNTHCTL_EL2::EL1PCTEN::CLEAR).into();
+        self.timer = ArmVcpuTimer::new(config.timer(), guest_hypervisor_control);
 
         self.guest_system_regs.sctlr_el1 = 0x30C50830;
         self.guest_system_regs.pmcr_el0 = 0;
@@ -426,8 +470,63 @@ impl<H: ArmHostOps> ArmVcpu<H> {
         const SYSREG_ICC_DIR_EL1: ArmSysRegAddr = ArmSysRegAddr::new(0x32_3016);
         const SYSREG_ICC_RPR_EL1: ArmSysRegAddr = ArmSysRegAddr::new(0x36_3016);
         const SYSREG_ICC_CTLR_EL1: ArmSysRegAddr = ArmSysRegAddr::new(0x38_3018);
+        const SYSREG_CNTFRQ_EL0: ArmSysRegAddr =
+            ArmSysRegAddr::new(SystemRegType::CNTFRQ_EL0 as usize);
+        const SYSREG_CNTPCT_EL0: ArmSysRegAddr =
+            ArmSysRegAddr::new(SystemRegType::CNTPCT_EL0 as usize);
+        const SYSREG_CNTP_TVAL_EL0: ArmSysRegAddr =
+            ArmSysRegAddr::new(SystemRegType::CNTP_TVAL_EL0 as usize);
+        const SYSREG_CNTP_CTL_EL0: ArmSysRegAddr =
+            ArmSysRegAddr::new(SystemRegType::CNTP_CTL_EL0 as usize);
+        const SYSREG_CNTP_CVAL_EL0: ArmSysRegAddr =
+            ArmSysRegAddr::new(SystemRegType::CNTP_CVAL_EL0 as usize);
 
         match (addr, write) {
+            (SYSREG_CNTFRQ_EL0, false) => {
+                self.set_gpr(reg, self.timer.config().frequency() as usize);
+                Ok(Some(ArmVmExit::Nothing))
+            }
+            (SYSREG_CNTPCT_EL0, false) => {
+                let counter = self
+                    .timer
+                    .guest_counter(ArmTimerKind::Physical, physical_counter())?;
+                self.set_gpr(reg, counter as usize);
+                Ok(Some(ArmVmExit::Nothing))
+            }
+            (SYSREG_CNTP_TVAL_EL0, false) => {
+                let value = self
+                    .timer
+                    .read_tval(ArmTimerKind::Physical, physical_counter())?;
+                self.set_gpr(reg, value as usize);
+                Ok(Some(ArmVmExit::Nothing))
+            }
+            (SYSREG_CNTP_CTL_EL0, false) => {
+                let value = self
+                    .timer
+                    .read_control(ArmTimerKind::Physical, physical_counter())?;
+                self.set_gpr(reg, value as usize);
+                Ok(Some(ArmVmExit::Nothing))
+            }
+            (SYSREG_CNTP_CVAL_EL0, false) => {
+                let value = self.timer.read_compare(ArmTimerKind::Physical)?;
+                self.set_gpr(reg, value as usize);
+                Ok(Some(ArmVmExit::Nothing))
+            }
+            (SYSREG_CNTP_TVAL_EL0, true) => {
+                self.timer
+                    .write_tval(ArmTimerKind::Physical, physical_counter(), value as u32)?;
+                Ok(Some(ArmVmExit::Nothing))
+            }
+            (SYSREG_CNTP_CTL_EL0, true) => {
+                self.timer
+                    .write_control(ArmTimerKind::Physical, value as u32)?;
+                Ok(Some(ArmVmExit::Nothing))
+            }
+            (SYSREG_CNTP_CVAL_EL0, true) => {
+                self.timer.write_compare(ArmTimerKind::Physical, value)?;
+                Ok(Some(ArmVmExit::Nothing))
+            }
+            (SYSREG_CNTFRQ_EL0 | SYSREG_CNTPCT_EL0, true) => Err(crate::ArmVcpuError::InvalidInput),
             (SYSREG_ICC_SGI1R_EL1, true) => {
                 debug!("arm_vcpu ICC_SGI1R_EL1 write: {value:#x}");
                 Ok(Some(ArmVmExit::SendIPI { value }))
@@ -475,6 +574,14 @@ impl<H: ArmHostOps> ArmVcpu<H> {
             }
         }
     }
+}
+
+fn physical_counter() -> u64 {
+    let counter: u64;
+    unsafe {
+        core::arch::asm!("mrs {counter}, CNTPCT_EL0", counter = out(reg) counter);
+    }
+    counter
 }
 
 pub(crate) fn pa_bits() -> usize {

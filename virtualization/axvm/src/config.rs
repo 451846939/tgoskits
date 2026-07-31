@@ -26,7 +26,10 @@ use axvm_types::{EmulatedDeviceType, InterruptTriggerMode};
 
 use crate::{
     arch::{ArchOps, CurrentArch},
-    machine::{GuestGicProfile, GuestPlicProfile, GuestSerialFdtIdentity, GuestSerialProfile},
+    machine::{
+        GuestGicCpuRegion, GuestGicProfile, GuestPlicProfile, GuestSerialFdtIdentity,
+        GuestSerialProfile, GuestTimerProfile,
+    },
 };
 
 /// Policy used by AxVM when deriving runtime guest boot image addresses.
@@ -108,6 +111,7 @@ pub struct AxVMConfig {
     serial_fdt_identity: Option<GuestSerialFdtIdentity>,
     gic_profile: Option<GuestGicProfile>,
     plic_profile: Option<GuestPlicProfile>,
+    timer_profile: Option<GuestTimerProfile>,
     serial_backend: Arc<dyn SerialBackend>,
 }
 
@@ -137,9 +141,8 @@ pub struct AxVMConfigParams {
 
 impl AxVMConfig {
     pub fn new(params: AxVMConfigParams) -> Self {
-        let serial_profile = params.serial_profile.unwrap_or_else(|| {
-            crate::machine::current_machine_profile(params.phys_cpu_ls.cpu_num()).serial
-        });
+        let machine = crate::machine::current_machine_profile(params.phys_cpu_ls.cpu_num());
+        let serial_profile = params.serial_profile.unwrap_or(machine.serial);
         Self {
             id: params.id,
             name: params.name,
@@ -161,6 +164,7 @@ impl AxVMConfig {
             serial_fdt_identity: None,
             gic_profile: None,
             plic_profile: None,
+            timer_profile: machine.timer,
             serial_backend: params
                 .serial_backend
                 .unwrap_or_else(|| Arc::new(NullSerialBackend)),
@@ -375,29 +379,43 @@ impl AxVMConfig {
     /// Replaces the virtual GIC windows with host firmware resources.
     pub fn replace_machine_gic(&mut self, profile: GuestGicProfile) -> crate::AxVmResult {
         const GICD_MINIMUM_SIZE: usize = 0x1_0000;
-        if profile.distributor_length < GICD_MINIMUM_SIZE {
+        if profile.distributor.length < GICD_MINIMUM_SIZE {
             return Err(crate::AxVmError::invalid_config(alloc::format!(
                 "AArch64 GIC distributor window {:#x} is smaller than {GICD_MINIMUM_SIZE:#x}",
-                profile.distributor_length
+                profile.distributor.length
             )));
         }
-        let required_redistributor_size = self
-            .phys_cpu_ls
-            .cpu_num()
-            .max(1)
-            .checked_mul(crate::machine::AARCH64_GIC_REDISTRIBUTOR_FRAME_SIZE)
-            .ok_or_else(|| {
-                crate::AxVmError::invalid_config(
-                    "AArch64 redistributor window size overflows usize",
-                )
-            })?;
-        if profile.redistributor_length < required_redistributor_size {
-            return Err(crate::AxVmError::invalid_config(alloc::format!(
-                "AArch64 GIC redistributor window {:#x} is smaller than required size \
-                 {required_redistributor_size:#x}",
-                profile.redistributor_length
-            )));
-        }
+        let cpu_num = self.phys_cpu_ls.cpu_num().max(1);
+        let (cpu_region, cpu_region_name, cpu_count) = match profile.cpu_region {
+            GuestGicCpuRegion::CpuInterface(region) => {
+                const GICC_MINIMUM_SIZE: usize = 0x1_000;
+                if region.length < GICC_MINIMUM_SIZE {
+                    return Err(crate::AxVmError::invalid_config(alloc::format!(
+                        "AArch64 GIC CPU-interface window {:#x} is smaller than \
+                         {GICC_MINIMUM_SIZE:#x}",
+                        region.length
+                    )));
+                }
+                (region, "gic-cpu-interface", None)
+            }
+            GuestGicCpuRegion::Redistributors(region) => {
+                let required_size = cpu_num
+                    .checked_mul(crate::machine::AARCH64_GIC_REDISTRIBUTOR_FRAME_SIZE)
+                    .ok_or_else(|| {
+                        crate::AxVmError::invalid_config(
+                            "AArch64 redistributor window size overflows usize",
+                        )
+                    })?;
+                if region.length < required_size {
+                    return Err(crate::AxVmError::invalid_config(alloc::format!(
+                        "AArch64 GIC redistributor window {:#x} is smaller than required size \
+                         {required_size:#x}",
+                        region.length
+                    )));
+                }
+                (region, "gic-redistributors", Some(cpu_num))
+            }
+        };
 
         let distributor = self
             .emu_devices
@@ -408,18 +426,25 @@ impl AxVMConfig {
                     "AArch64 machine profile has no interrupt controller",
                 )
             })?;
-        distributor.base_gpa = profile.distributor_base;
-        distributor.length = profile.distributor_length;
+        distributor.base_gpa = profile.distributor.base;
+        distributor.length = profile.distributor.length;
 
-        let redistributor = self
+        let per_cpu = self
             .emu_devices
             .iter_mut()
-            .find(|device| device.emu_type == EmulatedDeviceType::GPPTRedistributor)
+            .find(|device| device.emu_type == EmulatedDeviceType::GicCpuRegion)
             .ok_or_else(|| {
-                crate::AxVmError::invalid_config("AArch64 machine profile has no redistributor")
+                crate::AxVmError::invalid_config(
+                    "AArch64 machine profile has no per-CPU GIC region",
+                )
             })?;
-        redistributor.base_gpa = profile.redistributor_base;
-        redistributor.length = profile.redistributor_length;
+        per_cpu.name = cpu_region_name.into();
+        per_cpu.base_gpa = cpu_region.base;
+        per_cpu.length = cpu_region.length;
+        per_cpu.cfg_list.clear();
+        if let Some(cpu_count) = cpu_count {
+            per_cpu.cfg_list.push(cpu_count);
+        }
 
         self.gic_profile = Some(profile);
         Ok(())
@@ -428,6 +453,25 @@ impl AxVMConfig {
     /// Returns host firmware resources retained by the virtual GIC.
     pub fn gic_profile(&self) -> Option<&GuestGicProfile> {
         self.gic_profile.as_ref()
+    }
+
+    /// Replaces the AArch64 architectural timer resources with validated host firmware data.
+    pub fn replace_machine_timer(&mut self, profile: GuestTimerProfile) -> crate::AxVmResult {
+        if self.timer_profile.is_none() {
+            return Err(crate::AxVmError::invalid_config(
+                "the selected machine has no AArch64 architectural timer",
+            ));
+        }
+        profile
+            .validated_intids()
+            .map_err(crate::AxVmError::invalid_config)?;
+        self.timer_profile = Some(profile);
+        Ok(())
+    }
+
+    /// Returns the machine-owned AArch64 architectural timer resources.
+    pub fn timer_profile(&self) -> Option<&GuestTimerProfile> {
+        self.timer_profile.as_ref()
     }
 
     /// Replaces the virtual PLIC window with host firmware resources.
@@ -671,12 +715,17 @@ mod tests {
             ..Default::default()
         });
         let profile = GuestGicProfile {
+            compatible: "arm,gic-v3".into(),
             node_path: "/interrupt-controller@fe600000".into(),
             node_phandle: Some(1),
-            distributor_base: 0xfe60_0000,
-            distributor_length: 0x1_0000,
-            redistributor_base: 0xfe68_0000,
-            redistributor_length: 0x10_0000,
+            distributor: crate::machine::GuestMmioRegion {
+                base: 0xfe60_0000,
+                length: 0x1_0000,
+            },
+            cpu_region: GuestGicCpuRegion::Redistributors(crate::machine::GuestMmioRegion {
+                base: 0xfe68_0000,
+                length: 0x10_0000,
+            }),
         };
 
         config.replace_machine_gic(profile.clone()).unwrap();
@@ -694,7 +743,7 @@ mod tests {
         let redistributor = config
             .emu_devices()
             .iter()
-            .find(|device| device.emu_type == EmulatedDeviceType::GPPTRedistributor)
+            .find(|device| device.emu_type == EmulatedDeviceType::GicCpuRegion)
             .unwrap();
         assert_eq!(
             (redistributor.base_gpa, redistributor.length),

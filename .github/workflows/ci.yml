@@ -468,6 +468,19 @@ jobs:
             container_image: base
             limit_to_owner: ""
             main_pr_only: false
+          - name: Test axvisor aarch64 qemu (timer stress)
+            use_container: false
+            runs_on: '["self-hosted","linux","qcs"]'
+            self_hosted_owner: rcore-os
+            timeout_minutes: 30
+            command: |
+              cargo xtask image pull qemu-aarch64 --output-dir tmp/axbuild/images
+              cargo xtask axvisor test qemu --arch aarch64 --test-case gicv2-timer-stress
+              cargo xtask axvisor test qemu --arch aarch64 --test-case gicv3-timer-stress
+            cache_key: ""
+            container_image: base
+            limit_to_owner: ""
+            main_pr_only: false
           - name: Test axvisor riscv64 qemu (smoke)
             use_container: false
             runs_on: '["self-hosted","linux","qcs"]'

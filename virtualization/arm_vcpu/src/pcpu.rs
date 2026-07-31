@@ -27,6 +27,7 @@ pub struct ArmPerCpu {
     /// The original value of `VBAR_EL2` (exception vector base) before enabling
     /// the virtualization.
     pub original_vbar_el2: u64,
+    timer_frequency_hz: u64,
 }
 
 unsafe extern "C" {
@@ -36,9 +37,14 @@ unsafe extern "C" {
 impl ArmPerCpu {
     /// Creates per-CPU virtualization state.
     pub fn new(cpu_id: usize) -> ArmVcpuResult<Self> {
+        let timer_frequency_hz = CNTFRQ_EL0.get();
+        if timer_frequency_hz == 0 {
+            return Err(crate::ArmVcpuError::Unsupported);
+        }
         Ok(Self {
             cpu_id,
             original_vbar_el2: 0,
+            timer_frequency_hz,
         })
     }
 
@@ -100,5 +106,10 @@ impl ArmPerCpu {
     /// Returns the guest physical address width supported by this CPU.
     pub fn guest_phys_addr_bits(&self) -> usize {
         crate::vcpu::pa_bits()
+    }
+
+    /// Returns the architectural counter frequency recorded on this CPU.
+    pub const fn timer_frequency_hz(&self) -> u64 {
+        self.timer_frequency_hz
     }
 }

@@ -495,6 +495,12 @@ pub trait VmArchPerCpuOps: Sized {
             _ => 48,
         }
     }
+    /// Returns the architectural counter frequency recorded on this CPU.
+    ///
+    /// Architectures without an ARM-style shared counter return `None`.
+    fn timer_frequency_hz(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Execution state of an AxVM-owned vCPU wrapper.
@@ -701,8 +707,11 @@ pub enum EmulatedDeviceType {
 
     // Arch-specific interrupt controller devices.
     // 0x20 - 0x22: GPPT (GIC Partial Passthrough) devices.
-    /// ARM GIC Partial Passthrough Redistributor device.
-    GPPTRedistributor   = 0x20,
+    /// ARM GIC per-CPU register region.
+    ///
+    /// This is the GICC CPU-interface window for GICv2 and the redistributor
+    /// window for GICv3. The immutable machine profile selects the model.
+    GicCpuRegion        = 0x20,
     /// ARM GIC Partial Passthrough Distributor device.
     GPPTDistributor     = 0x21,
     /// ARM GIC Partial Passthrough Interrupt Translation Service device.
@@ -717,9 +726,6 @@ pub enum EmulatedDeviceType {
     LoongArchPchPic     = 0x25,
     /// x86 host I/O port passthrough range.
     X86PortPassthrough  = 0x26,
-    /// AArch64 architectural virtual timer system-register block.
-    Aarch64Vtimer       = 0x27,
-
     // 0x30: PPPT (PLIC Partial Passthrough) devices.
     /// RISC-V PLIC Partial Passthrough Global device.
     PPPTGlobal          = 0x30,
@@ -883,16 +889,13 @@ impl Display for EmulatedDeviceType {
             EmulatedDeviceType::Console => write!(f, "console"),
             EmulatedDeviceType::FwCfg => write!(f, "fw_cfg"),
             EmulatedDeviceType::InterruptController => write!(f, "interrupt controller"),
-            EmulatedDeviceType::GPPTRedistributor => {
-                write!(f, "gic partial passthrough redistributor")
-            }
+            EmulatedDeviceType::GicCpuRegion => write!(f, "gic per-cpu register region"),
             EmulatedDeviceType::GPPTDistributor => write!(f, "gic partial passthrough distributor"),
             EmulatedDeviceType::GPPTITS => write!(f, "gic partial passthrough its"),
             EmulatedDeviceType::X86IoApic => write!(f, "x86 io apic"),
             EmulatedDeviceType::X86Pit => write!(f, "x86 pit"),
             EmulatedDeviceType::LoongArchPchPic => write!(f, "loongarch pch pic"),
             EmulatedDeviceType::X86PortPassthrough => write!(f, "x86 port passthrough"),
-            EmulatedDeviceType::Aarch64Vtimer => write!(f, "aarch64 virtual timer"),
             EmulatedDeviceType::PPPTGlobal => write!(f, "plic partial passthrough global"),
             // EmulatedDeviceType::IOMMU => write!(f, "iommu"),
             // EmulatedDeviceType::ICCSRE => write!(f, "interrupt icc sre"),
@@ -909,20 +912,19 @@ impl Display for EmulatedDeviceType {
 
 impl EmulatedDeviceType {
     /// All known emulated device types.
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 16] = [
         EmulatedDeviceType::Dummy,
         EmulatedDeviceType::InterruptController,
         EmulatedDeviceType::Console,
         EmulatedDeviceType::FwCfg,
         EmulatedDeviceType::IVCChannel,
-        EmulatedDeviceType::GPPTRedistributor,
+        EmulatedDeviceType::GicCpuRegion,
         EmulatedDeviceType::GPPTDistributor,
         EmulatedDeviceType::GPPTITS,
         EmulatedDeviceType::X86IoApic,
         EmulatedDeviceType::X86Pit,
         EmulatedDeviceType::LoongArchPchPic,
         EmulatedDeviceType::X86PortPassthrough,
-        EmulatedDeviceType::Aarch64Vtimer,
         EmulatedDeviceType::PPPTGlobal,
         EmulatedDeviceType::VirtioBlk,
         EmulatedDeviceType::VirtioNet,
@@ -941,7 +943,7 @@ impl EmulatedDeviceType {
             EmulatedDeviceType::InterruptController
                 // | EmulatedDeviceType::SGIR
                 // | EmulatedDeviceType::ICCSRE
-                | EmulatedDeviceType::GPPTRedistributor
+                | EmulatedDeviceType::GicCpuRegion
                 | EmulatedDeviceType::X86IoApic
                 | EmulatedDeviceType::X86Pit
                 | EmulatedDeviceType::VirtioBlk
@@ -959,14 +961,13 @@ impl EmulatedDeviceType {
             0x2 => Some(EmulatedDeviceType::Console),
             0x3 => Some(EmulatedDeviceType::FwCfg),
             0xA => Some(EmulatedDeviceType::IVCChannel),
-            0x20 => Some(EmulatedDeviceType::GPPTRedistributor),
+            0x20 => Some(EmulatedDeviceType::GicCpuRegion),
             0x21 => Some(EmulatedDeviceType::GPPTDistributor),
             0x22 => Some(EmulatedDeviceType::GPPTITS),
             0x23 => Some(EmulatedDeviceType::X86IoApic),
             0x24 => Some(EmulatedDeviceType::X86Pit),
             0x25 => Some(EmulatedDeviceType::LoongArchPchPic),
             0x26 => Some(EmulatedDeviceType::X86PortPassthrough),
-            0x27 => Some(EmulatedDeviceType::Aarch64Vtimer),
             0x30 => Some(EmulatedDeviceType::PPPTGlobal),
             0xE1 => Some(EmulatedDeviceType::VirtioBlk),
             0xE2 => Some(EmulatedDeviceType::VirtioNet),

@@ -18,7 +18,7 @@
 
 #![cfg(target_arch = "aarch64")]
 
-use arm_vcpu::{Aarch64VCpuCreateConfig, Aarch64VCpuSetupConfig};
+use arm_vcpu::{Aarch64VCpuCreateConfig, Aarch64VCpuSetupConfig, ArmTimerVmConfig};
 
 /// Test default Aarch64VCpuCreateConfig
 #[test]
@@ -41,10 +41,11 @@ fn test_vcpu_create_config_fields() {
     assert_eq!(config.dtb_addr, 0x40000000);
 }
 
-/// Test default Aarch64VCpuSetupConfig
+/// Test the VM-wide counter offset carried by Aarch64VCpuSetupConfig.
 #[test]
-fn test_vcpu_setup_config_default() {
-    let config = Aarch64VCpuSetupConfig::default();
+fn test_vcpu_setup_config_counter_offset() {
+    let timer = ArmTimerVmConfig::new(24_000_000, 0x1234_5678, 0).unwrap();
+    let config = Aarch64VCpuSetupConfig::new(timer);
 
-    assert_eq!(config, Aarch64VCpuSetupConfig);
+    assert_eq!(config.timer(), timer);
 }

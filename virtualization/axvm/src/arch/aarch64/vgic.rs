@@ -5,7 +5,7 @@ use alloc::{sync::Arc, vec::Vec};
 use arm_vgic::{
     ArmVgicConfig, AssignedSpiConfig, GicAffinity, GicV3Backend, GicV3VcpuBinding, GicV3VcpuWake,
     GicVcpuId, HostGicVersion, PpiId, SpiId, TriggerMode, VgicAccessContext, VgicCore,
-    VgicDeviceSet, VgicError, VgicMmioRegion, VgicResult, VgicV3Config,
+    VgicDeviceSet, VgicError, VgicMmioRegion, VgicResult, VgicV2Config, VgicV3Config,
 };
 use ax_kspin::SpinNoIrq;
 use axdevice::{
@@ -17,11 +17,18 @@ use axdevice_base::{HostIrqId, VirtualInterruptController};
 use axvm_types::{EmulatedDeviceConfig, EmulatedDeviceType};
 
 use super::gic::{self, AssignedSpiRoutes};
-use crate::{AxVmError, AxVmResult, irq::deferred::DeferredVcpuKick};
+use crate::{AxVmError, AxVmResult, irq::deferred::DeferredVcpuKick, machine::GuestTimerProfile};
 
 const REDISTRIBUTOR_STRIDE: u64 = 0x2_0000;
-pub(crate) const GUEST_VIRTUAL_TIMER_PPI: u8 = 27;
-pub(crate) const GUEST_PHYSICAL_TIMER_PPI: u8 = 30;
+
+/// vCPU-local VGIC resources derived from the machine timer profile.
+pub(crate) struct Aarch64VcpuIrqBinding {
+    pub(crate) gic: GicV3VcpuBinding,
+    pub(crate) backend: Arc<gic::AxvmVgicBackend>,
+    pub(crate) virtual_timer_ppi: PpiId,
+    pub(crate) physical_timer_ppi: PpiId,
+    pub(crate) host_virtual_timer_intid: u32,
+}
 
 /// Typed VM-local service for vCPU attachment and physical-source lifecycle.
 pub(crate) struct Aarch64VgicRuntimeKey;
@@ -43,14 +50,16 @@ enum RuntimePhase {
 /// VM-owned control-plane state that is deliberately separate from IRQ state.
 pub(crate) struct Aarch64VgicRuntime {
     core: Arc<VgicCore>,
+    backend: Arc<gic::AxvmVgicBackend>,
     kick: Arc<DeferredVcpuKick>,
     phase: SpinNoIrq<RuntimePhase>,
 }
 
 impl Aarch64VgicRuntime {
-    fn new(vm_id: usize, core: Arc<VgicCore>) -> Arc<Self> {
+    fn new(vm_id: usize, core: Arc<VgicCore>, backend: Arc<gic::AxvmVgicBackend>) -> Arc<Self> {
         Arc::new(Self {
             core,
+            backend,
             kick: DeferredVcpuKick::new(vm_id),
             phase: SpinNoIrq::new(RuntimePhase::Inactive),
         })
@@ -60,22 +69,34 @@ impl Aarch64VgicRuntime {
         &self.core
     }
 
-    pub(crate) fn attach_vcpu(&self, vcpu_id: usize) -> VgicResult<GicV3VcpuBinding> {
-        let binding = self.core.attach_vcpu(
+    pub(crate) fn attach_vcpu(
+        &self,
+        vcpu_id: usize,
+        timer_profile: &GuestTimerProfile,
+    ) -> VgicResult<Aarch64VcpuIrqBinding> {
+        let gic = self.core.attach_vcpu(
             vcpu_id,
             Arc::new(Aarch64VcpuWake {
                 kick: self.kick.clone(),
                 vcpu_id,
             }),
         )?;
-        for ppi in [GUEST_VIRTUAL_TIMER_PPI, GUEST_PHYSICAL_TIMER_PPI] {
+        let virtual_timer_ppi = timer_ppi(timer_profile.virtual_intid)?;
+        let physical_timer_ppi = timer_ppi(timer_profile.nonsecure_physical_intid)?;
+        for ppi in [virtual_timer_ppi, physical_timer_ppi] {
             self.core.controller().configure_ppi_input(
                 GicVcpuId::new(vcpu_id),
-                PpiId::new(ppi)?,
+                ppi,
                 TriggerMode::Level,
             )?;
         }
-        Ok(binding)
+        Ok(Aarch64VcpuIrqBinding {
+            gic,
+            backend: self.backend.clone(),
+            virtual_timer_ppi,
+            physical_timer_ppi,
+            host_virtual_timer_intid: timer_profile.virtual_intid,
+        })
     }
 
     /// Claims host sources and publishes their fixed hard-IRQ routes.
@@ -159,6 +180,11 @@ impl Aarch64VgicRuntime {
         *self.phase.lock() = RuntimePhase::Inactive;
         Ok(())
     }
+}
+
+fn timer_ppi(intid: u32) -> VgicResult<PpiId> {
+    let raw = u8::try_from(intid).map_err(|_| VgicError::InvalidIntId { raw: intid })?;
+    PpiId::new(raw)
 }
 
 impl Drop for Aarch64VgicRuntime {
@@ -264,13 +290,13 @@ impl DeviceFactory for Aarch64VgicFactory {
     }
 }
 
-struct Aarch64RedistributorMarkerFactory {
+struct Aarch64GicCpuRegionMarkerFactory {
     expected: DeviceFingerprint,
 }
 
-impl DeviceFactory for Aarch64RedistributorMarkerFactory {
+impl DeviceFactory for Aarch64GicCpuRegionMarkerFactory {
     fn device_type(&self) -> EmulatedDeviceType {
-        EmulatedDeviceType::GPPTRedistributor
+        EmulatedDeviceType::GicCpuRegion
     }
 
     fn build(
@@ -279,10 +305,11 @@ impl DeviceFactory for Aarch64RedistributorMarkerFactory {
         _context: &DeviceBuildContext<'_>,
     ) -> DeviceManagerResult<DeviceBundle> {
         self.expected
-            .validate(config, "validate AArch64 virtual GIC redistributors")?;
+            .validate(config, "validate AArch64 virtual GIC per-CPU region")?;
         // The Distributor contribution atomically registers every frontend
-        // from one VgicCore. This marker consumes the machine descriptor so no
-        // second Redistributor construction path exists.
+        // from one VgicCore. This marker consumes the machine descriptor so
+        // neither the GICC nor Redistributor window gets a second construction
+        // path.
         Ok(DeviceBundle::new())
     }
 }
@@ -304,11 +331,12 @@ pub(crate) fn register_device_factories(
     vm: &crate::vm::AxVM,
     registry: &mut DeviceFactoryRegistry,
 ) -> AxVmResult<Arc<Aarch64VgicRuntime>> {
-    let (configs, placements, passthrough_irqs) = vm.with_config(|config| {
+    let (configs, placements, passthrough_irqs, gic_profile) = vm.with_config(|config| {
         (
             config.emu_devices().clone(),
             config.phys_cpu_ls.get_vcpu_affinities_pcpu_ids(),
             config.pass_through_irqs().to_vec(),
+            config.gic_profile().cloned(),
         )
     });
     let distributor = unique_config(
@@ -316,31 +344,26 @@ pub(crate) fn register_device_factories(
         EmulatedDeviceType::InterruptController,
         "AArch64 virtual GIC Distributor",
     )?;
-    let redistributors = unique_config(
+    let cpu_region_descriptor = unique_config(
         &configs,
-        EmulatedDeviceType::GPPTRedistributor,
-        "AArch64 virtual GIC Redistributors",
+        EmulatedDeviceType::GicCpuRegion,
+        "AArch64 virtual GIC per-CPU region",
     )?;
-    let [configured_vcpu_count] = redistributors.cfg_list.as_slice() else {
-        return Err(AxVmError::invalid_config(
-            "AArch64 redistributor descriptor requires one vCPU count",
-        ));
-    };
-    if *configured_vcpu_count != placements.len() {
-        return Err(AxVmError::invalid_config(alloc::format!(
-            "AArch64 redistributor descriptor names {} vCPUs, but placement has {}",
-            configured_vcpu_count,
-            placements.len()
-        )));
-    }
 
     let backend =
         gic::backend().map_err(|error| AxVmError::interrupt("create host GIC backend", error))?;
     let capabilities = backend.capabilities();
-    if capabilities.host_version() != HostGicVersion::V3 {
+    let guest_version = match gic_profile.as_ref().map(|profile| profile.cpu_region) {
+        Some(crate::machine::GuestGicCpuRegion::CpuInterface(_)) => HostGicVersion::V2,
+        Some(crate::machine::GuestGicCpuRegion::Redistributors(_)) | None => HostGicVersion::V3,
+    };
+    if capabilities.host_version() != guest_version {
         return Err(AxVmError::unsupported(
             "create AArch64 virtual GIC",
-            "the machine profile requires a GICv3 host CPU interface",
+            alloc::format!(
+                "machine profile requires {guest_version:?}, but the host CPU interface is {:?}",
+                capabilities.host_version()
+            ),
         ));
     }
     let affinities = placements
@@ -348,35 +371,81 @@ pub(crate) fn register_device_factories(
         .map(|(_, _, physical_id)| GicAffinity::from_mpidr(*physical_id as u64))
         .collect();
     let assigned_spis = assigned_spis(&passthrough_irqs)?;
-    let vgic_config = VgicV3Config::new(
-        axdevice_base::InterruptControllerId::new(0),
+    let controller_id = axdevice_base::InterruptControllerId::new(0);
+    let distributor_region =
         VgicMmioRegion::new(distributor.base_gpa as u64, distributor.length as u64)
-            .map_err(|error| AxVmError::interrupt("validate GIC Distributor range", error))?,
-        alloc::vec![
-            VgicMmioRegion::new(redistributors.base_gpa as u64, redistributors.length as u64,)
-                .map_err(|error| AxVmError::interrupt("validate GIC Redistributor range", error))?,
-        ],
-        REDISTRIBUTOR_STRIDE,
-        affinities,
+            .map_err(|error| AxVmError::interrupt("validate GIC Distributor range", error))?;
+    let cpu_region = VgicMmioRegion::new(
+        cpu_region_descriptor.base_gpa as u64,
+        cpu_region_descriptor.length as u64,
     )
-    .and_then(|config| config.with_spi_count(gic::host_spi_count()?))
-    .and_then(|config| config.with_list_register_count(capabilities.list_register_count()))
-    .and_then(|config| config.with_priority_bits(capabilities.priority_bits()))
-    .and_then(|config| config.with_assigned_spis(assigned_spis))
-    .map_err(|error| AxVmError::interrupt("construct AArch64 virtual GIC", error))?;
+    .map_err(|error| AxVmError::interrupt("validate GIC per-CPU range", error))?;
+    let spi_count = gic::host_spi_count()
+        .map_err(|error| AxVmError::interrupt("inspect host GIC SPI capacity", error))?;
+    let vgic_config = match guest_version {
+        HostGicVersion::V2 => {
+            if !cpu_region_descriptor.cfg_list.is_empty() {
+                return Err(AxVmError::invalid_config(
+                    "AArch64 GICv2 CPU-interface descriptor must not carry a vCPU count",
+                ));
+            }
+            ArmVgicConfig::V2(
+                VgicV2Config::new(controller_id, distributor_region, cpu_region, affinities)
+                    .and_then(|config| config.with_spi_count(spi_count))
+                    .and_then(|config| {
+                        config.with_list_register_count(capabilities.list_register_count())
+                    })
+                    .and_then(|config| config.with_priority_bits(capabilities.priority_bits()))
+                    .and_then(|config| config.with_assigned_spis(assigned_spis))
+                    .map_err(|error| {
+                        AxVmError::interrupt("construct AArch64 virtual GICv2", error)
+                    })?,
+            )
+        }
+        HostGicVersion::V3 => {
+            let [configured_vcpu_count] = cpu_region_descriptor.cfg_list.as_slice() else {
+                return Err(AxVmError::invalid_config(
+                    "AArch64 redistributor descriptor requires one vCPU count",
+                ));
+            };
+            if *configured_vcpu_count != placements.len() {
+                return Err(AxVmError::invalid_config(alloc::format!(
+                    "AArch64 redistributor descriptor names {} vCPUs, but placement has {}",
+                    configured_vcpu_count,
+                    placements.len()
+                )));
+            }
+            ArmVgicConfig::V3(
+                VgicV3Config::new(
+                    controller_id,
+                    distributor_region,
+                    alloc::vec![cpu_region],
+                    REDISTRIBUTOR_STRIDE,
+                    affinities,
+                )
+                .and_then(|config| config.with_spi_count(spi_count))
+                .and_then(|config| {
+                    config.with_list_register_count(capabilities.list_register_count())
+                })
+                .and_then(|config| config.with_priority_bits(capabilities.priority_bits()))
+                .and_then(|config| config.with_assigned_spis(assigned_spis))
+                .map_err(|error| AxVmError::interrupt("construct AArch64 virtual GICv3", error))?,
+            )
+        }
+    };
     let core = Arc::new(
-        VgicCore::new(ArmVgicConfig::V3(vgic_config), backend)
+        VgicCore::new(vgic_config, backend.clone())
             .map_err(|error| AxVmError::interrupt("create AArch64 virtual GIC", error))?,
     );
-    let runtime = Aarch64VgicRuntime::new(vm.id(), core);
+    let runtime = Aarch64VgicRuntime::new(vm.id(), core, backend);
 
     registry.register(Arc::new(Aarch64VgicFactory {
         vm_id: vm.id(),
         expected: DeviceFingerprint::from_config(distributor),
         runtime: runtime.clone(),
     }))?;
-    registry.register(Arc::new(Aarch64RedistributorMarkerFactory {
-        expected: DeviceFingerprint::from_config(redistributors),
+    registry.register(Arc::new(Aarch64GicCpuRegionMarkerFactory {
+        expected: DeviceFingerprint::from_config(cpu_region_descriptor),
     }))?;
     Ok(runtime)
 }

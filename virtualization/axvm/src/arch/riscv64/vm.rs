@@ -12,7 +12,7 @@ use super::{
     npt,
 };
 use crate::{
-    AxVmResult, ax_err,
+    AxVmError, AxVmResult, ax_err,
     config::AxVMConfig,
     vm::{
         AxVM, AxVMResources,
@@ -126,14 +126,21 @@ fn build_vcpu_setup_config(
 }
 
 fn guest_page_table_levels(vcpu_mappings: &[(usize, Option<usize>, usize)]) -> AxVmResult<usize> {
-    let levels = crate::architecture::minimum_target_cpu_capability(
-        riscv_vcpu::max_guest_page_table_levels(),
+    let levels = crate::architecture::minimum_recorded_target_cpu_capability(
+        "RISC-V G-stage page-table levels",
         vcpu_mappings,
         |cpu_id| {
-            crate::percpu::cpu_max_guest_page_table_levels(cpu_id)
-                .unwrap_or_else(riscv_vcpu::max_guest_page_table_levels)
+            crate::percpu::select_cpu_virtualization_capability(cpu_id, |levels, _, _| {
+                levels as u64
+            })
         },
-    );
+    )
+    .map_err(|error| {
+        crate::architecture::unsupported_target_cpu_capability(
+            "select RISC-V target CPU capability",
+            error,
+        )
+    })? as usize;
     match levels {
         3 | 4 => Ok(levels),
         _ => ax_err!(Unsupported, "no supported RISC-V G-stage paging mode"),

@@ -473,16 +473,12 @@ impl GicV3Controller {
         let Some(retirement) = retirement else {
             return Ok(());
         };
-        let result = match retirement {
+        match retirement {
             DeliveryRetirement::Emulated { intid } => {
-                self.inner.backend.retire_emulated_interrupt(vcpu, intid)
+                backend_result(self.inner.backend.retire_emulated_interrupt(vcpu, intid))
             }
-            DeliveryRetirement::Physical { binding } => self
-                .inner
-                .backend
-                .deactivate_physical_interrupt(vcpu, binding),
-        };
-        backend_result(result)
+            DeliveryRetirement::Physical { binding } => self.complete_physical_spi(vcpu, binding),
+        }
     }
 
     fn cpu_interface(

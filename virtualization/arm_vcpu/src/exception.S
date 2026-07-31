@@ -32,6 +32,28 @@
 .macro SAVE_VCPU_REGS_FROM_EL1
     SAVE_REGS_FROM_EL1
 
+    # Capture the guest timer, stop it, and restore the host counter domain
+    # before any branch-and-link can execute Rust.
+    mrs     x9, cntv_ctl_el0
+    and     w9, w9, #0x3
+    str     w9, [sp, {timer_virtual_control_offset}]
+    mrs     x9, cntv_cval_el0
+    str     x9, [sp, {timer_virtual_compare_offset}]
+    ldr     x9, [sp, {timer_virtual_generation_offset}]
+    add     x9, x9, #1
+    str     x9, [sp, {timer_virtual_generation_offset}]
+    mrs     x9, cntkctl_el1
+    str     x9, [sp, {timer_guest_kernel_control_offset}]
+    msr     cntv_ctl_el0, xzr
+    isb
+    msr     cntvoff_el2, xzr
+    ldr     x9, [sp, {timer_host_hypervisor_control_offset}]
+    msr     cnthctl_el2, x9
+    ldr     x9, [sp, {timer_host_kernel_control_offset}]
+    msr     cntkctl_el1, x9
+    strb    wzr, [sp, {timer_loaded_offset}]
+    isb
+
     # TPIDR_EL0 is shared by host tasks and guests. Save the guest value and
     # restore the host value before any branch-and-link can enter Rust.
     mrs     x9, tpidr_el0
@@ -97,7 +119,6 @@
 .endm
 
 .macro INVALID_EXCP_CURRENT_EL2, kind, source
-.p2align 7
     SAVE_REGS_FROM_EL1
     mov     x0, sp
     mov     x1, \kind
@@ -107,7 +128,6 @@
 .endm
 
 .macro INVALID_EXCP_LOWER_EL2, kind, source
-.p2align 7
     SAVE_VCPU_REGS_FROM_EL1
     mov     x0, sp
     mov     x1, \kind
@@ -117,7 +137,6 @@
 .endm
 
 .macro HANDLE_CURRENT_IRQ
-.p2align 7
     SAVE_REGS_FROM_EL1
     mov     x0, sp
     bl      current_el_irq_handler
@@ -125,7 +144,6 @@
 .endm
 
 .macro HANDLE_CURRENT_SYNC
-.p2align 7
     SAVE_REGS_FROM_EL1
     mov     x0, sp
     bl      current_el_sync_handler
@@ -133,7 +151,6 @@
 .endm
 
 .macro HANDLE_LOWER_IRQ_VCPU
-.p2align 7
     SAVE_VCPU_REGS_FROM_EL1
     mov     x0, {exception_irq}
     bl      vmexit_trampoline
@@ -141,11 +158,15 @@
 .endm
 
 .macro HANDLE_LOWER_SYNC_VCPU
-.p2align 7
     SAVE_VCPU_REGS_FROM_EL1
     mov     x0, {exception_sync}
     bl      vmexit_trampoline
     # vmexit_trampoline returns directly to ArmVcpu::run.
+.endm
+
+.macro VECTOR_SLOT handler
+    b       \handler
+    .space  0x80 - 4
 .endm
 
 .section .text
@@ -153,28 +174,28 @@
 .global exception_vector_base_vcpu
 exception_vector_base_vcpu:
     // current EL, with SP_EL0
-    INVALID_EXCP_CURRENT_EL2 0 0
-    INVALID_EXCP_CURRENT_EL2 1 0
-    INVALID_EXCP_CURRENT_EL2 2 0
-    INVALID_EXCP_CURRENT_EL2 3 0
+    VECTOR_SLOT .Linvalid_current_sp0_sync
+    VECTOR_SLOT .Linvalid_current_sp0_irq
+    VECTOR_SLOT .Linvalid_current_sp0_fiq
+    VECTOR_SLOT .Linvalid_current_sp0_serror
 
     // current EL, with SP_ELx
-    HANDLE_CURRENT_SYNC
-    HANDLE_CURRENT_IRQ
-    INVALID_EXCP_CURRENT_EL2 2 1
-    INVALID_EXCP_CURRENT_EL2 3 1
+    VECTOR_SLOT .Lhandle_current_spx_sync
+    VECTOR_SLOT .Lhandle_current_spx_irq
+    VECTOR_SLOT .Linvalid_current_spx_fiq
+    VECTOR_SLOT .Linvalid_current_spx_serror
 
     // lower EL, aarch64
-    HANDLE_LOWER_SYNC_VCPU
-    HANDLE_LOWER_IRQ_VCPU
-    INVALID_EXCP_LOWER_EL2 2 2
-    INVALID_EXCP_LOWER_EL2 3 2
+    VECTOR_SLOT .Lhandle_lower_aarch64_sync
+    VECTOR_SLOT .Lhandle_lower_aarch64_irq
+    VECTOR_SLOT .Linvalid_lower_aarch64_fiq
+    VECTOR_SLOT .Linvalid_lower_aarch64_serror
 
     // lower EL, aarch32
-    INVALID_EXCP_LOWER_EL2 0 3
-    INVALID_EXCP_LOWER_EL2 1 3
-    INVALID_EXCP_LOWER_EL2 2 3
-    INVALID_EXCP_LOWER_EL2 3 3
+    VECTOR_SLOT .Linvalid_lower_aarch32_sync
+    VECTOR_SLOT .Linvalid_lower_aarch32_irq
+    VECTOR_SLOT .Linvalid_lower_aarch32_fiq
+    VECTOR_SLOT .Linvalid_lower_aarch32_serror
 
 .global context_vm_entry
 context_vm_entry:
@@ -183,9 +204,67 @@ context_vm_entry:
     sub     sp, sp, {trap_frame_size}
     # Currently `sp` points to the base address of `ArmVcpu.ctx`, which stores guest's `TrapFrame`.
 .Lexception_return_guest_el1:
+    # Save the host timer controls and install the guest direct virtual timer.
+    # This is the final assembly-only window before ERET.
+    mrs     x9, cnthctl_el2
+    str     x9, [sp, {timer_host_hypervisor_control_offset}]
+    mrs     x9, cntkctl_el1
+    str     x9, [sp, {timer_host_kernel_control_offset}]
+    msr     cntv_ctl_el0, xzr
+    isb
+    ldr     x9, [sp, {timer_virtual_offset_offset}]
+    msr     cntvoff_el2, x9
+    ldr     x9, [sp, {timer_guest_hypervisor_control_offset}]
+    msr     cnthctl_el2, x9
+    ldr     x9, [sp, {timer_guest_kernel_control_offset}]
+    msr     cntkctl_el1, x9
+    ldr     x9, [sp, {timer_virtual_compare_offset}]
+    msr     cntv_cval_el0, x9
+    isb
+    ldr     w9, [sp, {timer_virtual_control_offset}]
+    msr     cntv_ctl_el0, x9
+    mov     w9, #1
+    strb    w9, [sp, {timer_loaded_offset}]
+    isb
     RESTORE_GUEST_REGS_INTO_EL1
     eret
 
 .Lexception_return_current_el2:
     RESTORE_CURRENT_REGS_INTO_EL2
     eret
+
+.Linvalid_current_sp0_sync:
+    INVALID_EXCP_CURRENT_EL2 0 0
+.Linvalid_current_sp0_irq:
+    INVALID_EXCP_CURRENT_EL2 1 0
+.Linvalid_current_sp0_fiq:
+    INVALID_EXCP_CURRENT_EL2 2 0
+.Linvalid_current_sp0_serror:
+    INVALID_EXCP_CURRENT_EL2 3 0
+
+.Lhandle_current_spx_sync:
+    HANDLE_CURRENT_SYNC
+.Lhandle_current_spx_irq:
+    HANDLE_CURRENT_IRQ
+.Linvalid_current_spx_fiq:
+    INVALID_EXCP_CURRENT_EL2 2 1
+.Linvalid_current_spx_serror:
+    INVALID_EXCP_CURRENT_EL2 3 1
+
+.Lhandle_lower_aarch64_sync:
+    HANDLE_LOWER_SYNC_VCPU
+.Lhandle_lower_aarch64_irq:
+    HANDLE_LOWER_IRQ_VCPU
+.Linvalid_lower_aarch64_fiq:
+    INVALID_EXCP_LOWER_EL2 2 2
+.Linvalid_lower_aarch64_serror:
+    INVALID_EXCP_LOWER_EL2 3 2
+
+.Linvalid_lower_aarch32_sync:
+    INVALID_EXCP_LOWER_EL2 0 3
+.Linvalid_lower_aarch32_irq:
+    INVALID_EXCP_LOWER_EL2 1 3
+.Linvalid_lower_aarch32_fiq:
+    INVALID_EXCP_LOWER_EL2 2 3
+.Linvalid_lower_aarch32_serror:
+    INVALID_EXCP_LOWER_EL2 3 3

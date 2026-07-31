@@ -344,6 +344,85 @@ fn pending_query_observes_private_interrupts_before_and_after_lr_refill() {
 }
 
 #[test]
+fn deasserting_a_pending_ppi_withdraws_the_saved_lr_before_wfi_wait() {
+    let (controller, backend) = controller(1, 2);
+    let vcpu = GicVcpuId::new(0);
+    let binding = attach(&controller, 0, GicAffinity::new(0, 0, 0, 0));
+    let timer = PpiId::new(27).unwrap();
+
+    controller
+        .write_redistributor(
+            vcpu,
+            GICR_SGI_BASE + GICD_ISENABLER,
+            AccessWidth::Dword,
+            1 << timer.raw(),
+        )
+        .unwrap();
+    controller.set_ppi_level(vcpu, timer, true).unwrap();
+    binding.load().unwrap();
+    binding.save().unwrap();
+    assert!(binding.has_pending_interrupt().unwrap());
+
+    controller.set_ppi_level(vcpu, timer, false).unwrap();
+
+    assert!(
+        !binding.has_pending_interrupt().unwrap(),
+        "a lowered timer line must not keep WFI runnable through a stale pending LR"
+    );
+    assert_eq!(
+        controller
+            .interrupt_state(Some(vcpu), IntId::Ppi(timer))
+            .unwrap(),
+        InterruptState::Inactive
+    );
+    binding.load().unwrap();
+    assert!(backend.loaded_intids(0).is_empty());
+    binding.save().unwrap();
+
+    controller.set_ppi_level(vcpu, timer, true).unwrap();
+    assert!(
+        binding.has_pending_interrupt().unwrap(),
+        "a later level assertion must still create a fresh delivery"
+    );
+}
+
+#[test]
+fn deasserting_a_pending_spi_withdraws_the_saved_lr_before_wfi_wait() {
+    let (controller, backend) = controller(1, 2);
+    let binding = attach(&controller, 0, GicAffinity::new(0, 0, 0, 0));
+    let line = SpiId::new(32).unwrap();
+
+    enable_spi(&controller, line);
+    controller
+        .configure_spi_input(line, TriggerMode::Level)
+        .unwrap();
+    controller.set_spi_level(line, true).unwrap();
+    binding.load().unwrap();
+    binding.save().unwrap();
+    assert!(binding.has_pending_interrupt().unwrap());
+
+    controller.set_spi_level(line, false).unwrap();
+
+    assert!(
+        !binding.has_pending_interrupt().unwrap(),
+        "a lowered device line must not keep WFI runnable through a stale pending LR"
+    );
+    assert_eq!(
+        controller.interrupt_state(None, IntId::Spi(line)).unwrap(),
+        InterruptState::Inactive
+    );
+    binding.load().unwrap();
+    assert!(backend.loaded_intids(0).is_empty());
+    binding.save().unwrap();
+
+    controller.set_spi_level(line, true).unwrap();
+    assert!(
+        binding.has_pending_interrupt().unwrap(),
+        "a later level assertion must still create a fresh delivery"
+    );
+}
+
+#[test]
 fn lr_exhaustion_queues_and_refills_without_repeating_completed_edges() {
     let (controller, backend) = controller(1, 1);
     let binding = attach(&controller, 0, GicAffinity::new(0, 0, 0, 0));

@@ -7,7 +7,7 @@ use fdt_raw::RegInfo;
 use super::tree::FdtTree;
 use crate::{
     AxVmResult, ax_err_type,
-    machine::{GuestGicProfile, GuestPlicProfile},
+    machine::{GuestGicCpuRegion, GuestGicProfile, GuestMmioRegion, GuestPlicProfile},
 };
 
 /// Rewrites the interrupt-controller resources to match the VM-owned controller.
@@ -30,20 +30,25 @@ pub(crate) fn install_machine_interrupt_controller(
                 .emulated_devices
                 .iter()
                 .find(|device| device.emu_type == EmulatedDeviceType::InterruptController);
-            let redistributor = machine
+            let per_cpu = machine
                 .emulated_devices
                 .iter()
-                .find(|device| device.emu_type == EmulatedDeviceType::GPPTRedistributor);
-            let (Some(distributor), Some(redistributor)) = (distributor, redistributor) else {
+                .find(|device| device.emu_type == EmulatedDeviceType::GicCpuRegion);
+            let (Some(distributor), Some(per_cpu)) = (distributor, per_cpu) else {
                 return Ok(());
             };
             fallback = GuestGicProfile {
+                compatible: "arm,gic-v3".into(),
                 node_path: alloc::string::String::new(),
                 node_phandle: None,
-                distributor_base: distributor.base_gpa,
-                distributor_length: distributor.length,
-                redistributor_base: redistributor.base_gpa,
-                redistributor_length: redistributor.length,
+                distributor: GuestMmioRegion {
+                    base: distributor.base_gpa,
+                    length: distributor.length,
+                },
+                cpu_region: GuestGicCpuRegion::Redistributors(GuestMmioRegion {
+                    base: per_cpu.base_gpa,
+                    length: per_cpu.length,
+                }),
             };
             &fallback
         }
@@ -78,43 +83,115 @@ pub(crate) fn host_plic_profile(fdt: &Fdt) -> AxVmResult<Option<GuestPlicProfile
     }))
 }
 
-/// Reads the host GICv3 register windows and firmware identity.
+/// Reads the host GIC register windows and firmware identity.
 pub(crate) fn host_gic_profile(fdt: &Fdt) -> AxVmResult<Option<GuestGicProfile>> {
-    let Some(controller) = fdt.iter_node_ids().find(|node_id| {
-        fdt.node(*node_id).is_some_and(|node| {
-            node.get_property("interrupt-controller").is_some()
-                && node
-                    .compatibles()
-                    .any(|compatible| compatible == "arm,gic-v3")
-        })
+    let Some((controller, compatible)) = fdt.iter_node_ids().find_map(|node_id| {
+        let node = fdt.node(node_id)?;
+        if node.get_property("interrupt-controller").is_none() {
+            return None;
+        }
+        node.compatibles()
+            .find(|compatible| is_supported_gic(compatible))
+            .map(|compatible| (node_id, alloc::string::String::from(compatible)))
     }) else {
         return Ok(None);
     };
     let view = fdt
         .view_typed(controller)
-        .ok_or_else(|| ax_err_type!(InvalidData, "host GICv3 node is missing"))?;
+        .ok_or_else(|| ax_err_type!(InvalidData, "host GIC node is missing"))?;
     let regs = view.regs();
     if regs.len() < 2 {
         return Err(ax_err_type!(
             InvalidData,
-            "host GICv3 node must provide distributor and redistributor ranges"
+            "host GIC node must provide distributor and per-CPU ranges"
         ));
     }
     let (distributor_base, distributor_length) = checked_reg(&regs[0], "distributor")?;
-    let (redistributor_base, redistributor_length) = checked_reg(&regs[1], "redistributor")?;
+    let per_cpu_name = if compatible == "arm,gic-v3" {
+        "redistributor"
+    } else {
+        "CPU interface"
+    };
+    let (per_cpu_base, per_cpu_length) = checked_reg(&regs[1], per_cpu_name)?;
     let node = view.as_node();
+    let per_cpu = GuestMmioRegion {
+        base: per_cpu_base,
+        length: per_cpu_length,
+    };
 
     Ok(Some(GuestGicProfile {
+        compatible,
         node_path: fdt.path_of(controller),
         node_phandle: node
             .get_property("phandle")
             .or_else(|| node.get_property("linux,phandle"))
             .and_then(Property::get_u32),
-        distributor_base,
-        distributor_length,
-        redistributor_base,
-        redistributor_length,
+        distributor: GuestMmioRegion {
+            base: distributor_base,
+            length: distributor_length,
+        },
+        cpu_region: if node
+            .compatibles()
+            .any(|compatible| compatible == "arm,gic-v3")
+        {
+            GuestGicCpuRegion::Redistributors(per_cpu)
+        } else {
+            GuestGicCpuRegion::CpuInterface(per_cpu)
+        },
     }))
+}
+
+/// Reads the host VGIC maintenance PPI INTID.
+pub(crate) fn host_gic_maintenance_intid(fdt: &Fdt) -> AxVmResult<Option<u32>> {
+    let Some(controller) = find_host_gic(fdt) else {
+        return Ok(None);
+    };
+    let node = fdt
+        .node(controller)
+        .ok_or_else(|| ax_err_type!(InvalidData, "host GIC node is missing"))?;
+    if node
+        .get_property("#interrupt-cells")
+        .and_then(Property::get_u32)
+        != Some(3)
+    {
+        return Err(ax_err_type!(
+            InvalidData,
+            "host GIC maintenance interrupt requires three interrupt cells"
+        ));
+    }
+    let Some(interrupts) = node.get_property("interrupts") else {
+        return Ok(None);
+    };
+    let mut cells = interrupts.as_reader();
+    let interrupt_type = cells.read_u32().ok_or_else(|| {
+        ax_err_type!(
+            InvalidData,
+            "host GIC maintenance interrupt type is missing"
+        )
+    })?;
+    let source = cells.read_u32().ok_or_else(|| {
+        ax_err_type!(
+            InvalidData,
+            "host GIC maintenance interrupt source is missing"
+        )
+    })?;
+    cells.read_u32().ok_or_else(|| {
+        ax_err_type!(
+            InvalidData,
+            "host GIC maintenance interrupt flags are missing"
+        )
+    })?;
+
+    if interrupt_type != 1 || source >= 16 {
+        return Err(ax_err_type!(
+            Unsupported,
+            alloc::format!(
+                "host GIC maintenance interrupt must be a PPI, got type {interrupt_type} source \
+                 {source}"
+            )
+        ));
+    }
+    Ok(Some(16 + source))
 }
 
 fn checked_reg(reg: &fdt_edit::RegFixed, name: &str) -> AxVmResult<(usize, usize)> {
@@ -166,29 +243,42 @@ fn checked_plic_reg(reg: &fdt_edit::RegFixed) -> AxVmResult<(usize, usize)> {
 }
 
 fn install_gic_registers(tree: &mut FdtTree, profile: &GuestGicProfile) -> AxVmResult {
+    match (&*profile.compatible, profile.cpu_region) {
+        ("arm,gic-v3", GuestGicCpuRegion::Redistributors(_))
+        | ("arm,cortex-a15-gic" | "arm,gic-400", GuestGicCpuRegion::CpuInterface(_)) => {}
+        _ => {
+            return Err(ax_err_type!(
+                InvalidData,
+                "guest GIC compatible string does not match its per-CPU register model"
+            ));
+        }
+    }
     let controller = (!profile.node_path.is_empty())
         .then(|| tree.inner().get_by_path_id(&profile.node_path))
         .flatten()
-        .or_else(|| find_gicv3(tree))
+        .or_else(|| find_gic(tree))
         .ok_or_else(|| {
             ax_err_type!(
                 InvalidData,
-                "guest FDT has no GICv3 interrupt-controller node"
+                "guest FDT has no GIC interrupt-controller node"
             )
         })?;
+    let cpu_region = match profile.cpu_region {
+        GuestGicCpuRegion::CpuInterface(region) | GuestGicCpuRegion::Redistributors(region) => {
+            region
+        }
+    };
     tree.inner_mut()
         .view_typed_mut(controller)
-        .ok_or_else(|| ax_err_type!(InvalidData, "guest GICv3 node is missing"))?
+        .ok_or_else(|| ax_err_type!(InvalidData, "guest GIC node is missing"))?
         .set_regs(&[
             RegInfo::new(
-                profile.distributor_base as u64,
-                Some(profile.distributor_length as u64),
+                profile.distributor.base as u64,
+                Some(profile.distributor.length as u64),
             ),
-            RegInfo::new(
-                profile.redistributor_base as u64,
-                Some(profile.redistributor_length as u64),
-            ),
+            RegInfo::new(cpu_region.base as u64, Some(cpu_region.length as u64)),
         ]);
+    tree.set_property(controller, prop_string("compatible", &profile.compatible))?;
     tree.set_property(controller, prop_u32("#interrupt-cells", 3))?;
     if let Some(phandle) = profile.node_phandle {
         install_controller_phandle(tree, controller, phandle, "GIC")?;
@@ -281,13 +371,33 @@ fn prop_u32(name: &str, value: u32) -> Property {
     property
 }
 
-fn find_gicv3(tree: &FdtTree) -> Option<NodeId> {
+fn prop_string(name: &str, value: &str) -> Property {
+    let mut property = Property::new(name, alloc::vec![]);
+    property.set_string(value);
+    property
+}
+
+fn find_gic(tree: &FdtTree) -> Option<NodeId> {
     tree.inner().iter_node_ids().find(|node_id| {
         tree.inner().node(*node_id).is_some_and(|node| {
             node.get_property("interrupt-controller").is_some()
-                && node
-                    .compatibles()
-                    .any(|compatible| compatible == "arm,gic-v3")
+                && node.compatibles().any(is_supported_gic)
+        })
+    })
+}
+
+fn is_supported_gic(compatible: &str) -> bool {
+    matches!(
+        compatible,
+        "arm,gic-v3" | "arm,cortex-a15-gic" | "arm,gic-400"
+    )
+}
+
+fn find_host_gic(fdt: &Fdt) -> Option<NodeId> {
+    fdt.iter_node_ids().find(|node_id| {
+        fdt.node(*node_id).is_some_and(|node| {
+            node.get_property("interrupt-controller").is_some()
+                && node.compatibles().any(is_supported_gic)
         })
     })
 }
@@ -327,12 +437,17 @@ mod tests {
             .unwrap();
 
         let profile = GuestGicProfile {
+            compatible: "arm,gic-v3".into(),
             node_path: "/intc@8000000".into(),
             node_phandle: Some(1),
-            distributor_base: 0x0800_0000,
-            distributor_length: 0x1_0000,
-            redistributor_base: 0x080a_0000,
-            redistributor_length: 0x2_0000,
+            distributor: GuestMmioRegion {
+                base: 0x0800_0000,
+                length: 0x1_0000,
+            },
+            cpu_region: GuestGicCpuRegion::Redistributors(GuestMmioRegion {
+                base: 0x080a_0000,
+                length: 0x2_0000,
+            }),
         };
         install_gic_registers(&mut tree, &profile).unwrap();
         let bytes = tree.finish();
@@ -396,14 +511,94 @@ mod tests {
         assert_eq!(
             profile,
             GuestGicProfile {
+                compatible: "arm,gic-v3".into(),
                 node_path: "/interrupt-controller@fe600000".into(),
                 node_phandle: Some(1),
-                distributor_base: 0xfe60_0000,
-                distributor_length: 0x1_0000,
-                redistributor_base: 0xfe68_0000,
-                redistributor_length: 0x10_0000,
+                distributor: GuestMmioRegion {
+                    base: 0xfe60_0000,
+                    length: 0x1_0000,
+                },
+                cpu_region: GuestGicCpuRegion::Redistributors(GuestMmioRegion {
+                    base: 0xfe68_0000,
+                    length: 0x10_0000,
+                }),
             }
         );
+    }
+
+    #[test]
+    fn resolves_and_reuses_host_gicv2_windows() {
+        let mut tree = FdtTree::new();
+        let root = tree.inner().root_id();
+        tree.set_property(root, prop_u32("#address-cells", 2))
+            .unwrap();
+        tree.set_property(root, prop_u32("#size-cells", 2)).unwrap();
+        let controller = tree.add_node(root, Node::new("interrupt-controller@8000000"));
+        let mut compatible = Property::new("compatible", vec![]);
+        compatible.set_string("arm,cortex-a15-gic");
+        tree.set_property(controller, compatible).unwrap();
+        tree.set_property(controller, Property::new("interrupt-controller", vec![]))
+            .unwrap();
+        tree.set_property(controller, prop_u32("phandle", 1))
+            .unwrap();
+        tree.inner_mut()
+            .view_typed_mut(controller)
+            .unwrap()
+            .set_regs(&[
+                RegInfo::new(0x0800_0000, Some(0x1_0000)),
+                RegInfo::new(0x0801_0000, Some(0x2_0000)),
+            ]);
+        let bytes = tree.finish();
+        let fdt = Fdt::from_bytes(&bytes).unwrap();
+
+        let profile = host_gic_profile(&fdt)
+            .unwrap()
+            .expect("host GICv2 must produce a machine interrupt profile");
+        assert_eq!(profile.compatible, "arm,cortex-a15-gic");
+        assert_eq!(
+            profile.cpu_region,
+            GuestGicCpuRegion::CpuInterface(GuestMmioRegion {
+                base: 0x0801_0000,
+                length: 0x2_0000,
+            })
+        );
+        let mut guest = FdtTree::from_bytes(&bytes).unwrap();
+        install_gic_registers(&mut guest, &profile).unwrap();
+        let guest = Fdt::from_bytes(&guest.finish()).unwrap();
+        let regs = guest
+            .get_by_path("/interrupt-controller@8000000")
+            .unwrap()
+            .regs();
+
+        assert_eq!(regs.len(), 2);
+        assert_eq!(
+            (regs[0].address, regs[0].size),
+            (0x0800_0000, Some(0x1_0000))
+        );
+        assert_eq!(
+            (regs[1].address, regs[1].size),
+            (0x0801_0000, Some(0x2_0000))
+        );
+    }
+
+    #[test]
+    fn resolves_host_gic_maintenance_ppi() {
+        let mut tree = FdtTree::new();
+        let root = tree.inner().root_id();
+        let controller = tree.add_node(root, Node::new("interrupt-controller@fe600000"));
+        let mut compatible = Property::new("compatible", vec![]);
+        compatible.set_string("arm,gic-v3");
+        tree.set_property(controller, compatible).unwrap();
+        tree.set_property(controller, Property::new("interrupt-controller", vec![]))
+            .unwrap();
+        tree.set_property(controller, prop_u32("#interrupt-cells", 3))
+            .unwrap();
+        let mut interrupts = Property::new("interrupts", vec![]);
+        interrupts.set_u32_ls(&[1, 9, 4]);
+        tree.set_property(controller, interrupts).unwrap();
+        let fdt = Fdt::from_bytes(&tree.finish()).unwrap();
+
+        assert_eq!(host_gic_maintenance_intid(&fdt).unwrap(), Some(25));
     }
 
     #[test]

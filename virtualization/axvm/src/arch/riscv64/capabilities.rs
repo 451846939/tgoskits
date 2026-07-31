@@ -92,6 +92,7 @@ pub(super) fn patch_runtime_fdt(
         None,
         plic_profile.as_ref(),
         None,
+        None,
         false,
     )?;
     super::fdt::ensure_chosen_from_host(guest_fdt, host_fdt.as_ref())

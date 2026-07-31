@@ -19,6 +19,10 @@ pub use core::{
     update_fdt, update_provided_fdt,
 };
 
+pub(crate) fn host_gic_maintenance_intid(fdt: &Fdt) -> AxVmResult<Option<u32>> {
+    core::interrupt::host_gic_maintenance_intid(fdt)
+}
+
 pub(crate) fn guest_fdt_policy() -> core::GuestFdtPolicy {
     core::GuestFdtPolicy {
         patch_runtime: super::capabilities::patch_runtime_fdt,

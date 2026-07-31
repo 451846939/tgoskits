@@ -14,6 +14,7 @@ static TIMER_TICKET_ID: AtomicU64 = AtomicU64::new(1);
 percpu_static! {
     TIMER_LIST: TimerList<TaskWakeupEvent> = TimerList::new(),
     TIMER_CALLBACKS: Vec<Box<dyn Fn(TimeValue) + Send + Sync>> = Vec::new(),
+    TIMER_IRQ_CALLBACKS: Vec<Box<dyn Fn(TimeValue) + Send + Sync>> = Vec::new(),
     PROGRAMMED_DEADLINE_NANOS: u64 = 0,
 }
 
@@ -65,9 +66,35 @@ where
     });
 }
 
+/// Registers a callback invoked on every hardware timer IRQ.
+///
+/// Unlike [`register_timer_callback`], this callback also runs for one-shot
+/// deadlines that occur between periodic scheduler ticks. Callbacks execute in
+/// hard-IRQ context and therefore must not allocate, sleep, or acquire
+/// sleepable locks.
+pub fn register_timer_irq_callback<F>(callback: F)
+where
+    F: Fn(TimeValue) + Send + Sync + 'static,
+{
+    with_local_exclusive(|exclusive| {
+        TIMER_IRQ_CALLBACKS
+            .with_current_mut(exclusive, |callbacks| callbacks.push(Box::new(callback)))
+    });
+}
+
 fn check_callbacks() {
     with_local_pin(|pin| {
         TIMER_CALLBACKS.with_current(pin, |callbacks| {
+            for callback in callbacks {
+                callback(monotonic_time());
+            }
+        })
+    });
+}
+
+fn check_irq_callbacks() {
+    with_local_pin(|pin| {
+        TIMER_IRQ_CALLBACKS.with_current(pin, |callbacks| {
             for callback in callbacks {
                 callback(monotonic_time());
             }
@@ -121,6 +148,7 @@ pub(crate) fn set_alarm_wakeup(deadline: TimeValue, task: AxTaskRef) {
 // SAFETY: only called in timer irq handler, so irq and preemption are
 // both disabled here.
 pub fn check_events(run_callbacks: bool) {
+    check_irq_callbacks();
     if run_callbacks {
         check_callbacks();
     }

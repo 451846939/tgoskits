@@ -38,7 +38,7 @@ pub(crate) fn install_machine_serial(
 
 /// Returns physical UART nodes that must remain owned by the host.
 pub(crate) fn physical_serial_paths(fdt: &Fdt) -> Vec<String> {
-    let stdout_path = stdout_path(fdt);
+    let console_path = console_path(fdt);
     let mut paths = fdt
         .iter_node_ids()
         .filter_map(|node_id| {
@@ -54,7 +54,7 @@ pub(crate) fn physical_serial_paths(fdt: &Fdt) -> Vec<String> {
                     || compatible == "ns16550"
                     || compatible == "ns16550a"
             });
-            (serial_name || serial_compatible || stdout_path.as_deref() == Some(path.as_str()))
+            (serial_name || serial_compatible || console_path.as_deref() == Some(path.as_str()))
                 .then_some(path)
         })
         .collect::<Vec<_>>();
@@ -72,45 +72,38 @@ pub(crate) fn host_selected_serial(
     fallback: GuestSerialProfile,
     interrupt_encoding: GuestSerialFdtInterrupt,
 ) -> AxVmResult<Option<HostSelectedSerial>> {
-    let Some((stdout_selector, path)) = stdout_selection(fdt) else {
+    let Some((stdout_selector, path)) = console_selection(fdt) else {
         return Ok(None);
     };
     let serial = fdt.get_by_path(&path).ok_or_else(|| {
         ax_err_type!(
             InvalidData,
-            format!("host stdout UART node {path} is missing")
+            format!("host console UART node {path} is missing")
         )
     })?;
     let node = serial.as_node();
     let compatibles = node.compatibles().collect::<Vec<_>>();
-    let model = if compatibles.contains(&"arm,pl011") {
-        GuestSerialModel::Pl011
-    } else if compatibles
-        .iter()
-        .any(|compatible| matches!(*compatible, "ns16550" | "ns16550a" | "snps,dw-apb-uart"))
-    {
-        GuestSerialModel::Uart16550
-    } else {
-        return Err(ax_err_type!(
+    let model = serial_model(node).ok_or_else(|| {
+        ax_err_type!(
             Unsupported,
             format!(
-                "host stdout UART node {path} has no supported virtual register model: \
+                "host console UART node {path} has no supported virtual register model: \
                  {compatibles:?}"
             )
-        ));
-    };
+        )
+    })?;
 
     let reg = serial.regs().into_iter().next().ok_or_else(|| {
         ax_err_type!(
             InvalidData,
-            format!("host stdout UART node {path} has no register range")
+            format!("host console UART node {path} has no register range")
         )
     })?;
     let base = usize::try_from(reg.address).map_err(|_| {
         ax_err_type!(
             InvalidData,
             format!(
-                "host stdout UART address does not fit usize: {:#x}",
+                "host console UART address does not fit usize: {:#x}",
                 reg.address
             )
         )
@@ -120,21 +113,21 @@ pub(crate) fn host_selected_serial(
         .ok_or_else(|| {
             ax_err_type!(
                 InvalidData,
-                format!("host stdout UART node {path} has no register range size")
+                format!("host console UART node {path} has no register range size")
             )
         })
         .and_then(|length| {
             usize::try_from(length).map_err(|_| {
                 ax_err_type!(
                     InvalidData,
-                    format!("host stdout UART range size does not fit usize: {length:#x}")
+                    format!("host console UART range size does not fit usize: {length:#x}")
                 )
             })
         })?;
     if length == 0 {
         return Err(ax_err_type!(
             InvalidData,
-            format!("host stdout UART node {path} has an empty register range")
+            format!("host console UART node {path} has an empty register range")
         ));
     }
 
@@ -154,7 +147,7 @@ pub(crate) fn host_selected_serial(
             if shift >= usize::BITS {
                 return Err(ax_err_type!(
                     InvalidData,
-                    format!("host stdout UART reg-shift {shift} is too large")
+                    format!("host console UART reg-shift {shift} is too large")
                 ));
             }
             let register_width = node
@@ -164,7 +157,7 @@ pub(crate) fn host_selected_serial(
                     AccessWidth::try_from(width as usize).map_err(|_| {
                         ax_err_type!(
                             InvalidData,
-                            format!("host stdout UART reg-io-width {width} is unsupported")
+                            format!("host console UART reg-io-width {width} is unsupported")
                         )
                     })
                 })?;
@@ -179,7 +172,7 @@ pub(crate) fn host_selected_serial(
     let interrupt = serial.interrupts().into_iter().next().ok_or_else(|| {
         ax_err_type!(
             InvalidData,
-            format!("host stdout UART node {path} has no interrupt")
+            format!("host console UART node {path} has no interrupt")
         )
     })?;
     let irq = decode_interrupt_id(&path, interrupt_encoding, &interrupt.specifier)?;
@@ -220,7 +213,7 @@ fn decode_interrupt_id(
             if specifier.first().copied() != Some(0) {
                 return Err(ax_err_type!(
                     Unsupported,
-                    format!("host stdout UART node {path} is not connected to a GIC SPI")
+                    format!("host console UART node {path} is not connected to a GIC SPI")
                 ));
             }
             specifier
@@ -230,7 +223,7 @@ fn decode_interrupt_id(
                 .ok_or_else(|| {
                     ax_err_type!(
                         InvalidData,
-                        format!("host stdout UART node {path} has an invalid GIC interrupt")
+                        format!("host console UART node {path} has an invalid GIC interrupt")
                     )
                 })?
         }
@@ -241,14 +234,14 @@ fn decode_interrupt_id(
             .ok_or_else(|| {
                 ax_err_type!(
                     InvalidData,
-                    format!("host stdout UART node {path} has an invalid PLIC interrupt")
+                    format!("host console UART node {path} has an invalid PLIC interrupt")
                 )
             })?,
     };
     usize::try_from(raw).map_err(|_| {
         ax_err_type!(
             InvalidData,
-            format!("host stdout UART interrupt does not fit usize: {raw}")
+            format!("host console UART interrupt does not fit usize: {raw}")
         )
     })
 }
@@ -387,7 +380,7 @@ fn install_pl011_clock(tree: &mut FdtTree, clock_hz: u32) -> AxVmResult<u32> {
     Ok(phandle)
 }
 
-fn interrupt_controller_phandle(
+pub(super) fn interrupt_controller_phandle(
     tree: &mut FdtTree,
     encoding: GuestSerialFdtInterrupt,
 ) -> AxVmResult<u32> {
@@ -462,8 +455,56 @@ fn stdout_selection(fdt: &Fdt) -> Option<(String, String)> {
     Some((raw.into(), path.into()))
 }
 
-fn stdout_path(fdt: &Fdt) -> Option<String> {
-    stdout_selection(fdt).map(|(_, path)| path)
+fn console_selection(fdt: &Fdt) -> Option<(String, String)> {
+    stdout_selection(fdt).or_else(|| earlycon_selection(fdt))
+}
+
+fn earlycon_selection(fdt: &Fdt) -> Option<(String, String)> {
+    let bootargs = fdt
+        .get_by_path("/chosen")?
+        .as_node()
+        .get_property("bootargs")?
+        .as_str()?;
+    let address = bootargs
+        .split_ascii_whitespace()
+        .filter_map(|argument| argument.strip_prefix("earlycon="))
+        .find_map(|configuration| {
+            configuration
+                .split(',')
+                .find_map(parse_earlycon_mmio_address)
+        })?;
+    let path = fdt.iter_node_ids().find_map(|node_id| {
+        let node = fdt.node(node_id)?;
+        serial_model(node)?;
+        fdt.view_typed(node_id)?
+            .regs()
+            .into_iter()
+            .any(|reg| reg.address == address)
+            .then(|| fdt.path_of(node_id))
+    })?;
+    Some((path.clone(), path))
+}
+
+fn parse_earlycon_mmio_address(component: &str) -> Option<u64> {
+    let digits = component
+        .strip_prefix("0x")
+        .or_else(|| component.strip_prefix("0X"))?;
+    u64::from_str_radix(digits, 16).ok()
+}
+
+fn serial_model(node: &Node) -> Option<GuestSerialModel> {
+    let mut uart_16550 = false;
+    for compatible in node.compatibles() {
+        if compatible == "arm,pl011" {
+            return Some(GuestSerialModel::Pl011);
+        }
+        uart_16550 |= matches!(compatible, "ns16550" | "ns16550a" | "snps,dw-apb-uart");
+    }
+    uart_16550.then_some(GuestSerialModel::Uart16550)
+}
+
+fn console_path(fdt: &Fdt) -> Option<String> {
+    console_selection(fdt).map(|(_, path)| path)
 }
 
 fn prop_u32(name: &str, value: u32) -> Property {
@@ -989,5 +1030,71 @@ mod tests {
             Some(4)
         );
         assert!(guest_fdt.get_by_path("/vuart-clock").is_none());
+    }
+
+    #[test]
+    fn resolves_earlycon_uart_when_stdout_path_is_missing() {
+        let mut tree = tree_with_controller("arm,gic-v3", "interrupt-controller@fd400000");
+        let root = tree.inner().root_id();
+        let serial = tree.add_node(root, Node::new("serial@fe660000"));
+        tree.set_property(
+            serial,
+            prop_string_list("compatible", &["rockchip,rk3568-uart", "snps,dw-apb-uart"]),
+        )
+        .unwrap();
+        tree.inner_mut()
+            .view_typed_mut(serial)
+            .unwrap()
+            .set_regs(&[RegInfo::new(0xfe66_0000, Some(0x100))]);
+        tree.set_property(serial, prop_u32("reg-shift", 2)).unwrap();
+        tree.set_property(serial, prop_u32("reg-io-width", 4))
+            .unwrap();
+        tree.set_property(serial, prop_u32_list("interrupts", &[0, 0x76, 4]))
+            .unwrap();
+        let chosen = tree.ensure_path("/chosen").unwrap();
+        tree.set_property(
+            chosen,
+            prop_string(
+                "bootargs",
+                "earlycon=uart8250,mmio32,0xfe660000 console=ttyFIQ0",
+            ),
+        )
+        .unwrap();
+
+        let host_dtb = tree.finish();
+        let host_fdt = Fdt::from_bytes(&host_dtb).unwrap();
+        let fallback = GuestSerialProfile {
+            model: GuestSerialModel::Pl011,
+            transport: GuestSerialTransport::Mmio {
+                base: 0x0900_0000,
+                length: 0x1000,
+                register_shift: 0,
+                register_width: AccessWidth::Dword,
+            },
+            irq: 33,
+            clock_hz: 24_000_000,
+        };
+
+        let resolved = host_selected_serial(&host_fdt, fallback, GuestSerialFdtInterrupt::GicSpi)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            resolved.profile,
+            GuestSerialProfile {
+                model: GuestSerialModel::Uart16550,
+                transport: GuestSerialTransport::Mmio {
+                    base: 0xfe66_0000,
+                    length: 0x100,
+                    register_shift: 2,
+                    register_width: AccessWidth::Dword,
+                },
+                irq: 150,
+                clock_hz: 24_000_000,
+            }
+        );
+        assert_eq!(resolved.identity.node_path, "/serial@fe660000");
+        assert_eq!(resolved.identity.interrupt_specifier, [0, 0x76, 4]);
+        assert_eq!(resolved.identity.stdout_path, "/serial@fe660000");
     }
 }

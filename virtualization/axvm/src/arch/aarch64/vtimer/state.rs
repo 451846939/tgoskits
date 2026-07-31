@@ -1,82 +1,154 @@
-//! Timer state transitions and generation-checked host scheduling.
+//! Connects vCPU-owned architectural timer state to VGIC PPIs and host wakeups.
 
 use alloc::{boxed::Box, sync::Arc};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use aarch64_cpu_ext::registers::{CNTFRQ_EL0, CNTPCT_EL0, Readable};
-use arm_vcpu::ArmVirtualTimerState;
-use arm_vgic::{GicVcpuId, PpiId, VgicCore};
+use aarch64_cpu_ext::registers::{CNTPCT_EL0, Readable};
+use arm_vcpu::{ArmTimerKind, ArmTimerSnapshot};
+use arm_vgic::{GicVcpuId, PpiId, VgicCore, VgicResult};
 use ax_kspin::SpinNoIrq;
 
-use crate::host::{HostTime, default_host};
+use crate::{
+    arch::aarch64::gic::AxvmVgicBackend,
+    host::{HostCpu, HostTime, default_host},
+    timer::VmTimerHandle,
+};
 
-const CONTROL_ENABLE: u32 = 1 << 0;
-const CONTROL_MASK: u32 = 1 << 1;
-const CONTROL_STATUS: u32 = 1 << 2;
 const NANOS_PER_SECOND: u128 = 1_000_000_000;
 
-/// Bridges the hardware-backed guest virtual timer into canonical VGIC state.
-///
-/// Host timer events are intentionally invalidated by generation instead of
-/// being canceled by token. AxVM timer wheels are per-pCPU, while a vCPU may
-/// migrate between its allowed pCPUs after WFI. A stale event can therefore
-/// remain on its original wheel, but it cannot assert an interrupt after the
-/// generation changes.
-pub(in crate::arch::aarch64) struct VirtualTimerRelay {
-    vgic: Arc<VgicCore>,
-    vcpu: GicVcpuId,
-    ppi: PpiId,
-    frequency: u64,
-    generation: AtomicU64,
+#[derive(Clone, Copy)]
+struct HostTimerActivation {
+    token: usize,
+    owner_cpu: usize,
 }
 
-impl VirtualTimerRelay {
-    pub(in crate::arch::aarch64) const fn new(
+/// Bridges one vCPU's canonical timer contexts into its private VGIC lines.
+///
+/// The binding owns only delivery plumbing. Compare values, controls, and
+/// interrupt conditions remain in `arm_vcpu`; pending/active/EOI state remains
+/// in the VGIC.
+pub(in crate::arch::aarch64) struct Aarch64TimerBinding {
+    vm_id: usize,
+    vgic: Arc<VgicCore>,
+    backend: Arc<AxvmVgicBackend>,
+    vcpu: GicVcpuId,
+    virtual_ppi: PpiId,
+    physical_ppi: PpiId,
+    host_virtual_timer_intid: u32,
+    frequency: u64,
+    registered: AtomicBool,
+    wait_generation: AtomicU64,
+    scheduled: SpinNoIrq<Option<VmTimerHandle>>,
+    host_activation: SpinNoIrq<Option<HostTimerActivation>>,
+}
+
+impl Aarch64TimerBinding {
+    pub(in crate::arch::aarch64) fn new(
+        vm_id: usize,
         vgic: Arc<VgicCore>,
+        backend: Arc<AxvmVgicBackend>,
         vcpu: GicVcpuId,
-        ppi: PpiId,
+        virtual_ppi: PpiId,
+        physical_ppi: PpiId,
+        host_virtual_timer_intid: u32,
         frequency: u64,
-    ) -> Self {
-        Self {
+    ) -> VgicResult<Arc<Self>> {
+        let binding = Arc::new(Self {
+            vm_id,
             vgic,
+            backend: backend.clone(),
             vcpu,
-            ppi,
+            virtual_ppi,
+            physical_ppi,
+            host_virtual_timer_intid,
             frequency,
-            generation: AtomicU64::new(0),
-        }
+            registered: AtomicBool::new(false),
+            wait_generation: AtomicU64::new(0),
+            scheduled: SpinNoIrq::new(None),
+            host_activation: SpinNoIrq::new(None),
+        });
+        backend.register_timer_ppi(vcpu, virtual_ppi, Arc::downgrade(&binding))?;
+        binding.registered.store(true, Ordering::Release);
+        Ok(binding)
     }
 
-    /// Publishes the level sampled when hardware saved `CNTV_CTL_EL0`.
-    pub(in crate::arch::aarch64) fn synchronize_level(
-        &self,
-        state: ArmVirtualTimerState,
-    ) -> arm_vgic::VgicResult {
+    /// Completes a banked PPI activation before this vCPU migrates to another pCPU.
+    pub(in crate::arch::aarch64) fn prepare_run(&self) -> VgicResult {
+        let current_cpu = default_host().this_cpu_id();
+        let activation = {
+            let mut active = self.host_activation.lock();
+            if active
+                .as_ref()
+                .is_some_and(|activation| activation.owner_cpu != current_cpu)
+            {
+                active.take()
+            } else {
+                None
+            }
+        };
+        if let Some(activation) = activation {
+            if let Err(error) = self.complete_host_activation(activation) {
+                *self.host_activation.lock() = Some(activation);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    /// Claims one acknowledged host CNTV PPI without deactivating it.
+    pub(in crate::arch::aarch64) fn accept_host_irq(&self, token: usize) -> bool {
+        if super::super::gic::host_irq_intid(token) != self.host_virtual_timer_intid {
+            return false;
+        }
+        let activation = HostTimerActivation {
+            token,
+            owner_cpu: default_host().this_cpu_id(),
+        };
+        let mut active = self.host_activation.lock();
+        if active.is_some() {
+            drop(active);
+            super::super::gic::deactivate_host_irq(token);
+        } else {
+            *active = Some(activation);
+        }
+        true
+    }
+
+    /// Publishes the current timer output levels before VGIC state is saved.
+    pub(in crate::arch::aarch64) fn synchronize(&self, snapshot: ArmTimerSnapshot) -> VgicResult {
         self.invalidate_wait();
-        self.vgic
-            .controller()
-            .set_ppi_level(self.vcpu, self.ppi, state.irq_asserted())
+        self.publish_levels(snapshot, physical_counter())
+            .map(|_| ())
     }
 
-    /// Arms one host wakeup for a trapped guest WFI.
-    pub(in crate::arch::aarch64) fn arm_wait(self: &Arc<Self>, state: ArmVirtualTimerState) {
-        if !state.delivery_enabled() || state.irq_asserted() {
-            return;
+    /// Re-evaluates both timers and arms the earliest wakeup for guest WFI.
+    pub(in crate::arch::aarch64) fn arm_wait(
+        self: &Arc<Self>,
+        snapshot: ArmTimerSnapshot,
+    ) -> VgicResult {
+        self.invalidate_wait();
+        let now_counter = physical_counter();
+        if self.publish_levels(snapshot, now_counter)? {
+            return Ok(());
         }
+        let Some(deadline_counter) = snapshot.earliest_deadline(now_counter) else {
+            return Ok(());
+        };
 
         let generation = self
-            .generation
+            .wait_generation
             .fetch_add(1, Ordering::AcqRel)
             .wrapping_add(1);
-        let deadline = host_deadline_ns(state.physical_deadline(), self.frequency);
-        let relay = Arc::downgrade(self);
-        crate::timer::register_timer(
-            deadline,
+        let deadline_ns = host_deadline_ns(deadline_counter, now_counter, self.frequency);
+        let binding = Arc::downgrade(self);
+        let handle = crate::timer::register_timer_handle(
+            deadline_ns,
             Box::new(move |_| {
-                let Some(relay) = relay.upgrade() else {
+                let Some(binding) = binding.upgrade() else {
                     return;
                 };
-                if relay
-                    .generation
+                if binding
+                    .wait_generation
                     .compare_exchange(
                         generation,
                         generation.wrapping_add(1),
@@ -87,212 +159,136 @@ impl VirtualTimerRelay {
                 {
                     return;
                 }
-                if let Err(error) = relay
-                    .vgic
-                    .controller()
-                    .set_ppi_level(relay.vcpu, relay.ppi, true)
+                binding.scheduled.lock().take();
+                if let Err(error) =
+                    crate::runtime::vcpus::notify_vcpu(binding.vm_id, binding.vcpu.raw())
                 {
-                    warn!("failed to deliver AArch64 virtual timer interrupt: {error}");
+                    warn!(
+                        "failed to wake VM[{}] vCPU {} for architectural timer: {error:?}",
+                        binding.vm_id,
+                        binding.vcpu.raw()
+                    );
                 }
             }),
         );
-    }
 
-    /// Invalidates a pending host wakeup before the vCPU enters again.
-    pub(in crate::arch::aarch64) fn invalidate_wait(&self) {
-        self.generation.fetch_add(1, Ordering::AcqRel);
-    }
-}
-
-pub(super) struct VirtualPhysicalTimer {
-    vgic: Arc<VgicCore>,
-    vcpu: GicVcpuId,
-    ppi: PpiId,
-    frequency: u64,
-    state: SpinNoIrq<TimerState>,
-    generation: AtomicU64,
-    scheduled_token: SpinNoIrq<Option<usize>>,
-}
-
-impl VirtualPhysicalTimer {
-    pub(super) const fn new(
-        vgic: Arc<VgicCore>,
-        vcpu: GicVcpuId,
-        ppi: PpiId,
-        frequency: u64,
-    ) -> Self {
-        Self {
-            vgic,
-            vcpu,
-            ppi,
-            frequency,
-            state: SpinNoIrq::new(TimerState {
-                compare: u64::MAX,
-                control: 0,
-            }),
-            generation: AtomicU64::new(0),
-            scheduled_token: SpinNoIrq::new(None),
-        }
-    }
-
-    pub(super) fn read_control(&self) -> u64 {
-        let state = *self.state.lock();
-        let status = state.enabled() && physical_counter() >= state.compare;
-        u64::from(state.control | if status { CONTROL_STATUS } else { 0 })
-    }
-
-    pub(super) fn read_tval(&self) -> u64 {
-        u64::from(self.state.lock().compare.wrapping_sub(physical_counter()) as u32)
-    }
-
-    pub(super) fn read_compare(&self) -> u64 {
-        self.state.lock().compare
-    }
-
-    pub(super) fn write_control(self: &Arc<Self>, value: u32) -> arm_vgic::VgicResult {
-        self.update(|state| state.control = value & (CONTROL_ENABLE | CONTROL_MASK))
-    }
-
-    pub(super) fn write_tval(self: &Arc<Self>, value: u32) -> arm_vgic::VgicResult {
-        let delta = i64::from(value as i32);
-        self.update(|state| state.compare = physical_counter().wrapping_add_signed(delta))
-    }
-
-    pub(super) fn write_compare(self: &Arc<Self>, value: u64) -> arm_vgic::VgicResult {
-        self.update(|state| state.compare = value)
-    }
-
-    fn update(self: &Arc<Self>, update: impl FnOnce(&mut TimerState)) -> arm_vgic::VgicResult {
-        let action = {
-            let mut state = self.state.lock();
-            update(&mut state);
-            let generation = self
-                .generation
-                .fetch_add(1, Ordering::AcqRel)
-                .wrapping_add(1);
-            state.action(physical_counter(), generation)
-        };
-        self.apply(action)
-    }
-
-    fn apply(self: &Arc<Self>, action: TimerAction) -> arm_vgic::VgicResult {
-        self.cancel_scheduled();
-        match action {
-            TimerAction::Lower => self
-                .vgic
-                .controller()
-                .set_ppi_level(self.vcpu, self.ppi, false),
-            TimerAction::Raise => self
-                .vgic
-                .controller()
-                .set_ppi_level(self.vcpu, self.ppi, true),
-            TimerAction::Schedule {
-                compare,
-                generation,
-            } => {
-                self.vgic
-                    .controller()
-                    .set_ppi_level(self.vcpu, self.ppi, false)?;
-                self.schedule(compare, generation);
-                Ok(())
-            }
-        }
-    }
-
-    fn schedule(self: &Arc<Self>, compare: u64, generation: u64) {
-        let deadline = host_deadline_ns(compare, self.frequency);
-        let timer = Arc::downgrade(self);
-        let token = crate::timer::register_timer(
-            deadline,
-            Box::new(move |_| {
-                let Some(timer) = timer.upgrade() else {
-                    return;
-                };
-                if let Err(error) = timer.expire(generation) {
-                    warn!("failed to deliver AArch64 architectural timer interrupt: {error}");
-                }
-            }),
-        );
         let (stale, previous) = {
-            let mut scheduled = self.scheduled_token.lock();
-            if self.generation.load(Ordering::Acquire) != generation {
+            let mut scheduled = self.scheduled.lock();
+            if self.wait_generation.load(Ordering::Acquire) != generation {
                 (true, None)
             } else {
-                (false, scheduled.replace(token))
+                (false, scheduled.replace(handle))
             }
         };
         if stale {
-            crate::timer::cancel_timer(token);
-            return;
+            crate::timer::cancel_timer_handle(handle);
+        } else if let Some(previous) = previous {
+            crate::timer::cancel_timer_handle(previous);
         }
-        if let Some(previous) = previous {
-            crate::timer::cancel_timer(previous);
+        Ok(())
+    }
+
+    /// Invalidates and remotely cancels any scheduled wait callback.
+    pub(in crate::arch::aarch64) fn invalidate_wait(&self) {
+        self.wait_generation.fetch_add(1, Ordering::AcqRel);
+        let scheduled = self.scheduled.lock().take();
+        if let Some(handle) = scheduled {
+            crate::timer::cancel_timer_handle(handle);
         }
     }
 
-    fn cancel_scheduled(&self) {
-        if let Some(token) = self.scheduled_token.lock().take() {
-            crate::timer::cancel_timer(token);
-        }
+    /// Clears both private timer lines and invalidates all scheduled work.
+    pub(in crate::arch::aarch64) fn reset(&self) -> VgicResult {
+        self.invalidate_wait();
+        let controller = self.vgic.controller();
+        controller.set_ppi_level(self.vcpu, self.virtual_ppi, false)?;
+        controller.set_ppi_level(self.vcpu, self.physical_ppi, false)?;
+        self.retire_host_activation()
     }
 
-    fn expire(self: &Arc<Self>, generation: u64) -> arm_vgic::VgicResult {
-        if self.generation.load(Ordering::Acquire) != generation {
+    fn publish_levels(
+        &self,
+        snapshot: ArmTimerSnapshot,
+        physical_counter: u64,
+    ) -> VgicResult<bool> {
+        let virtual_level = snapshot.irq_asserted(ArmTimerKind::Virtual, physical_counter);
+        let physical_level = snapshot.irq_asserted(ArmTimerKind::Physical, physical_counter);
+        let controller = self.vgic.controller();
+        controller.set_ppi_level(self.vcpu, self.virtual_ppi, virtual_level)?;
+        controller.set_ppi_level(self.vcpu, self.physical_ppi, physical_level)?;
+        Ok(virtual_level || physical_level)
+    }
+
+    pub(in crate::arch::aarch64) fn retire_host_activation(&self) -> VgicResult {
+        let activation = self.host_activation.lock().take();
+        let Some(activation) = activation else {
+            return Ok(());
+        };
+        if let Err(error) = self.complete_host_activation(activation) {
+            *self.host_activation.lock() = Some(activation);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn complete_host_activation(&self, activation: HostTimerActivation) -> VgicResult {
+        let current_cpu = default_host().this_cpu_id();
+        if activation.owner_cpu == current_cpu {
+            super::super::gic::deactivate_host_irq(activation.token);
             return Ok(());
         }
-        let action = self.state.lock().action(physical_counter(), generation);
-        self.apply(action)
+
+        let mut token = activation.token;
+        crate::host::task::run_on_cpu_sync(
+            activation.owner_cpu,
+            deactivate_host_timer_irq,
+            (&mut token as *mut usize).cast(),
+        )
+        .map_err(|error| arm_vgic::VgicError::Backend {
+            operation: "deactivate host virtual-timer PPI",
+            detail: alloc::format!(
+                "cannot run completion on owner CPU {}: {error:?}",
+                activation.owner_cpu
+            ),
+        })
     }
 }
 
-#[derive(Clone, Copy)]
-struct TimerState {
-    compare: u64,
-    control: u32,
-}
-
-impl TimerState {
-    const fn enabled(self) -> bool {
-        self.control & CONTROL_ENABLE != 0
-    }
-
-    const fn masked(self) -> bool {
-        self.control & CONTROL_MASK != 0
-    }
-
-    fn action(self, now: u64, generation: u64) -> TimerAction {
-        if !self.enabled() || self.masked() {
-            TimerAction::Lower
-        } else if now >= self.compare {
-            TimerAction::Raise
-        } else {
-            TimerAction::Schedule {
-                compare: self.compare,
-                generation,
-            }
+impl Drop for Aarch64TimerBinding {
+    fn drop(&mut self) {
+        if self.registered.swap(false, Ordering::AcqRel) {
+            self.backend
+                .unregister_timer_ppi(self.vcpu, self.virtual_ppi);
+        }
+        self.invalidate_wait();
+        if let Some(activation) = self.host_activation.lock().take()
+            && let Err(error) = self.complete_host_activation(activation)
+        {
+            warn!("failed to complete host timer PPI while dropping binding: {error}");
         }
     }
 }
 
-enum TimerAction {
-    Lower,
-    Raise,
-    Schedule { compare: u64, generation: u64 },
+/// # Safety
+///
+/// `arg` must point to a live `usize` for the duration of the synchronous
+/// cross-CPU call.
+unsafe fn deactivate_host_timer_irq(arg: *mut ()) {
+    let token = unsafe { *arg.cast::<usize>() };
+    super::super::gic::deactivate_host_irq(token);
 }
 
-pub(super) fn physical_counter() -> u64 {
+pub(in crate::arch::aarch64) fn physical_counter() -> u64 {
     CNTPCT_EL0.get()
 }
 
-pub(in crate::arch::aarch64) fn counter_frequency() -> u64 {
-    CNTFRQ_EL0.get()
-}
-
-fn host_deadline_ns(compare: u64, frequency: u64) -> u64 {
-    let now_counter = physical_counter();
+fn host_deadline_ns(deadline_counter: u64, now_counter: u64, frequency: u64) -> u64 {
     let now_ns = default_host().monotonic_time().as_nanos();
-    let delta_ticks = compare.saturating_sub(now_counter) as u128;
-    let delta_ns = delta_ticks
+    let remaining_ticks = deadline_counter.wrapping_sub(now_counter) as i64;
+    if remaining_ticks <= 0 {
+        return now_ns.min(u128::from(u64::MAX)) as u64;
+    }
+    let delta_ns = (remaining_ticks as u128)
         .saturating_mul(NANOS_PER_SECOND)
         .saturating_add(u128::from(frequency - 1))
         / u128::from(frequency);

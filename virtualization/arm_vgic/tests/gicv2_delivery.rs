@@ -22,6 +22,7 @@ const GICC_DIR: u64 = 0x1000;
 #[derive(Default)]
 struct TestBackend {
     loaded: Mutex<Vec<(usize, Vec<IntId>)>>,
+    retired: Mutex<Vec<(GicVcpuId, IntId)>>,
 }
 
 impl TestBackend {
@@ -33,6 +34,10 @@ impl TestBackend {
             .rev()
             .find_map(|(loaded_vcpu, intids)| (*loaded_vcpu == vcpu).then(|| intids.clone()))
             .unwrap_or_default()
+    }
+
+    fn retired_interrupts(&self) -> Vec<(GicVcpuId, IntId)> {
+        self.retired.lock().unwrap().clone()
     }
 }
 
@@ -63,6 +68,15 @@ impl VgicBackend for TestBackend {
         _vcpu: GicVcpuId,
         _state: &mut CpuInterfaceState,
     ) -> Result<(), GicV3BackendError> {
+        Ok(())
+    }
+
+    fn retire_emulated_interrupt(
+        &self,
+        vcpu: GicVcpuId,
+        intid: IntId,
+    ) -> Result<(), GicV3BackendError> {
+        self.retired.lock().unwrap().push((vcpu, intid));
         Ok(())
     }
 }
@@ -153,7 +167,7 @@ fn v2_distributor_clear_enable_and_cpu_target_share_canonical_state() {
 
 #[test]
 fn v2_cpu_interface_acknowledge_eoi_and_dir_obey_eoi_mode() {
-    let (core, _) = core();
+    let (core, backend) = core();
     let _binding = core.attach_vcpu(0, Arc::new(Wake)).unwrap();
     let vcpu = GicVcpuId::new(0);
     let ppi = 27u32;
@@ -192,6 +206,10 @@ fn v2_cpu_interface_acknowledge_eoi_and_dir_obey_eoi_mode() {
             .unwrap(),
         InterruptState::Inactive
     );
+    assert_eq!(
+        backend.retired_interrupts(),
+        vec![(vcpu, IntId::new(ppi).unwrap())]
+    );
 
     core.inject(0, ppi, InterruptTrigger::EdgeTriggered)
         .unwrap();
@@ -215,6 +233,13 @@ fn v2_cpu_interface_acknowledge_eoi_and_dir_obey_eoi_mode() {
             .interrupt_state(Some(vcpu), IntId::new(ppi).unwrap())
             .unwrap(),
         InterruptState::Inactive
+    );
+    assert_eq!(
+        backend.retired_interrupts(),
+        vec![
+            (vcpu, IntId::new(ppi).unwrap()),
+            (vcpu, IntId::new(ppi).unwrap())
+        ]
     );
 }
 

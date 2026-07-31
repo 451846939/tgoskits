@@ -59,7 +59,7 @@ struct ControllerState {
     distributor: DistributorState,
     redistributors: BTreeMap<GicVcpuId, RedistributorState>,
     spi_backings: BTreeMap<SpiId, SpiBacking>,
-    acknowledged_physical_spis: BTreeSet<SpiId>,
+    physical_spi_acknowledged: BTreeMap<SpiId, bool>,
     releasing_physical_spis: BTreeSet<SpiId>,
     msi_backings: BTreeMap<(ItsId, ItsDeviceId, EventId), MsiBacking>,
     active_vcpus: alloc::collections::BTreeSet<GicVcpuId>,
@@ -110,7 +110,7 @@ impl GicV3Controller {
                     distributor,
                     redistributors: BTreeMap::new(),
                     spi_backings: BTreeMap::new(),
-                    acknowledged_physical_spis: BTreeSet::new(),
+                    physical_spi_acknowledged: BTreeMap::new(),
                     releasing_physical_spis: BTreeSet::new(),
                     msi_backings: BTreeMap::new(),
                     active_vcpus: alloc::collections::BTreeSet::new(),
@@ -161,6 +161,7 @@ impl GicV3Controller {
                 vcpu,
                 affinity,
                 self.inner.config.list_register_count(),
+                self.inner.config.spi_count(),
                 wake,
             )?,
         );
@@ -196,6 +197,16 @@ impl GicV3Controller {
             let mut state = self.inner.state.lock();
             state.require_software_spi(spi, &self.inner.config, "set SPI level")?;
             state.distributor.set_level(spi, asserted)?;
+            if !asserted {
+                let mut canceled = false;
+                for redistributor in state.redistributors.values_mut() {
+                    canceled |= redistributor.withdraw_pending_delivery(IntId::Spi(spi));
+                }
+                if canceled {
+                    state.distributor.interrupt_mut(spi)?.cancel_inflight();
+                }
+                return Ok(());
+            }
             state.queue_spi_if_deliverable(spi)?
         };
         wake_vcpu(wake)

@@ -61,6 +61,19 @@ core::arch::global_asm!(
     trap_frame_size = const crate::ARM_VCPU_TRAP_FRAME_SIZE,
     guest_tpidr_el0_offset = const crate::vcpu::ARM_VCPU_GUEST_TPIDR_EL0_OFFSET,
     host_tpidr_el0_offset = const crate::vcpu::ARM_VCPU_HOST_TPIDR_EL0_OFFSET,
+    timer_virtual_offset_offset = const crate::vcpu::ARM_VCPU_TIMER_VIRTUAL_OFFSET_OFFSET,
+    timer_virtual_compare_offset = const crate::vcpu::ARM_VCPU_TIMER_VIRTUAL_COMPARE_OFFSET,
+    timer_virtual_control_offset = const crate::vcpu::ARM_VCPU_TIMER_VIRTUAL_CONTROL_OFFSET,
+    timer_virtual_generation_offset = const crate::vcpu::ARM_VCPU_TIMER_VIRTUAL_GENERATION_OFFSET,
+    timer_guest_hypervisor_control_offset =
+        const crate::vcpu::ARM_VCPU_TIMER_GUEST_HYPERVISOR_CONTROL_OFFSET,
+    timer_guest_kernel_control_offset =
+        const crate::vcpu::ARM_VCPU_TIMER_GUEST_KERNEL_CONTROL_OFFSET,
+    timer_host_hypervisor_control_offset =
+        const crate::vcpu::ARM_VCPU_TIMER_HOST_HYPERVISOR_CONTROL_OFFSET,
+    timer_host_kernel_control_offset =
+        const crate::vcpu::ARM_VCPU_TIMER_HOST_KERNEL_CONTROL_OFFSET,
+    timer_loaded_offset = const crate::vcpu::ARM_VCPU_TIMER_LOADED_OFFSET,
 );
 
 /// Handles synchronous exceptions that occur during the execution of a guest VM.

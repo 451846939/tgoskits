@@ -9,13 +9,7 @@ use crate::{
     ax_err_type,
 };
 
-impl HostTimePlatform for Aarch64Arch {
-    fn register_timer_callback() {
-        ax_std::os::arceos::modules::ax_task::register_timer_callback(|_| {
-            crate::check_timer_events();
-        });
-    }
-}
+impl HostTimePlatform for Aarch64Arch {}
 
 impl MachinePlatform for Aarch64Arch {
     const MACHINE_ARCHITECTURE: crate::machine::MachineArchitecture =
@@ -79,14 +73,18 @@ pub(super) fn patch_runtime_fdt(
     vm: &crate::AxVMRef,
     crate_config: &axvmconfig::GuestConfig,
 ) -> AxVmResult<alloc::vec::Vec<u8>> {
-    let (initrd, serial_profile, serial_identity, gic_profile) = vm.with_config(|config| {
-        (
-            super::fdt::initrd_start_size_from_image_config(config.image_config.ramdisk.as_ref()),
-            config.serial_profile(),
-            config.serial_fdt_identity().cloned(),
-            config.gic_profile().cloned(),
-        )
-    });
+    let (initrd, serial_profile, serial_identity, gic_profile, timer_profile) =
+        vm.with_config(|config| {
+            (
+                super::fdt::initrd_start_size_from_image_config(
+                    config.image_config.ramdisk.as_ref(),
+                ),
+                config.serial_profile(),
+                config.serial_fdt_identity().cloned(),
+                config.gic_profile().cloned(),
+                config.timer_profile().cloned(),
+            )
+        });
     super::fdt::core::create::patch_guest_fdt_for_runtime(
         fdt_bytes,
         &vm.memory_regions(),
@@ -95,6 +93,7 @@ pub(super) fn patch_runtime_fdt(
         serial_identity.as_ref(),
         gic_profile.as_ref(),
         None,
+        timer_profile.as_ref(),
         initrd,
         true,
     )

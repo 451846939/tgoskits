@@ -6,8 +6,9 @@ use axdevice_base::{InterruptTrigger, ItsId};
 
 use super::{ControllerInner, ControllerState, GicV3Controller, MsiBacking, SpiBacking};
 use crate::{
-    EventId, GicVcpuId, IntId, ItsDeviceId, LpiId, PhysicalInterruptBinding, PhysicalIrqId,
-    PhysicalMsiBinding, RedistributorState, SpiId, VgicError, VgicResult, backend_result,
+    EventId, GicVcpuId, IntId, ItsDeviceId, LpiId, PhysicalInterruptBinding,
+    PhysicalInterruptCompletion, PhysicalIrqId, PhysicalMsiBinding, RedistributorState, SpiId,
+    VgicError, VgicResult, backend_result,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -55,6 +56,68 @@ impl GicV3Controller {
         };
         if let Some(wake) = wake {
             wake.wake()?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn resample_physical_spi(&self, binding: PhysicalInterruptBinding) -> VgicResult {
+        let IntId::Spi(spi) = binding.guest() else {
+            return Err(VgicError::WrongIntIdClass {
+                intid: binding.guest(),
+                operation: "resample physical SPI",
+            });
+        };
+        let wake = {
+            let mut state = self.inner.state.lock();
+            match state.spi_backings.get(&spi).copied() {
+                Some(SpiBacking::Physical(owned)) if owned == binding => {}
+                Some(SpiBacking::Physical(_)) => {
+                    return Err(VgicError::InvalidStateTransition {
+                        intid: binding.guest(),
+                        operation: "resample physical SPI",
+                        detail: "the physical binding changed during completion".into(),
+                    });
+                }
+                _ => {
+                    return Err(VgicError::ResourceNotFound {
+                        resource: alloc::format!("physical backing for SPI {}", spi.raw()),
+                        operation: "resample physical SPI",
+                    });
+                }
+            }
+            state.queue_physical_spi(spi, binding)?
+        };
+        if let Some(wake) = wake {
+            wake.wake()?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn complete_physical_spi(
+        &self,
+        vcpu: GicVcpuId,
+        binding: PhysicalInterruptBinding,
+    ) -> VgicResult {
+        let completion = backend_result(
+            self.inner
+                .backend
+                .complete_physical_interrupt(vcpu, binding),
+        )?;
+        if completion == PhysicalInterruptCompletion::Asserted
+            && let Err(error) = self.resample_physical_spi(binding)
+        {
+            if let Err(rollback_error) = backend_result(
+                self.inner
+                    .backend
+                    .deactivate_physical_interrupt(vcpu, binding),
+            ) {
+                log::warn!(
+                    "failed to deactivate physical SPI {:?} after resampling failed: \
+                     {rollback_error}",
+                    binding.host()
+                );
+            }
+            return Err(error);
         }
         Ok(())
     }
@@ -123,10 +186,12 @@ impl GicV3Controller {
             state
                 .spi_backings
                 .insert(spi, SpiBacking::Physical(binding));
+            state.physical_spi_acknowledged.insert(spi, false);
         }
         if let Err(error) = backend_result(self.inner.backend.bind_physical_interrupt(binding)) {
             let mut state = self.inner.state.lock();
             state.spi_backings.remove(&spi);
+            state.physical_spi_acknowledged.remove(&spi);
             if let Err(rollback_error) = state.distributor.release_spi_claim(spi) {
                 log::warn!(
                     "failed to roll back SPI ownership after backend error: {rollback_error}"
@@ -171,7 +236,7 @@ impl GicV3Controller {
 
         let mut state = self.inner.state.lock();
         state.spi_backings.remove(&spi);
-        state.acknowledged_physical_spis.remove(&spi);
+        state.physical_spi_acknowledged.remove(&spi);
         state.releasing_physical_spis.remove(&spi);
         state.distributor.release_spi_claim(spi)
     }
@@ -250,6 +315,7 @@ impl GicV3Controller {
 
         let mut state = self.inner.state.lock();
         state.spi_backings.remove(&spi);
+        state.physical_spi_acknowledged.remove(&spi);
         state.releasing_physical_spis.remove(&spi);
         state.distributor.release_spi_claim(spi)
     }
@@ -401,7 +467,10 @@ impl GicV3Controller {
 
 impl ControllerState {
     fn physical_spi_has_delivery(&self, spi: SpiId, binding: PhysicalInterruptBinding) -> bool {
-        self.acknowledged_physical_spis.contains(&spi)
+        self.physical_spi_acknowledged
+            .get(&spi)
+            .copied()
+            .unwrap_or(false)
             || self.redistributors.values().any(|redistributor| {
                 redistributor.has_physical_delivery(IntId::Spi(spi), binding.host())
             })
@@ -412,7 +481,10 @@ impl ControllerState {
     }
 
     fn clear_physical_spi_delivery(&mut self, spi: SpiId, binding: PhysicalInterruptBinding) {
-        self.acknowledged_physical_spis.remove(&spi);
+        *self
+            .physical_spi_acknowledged
+            .get_mut(&spi)
+            .expect("an owned physical SPI must have acknowledgement state") = false;
         for redistributor in self.redistributors.values_mut() {
             redistributor.remove_physical_delivery(IntId::Spi(spi), binding.host());
         }

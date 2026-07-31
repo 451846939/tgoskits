@@ -98,7 +98,11 @@ fn is_machine_interrupt_controller(node: &Node) -> bool {
         && node.compatibles().any(|compatible| {
             matches!(
                 compatible,
-                "arm,gic-v3" | "riscv,plic0" | "sifive,plic-1.0.0"
+                "arm,gic-v3"
+                    | "arm,cortex-a15-gic"
+                    | "arm,gic-400"
+                    | "riscv,plic0"
+                    | "sifive,plic-1.0.0"
             )
         })
 }
@@ -326,6 +330,7 @@ pub(crate) fn patch_guest_fdt_for_runtime(
     serial_identity: Option<&crate::machine::GuestSerialFdtIdentity>,
     gic_profile: Option<&crate::machine::GuestGicProfile>,
     plic_profile: Option<&crate::machine::GuestPlicProfile>,
+    timer_profile: Option<&crate::machine::GuestTimerProfile>,
     initrd_start_size: Option<(u64, u64)>,
     create_chosen: bool,
 ) -> AxVmResult<Vec<u8>> {
@@ -345,6 +350,7 @@ pub(crate) fn patch_guest_fdt_for_runtime(
         gic_profile,
         plic_profile,
     )?;
+    super::timer::install_machine_timer(&mut tree, timer_profile)?;
     super::serial::install_machine_serial(&mut tree, serial_profile, serial_identity)?;
     Ok(tree.finish())
 }
@@ -495,6 +501,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             false,
         )
         .unwrap();
@@ -508,6 +515,7 @@ mod tests {
             &[],
             &cfg,
             serial,
+            None,
             None,
             None,
             None,

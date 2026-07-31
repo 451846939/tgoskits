@@ -1,30 +1,65 @@
 //! Small capability boundaries implemented by the selected guest architecture.
 
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
+
+use ax_std::os::arceos::modules::ax_task::IrqNotify;
+
 use crate::AxVmResult;
 
-/// Selects the smallest capability across a default and every target CPU.
-pub(crate) fn minimum_cpu_capability(
-    default: usize,
-    cpu_capabilities: impl IntoIterator<Item = usize>,
-) -> usize {
-    cpu_capabilities
-        .into_iter()
-        .fold(default, |minimum, capability| minimum.min(capability))
+/// Failure to collect one capability from every physical CPU targeted by a VM.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub(crate) enum TargetCpuCapabilityError {
+    /// The VM has no physical CPU target.
+    #[error("no target physical CPU is configured for {capability}")]
+    NoTargets { capability: &'static str },
+    /// One target CPU did not publish the requested capability.
+    #[error("target CPU {cpu_id} has no recorded {capability}")]
+    Missing {
+        capability: &'static str,
+        cpu_id: usize,
+    },
 }
 
-/// Selects the smallest capability supported by every CPU on which a VM's
-/// vCPUs may run.
-pub(crate) fn minimum_target_cpu_capability(
-    default: usize,
+/// Selects the smallest recorded capability across every target physical CPU.
+pub(crate) fn minimum_recorded_target_cpu_capability(
+    capability: &'static str,
     vcpu_mappings: &[(usize, Option<usize>, usize)],
-    mut capability_for_cpu: impl FnMut(usize) -> usize,
-) -> usize {
-    minimum_cpu_capability(
-        default,
-        crate::architecture::ops::target_phys_cpu_ids(vcpu_mappings)
-            .into_iter()
-            .map(&mut capability_for_cpu),
-    )
+    capability_for_cpu: impl FnMut(usize) -> Option<u64>,
+) -> Result<u64, TargetCpuCapabilityError> {
+    let capabilities =
+        recorded_target_cpu_capabilities(capability, vcpu_mappings, capability_for_cpu)?;
+    let mut capabilities = capabilities.into_iter();
+    let (_, first) = capabilities
+        .next()
+        .ok_or(TargetCpuCapabilityError::NoTargets { capability })?;
+    Ok(capabilities.fold(first, |minimum, (_, value)| minimum.min(value)))
+}
+
+pub(crate) fn recorded_target_cpu_capabilities(
+    capability: &'static str,
+    vcpu_mappings: &[(usize, Option<usize>, usize)],
+    mut capability_for_cpu: impl FnMut(usize) -> Option<u64>,
+) -> Result<Vec<(usize, u64)>, TargetCpuCapabilityError> {
+    let cpu_ids = crate::architecture::ops::target_phys_cpu_ids(vcpu_mappings);
+    if cpu_ids.is_empty() {
+        return Err(TargetCpuCapabilityError::NoTargets { capability });
+    }
+    cpu_ids
+        .into_iter()
+        .map(|cpu_id| {
+            capability_for_cpu(cpu_id)
+                .map(|value| (cpu_id, value))
+                .ok_or(TargetCpuCapabilityError::Missing { capability, cpu_id })
+        })
+        .collect()
+}
+
+/// Maps a missing target-CPU capability into the AxVM host-capability domain.
+pub(crate) fn unsupported_target_cpu_capability(
+    operation: &'static str,
+    error: TargetCpuCapabilityError,
+) -> crate::AxVmError {
+    crate::AxVmError::unsupported(operation, error)
 }
 
 /// Architecture selection for fixed guest machine resources.
@@ -88,7 +123,23 @@ pub(crate) trait HostTimePlatform {
         ax_std::os::arceos::modules::ax_hal::time::set_oneshot_timer(deadline_ns);
     }
 
-    fn register_timer_callback() {}
+    fn register_timer_callback(notify: Arc<IrqNotify>) {
+        register_vm_timer_irq_callback(
+            |callback| {
+                ax_std::os::arceos::modules::ax_task::register_timer_irq_callback(move |_| {
+                    callback();
+                });
+            },
+            move || notify.notify_irq(),
+        );
+    }
+}
+
+fn register_vm_timer_irq_callback(
+    register: impl FnOnce(Box<dyn Fn() + Send + Sync>),
+    callback: impl Fn() + Send + Sync + 'static,
+) {
+    register(Box::new(callback));
 }
 
 #[cfg(test)]
@@ -96,17 +147,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn minimum_cpu_capability_uses_the_weakest_heterogeneous_cpu() {
-        assert_eq!(minimum_cpu_capability(48, [48, 44]), 44);
-    }
-
-    #[test]
-    fn minimum_cpu_capability_keeps_the_default_without_targets() {
-        assert_eq!(minimum_cpu_capability(39, []), 39);
-    }
-
-    #[test]
-    fn target_cpu_capability_includes_every_cpu_in_vcpu_affinity_masks() {
+    fn recorded_minimum_includes_every_cpu_in_vcpu_affinity_masks() {
         let mappings = [
             (0, Some((1 << 0) | (1 << 2)), 0),
             (1, None, 1),
@@ -115,8 +156,44 @@ mod tests {
         let capabilities = [48, 44, 42, 39];
 
         assert_eq!(
-            minimum_target_cpu_capability(52, &mappings, |cpu_id| capabilities[cpu_id]),
-            39
+            minimum_recorded_target_cpu_capability("IPA bits", &mappings, |cpu_id| {
+                Some(capabilities[cpu_id])
+            }),
+            Ok(39)
         );
+    }
+
+    #[test]
+    fn recorded_minimum_rejects_an_empty_target_set() {
+        assert_eq!(
+            minimum_recorded_target_cpu_capability("IPA bits", &[], |_| Some(48)),
+            Err(TargetCpuCapabilityError::NoTargets {
+                capability: "IPA bits",
+            })
+        );
+    }
+
+    #[test]
+    fn recorded_minimum_rejects_an_uninitialized_target_cpu() {
+        let mappings = [(0, Some((1 << 0) | (1 << 2)), 0)];
+
+        assert_eq!(
+            minimum_recorded_target_cpu_capability("IPA bits", &mappings, |cpu_id| {
+                [Some(48), None, None][cpu_id]
+            }),
+            Err(TargetCpuCapabilityError::Missing {
+                capability: "IPA bits",
+                cpu_id: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn default_host_timer_policy_registers_the_vm_timer_irq_consumer() {
+        let mut installed = false;
+
+        register_vm_timer_irq_callback(|_| installed = true, || {});
+
+        assert!(installed);
     }
 }

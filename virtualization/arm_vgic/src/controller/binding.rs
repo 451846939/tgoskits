@@ -292,16 +292,15 @@ impl GicV3VcpuBinding {
         let mut first_error = None;
         for retirement in retirements {
             let result = match retirement {
-                DeliveryRetirement::Emulated { intid } => self
-                    .controller
-                    .inner
-                    .backend
-                    .retire_emulated_interrupt(self.vcpu, intid),
-                DeliveryRetirement::Physical { binding } => self
-                    .controller
-                    .inner
-                    .backend
-                    .deactivate_physical_interrupt(self.vcpu, binding),
+                DeliveryRetirement::Emulated { intid } => backend_result(
+                    self.controller
+                        .inner
+                        .backend
+                        .retire_emulated_interrupt(self.vcpu, intid),
+                ),
+                DeliveryRetirement::Physical { binding } => {
+                    self.controller.complete_physical_spi(self.vcpu, binding)
+                }
             };
             if let Err(error) = result
                 && first_error.is_none()
@@ -310,7 +309,7 @@ impl GicV3VcpuBinding {
             }
         }
         match first_error {
-            Some(error) => backend_result(Err(error)),
+            Some(error) => Err(error),
             None => Ok(()),
         }
     }

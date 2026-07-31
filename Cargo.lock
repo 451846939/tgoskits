@@ -425,6 +425,7 @@ name = "arm_vcpu"
 version = "0.5.17"
 dependencies = [
  "aarch64-cpu 11.2.0",
+ "aarch64_sysreg",
  "log",
  "numeric-enum-macro",
  "spin",
@@ -1620,7 +1621,6 @@ name = "axvm"
 version = "0.5.24"
 dependencies = [
  "aarch64-cpu-ext",
- "aarch64_sysreg",
  "arm-gic-driver",
  "arm_vcpu",
  "arm_vgic",

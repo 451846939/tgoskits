@@ -12,11 +12,12 @@ use crate::{
 
 pub(crate) mod create;
 mod device;
-mod interrupt;
+pub(crate) mod interrupt;
 mod parser;
 mod policy;
 mod print;
 pub(crate) mod serial;
+pub(crate) mod timer;
 pub(crate) mod tree;
 
 #[cfg(test)]
@@ -82,6 +83,19 @@ fn resolve_machine_resources_from_host(
             gic
         );
         vm_config.replace_machine_gic(gic)?;
+    }
+    if crate::machine::current_machine_profile(1).timer.is_some() {
+        let timer = timer::host_timer_profile(&host_fdt)?.ok_or_else(|| {
+            ax_err_type!(
+                InvalidData,
+                "host FDT does not provide a valid arm,armv8-timer node"
+            )
+        })?;
+        info!(
+            "VM[{}] architectural timer follows host firmware PPIs",
+            vm_config.id()
+        );
+        vm_config.replace_machine_timer(timer)?;
     }
     if let Some(plic) = interrupt::host_plic_profile(&host_fdt)? {
         info!(

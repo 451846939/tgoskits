@@ -4,7 +4,7 @@ extern crate alloc;
 
 #[cfg(test)]
 use alloc::vec::Vec;
-use alloc::{boxed::Box, collections::BTreeMap};
+use alloc::{boxed::Box, collections::BTreeMap, sync::Arc};
 #[cfg(test)]
 use core::sync::atomic::AtomicU64;
 use core::{
@@ -17,6 +17,7 @@ use std::sync::{Mutex, MutexGuard};
 use ax_kernel_guard::NoPreempt;
 use ax_kspin::SpinNoIrq;
 use ax_lazyinit::LazyInit;
+use ax_std::os::arceos::modules::ax_task::IrqNotify;
 use ax_timer_list::{TimeValue, TimerEvent, TimerList};
 
 #[cfg(not(test))]
@@ -24,6 +25,14 @@ use crate::host::{HostTime, default_host, task};
 
 static TOKEN: AtomicUsize = AtomicUsize::new(0);
 const HOST_TIMER_PARK_DELAY: Duration = Duration::from_secs(1);
+const TIMER_WORKER_STACK_SIZE: usize = 0x20_000;
+
+/// Owner-aware handle for one AxVM timer-wheel entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct VmTimerHandle {
+    token: usize,
+    owner_cpu: usize,
+}
 
 struct VmTimerEvent {
     token: usize,
@@ -79,13 +88,21 @@ impl TimerWheels {
         wheel.next_deadline()
     }
 
-    fn cancel(&mut self, token: usize) -> Option<(usize, Option<TimeValue>)> {
-        let owner_cpu = self.owners.remove(&token)?;
-        let next_deadline = self.wheels.get_mut(&owner_cpu).map(|wheel| {
-            wheel.cancel(|event| event.token == token);
-            wheel.next_deadline()
-        });
-        Some((owner_cpu, next_deadline.flatten()))
+    fn handle(&self, token: usize) -> Option<VmTimerHandle> {
+        self.owners
+            .get(&token)
+            .copied()
+            .map(|owner_cpu| VmTimerHandle { token, owner_cpu })
+    }
+
+    fn cancel_handle(&mut self, handle: VmTimerHandle) -> Option<Option<TimeValue>> {
+        if self.owners.get(&handle.token).copied() != Some(handle.owner_cpu) {
+            return None;
+        }
+        self.owners.remove(&handle.token);
+        let wheel = self.wheels.get_mut(&handle.owner_cpu)?;
+        wheel.cancel(|event| event.token == handle.token);
+        Some(wheel.next_deadline())
     }
 
     fn expire_one(
@@ -116,25 +133,43 @@ pub(crate) fn register_timer(
     deadline_ns: u64,
     callback: Box<dyn FnOnce(Duration) + Send + 'static>,
 ) -> usize {
+    register_timer_handle(deadline_ns, callback).token
+}
+
+pub(crate) fn register_timer_handle(
+    deadline_ns: u64,
+    callback: Box<dyn FnOnce(Duration) + Send + 'static>,
+) -> VmTimerHandle {
     let token = TOKEN.fetch_add(1, Ordering::Relaxed);
-    let next_deadline = with_current_timer_wheels(|cpu_id, timer_wheels| {
-        timer_wheels.register(
+    let (owner_cpu, next_deadline) = with_current_timer_wheels(|cpu_id, timer_wheels| {
+        let next_deadline = timer_wheels.register(
             cpu_id,
             token,
             TimeValue::from_nanos(deadline_ns),
             VmTimerEvent::new(token, callback),
-        )
+        );
+        (cpu_id, next_deadline)
     });
     rearm_host_timer(next_deadline);
-    token
+    VmTimerHandle { token, owner_cpu }
+}
+
+pub(crate) fn cancel_timer_handle(handle: VmTimerHandle) {
+    let _guard = NoPreempt::new();
+    let current_cpu = current_cpu_id();
+    let next_deadline = with_timer_wheels(|timer_wheels| timer_wheels.cancel_handle(handle));
+    if let Some(next_deadline) = next_deadline {
+        rearm_owner_host_timer(handle.owner_cpu, current_cpu, next_deadline);
+    }
 }
 
 pub(crate) fn cancel_timer(token: usize) {
-    let _guard = NoPreempt::new();
-    let current_cpu = current_cpu_id();
-    let canceled = with_timer_wheels(|timer_wheels| timer_wheels.cancel(token));
-    if let Some((owner_cpu, next_deadline)) = canceled {
-        rearm_owner_host_timer(owner_cpu, current_cpu, next_deadline);
+    let handle = {
+        let _guard = NoPreempt::new();
+        with_timer_wheels(|timer_wheels| timer_wheels.handle(token))
+    };
+    if let Some(handle) = handle {
+        cancel_timer_handle(handle);
     }
 }
 
@@ -221,7 +256,24 @@ pub(crate) fn init_percpu() {
     with_current_timer_wheels(|cpu_id, timer_wheels| {
         timer_wheels.ensure_cpu(cpu_id);
     });
-    crate::arch::register_timer_callback();
+
+    let cpu_id = current_cpu_id();
+    let notify = Arc::new(IrqNotify::new());
+    let worker_notify = notify.clone();
+    let worker = crate::host::task::TaskInner::new(
+        move || loop {
+            worker_notify.wait();
+            check_events();
+        },
+        alloc::format!("axvm-timer-{cpu_id}"),
+        TIMER_WORKER_STACK_SIZE,
+    );
+    let cpu_bit = 1usize
+        .checked_shl(cpu_id as u32)
+        .expect("AxVM timer worker CPU ID must fit the host CPU mask");
+    worker.set_cpumask(crate::host::task::cpu_mask_from_raw_bits(cpu_bit));
+    crate::host::task::spawn_task(worker);
+    crate::arch::register_timer_callback(notify);
 }
 
 fn with_timer_wheels<R>(operation: impl FnOnce(&mut TimerWheels) -> R) -> R {
@@ -329,7 +381,7 @@ mod tests {
         check_events();
         assert_eq!(TEST_CALLBACK_NOW_NS.load(Ordering::Acquire), 10_000_000);
         assert_eq!(
-            with_timer_wheels(|timer_wheels| timer_wheels.cancel(token)),
+            with_timer_wheels(|timer_wheels| timer_wheels.handle(token)),
             None
         );
     }
@@ -346,9 +398,15 @@ mod tests {
         assert_eq!(timer_wheels.next_deadline(0), Some(deadline));
         assert_eq!(timer_wheels.next_deadline(1), None);
 
-        assert_eq!(timer_wheels.cancel(7), Some((0, None)));
+        assert_eq!(
+            timer_wheels.cancel_handle(VmTimerHandle {
+                token: 7,
+                owner_cpu: 0,
+            }),
+            Some(None)
+        );
         assert_eq!(timer_wheels.next_deadline(0), None);
-        assert_eq!(timer_wheels.cancel(7), None);
+        assert_eq!(timer_wheels.handle(7), None);
     }
 
     #[test]
@@ -360,7 +418,13 @@ mod tests {
         timer_wheels.register(1, 11, early, event(11));
         timer_wheels.register(1, 12, late, event(12));
 
-        assert_eq!(timer_wheels.cancel(11), Some((1, Some(late))));
+        assert_eq!(
+            timer_wheels.cancel_handle(VmTimerHandle {
+                token: 11,
+                owner_cpu: 1,
+            }),
+            Some(Some(late))
+        );
         assert_eq!(timer_wheels.next_deadline(1), Some(late));
     }
 
@@ -374,7 +438,13 @@ mod tests {
             timer_wheels.register(0, 31, stale_deadline, event(31)),
             Some(stale_deadline)
         );
-        assert_eq!(timer_wheels.cancel(31), Some((0, None)));
+        assert_eq!(
+            timer_wheels.cancel_handle(VmTimerHandle {
+                token: 31,
+                owner_cpu: 0,
+            }),
+            Some(None)
+        );
         assert_eq!(
             timer_wheels.register(1, 32, migrated_deadline, event(32)),
             Some(migrated_deadline)
@@ -386,7 +456,7 @@ mod tests {
             .expect("migrated timer event should expire on the new owner CPU");
         assert_eq!(deadline, migrated_deadline);
         assert_eq!(migrated_event.token, 32);
-        assert_eq!(timer_wheels.cancel(32), None);
+        assert_eq!(timer_wheels.handle(32), None);
     }
 
     #[test]
@@ -398,7 +468,7 @@ mod tests {
         let expired = timer_wheels.expire_one(2, deadline);
 
         assert!(expired.is_some());
-        assert_eq!(timer_wheels.cancel(21), None);
+        assert_eq!(timer_wheels.handle(21), None);
     }
 
     #[test]
@@ -428,6 +498,48 @@ mod tests {
         assert_eq!(
             lock_test_mutex(&TEST_REARMS).as_slice(),
             &[(0, Some(Duration::from_nanos(1_000_000_000)))]
+        );
+    }
+
+    #[test]
+    fn owner_aware_handle_rejects_a_stale_cpu_identity() {
+        let mut timer_wheels = TimerWheels::new();
+        let deadline = Duration::from_secs(1);
+        timer_wheels.register(2, 41, deadline, event(41));
+
+        assert_eq!(
+            timer_wheels.cancel_handle(VmTimerHandle {
+                token: 41,
+                owner_cpu: 1,
+            }),
+            None
+        );
+        assert_eq!(timer_wheels.next_deadline(2), Some(deadline));
+        assert_eq!(
+            timer_wheels.cancel_handle(VmTimerHandle {
+                token: 41,
+                owner_cpu: 2,
+            }),
+            Some(None)
+        );
+    }
+
+    #[test]
+    fn remote_handle_cancel_reprograms_the_recorded_owner_cpu() {
+        let _guard = lock_test_mutex(&TEST_LOCK);
+        reset_global_timer_state();
+
+        set_current_cpu_for_test(2);
+        let handle = register_timer_handle(20_000_000, Box::new(|_| {}));
+        lock_test_mutex(&TEST_REARMS).clear();
+
+        set_current_cpu_for_test(0);
+        cancel_timer_handle(handle);
+
+        assert_eq!(lock_test_mutex(&TEST_REMOTE_REARMS).as_slice(), &[2]);
+        assert_eq!(
+            lock_test_mutex(&TEST_REARMS).as_slice(),
+            &[(2, Some(Duration::from_secs(1)))]
         );
     }
 }

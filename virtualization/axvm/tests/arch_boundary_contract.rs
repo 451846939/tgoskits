@@ -155,7 +155,9 @@ fn aarch64_assigned_spis_use_split_eoi_and_explicit_teardown() {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/arch/aarch64/gic/physical.rs"),
     )
     .unwrap_or_default();
+    let deferred_kick = include_str!("../src/irq/deferred.rs");
     let vgic = include_str!("../src/arch/aarch64/vgic.rs");
+    let controller = include_str!("../../arm_vgic/src/controller/mod.rs");
     let physical = include_str!("../../arm_vgic/src/controller/physical.rs");
     let binding = include_str!("../../arm_vgic/src/controller/binding.rs");
 
@@ -169,14 +171,40 @@ fn aarch64_assigned_spis_use_split_eoi_and_explicit_teardown() {
         !gic.contains("Weak<VgicCore>")
             && !gic.contains("ASSIGNED_SPI_ROUTES: SpinNoIrq<BTreeMap")
             && physical_ingress.contains("AtomicPtr<AssignedSpiBinding>")
-            && physical_ingress.contains("IrqNotify")
-            && physical_ingress.contains("notify_irq()")
             && physical_ingress.contains("controller.forward_physical_spi"),
-        "hard IRQ routing must publish through a fixed preallocated route and defer controller \
-         lookup/state mutation to task context"
+        "hard IRQ routing must publish through a fixed preallocated route into canonical VGIC \
+         state"
     );
     assert!(
-        binding.contains("deactivate_physical_interrupt(self.vcpu, binding)")
+        !physical_ingress.contains("IrqNotify")
+            && !physical_ingress.contains("notify_irq()")
+            && !physical_ingress.contains("TaskInner::new")
+            && controller.contains("state: SpinNoIrq<ControllerState>")
+            && deferred_kick.contains("pending_vcpus: AtomicUsize")
+            && deferred_kick.contains("self.notify.notify_irq()"),
+        "the physical top half must mutate only IRQ-safe controller state; only the preallocated \
+         vCPU kick may be deferred to task context"
+    );
+    let publish_active = physical_ingress
+        .find("*delivery = AssignedSpiDelivery::Active")
+        .expect("assigned SPI ingress must publish its active ownership");
+    let forward_canonical = physical_ingress
+        .find("self.controller.forward_physical_spi(self.irq)")
+        .expect("assigned SPI ingress must update canonical VGIC state");
+    assert!(
+        publish_active < forward_canonical,
+        "the route must publish active host-IRQ ownership before canonical forwarding can wake \
+         and preempt the current task"
+    );
+    assert!(
+        physical_ingress.contains("delivery: SpinNoIrq<AssignedSpiDelivery>")
+            && physical_ingress.contains("AssignedSpiDelivery::Completing")
+            && physical_ingress.contains("complete_assigned_spi")
+            && gic.contains("physical::complete_assigned_spi(binding.host(), ||"),
+        "assigned-SPI completion must keep ingress serialized until host DIR has finished"
+    );
+    assert!(
+        binding.contains("complete_physical_spi(self.vcpu, binding)")
             && physical.contains("deactivate_physical_interrupt(binding.target(), binding)")
             && physical.contains("clear_physical_spi_delivery(spi, binding)")
             && physical.contains("unbind_physical_interrupt(binding)"),
@@ -268,9 +296,7 @@ fn aarch64_preserves_host_irq_identity_and_virtualizes_the_guest_timer() {
     let architecture = include_str!("../src/arch/aarch64/mod.rs");
     let gic = include_str!("../src/arch/aarch64/gic.rs");
     let vgic = include_str!("../src/arch/aarch64/vgic.rs");
-    let timer_device = include_str!("../src/arch/aarch64/vtimer/device.rs");
     let timer_state = include_str!("../src/arch/aarch64/vtimer/state.rs");
-    let arm_vcpu = include_str!("../../arm_vcpu/src/vcpu.rs");
 
     assert!(
         gic.contains("identity forwarding requires guest INTID")
@@ -278,19 +304,36 @@ fn aarch64_preserves_host_irq_identity_and_virtualizes_the_guest_timer() {
         "assigned devices must preserve host GIC INTID identity"
     );
     assert!(
-        vgic.contains("GUEST_VIRTUAL_TIMER_PPI: u8 = 27")
-            && vgic.contains("GUEST_PHYSICAL_TIMER_PPI: u8 = 30")
-            && timer_device.contains("current_vcpu_id()")
+        vgic.contains("timer_profile.virtual_intid")
+            && vgic.contains("timer_profile.nonsecure_physical_intid")
+            && timer_state.contains("host_virtual_timer_intid")
             && timer_state.contains("set_ppi_level")
             && !timer_state.contains("register_platform_irq_injector"),
-        "architectural virtual and non-secure physical timers must use their standard level PPIs"
+        "architectural timer PPIs must come from the machine profile and remain level lines"
     );
     assert!(
-        architecture.contains("fn after_vcpu_run(")
-            && architecture.contains("synchronize_virtual_timer()")
-            && timer_state.contains("synchronize_level")
-            && arm_vcpu.contains("pub fn virtual_timer_state(&self) -> ArmVirtualTimerState"),
-        "the saved CNTV level must drive canonical vGIC PPI 27 state after every guest exit"
+        architecture.contains("let timer_result = self.synchronize_timer();")
+            && architecture.contains("let save_result = vgic_backend_result(binding.save());")
+            && timer_state.contains("ArmTimerSnapshot")
+            && timer_state.contains("ArmTimerKind::Virtual")
+            && timer_state.contains("ArmTimerKind::Physical"),
+        "vCPU-owned CNTV/CNTP levels must enter canonical VGIC state before VGIC save"
+    );
+}
+
+#[test]
+fn aarch64_host_timer_ppi_completion_follows_guest_retirement() {
+    let gic = include_str!("../src/arch/aarch64/gic.rs");
+    let timer_state = include_str!("../src/arch/aarch64/vtimer/state.rs");
+
+    assert!(
+        gic.contains("fn retire_emulated_interrupt(") && gic.contains(".retire_host_activation()"),
+        "the VGIC backend must complete a host timer PPI only after canonical guest retirement"
+    );
+    assert!(
+        !timer_state.contains("if !virtual_level")
+            && timer_state.contains("fn retire_host_activation(&self)"),
+        "lowering the timer line before guest EOI/DIR must not deactivate its host PPI"
     );
 }
 
@@ -317,7 +360,7 @@ fn aarch64_traps_guest_wfi_without_losing_an_already_pending_virtual_irq() {
     );
     assert!(exit_types.contains("WaitForInterrupt"));
     assert!(
-        architecture.contains("vcpu.get_arch_vcpu().arm_virtual_timer_wait()?")
+        architecture.contains("vcpu.get_arch_vcpu().arm_timer_wait()?")
             && architecture.contains("waits_for_event: true")
             && architecture.contains("has_pending_interrupt()"),
         "AxVM must arm CNTV wakeup and check canonical VGIC pending state before sleeping"
@@ -329,14 +372,16 @@ fn aarch64_traps_guest_wfi_without_losing_an_already_pending_virtual_irq() {
 }
 
 #[test]
-fn aarch64_guest_timer_state_is_banked_by_current_vcpu() {
-    let device = include_str!("../src/arch/aarch64/vtimer/device.rs");
+fn aarch64_guest_timer_state_is_owned_by_each_vcpu() {
+    let timer = include_str!("../../arm_vcpu/src/timer.rs");
+    let vm = include_str!("../src/arch/aarch64/vm.rs");
     let state = include_str!("../src/arch/aarch64/vtimer/state.rs");
 
-    assert!(device.contains("crate::current_vcpu_id()"));
-    assert!(device.contains(".get(vcpu)"));
-    assert!(state.contains("generation"));
-    assert!(state.contains("cancel_timer"));
+    assert!(timer.contains("pub struct ArmVcpuTimer"));
+    assert!(timer.contains("physical_timer: ArmTimerContext"));
+    assert!(state.contains("VmTimerHandle"));
+    assert!(state.contains("cancel_timer_handle"));
+    assert!(!vm.contains("Aarch64VtimerFactory"));
 }
 
 #[test]
@@ -555,25 +600,18 @@ fn host_time_trait_only_exposes_common_clock_capabilities() {
 
 #[test]
 fn aarch64_host_time_registers_axvm_timer_callback() {
-    let capabilities = include_str!("../src/arch/aarch64/capabilities.rs");
-    let (_, impl_and_rest) = capabilities
-        .split_once("impl HostTimePlatform for Aarch64Arch")
-        .expect("AArch64 must implement HostTimePlatform explicitly");
-    let (impl_body, _) = impl_and_rest
-        .split_once("impl BootImagePlatform for Aarch64Arch")
-        .expect("AArch64 HostTimePlatform implementation must precede BootImagePlatform");
+    let aarch64 = include_str!("../src/arch/aarch64/capabilities.rs");
+    let common = include_str!("../src/architecture/capabilities.rs");
 
     assert!(
-        impl_body.contains("fn register_timer_callback()"),
-        "AArch64 HostTimePlatform must override the empty default timer callback hook"
+        aarch64.contains("impl HostTimePlatform for Aarch64Arch {}"),
+        "AArch64 must use the common deferred host-timer path"
     );
     assert!(
-        impl_body.contains("ax_task::register_timer_callback"),
-        "AArch64 must register with the host task timer callback path"
-    );
-    assert!(
-        impl_body.contains("crate::check_timer_events();"),
-        "AArch64 host timer callback must drain the AxVM timer wheel"
+        common.contains("fn register_timer_callback(notify: Arc<IrqNotify>)")
+            && common.contains("ax_task::register_timer_irq_callback")
+            && common.contains("notify.notify_irq()"),
+        "hard IRQ must publish only to IrqNotify; the pinned worker drains the timer wheel"
     );
 }
 

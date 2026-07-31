@@ -42,9 +42,9 @@ impl GicV3Controller {
                 }
             }
             let acknowledged_physical_spis = state
-                .acknowledged_physical_spis
+                .physical_spi_acknowledged
                 .iter()
-                .copied()
+                .filter_map(|(spi, acknowledged)| acknowledged.then_some(*spi))
                 .collect::<Vec<_>>();
             for spi in acknowledged_physical_spis {
                 if let Some(wake) = state.queue_acknowledged_physical_spi_if_deliverable(spi)? {

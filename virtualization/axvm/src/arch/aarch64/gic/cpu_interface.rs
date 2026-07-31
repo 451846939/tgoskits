@@ -7,7 +7,7 @@ use arm_gic_driver::v3::{
 };
 use arm_vgic::{
     CpuInterfaceState, GicV3BackendError, GicVcpuId, HostGicVersion, IntId, InterruptState,
-    ListRegisterBacking, ListRegisterState, PhysicalIrqId, Priority, VgicBackendCapabilities,
+    ListRegisterBacking, ListRegisterState, Priority, VgicBackendCapabilities,
 };
 use ax_kspin::SpinNoIrq;
 use spin::Once;
@@ -273,23 +273,8 @@ fn encode_v2_list_register(entry: ListRegisterState) -> Result<u32, GicV3Backend
         | (state << 28)
         | (1 << 30);
     match entry.backing() {
-        ListRegisterBacking::Software => {
+        ListRegisterBacking::Software | ListRegisterBacking::Physical(_) => {
             raw |= 1 << 19;
-        }
-        ListRegisterBacking::Physical(physical) => {
-            let physical = u32::try_from(physical.raw()).map_err(|_| {
-                GicV3BackendError::new(
-                    "encode GICv2 list register",
-                    alloc::format!("physical IRQ {} does not fit GICH_LR", physical.raw()),
-                )
-            })?;
-            if physical >= 1024 {
-                return Err(GicV3BackendError::new(
-                    "encode GICv2 list register",
-                    alloc::format!("physical IRQ {physical} exceeds the 10-bit GICH_LR field"),
-                ));
-            }
-            raw |= (physical << 10) | (1 << 31);
         }
     }
     Ok(raw)
@@ -309,15 +294,12 @@ fn decode_v2_list_register(
     };
     let intid = decode_intid(index, raw & 0x3ff, "GICv2")?;
     let priority = Priority::new((((raw >> 23) & 0x1f) << 3) as u8);
-    if raw & (1 << 31) == 0 {
-        require_software_backing(index, previous, "GICv2")?;
-        return Ok(Some(ListRegisterState::new(intid, priority, state)));
+    if raw & (1 << 31) != 0 {
+        return Err(unexpected_hardware_backing(index, "GICv2"));
     }
-    let physical = PhysicalIrqId::new(u64::from((raw >> 10) & 0x3ff));
-    validate_physical_backing(index, previous, intid, physical, "GICv2")?;
-    Ok(Some(ListRegisterState::new_physical(
-        intid, priority, state, physical,
-    )))
+    Ok(Some(decode_resampled_backing(
+        index, previous, intid, priority, state, "GICv2",
+    )?))
 }
 
 fn load_v3(state: &CpuInterfaceState) -> Result<(), GicV3BackendError> {
@@ -449,14 +431,8 @@ fn write_v3_list_register(index: usize, entry: ListRegisterState) -> Result<(), 
         + ICH_LR_EL2::PRIORITY.val(u64::from(entry.priority().raw()))
         + ICH_LR_EL2::GROUP::SET
         + state;
-    if let ListRegisterBacking::Physical(physical) = entry.backing() {
-        let pintid = u16::try_from(physical.raw()).map_err(|_| {
-            GicV3BackendError::new(
-                "encode GICv3 list register",
-                alloc::format!("physical IRQ {} does not fit PINTID", physical.raw()),
-            )
-        })?;
-        fields = fields + ICH_LR_EL2::HW::SET + ICH_LR_EL2::PINTID.val(u64::from(pintid));
+    if matches!(entry.backing(), ListRegisterBacking::Physical(_)) {
+        fields = fields + ICH_LR_EL2::EOI::SET;
     }
     ich_lr_el2_write(index, fields);
     Ok(())
@@ -481,15 +457,12 @@ fn read_v3_list_register(
     };
     let intid = decode_intid(index, raw.read(ICH_LR_EL2::VINTID) as u32, "GICv3")?;
     let priority = Priority::new(raw.read(ICH_LR_EL2::PRIORITY) as u8);
-    if !raw.is_set(ICH_LR_EL2::HW) {
-        require_software_backing(index, previous, "GICv3")?;
-        return Ok(Some(ListRegisterState::new(intid, priority, state)));
+    if raw.is_set(ICH_LR_EL2::HW) {
+        return Err(unexpected_hardware_backing(index, "GICv3"));
     }
-    let physical = PhysicalIrqId::new(raw.read(ICH_LR_EL2::PINTID));
-    validate_physical_backing(index, previous, intid, physical, "GICv3")?;
-    Ok(Some(ListRegisterState::new_physical(
-        intid, priority, state, physical,
-    )))
+    Ok(Some(decode_resampled_backing(
+        index, previous, intid, priority, state, "GICv3",
+    )?))
 }
 
 fn decode_intid(index: usize, raw: u32, version: &'static str) -> Result<IntId, GicV3BackendError> {
@@ -501,46 +474,43 @@ fn decode_intid(index: usize, raw: u32, version: &'static str) -> Result<IntId, 
     })
 }
 
-fn require_software_backing(
-    index: usize,
-    previous: Option<ListRegisterState>,
-    version: &'static str,
-) -> Result<(), GicV3BackendError> {
-    if previous.is_some_and(|entry| matches!(entry.backing(), ListRegisterBacking::Physical(_))) {
-        Err(GicV3BackendError::new(
-            "decode virtual list register",
-            alloc::format!("{version} LR{index} lost its physical backing"),
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-fn validate_physical_backing(
+fn decode_resampled_backing(
     index: usize,
     previous: Option<ListRegisterState>,
     intid: IntId,
-    physical: PhysicalIrqId,
+    priority: Priority,
+    state: InterruptState,
     version: &'static str,
-) -> Result<(), GicV3BackendError> {
-    let previous = previous.ok_or_else(|| {
-        GicV3BackendError::new(
-            "decode virtual list register",
-            alloc::format!("{version} LR{index} acquired unexpected physical backing"),
-        )
-    })?;
-    if previous.intid() != intid || previous.backing() != ListRegisterBacking::Physical(physical) {
-        return Err(GicV3BackendError::new(
-            "decode virtual list register",
-            alloc::format!(
-                "{version} LR{index} changed physical identity from {:?}/{:?} to \
-                 {intid:?}/{physical:?}",
-                previous.intid(),
-                previous.backing()
-            ),
-        ));
+) -> Result<ListRegisterState, GicV3BackendError> {
+    match previous {
+        Some(previous) if previous.intid() == intid => match previous.backing() {
+            ListRegisterBacking::Software => Ok(ListRegisterState::new(intid, priority, state)),
+            ListRegisterBacking::Physical(physical) => Ok(ListRegisterState::new_physical(
+                intid, priority, state, physical,
+            )),
+        },
+        Some(previous) if matches!(previous.backing(), ListRegisterBacking::Physical(_)) => {
+            Err(GicV3BackendError::new(
+                "decode virtual list register",
+                alloc::format!(
+                    "{version} LR{index} changed the INTID of a resampled physical delivery from \
+                     {:?} to {intid:?}",
+                    previous.intid()
+                ),
+            ))
+        }
+        Some(_) | None => Ok(ListRegisterState::new(intid, priority, state)),
     }
-    Ok(())
+}
+
+fn unexpected_hardware_backing(index: usize, version: &'static str) -> GicV3BackendError {
+    GicV3BackendError::new(
+        "decode virtual list register",
+        alloc::format!(
+            "{version} LR{index} acquired direct hardware backing; assigned interrupts require \
+             software resampling"
+        ),
+    )
 }
 
 fn require_lr_count(

@@ -86,6 +86,14 @@ pub enum VgicError {
         /// Operation requiring it.
         operation: &'static str,
     },
+    /// A hard-IRQ delivery exhausted its preallocated queue capacity.
+    #[error("vCPU {vcpu} has no preallocated delivery slot for {intid:?}")]
+    DeliveryQueueFull {
+        /// Target virtual CPU.
+        vcpu: usize,
+        /// Interrupt that could not be queued without allocating.
+        intid: IntId,
+    },
     /// Guest-memory access for an ITS queue failed.
     #[error("ITS guest-memory {operation} at {address:#x} for {length} bytes failed: {detail}")]
     GuestMemory {

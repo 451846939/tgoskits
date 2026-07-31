@@ -113,6 +113,7 @@ pub(crate) struct RedistributorState {
     sgi_sources: [u8; 16],
     lpis: BTreeMap<LpiId, InterruptRecord>,
     queued_deliveries: VecDeque<QueuedDelivery>,
+    physical_delivery_reserve: usize,
     cpu_interface: CpuInterfaceState,
     wake: Arc<dyn GicV3VcpuWake>,
     lpis_enabled: bool,
@@ -125,6 +126,7 @@ impl RedistributorState {
         vcpu: GicVcpuId,
         affinity: GicAffinity,
         list_register_count: usize,
+        spi_count: usize,
         wake: Arc<dyn GicV3VcpuWake>,
     ) -> VgicResult<Self> {
         let mut private_interrupts = Vec::with_capacity(32);
@@ -143,7 +145,8 @@ impl RedistributorState {
             private_interrupts,
             sgi_sources: [0; 16],
             lpis: BTreeMap::new(),
-            queued_deliveries: VecDeque::new(),
+            queued_deliveries: VecDeque::with_capacity(32 + spi_count),
+            physical_delivery_reserve: spi_count,
             cpu_interface: CpuInterfaceState::new(list_register_count),
             wake,
             lpis_enabled: false,
@@ -200,8 +203,18 @@ impl RedistributorState {
         self.queue_delivery(QueuedDelivery::software(intid));
     }
 
-    pub(crate) fn queue_physical(&mut self, intid: IntId, physical: PhysicalIrqId) {
-        self.queue_delivery(QueuedDelivery::physical(intid, physical));
+    pub(crate) fn queue_physical(&mut self, intid: IntId, physical: PhysicalIrqId) -> VgicResult {
+        let delivery = QueuedDelivery::physical(intid, physical);
+        if self.prepare_queued_delivery(delivery) {
+            if self.queued_deliveries.len() == self.queued_deliveries.capacity() {
+                return Err(VgicError::DeliveryQueueFull {
+                    vcpu: self.vcpu.raw(),
+                    intid,
+                });
+            }
+            self.queued_deliveries.push_back(delivery);
+        }
+        Ok(())
     }
 
     pub(crate) fn has_physical_delivery(&self, intid: IntId, physical: PhysicalIrqId) -> bool {
@@ -237,6 +250,22 @@ impl RedistributorState {
     }
 
     fn queue_delivery(&mut self, delivery: QueuedDelivery) {
+        if !self.prepare_queued_delivery(delivery) {
+            return;
+        }
+        let free_slots = self
+            .queued_deliveries
+            .capacity()
+            .saturating_sub(self.queued_deliveries.len());
+        if free_slots <= self.physical_delivery_reserve {
+            self.queued_deliveries
+                .reserve(self.physical_delivery_reserve.saturating_add(1));
+        }
+        self.queued_deliveries.push_back(delivery);
+    }
+
+    /// Updates an existing delivery and returns whether a new queue slot is required.
+    fn prepare_queued_delivery(&mut self, delivery: QueuedDelivery) -> bool {
         if let Some(queued) = self
             .queued_deliveries
             .iter_mut()
@@ -247,7 +276,7 @@ impl RedistributorState {
             {
                 queued.pend();
             }
-            return;
+            return false;
         }
         if let Some(entry) = self
             .cpu_interface
@@ -265,9 +294,9 @@ impl RedistributorState {
                     state => state,
                 });
             }
-            return;
+            return false;
         }
-        self.queued_deliveries.push_back(delivery);
+        true
     }
 
     pub(crate) fn clear_pending_delivery(&mut self, intid: IntId) -> bool {
@@ -537,20 +566,17 @@ impl RedistributorState {
         state: InterruptState,
     ) {
         delivery.set_state(state);
-        self.queued_deliveries.push_back(delivery);
+        self.queue_delivery(delivery);
     }
 
     fn clear_queued_pending(&mut self, intid: IntId) {
-        let mut retained = VecDeque::with_capacity(self.queued_deliveries.len());
-        while let Some(mut delivery) = self.queued_deliveries.pop_front() {
+        for delivery in &mut self.queued_deliveries {
             if delivery.intid() == intid {
                 delivery.clear_pending();
             }
-            if delivery.state() != InterruptState::Inactive {
-                retained.push_back(delivery);
-            }
         }
-        self.queued_deliveries = retained;
+        self.queued_deliveries
+            .retain(|delivery| delivery.state() != InterruptState::Inactive);
     }
 
     fn delivery_priority(
@@ -598,7 +624,11 @@ impl RedistributorState {
     }
 
     pub(crate) fn set_ppi_level(&mut self, ppi: PpiId, asserted: bool) {
-        self.private_interrupts[ppi.raw() as usize].set_level(asserted);
+        let index = ppi.raw() as usize;
+        self.private_interrupts[index].set_level(asserted);
+        if !asserted && self.clear_pending_delivery(IntId::Ppi(ppi)) {
+            self.private_interrupts[index].cancel_inflight();
+        }
     }
 
     pub(crate) fn set_ppi_trigger(&mut self, ppi: PpiId, trigger: TriggerMode) {
@@ -667,5 +697,47 @@ fn select_pending(
     }
     if selected.is_none_or(|current| (priority, intid) < (current.1, current.0)) {
         *selected = Some((intid, priority));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct NoopWake;
+
+    impl GicV3VcpuWake for NoopWake {
+        fn wake(&self) -> VgicResult {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn physical_delivery_uses_only_preallocated_queue_slots() {
+        let mut redistributor = RedistributorState::new(
+            GicVcpuId::new(0),
+            GicAffinity::new(0, 0, 0, 0),
+            4,
+            4,
+            Arc::new(NoopWake),
+        )
+        .unwrap();
+        let capacity = redistributor.queued_deliveries.capacity();
+
+        for raw in 0..32 {
+            redistributor.queue(IntId::new(raw).unwrap());
+        }
+        for raw in 32..36 {
+            redistributor
+                .queue_physical(IntId::new(raw).unwrap(), PhysicalIrqId::new(u64::from(raw)))
+                .unwrap();
+        }
+
+        assert_eq!(redistributor.queued_deliveries.capacity(), capacity);
+        assert!(matches!(
+            redistributor.queue_physical(IntId::new(36).unwrap(), PhysicalIrqId::new(36),),
+            Err(VgicError::DeliveryQueueFull { .. })
+        ));
+        assert_eq!(redistributor.queued_deliveries.capacity(), capacity);
     }
 }

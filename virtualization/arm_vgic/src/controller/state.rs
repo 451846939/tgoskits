@@ -104,7 +104,15 @@ impl ControllerState {
                 ),
             });
         }
-        self.acknowledged_physical_spis.insert(spi);
+        let acknowledged = self
+            .physical_spi_acknowledged
+            .get_mut(&spi)
+            .ok_or_else(|| VgicError::InvalidStateTransition {
+                intid: IntId::Spi(spi),
+                operation: "forward physical SPI",
+                detail: "the physical binding has no preallocated acknowledgement state".into(),
+            })?;
+        *acknowledged = true;
         self.queue_acknowledged_physical_spi_if_deliverable(spi)
     }
 
@@ -112,7 +120,12 @@ impl ControllerState {
         &mut self,
         spi: SpiId,
     ) -> VgicResult<Option<Arc<dyn GicV3VcpuWake>>> {
-        if !self.acknowledged_physical_spis.contains(&spi) {
+        if !self
+            .physical_spi_acknowledged
+            .get(&spi)
+            .copied()
+            .unwrap_or(false)
+        {
             return Ok(None);
         }
         let binding = match self.spi_backings.get(&spi).copied() {
@@ -135,9 +148,12 @@ impl ControllerState {
             return Ok(None);
         }
         let redistributor = self.redistributor_mut(binding.target(), "forward physical SPI")?;
-        redistributor.queue_physical(IntId::Spi(spi), binding.host());
+        redistributor.queue_physical(IntId::Spi(spi), binding.host())?;
         let wake = redistributor.wake();
-        self.acknowledged_physical_spis.remove(&spi);
+        *self
+            .physical_spi_acknowledged
+            .get_mut(&spi)
+            .expect("an owned physical SPI must have acknowledgement state") = false;
         Ok(Some(wake))
     }
 
@@ -451,7 +467,7 @@ impl ControllerState {
             self.redistributor_mut(vcpu, "requeue software interrupt")?
                 .queue(intid);
         }
-        self.retirement_for(delivery.backing(), intid, false)
+        self.retirement_for(delivery.backing(), intid)
     }
 
     pub(super) fn deactivate_interrupt(
@@ -499,18 +515,16 @@ impl ControllerState {
             self.redistributor_mut(vcpu, "requeue deactivated interrupt")?
                 .queue(intid);
         }
-        self.retirement_for(delivery.backing(), intid, true)
+        self.retirement_for(delivery.backing(), intid)
     }
 
     fn retirement_for(
         &self,
         backing: ListRegisterBacking,
         intid: IntId,
-        explicit_deactivation: bool,
     ) -> VgicResult<Option<DeliveryRetirement>> {
         match backing {
             ListRegisterBacking::Software => Ok(Some(DeliveryRetirement::Emulated { intid })),
-            ListRegisterBacking::Physical(_) if !explicit_deactivation => Ok(None),
             ListRegisterBacking::Physical(host) => {
                 let IntId::Spi(spi) = intid else {
                     return Err(VgicError::WrongIntIdClass {

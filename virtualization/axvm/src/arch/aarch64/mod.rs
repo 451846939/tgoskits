@@ -80,14 +80,7 @@ impl ArchOps for Aarch64Arch {
         _vm: &crate::AxVMRef,
         vcpu: &crate::vm::AxVCpuRef<Self::VCpu>,
     ) -> AxVmResult {
-        vcpu.get_arch_vcpu().invalidate_virtual_timer_wait();
-        Ok(())
-    }
-
-    fn after_vcpu_run(_vm: &crate::AxVMRef, vcpu: &crate::vm::AxVCpuRef<Self::VCpu>) {
-        if let Err(error) = vcpu.get_arch_vcpu().synchronize_virtual_timer() {
-            warn!("failed to synchronize AArch64 virtual timer PPI: {error:?}");
-        }
+        vcpu.get_arch_vcpu().prepare_timer_run()
     }
 
     fn on_last_vcpu_exit(vm: &crate::AxVMRef) -> AxVmResult {
@@ -159,7 +152,7 @@ impl ArchOps for Aarch64Arch {
                 Aarch64DeferredRunWork::ExternalInterrupt { token },
             )),
             ArmVmExit::WaitForInterrupt => {
-                vcpu.get_arch_vcpu().arm_virtual_timer_wait()?;
+                vcpu.get_arch_vcpu().arm_timer_wait()?;
                 Ok(BoundVcpuExit::Complete(VcpuRunAction {
                     waits_for_event: true,
                     stop_reason: None,
@@ -214,15 +207,17 @@ impl ArchOps for Aarch64Arch {
 
     fn finish_deferred_run_work(
         _vm: &crate::AxVMRef,
-        _vcpu: &crate::vm::AxVCpuRef<Self::VCpu>,
+        vcpu: &crate::vm::AxVCpuRef<Self::VCpu>,
         work: Self::DeferredRunWork,
     ) -> AxVmResult<VcpuRunAction> {
         match work {
             Aarch64DeferredRunWork::ExternalInterrupt { token } => {
                 if let Some(token) = token {
-                    gic::route_acknowledged_host_irq(token).map_err(|error| {
-                        crate::AxVmError::interrupt("route acknowledged host IRQ", error)
-                    })?;
+                    if !vcpu.get_arch_vcpu().accept_host_timer_irq(token) {
+                        gic::route_acknowledged_host_irq(token).map_err(|error| {
+                            crate::AxVmError::interrupt("route acknowledged host IRQ", error)
+                        })?;
+                    }
                 }
                 crate::check_timer_events();
             }
@@ -243,7 +238,29 @@ impl ArchOps for Aarch64Arch {
                 return true;
             }
             match vcpu.get_arch_vcpu().has_pending_interrupt() {
-                Ok(pending) => pending,
+                Ok(true) => true,
+                Ok(false) => match vcpu.get_arch_vcpu().arm_timer_wait() {
+                    Ok(()) => match vcpu.get_arch_vcpu().has_pending_interrupt() {
+                        Ok(pending) => pending,
+                        Err(error) => {
+                            warn!(
+                                "VM[{}] VCpu[{}] cannot recheck VGIC after arming timer: {error:?}",
+                                vm.id(),
+                                vcpu.id()
+                            );
+                            true
+                        }
+                    },
+                    Err(error) => {
+                        warn!(
+                            "VM[{}] VCpu[{}] cannot rearm architectural timer before WFI wait: \
+                             {error:?}",
+                            vm.id(),
+                            vcpu.id()
+                        );
+                        true
+                    }
+                },
                 Err(error) => {
                     warn!(
                         "VM[{}] VCpu[{}] cannot query VGIC pending state before WFI wait: \
@@ -287,39 +304,44 @@ impl ArmHostOps for AxvmArmHostOps {
 }
 
 pub(crate) struct AxvmArmVcpu {
+    vm_id: usize,
     inner: ArmVcpu<AxvmArmHostOps>,
     vgic: Option<Arc<VgicCore>>,
     vgic_binding: Option<GicV3VcpuBinding>,
-    virtual_timer_relay: Option<Arc<vtimer::VirtualTimerRelay>>,
+    timer_binding: Option<Arc<vtimer::Aarch64TimerBinding>>,
 }
 
 impl AxvmArmVcpu {
     pub(crate) fn attach_vgic(
         &mut self,
         vgic: Arc<VgicCore>,
-        binding: GicV3VcpuBinding,
+        irq_binding: vgic::Aarch64VcpuIrqBinding,
+        timer_config: arm_vcpu::ArmTimerVmConfig,
     ) -> AxVmResult {
         if self.vgic_binding.is_some() {
             return ax_err!(BadState, "AArch64 vCPU already has a VGIC binding");
         }
-        let ppi = arm_vgic::PpiId::new(vgic::GUEST_VIRTUAL_TIMER_PPI)
-            .map_err(|error| crate::AxVmError::interrupt("validate virtual timer PPI", error))?;
-        let frequency = vtimer::counter_frequency();
-        if frequency == 0 {
-            return Err(crate::AxVmError::unsupported(
-                "attach AArch64 virtual timer",
-                "CNTFRQ_EL0 reports zero",
-            ));
-        }
-        let relay = Arc::new(vtimer::VirtualTimerRelay::new(
+        let vgic::Aarch64VcpuIrqBinding {
+            gic: binding,
+            backend,
+            virtual_timer_ppi,
+            physical_timer_ppi,
+            host_virtual_timer_intid,
+        } = irq_binding;
+        let timer_binding = vtimer::Aarch64TimerBinding::new(
+            self.vm_id,
             vgic.clone(),
+            backend,
             binding.vcpu(),
-            ppi,
-            frequency,
-        ));
+            virtual_timer_ppi,
+            physical_timer_ppi,
+            host_virtual_timer_intid,
+            timer_config.frequency(),
+        )
+        .map_err(|error| crate::AxVmError::interrupt("bind host virtual-timer PPI", error))?;
         self.vgic = Some(vgic);
         self.vgic_binding = Some(binding);
-        self.virtual_timer_relay = Some(relay);
+        self.timer_binding = Some(timer_binding);
         Ok(())
     }
 
@@ -363,30 +385,52 @@ impl AxvmArmVcpu {
             .map_err(|error| crate::AxVmError::interrupt("deactivate virtual interrupt", error))
     }
 
-    fn synchronize_virtual_timer(&self) -> AxVmResult {
-        self.virtual_timer_relay
+    fn synchronize_timer(&self) -> BackendResult {
+        let snapshot = arm_result(self.inner.timer_snapshot())?;
+        let binding = self
+            .timer_binding
             .as_ref()
-            .ok_or_else(|| {
-                crate::AxVmError::resource_unavailable("virtual timer relay", "missing")
-            })?
-            .synchronize_level(self.inner.virtual_timer_state())
-            .map_err(|error| crate::AxVmError::interrupt("synchronize virtual timer PPI", error))
+            .ok_or(BackendError::InvalidState)?;
+        vgic_backend_result(binding.synchronize(snapshot))
     }
 
-    fn arm_virtual_timer_wait(&self) -> AxVmResult {
-        self.virtual_timer_relay
+    fn arm_timer_wait(&self) -> AxVmResult {
+        let snapshot = self.inner.timer_snapshot().map_err(|error| {
+            crate::AxVmError::vcpu(
+                "snapshot AArch64 architectural timers",
+                alloc::format!("{error:?}"),
+            )
+        })?;
+        self.timer_binding
             .as_ref()
             .ok_or_else(|| {
-                crate::AxVmError::resource_unavailable("virtual timer relay", "missing")
+                crate::AxVmError::resource_unavailable("AArch64 timer binding", "missing")
             })?
-            .arm_wait(self.inner.virtual_timer_state());
-        Ok(())
+            .arm_wait(snapshot)
+            .map_err(|error| crate::AxVmError::interrupt("arm architectural timer wait", error))
     }
 
     fn invalidate_virtual_timer_wait(&self) {
-        if let Some(relay) = &self.virtual_timer_relay {
-            relay.invalidate_wait();
+        if let Some(binding) = &self.timer_binding {
+            binding.invalidate_wait();
         }
+    }
+
+    fn prepare_timer_run(&self) -> AxVmResult {
+        self.invalidate_virtual_timer_wait();
+        self.timer_binding
+            .as_ref()
+            .ok_or_else(|| {
+                crate::AxVmError::resource_unavailable("AArch64 timer binding", "missing")
+            })?
+            .prepare_run()
+            .map_err(|error| crate::AxVmError::interrupt("prepare timer PPI route", error))
+    }
+
+    fn accept_host_timer_irq(&self, token: usize) -> bool {
+        self.timer_binding
+            .as_ref()
+            .is_some_and(|binding| binding.accept_host_irq(token))
     }
 
     fn has_pending_interrupt(&self) -> AxVmResult<bool> {
@@ -403,10 +447,11 @@ impl VmArchVcpuOps for AxvmArmVcpu {
 
     fn new(vm_id: VMId, vcpu_id: VCpuId, config: Self::CreateConfig) -> BackendResult<Self> {
         arm_result(ArmVcpu::new(vm_id, vcpu_id, config)).map(|inner| Self {
+            vm_id,
             inner,
             vgic: None,
             vgic_binding: None,
-            virtual_timer_relay: None,
+            timer_binding: None,
         })
     }
 
@@ -432,9 +477,11 @@ impl VmArchVcpuOps for AxvmArmVcpu {
             .ok_or(BackendError::InvalidState)?;
         vgic_backend_result(binding.load())?;
         let run_result = arm_result(self.inner.run());
+        let timer_result = self.synchronize_timer();
         let save_result = vgic_backend_result(binding.save());
         match run_result {
             Ok(exit) => {
+                timer_result?;
                 save_result?;
                 Ok(exit)
             }
@@ -482,6 +529,16 @@ impl VmArchVcpuOps for AxvmArmVcpu {
     }
 }
 
+impl Drop for AxvmArmVcpu {
+    fn drop(&mut self) {
+        if let Some(binding) = &self.timer_binding
+            && let Err(error) = binding.reset()
+        {
+            warn!("failed to reset AArch64 timer binding while dropping vCPU: {error}");
+        }
+    }
+}
+
 pub(crate) struct AxvmArmPerCpu(ArmPerCpu);
 
 impl VmArchPerCpuOps for AxvmArmPerCpu {
@@ -494,10 +551,21 @@ impl VmArchPerCpuOps for AxvmArmPerCpu {
     }
 
     fn hardware_enable(&mut self) -> BackendResult {
-        arm_result(self.0.hardware_enable::<AxvmArmHostOps>())
+        arm_result(self.0.hardware_enable::<AxvmArmHostOps>())?;
+        if let Err(error) = gic::enable_maintenance_interrupt() {
+            if let Err(rollback_error) = self.0.hardware_disable() {
+                warn!(
+                    "failed to roll back AArch64 virtualization after maintenance IRQ setup \
+                     failed: {rollback_error:?}"
+                );
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn hardware_disable(&mut self) -> BackendResult {
+        gic::disable_maintenance_interrupt()?;
         arm_result(self.0.hardware_disable())
     }
 
@@ -507,6 +575,10 @@ impl VmArchPerCpuOps for AxvmArmPerCpu {
 
     fn guest_phys_addr_bits(&self) -> usize {
         self.0.guest_phys_addr_bits()
+    }
+
+    fn timer_frequency_hz(&self) -> Option<u64> {
+        Some(self.0.timer_frequency_hz())
     }
 }
 
@@ -523,6 +595,7 @@ fn vgic_backend_result<T>(result: arm_vgic::VgicResult<T>) -> BackendResult<T> {
         | arm_vgic::VgicError::InvalidItsCommand { .. }
         | arm_vgic::VgicError::ItsCommandBudgetExceeded { .. } => BackendError::InvalidData,
         arm_vgic::VgicError::ResourceConflict { .. } => BackendError::ResourceBusy,
+        arm_vgic::VgicError::DeliveryQueueFull { .. } => BackendError::OutOfMemory,
         arm_vgic::VgicError::Unsupported { .. } => BackendError::Unsupported,
         arm_vgic::VgicError::ResourceNotFound { .. }
         | arm_vgic::VgicError::InvalidStateTransition { .. }
