@@ -20,8 +20,8 @@ use dma_api::{
 use irq_framework::{HwIrq, IrqDomainId, IrqId};
 use rdif_block::{
     BatchSubmitDisposition, BatchSubmitResult, CompletedRequest, CompletionSink, ControlEvent,
-    DriverGeneric, HardIrqHandler, HardwareQueue, IrqAck, IrqQueueMask, OwnedRequestBatch,
-    QueueLimits, RequestId, SubmissionSink,
+    DriverGeneric, GroupIrqSink, HardIrqHandler, HardwareQueue, IrqAck, IrqDisposition,
+    IrqQueueMask, OwnedRequestBatch, QueueLimits, RequestId, SharedHardIrqHandler, SubmissionSink,
 };
 
 use super::{device::create_cpu_channels, *};
@@ -123,6 +123,14 @@ struct QueueZeroHandler;
 impl HardIrqHandler for QueueZeroHandler {
     fn ack(&mut self) -> IrqAck {
         IrqAck::cleared(IrqQueueMask::from_queue(0), ControlEvent::new(0, 0))
+    }
+}
+
+struct SharedSpuriousHandler;
+
+impl SharedHardIrqHandler for SharedSpuriousHandler {
+    fn ack(&mut self, _sink: &mut dyn GroupIrqSink) -> IrqDisposition {
+        IrqDisposition::Spurious
     }
 }
 
@@ -331,10 +339,120 @@ impl BlockController for LifecycleController {
     }
 }
 
+struct GroupMemberController {
+    name: &'static str,
+    queue: Option<LifecycleQueue>,
+    log: Arc<StdMutex<Vec<&'static str>>>,
+}
+
+impl DriverGeneric for GroupMemberController {
+    fn name(&self) -> &str {
+        self.name
+    }
+}
+
+impl BlockController for GroupMemberController {
+    fn device_info(&self) -> DeviceInfo {
+        test_queue_info().device
+    }
+
+    fn max_io_queues(&self) -> usize {
+        1
+    }
+
+    fn advance(&mut self, event: ControllerEvent) -> Result<ControllerUpdate, BlkError> {
+        match event {
+            ControllerEvent::Start { .. } => Ok(ControllerUpdate::with_resources(
+                ControllerState::Ready,
+                vec![Box::new(self.queue.take().ok_or(BlkError::Io)?)],
+                Vec::new(),
+            )),
+            ControllerEvent::QuiesceIrqs => {
+                self.log.lock().unwrap().push("member_quiesce");
+                Ok(ControllerUpdate::state(ControllerState::Ready))
+            }
+            ControllerEvent::Shutdown | ControllerEvent::Watchdog { .. } => {
+                self.log.lock().unwrap().push("member_shutdown");
+                Ok(ControllerUpdate::state(ControllerState::Shutdown))
+            }
+            _ => Ok(ControllerUpdate::state(ControllerState::Ready)),
+        }
+    }
+}
+
+struct TestControllerGroup {
+    members: Option<Vec<BlockGroupMember>>,
+    log: Arc<StdMutex<Vec<&'static str>>>,
+}
+
+impl DriverGeneric for TestControllerGroup {
+    fn name(&self) -> &str {
+        "test-controller-group"
+    }
+}
+
+impl BlockControllerGroup for TestControllerGroup {
+    fn advance(&mut self, event: GroupControllerEvent) -> Result<GroupControllerUpdate, BlkError> {
+        match event {
+            GroupControllerEvent::Start => Ok(GroupControllerUpdate::with_resources(
+                ControllerState::Ready,
+                self.members.take().ok_or(BlkError::Io)?,
+                vec![SharedIrqEndpoint::new(0, Box::new(SharedSpuriousHandler))],
+            )),
+            GroupControllerEvent::Rearm { .. } => {
+                self.log.lock().unwrap().push("group_rearm");
+                Ok(GroupControllerUpdate::state(ControllerState::Ready))
+            }
+            GroupControllerEvent::QuiesceIrqs => {
+                self.log.lock().unwrap().push("group_quiesce");
+                Ok(GroupControllerUpdate::state(ControllerState::Ready))
+            }
+            GroupControllerEvent::Shutdown => {
+                self.log.lock().unwrap().push("group_shutdown");
+                Ok(GroupControllerUpdate::state(ControllerState::Shutdown))
+            }
+            _ => Ok(GroupControllerUpdate::state(ControllerState::Ready)),
+        }
+    }
+}
+
 struct EndpointFirstController {
     queue: Option<LifecycleQueue>,
     register_retries: Arc<AtomicUsize>,
     log: Arc<StdMutex<Vec<&'static str>>>,
+}
+
+struct WaitingForIrqController;
+
+impl DriverGeneric for WaitingForIrqController {
+    fn name(&self) -> &str {
+        "waiting-for-irq-controller"
+    }
+}
+
+impl BlockController for WaitingForIrqController {
+    fn device_info(&self) -> DeviceInfo {
+        test_queue_info().device
+    }
+
+    fn max_io_queues(&self) -> usize {
+        1
+    }
+
+    fn advance(&mut self, event: ControllerEvent) -> Result<ControllerUpdate, BlkError> {
+        match event {
+            ControllerEvent::Start { .. } => Ok(ControllerUpdate::with_resources(
+                ControllerState::WaitingForIrq,
+                Vec::new(),
+                vec![IrqEndpoint::new(0, 0, Box::new(SpuriousHandler))],
+            )),
+            ControllerEvent::Rearm { .. } => {
+                Ok(ControllerUpdate::state(ControllerState::WaitingForIrq))
+            }
+            ControllerEvent::Shutdown => Ok(ControllerUpdate::state(ControllerState::Shutdown)),
+            _ => Ok(ControllerUpdate::state(ControllerState::WaitingForIrq)),
+        }
+    }
 }
 
 impl DriverGeneric for EndpointFirstController {
@@ -689,6 +807,72 @@ fn teardown_disables_controller_before_queue_memory_is_released() {
 }
 
 #[test]
+fn controller_group_registers_one_shared_irq_for_two_members_and_tears_down_once() {
+    let _registrar_guard = lock_test_irq_registrar();
+    crate::os::task::install_test_runtime_ops();
+    let log = Arc::new(StdMutex::new(Vec::new()));
+    *TEST_IRQ_REGISTRAR.log.lock().unwrap() = Some(Arc::clone(&log));
+    *TEST_IRQ_REGISTRAR.action.lock().unwrap() = None;
+    TEST_IRQ_REGISTRAR
+        .fail_registration
+        .store(false, Ordering::Release);
+    set_irq_registrar(&TEST_IRQ_REGISTRAR);
+
+    let member = |member_name| {
+        Box::new(GroupMemberController {
+            name: member_name,
+            queue: Some(LifecycleQueue {
+                log: Arc::clone(&log),
+            }),
+            log: Arc::clone(&log),
+        }) as Box<dyn BlockController>
+    };
+    let group = TestControllerGroup {
+        members: Some(vec![
+            BlockGroupMember::new(0, member("group-member-0")),
+            BlockGroupMember::new(1, member("group-member-1")),
+        ]),
+        log: Arc::clone(&log),
+    };
+    let irq = IrqId::new(IrqDomainId(1), HwIrq(14));
+    let runtime = BlockRuntime::from_rdif_sources(
+        Vec::new(),
+        [RdifBlockGroup::new_with_irqs(
+            "shared-group",
+            [BlockIrqSource { source_id: 0, irq }],
+            Box::new(group),
+        )],
+    );
+
+    assert_eq!(runtime.devices().len(), 2);
+    assert_eq!(
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|entry| **entry == "irq_register_disabled")
+            .count(),
+        1
+    );
+    assert_eq!(runtime.release_irqs_for_passthrough(), 1);
+    let log = log.lock().unwrap();
+    assert_eq!(
+        log.iter()
+            .filter(|entry| **entry == "irq_disable_sync")
+            .count(),
+        1
+    );
+    assert_eq!(log.iter().filter(|entry| **entry == "irq_free").count(), 1);
+    assert_eq!(
+        log.iter()
+            .filter(|entry| **entry == "member_shutdown")
+            .count(),
+        2
+    );
+    assert!(log_position(&log, "irq_disable_sync") < log_position(&log, "member_shutdown"));
+    assert!(log_position(&log, "member_shutdown") < log_position(&log, "group_shutdown"));
+}
+
+#[test]
 fn late_hctx_failure_cannot_resurrect_a_stopped_device() {
     let _registrar_guard = lock_test_irq_registrar();
     crate::os::task::install_test_runtime_ops();
@@ -804,6 +988,31 @@ fn controller_can_register_control_irq_before_creating_an_io_queue() {
     );
     assert_eq!(handle.inner.hctxs.lock().len(), 1);
     assert_eq!(handle.inner.cpu_channels.lock().len(), 1);
+    assert_eq!(handle.shutdown(), 1);
+}
+
+#[test]
+fn bootstrap_preserves_waiting_for_irq_controller_without_io_queue() {
+    let _registrar_guard = lock_test_irq_registrar();
+    crate::os::task::install_test_runtime_ops();
+    let log = Arc::new(StdMutex::new(Vec::new()));
+    *TEST_IRQ_REGISTRAR.log.lock().unwrap() = Some(log);
+    *TEST_IRQ_REGISTRAR.action.lock().unwrap() = None;
+    TEST_IRQ_REGISTRAR
+        .fail_registration
+        .store(false, Ordering::Release);
+    set_irq_registrar(&TEST_IRQ_REGISTRAR);
+    let irq = IrqId::new(IrqDomainId(1), HwIrq(15));
+
+    let handle = BlockDeviceHandle::bootstrap(
+        String::from("waiting-for-irq"),
+        vec![BlockIrqSource { source_id: 0, irq }],
+        Box::new(WaitingForIrqController),
+    )
+    .expect("a control IRQ may precede creation of the first I/O queue");
+
+    assert_eq!(handle.inner.state.load(Ordering::Acquire), DEVICE_STARTING);
+    assert!(handle.inner.hctxs.lock().is_empty());
     assert_eq!(handle.shutdown(), 1);
 }
 
