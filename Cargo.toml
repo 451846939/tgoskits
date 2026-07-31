@@ -97,7 +97,6 @@ members = [
     "os/arceos/api/*",
     "os/arceos/modules/axalloc",
     "os/arceos/modules/axdisplay",
-    "os/arceos/modules/axdma",
     "os/arceos/modules/axfs-ng",
     "os/arceos/modules/axhal",
     "os/arceos/modules/axinput",
@@ -148,7 +147,6 @@ ax-cgroup = { version = "0.1.0", path = "components/ax-cgroup" }
 ax-ctor-bare = { version = "0.4.8", path = "components/ctor_bare/ctor_bare" }
 ax-ctor-bare-macros = { version = "0.4.8", path = "components/ctor_bare/ctor_bare_macros" }
 ax-display = { version = "0.6.6", path = "os/arceos/modules/axdisplay" }
-ax-dma = { version = "0.6.13", path = "os/arceos/modules/axdma" }
 ax-driver = { version = "0.12.1", path = "drivers/ax-driver" }
 virtio-drivers = { version = "0.13.0", default-features = false }
 ax-errno = { version = "0.6.1", path = "components/axerrno" }
@@ -202,6 +200,7 @@ axvisor = { version = "0.5.22", path = "os/axvisor" }
 axvm = { version = "0.5.24", path = "virtualization/axvm", default-features = false }
 axvm-types = { version = "0.7.1", path = "virtualization/axvm-types" }
 axvmconfig = { version = "0.8.2", path = "virtualization/axvmconfig", default-features = false }
+ahci-driver = { version = "0.1.0", path = "drivers/blk/ahci-driver" }
 bitmap-allocator = { version = "0.4.6", path = "memory/bitmap-allocator" }
 bwbench-client = { version = "0.3.1", path = "os/arceos/tools/bwbench_client" }
 define-simple-traits = { version = "0.3.4", path = "components/crate_interface/test_crates/define-simple-traits" }
@@ -329,7 +328,6 @@ trait-ffi = "0.2.11"
 tock-registers = "0.10"
 sg200x-bsp = { version = "0.7.1", default-features = false }
 sg200x-jpu = { version = "0.1.1", path = "drivers/vpu/sg200x-jpu" }
-simple-ahci = "0.1.1-preview.1"
 bcm2835-sdhci = "0.1.1-preview.1"
 x86 = "0.52"
 kmod-tools = "0.3"
