@@ -82,6 +82,33 @@ impl ProcessPtraceState {
             stop_fp_data: PiMutex::new(BTreeMap::new()),
         }
     }
+
+    /// Snapshots ptrace work for one syscall boundary.
+    ///
+    /// As in Linux's `syscall_work`, an untraced task takes a lock-free fast
+    /// path. Traced tasks retain their entry/exit state across the stop; the
+    /// tracer advances it only when resuming that exact syscall stop.
+    pub(super) fn syscall_trace_if_active(&self, tid: u32) -> Option<SyscallTraceState> {
+        if !self.traceme.load(Ordering::Acquire)
+            && self.attach_mode.load(Ordering::Acquire) == PtraceAttachMode::None as u8
+        {
+            return None;
+        }
+        Some(
+            self.syscall_trace
+                .lock()
+                .get(&tid)
+                .copied()
+                .unwrap_or_default(),
+        )
+    }
+}
+
+#[cfg(axtest)]
+pub(crate) fn inactive_ptrace_syscall_gate_is_lock_free_for_test() -> bool {
+    ProcessPtraceState::new()
+        .syscall_trace_if_active(1)
+        .is_none()
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -522,14 +549,6 @@ impl ProcessData {
             }
         };
         traces.insert(tid, next);
-    }
-
-    pub fn take_ptrace_syscall_trace_for(&self, tid: u32) -> SyscallTraceState {
-        self.ptrace
-            .syscall_trace
-            .lock()
-            .remove(&tid)
-            .unwrap_or_default()
     }
 
     pub fn set_ptrace_options(&self, opts: usize) {

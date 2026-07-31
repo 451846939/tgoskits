@@ -12,8 +12,8 @@ use syscalls::Sysno;
 use super::unaligned::{UnalignedEmulationResult, emulate_user_unaligned};
 use super::{
     SyscallRestartInfo, SyscallTraceState, Thread, TimerState, check_signals, current_user_task,
-    poll_process_timer, ptrace_stop_current, ptrace_syscall_stop_current, raise_signal_fatal,
-    set_timer_state, unblock_next_signal, wait_existing_ptrace_stop_current,
+    poll_process_timers, ptrace_stop_current, ptrace_syscall_stop_current, raise_signal_fatal,
+    set_timer_state, wait_existing_ptrace_stop_current,
 };
 use crate::syscall::{handle_syscall, syscall_allows_signal_restart};
 
@@ -119,7 +119,7 @@ pub fn new_user_task(
 
             let reason = uctx.run();
 
-            set_timer_state(&curr, TimerState::Kernel);
+            set_timer_state(thr, TimerState::Kernel);
 
             let saved_a0 = uctx.arg0();
             let saved_sysno = uctx.sysno();
@@ -131,8 +131,8 @@ pub fn new_user_task(
 
             match reason {
                 ReturnReason::Syscall => {
-                    let trace_state = thr.proc_data.ptrace_syscall_trace_state_for(tid);
-                    if matches!(trace_state, SyscallTraceState::Entry)
+                    let ptrace_trace = thr.proc_data.ptrace.syscall_trace_if_active(tid);
+                    if matches!(ptrace_trace, Some(SyscallTraceState::Entry))
                         && let Some(resume_signo) = ptrace_syscall_stop_current(
                             thr,
                             Signo::SIGTRAP,
@@ -143,9 +143,13 @@ pub fn new_user_task(
                         enqueue_ptrace_syscall_resume_signal(thr, resume_signo);
                     }
 
+                    // The tracer may replace the syscall number and arguments
+                    // while the entry stop is active.
                     let syscall_no = uctx.sysno();
                     let syscall_arg0 = uctx.arg0();
-                    if let Some(exit_code) = ptrace_exit_event_code(syscall_no, syscall_arg0)
+                    if ptrace_trace.is_some()
+                        && let Some(exit_code) =
+                            ptrace_exit_event_code(syscall_no, syscall_arg0)
                         && crate::syscall::ptrace_notify_exit(
                             thr.proc_data.proc.pid(),
                             exit_code,
@@ -154,30 +158,32 @@ pub fn new_user_task(
                         let _ = ptrace_stop_current(thr, Signo::SIGTRAP, &mut uctx);
                     }
 
-                    handle_syscall(&mut uctx);
-                    if stop_for_pending_ptrace_event(thr, &mut uctx) {
-                        continue;
-                    }
-                    if thr.proc_data.take_ptrace_exec_stop_pending() {
-                        let _is_event =
-                            crate::syscall::ptrace_notify_exec(thr.proc_data.proc.pid());
-                        if let Some(_resume_sig) =
-                            ptrace_stop_current(thr, Signo::SIGTRAP, &mut uctx)
-                        {
+                    handle_syscall(thr, &mut uctx);
+                    if ptrace_trace.is_some() {
+                        if stop_for_pending_ptrace_event(thr, &mut uctx) {
                             continue;
                         }
-                    }
-                    if matches!(
-                        thr.proc_data.ptrace_syscall_trace_state_for(tid),
-                        SyscallTraceState::Exit
-                    ) {
-                        let resume_signo = ptrace_syscall_stop_current(
-                            thr,
-                            Signo::SIGTRAP,
-                            &mut uctx,
-                            syscall_no,
-                        );
-                        enqueue_ptrace_syscall_resume_signal(thr, resume_signo.flatten());
+                        if thr.proc_data.take_ptrace_exec_stop_pending() {
+                            let _is_event =
+                                crate::syscall::ptrace_notify_exec(thr.proc_data.proc.pid());
+                            if let Some(_resume_sig) =
+                                ptrace_stop_current(thr, Signo::SIGTRAP, &mut uctx)
+                            {
+                                continue;
+                            }
+                        }
+                        if matches!(
+                            thr.proc_data.ptrace_syscall_trace_state_for(tid),
+                            SyscallTraceState::Exit
+                        ) {
+                            let resume_signo = ptrace_syscall_stop_current(
+                                thr,
+                                Signo::SIGTRAP,
+                                &mut uctx,
+                                syscall_no,
+                            );
+                            enqueue_ptrace_syscall_resume_signal(thr, resume_signo.flatten());
+                        }
                     }
                 }
                 ReturnReason::PageFault(addr, flags) => {
@@ -365,7 +371,7 @@ pub fn new_user_task(
                 }
             }
 
-            if !unblock_next_signal() {
+            if !thr.unblock_next_signal_check() {
                 // POSIX timers are also driven by the alarm task, but polling
                 // here closes the window where an expired timer is only noticed
                 // after the current syscall returns to userspace.
@@ -395,7 +401,7 @@ pub fn new_user_task(
                     // wake reason for a subsequent interruptible syscall.
                     let interrupt_snapshot = thr.interrupt_snapshot();
                     if poll_timer {
-                        poll_process_timer(thr.proc_data.proc.pid());
+                        poll_process_timers(&thr.proc_data);
                         poll_timer = false;
                     }
                     while check_signals(thr, &mut uctx, None, pending_restart) {
@@ -408,7 +414,7 @@ pub fn new_user_task(
                 }
             }
 
-            set_timer_state(&curr, TimerState::User);
+            set_timer_state(thr, TimerState::User);
         }
     }
 }
