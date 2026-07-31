@@ -64,7 +64,7 @@ fn dropping_an_attached_registration_is_rejected() {
     let registration = TestRegistration::new();
     let token = expect_registered(cell.register(registration.registration()));
 
-    core::mem::forget(token);
+    let _ = token;
     drop(registration);
 }
 
