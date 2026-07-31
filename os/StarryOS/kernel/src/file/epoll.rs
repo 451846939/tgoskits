@@ -726,34 +726,19 @@ impl Epoll {
                     if keep_ready {
                         keep.push_back(Arc::downgrade(&interest));
                     } else {
+                        // EPOLLET edge-triggered: after reporting the fd once,
+                        // it must NOT be reported again until a *new* edge
+                        // (a fresh wakeup) arrives — even if the fd is still
+                        // readable because the caller left data unconsumed
+                        // (man 7 epoll; Linux ep_send_events does not re-add an
+                        // edge-triggered epi to the ready list). Re-arm a fresh
+                        // waker so the next edge transition re-queues the
+                        // interest via InterestWaker::wake_by_ref; do NOT
+                        // re-enqueue based on the current (possibly residual)
+                        // readability, which would degrade EPOLLET into
+                        // level-triggered behavior.
                         interest.mark_not_in_queue();
-                        // EPOLLET: install a fresh waker so the next edge
-                        // transition fires.  There is a race window between
-                        // mark_not_in_queue() above and register_waker_only()
-                        // below: the previous InterestWaker may have already
-                        // been consumed by the wake that delivered the event
-                        // we are returning here, leaving the underlying
-                        // PollSet empty.  If new data arrives in that gap,
-                        // poll_update.wake() hits the empty PollSet and the
-                        // notification is silently dropped — EPOLLET would
-                        // then never fire again because the new waker is
-                        // installed only after the data already arrived.
-                        // Close the window by re-checking the file's poll
-                        // state after registering and re-queueing the
-                        // interest directly if IN-side data is already
-                        // present.  EPOLLOUT is intentionally excluded: it
-                        // is normally always ready on writable sockets and
-                        // would cause a busy-loop.
                         self.register_waker_only(&interest);
-                        let in_mask = interest.event.events
-                            & (IoEvents::IN | IoEvents::RDHUP | IoEvents::HUP);
-                        if !in_mask.is_empty()
-                            && let Some(f) = interest.key.get_file()
-                            && !(f.poll() & in_mask).is_empty()
-                            && interest.try_mark_in_queue()
-                        {
-                            self.inner.enqueue_marked_ready(&interest);
-                        }
                     }
                 }
                 ConsumeResult::NoEvent => {

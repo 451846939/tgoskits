@@ -349,15 +349,21 @@ pub fn sys_getsockopt(
             if *optlen == 0 {
                 return Ok(0);
             }
-            let so_type = match &**socket {
-                SocketInner::Tcp(_) => SOCK_STREAM,
-                SocketInner::Udp(_) => SOCK_DGRAM,
-                SocketInner::Raw(_) => SOCK_RAW,
-                SocketInner::Unix(_) => SOCK_STREAM,
+            let so_type: i32 = match &**socket {
+                SocketInner::Tcp(_) => SOCK_STREAM as i32,
+                SocketInner::Udp(_) => SOCK_DGRAM as i32,
+                SocketInner::Raw(_) => SOCK_RAW as i32,
+                // Unix sockets carry stream/dgram/seqpacket; the concrete type
+                // lives in the transport's socket options, not the enum variant.
+                SocketInner::Unix(_) => {
+                    let mut t = 0i32;
+                    socket.get_option(GetSocketOption::SocketType(&mut t))?;
+                    t
+                }
                 #[cfg(feature = "vsock")]
-                SocketInner::Vsock(_) => SOCK_STREAM,
+                SocketInner::Vsock(_) => SOCK_STREAM as i32,
             };
-            *get(optval, optlen)? = so_type as i32;
+            *get(optval, optlen)? = so_type;
             return Ok(0);
         }
         if level == SOL_SOCKET && optname == SO_BINDTODEVICE {
