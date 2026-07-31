@@ -478,4 +478,14 @@ mod tests {
         assert_eq!(regions[1].size, 0x10000);
         assert_eq!(regions[1].map_type, VmMemMappingType::MapReserved);
     }
+
+    #[test]
+    fn build_axvm_config_copies_explicit_passthrough_irqs() {
+        let mut crate_config = AxVMCrateConfig::default();
+        crate_config.devices.passthrough_irqs = vec![4, 4, 17];
+
+        let vm_config = build_axvm_config(&crate_config);
+
+        assert_eq!(vm_config.pass_through_irqs(), &vec![4, 17]);
+    }
 }

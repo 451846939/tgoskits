@@ -6,7 +6,7 @@ use alloc::{
 use ax_kernel_guard::NoPreemptIrqSave;
 use ax_runtime::hal::cpu::uspace::UserContext;
 use ax_sync::Mutex;
-use ax_task::{AxTaskExt, spawn_task};
+use ax_task::{AxTaskExt, spawn_task_with};
 use starry_process::{Pid, Process};
 
 use crate::{
@@ -111,8 +111,7 @@ pub fn init(args: &[String], envs: &[String]) {
 
     let task = {
         let _guard = NoPreemptIrqSave::new();
-        let task = spawn_task(task);
-        add_task_to_table(&task);
+        let task = spawn_task_with(task, add_task_to_table);
         tty::arm_console_irq();
         task
     };
@@ -123,9 +122,14 @@ pub fn init(args: &[String], envs: &[String]) {
 
     let fs_context = ax_fs_ng::vfs::current_fs_context();
     let cx = fs_context.lock();
-    cx.root_dir()
-        .unmount_all()
-        .expect("Failed to unmount all filesystems");
+    // Best-effort teardown, matching Linux's shutdown path. A process that exited while
+    // holding a mount namespace (bind mounts, pivot_root) can leave the mount tree in a
+    // state `unmount_all` rejects; at shutdown that must be logged, not turned into a
+    // kernel panic that fails an otherwise clean run. The rootfs flush below is what
+    // matters for on-disk integrity.
+    if let Err(err) = cx.root_dir().unmount_all() {
+        warn!("shutdown: unmount_all failed (best-effort): {err:?}");
+    }
     cx.root_dir()
         .filesystem()
         .flush()

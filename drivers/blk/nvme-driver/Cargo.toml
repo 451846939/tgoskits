@@ -19,9 +19,6 @@ rdif-block.workspace = true
 spin.workspace = true
 tock-registers = "0.10"
 
-[lib]
-test = false
-
 # bare-test integration test is temporarily disabled.
 # [[test]]
 # harness = false

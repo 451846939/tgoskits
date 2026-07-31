@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Move block I/O to owned DMA and acknowledged-IRQ progression with a
+  controller-lifetime 4 KiB IDMAC descriptor ring.
+- Keep the validated 32-bit DMA mask and quarantine ownership when recovery
+  cannot prove that DMA is quiescent.
+- Build only the active IDMAC chain for each request and route acknowledgement
+  exclusively through the owned IRQ endpoint.
+- Match all shared protocol progress and bus-width states exhaustively instead
+  of treating an unknown terminal state as pending or an unknown width as
+  1-bit.
+
+### Removed
+
+- Remove FIFO block fallback, cloned DMA capabilities, and synchronous
+  completion polling.
+- Remove the direct host `handle_irq` compatibility entry point.
+
 ## [0.3.3](https://github.com/rcore-os/tgoskits/compare/phytium-mci-host-v0.3.2...phytium-mci-host-v0.3.3) - 2026-07-23
 
 ### Other
