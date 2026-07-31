@@ -430,6 +430,14 @@ impl ArmVgicHostIf for ArmVgicHostIfImpl {
         crate::current_vm_id().expect("current AArch64 VM is not set")
     }
 
+    fn queue_virtual_interrupt(vm_id: usize, vcpu_id: usize, vector: u8) {
+        if let Err(err) = crate::runtime::vcpus::queue_interrupt(vm_id, vcpu_id, vector as usize) {
+            warn!(
+                "failed to queue VM[{vm_id}] vCPU[{vcpu_id}] virtual interrupt {vector}: {err:?}"
+            );
+        }
+    }
+
     fn current_time_nanos() -> u64 {
         default_host().monotonic_time().as_nanos() as u64
     }
@@ -463,14 +471,5 @@ impl ArmVgicHostIf for ArmVgicHostIfImpl {
 
     fn hardware_inject_virtual_interrupt(vector: u8) {
         gic::inject_interrupt(vector as usize);
-    }
-
-    fn inject_vm_vcpu_interrupt(vm_id: usize, vcpu_id: usize, vector: u8) {
-        if let Err(error) = crate::manager::inject_vm_vcpu_interrupt(vm_id, vcpu_id, vector as _) {
-            warn!(
-                "failed to inject AArch64 virtual timer interrupt {vector:#x} into VM[{vm_id}] \
-                 VCpu[{vcpu_id}]: {error:?}"
-            );
-        }
     }
 }

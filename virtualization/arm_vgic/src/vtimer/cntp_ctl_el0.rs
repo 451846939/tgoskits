@@ -23,20 +23,20 @@ use axdevice_base::{
 };
 use log::debug;
 
-use crate::vtimer::{VtimerBackend, VtimerState};
+use super::cntp_timer::CntpTimerState;
 
 const CNTP_CTL_EL0_ADDR: u32 = SystemRegType::CNTP_CTL_EL0 as u32;
 
 impl SysCntpCtlEl0 {
     /// Reads CNTP_CTL_EL0.
     pub fn read_register(&self, _width: AccessWidth) -> DeviceResult<usize> {
-        Ok(self.state.control(self.backend.current_time_nanos()) as usize)
+        Ok(self.state.read_ctl() as usize)
     }
 
     /// Writes CNTP_CTL_EL0.
     pub fn write_register(&self, _width: AccessWidth, val: usize) -> DeviceResult {
         debug!("Write to virtual timer register CNTP_CTL_EL0, value: {val}");
-        self.state.write_control(val as u32, self.backend.as_ref());
+        self.state.write_ctl(val as u32);
         Ok(())
     }
 }
@@ -45,22 +45,30 @@ impl SysCntpCtlEl0 {
 ///
 /// Provides virtualization support for the physical timer control register.
 pub struct SysCntpCtlEl0 {
-    state: Arc<VtimerState>,
-    backend: Arc<dyn VtimerBackend>,
+    state: Arc<CntpTimerState>,
     resources: [Resource; 1],
 }
 
 impl SysCntpCtlEl0 {
     /// Creates a new CNTP_CTL_EL0 register emulator.
-    pub fn new(state: Arc<VtimerState>, backend: Arc<dyn VtimerBackend>) -> Self {
+    pub fn new() -> Self {
+        Self::from_state(Arc::new(CntpTimerState::new()))
+    }
+
+    pub(super) fn from_state(state: Arc<CntpTimerState>) -> Self {
         Self {
             state,
-            backend,
             resources: [Resource::SysReg {
                 addr: CNTP_CTL_EL0_ADDR,
                 count: 1,
             }],
         }
+    }
+}
+
+impl Default for SysCntpCtlEl0 {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

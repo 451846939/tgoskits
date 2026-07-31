@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use aarch64_cpu::registers::{CNTPCT_EL0, Readable};
+extern crate alloc;
+
+use alloc::sync::Arc;
+
 use aarch64_sysreg::SystemRegType;
 use axdevice_base::{
     AccessWidth, BusAccess, BusKind, BusResponse, Device, DeviceAccess, DeviceError, DeviceResult,
@@ -20,49 +23,58 @@ use axdevice_base::{
 };
 use log::debug;
 
-const CNTPCT_EL0_ADDR: u32 = SystemRegType::CNTPCT_EL0 as u32;
+use super::cntp_timer::CntpTimerState;
 
-impl SysCntpctEl0 {
-    /// Reads CNTPCT_EL0.
+const CNTP_CVAL_EL0_ADDR: u32 = SystemRegType::CNTP_CVAL_EL0 as u32;
+
+impl SysCntpCvalEl0 {
+    /// Reads CNTP_CVAL_EL0.
     pub fn read_register(&self, _width: AccessWidth) -> DeviceResult<usize> {
-        Ok(CNTPCT_EL0.get() as usize)
+        Ok(self.state.read_cval() as usize)
     }
 
-    /// Ignores guest writes to the read-only CNTPCT_EL0 register.
+    /// Writes CNTP_CVAL_EL0.
     pub fn write_register(&self, _width: AccessWidth, val: usize) -> DeviceResult {
-        debug!("Write to read-only virtual counter register CNTPCT_EL0, value: {val}");
+        debug!("Write to virtual timer register CNTP_CVAL_EL0, value: {val}");
+        self.state.write_cval(val as u64);
         Ok(())
     }
 }
 
-/// System register emulation for CNTPCT_EL0.
+/// System register emulation for CNTP_CVAL_EL0.
 ///
-/// Provides virtualization support for the physical counter register.
-pub struct SysCntpctEl0 {
+/// Provides virtualization support for the physical timer compare register.
+pub struct SysCntpCvalEl0 {
+    state: Arc<CntpTimerState>,
     resources: [Resource; 1],
 }
 
-impl SysCntpctEl0 {
-    /// Creates a new CNTPCT_EL0 register emulator.
+impl SysCntpCvalEl0 {
+    /// Creates a new CNTP_CVAL_EL0 register emulator.
     pub fn new() -> Self {
+        Self::from_state(Arc::new(CntpTimerState::new()))
+    }
+
+    pub(super) fn from_state(state: Arc<CntpTimerState>) -> Self {
         Self {
+            state,
             resources: [Resource::SysReg {
-                addr: CNTPCT_EL0_ADDR,
+                addr: CNTP_CVAL_EL0_ADDR,
                 count: 1,
             }],
         }
     }
 }
 
-impl Default for SysCntpctEl0 {
+impl Default for SysCntpCvalEl0 {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Device for SysCntpctEl0 {
+impl Device for SysCntpCvalEl0 {
     fn name(&self) -> &str {
-        "aarch64-cntpct-el0"
+        "aarch64-cntp-cval-el0"
     }
 
     fn resources(&self) -> &[Resource] {
@@ -74,7 +86,7 @@ impl Device for SysCntpctEl0 {
         access: &BusAccess,
         _context: &mut dyn DeviceAccess,
     ) -> Result<BusResponse, DeviceError> {
-        if access.kind != BusKind::SysReg || access.addr != CNTPCT_EL0_ADDR as u64 {
+        if access.kind != BusKind::SysReg || access.addr != CNTP_CVAL_EL0_ADDR as u64 {
             return Err(DeviceError::OutOfRange { addr: access.addr });
         }
         if access.is_read {
