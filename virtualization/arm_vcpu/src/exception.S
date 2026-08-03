@@ -29,9 +29,7 @@
     stp     x10, x11, [sp, 32 * 8]
 .endm
 
-.macro SAVE_VCPU_REGS_FROM_EL1
-    SAVE_REGS_FROM_EL1
-
+.macro SAVE_VCPU_RUNTIME_FROM_EL1
     # Capture the guest timer, stop it, and restore the host counter domain
     # before any branch-and-link can execute Rust.
     mrs     x9, cntv_ctl_el0
@@ -60,6 +58,35 @@
     str     x9, [sp, {guest_tpidr_el0_offset}]
     ldr     x9, [sp, {host_tpidr_el0_offset}]
     msr     tpidr_el0, x9
+.endm
+
+.macro SAVE_VCPU_REGS_FROM_EL1
+    SAVE_REGS_FROM_EL1
+    SAVE_VCPU_RUNTIME_FROM_EL1
+.endm
+
+.macro ACK_PENDING_HOST_IRQ
+    # CNTV is a level-triggered PPI. Capture the host IAR while the timer is
+    # still asserted; SAVE_VCPU_RUNTIME_FROM_EL1 may then stop CNTV without
+    # turning the acknowledgement into a spurious INTID. Rust performs the
+    # priority drop only after the host timer context has been restored.
+    mov     w9, #-1
+    str     w9, [sp, {host_pending_irq_ack_offset}]
+    ldr     x9, [sp, {host_irq_interface_offset}]
+    cmp     x9, #{host_irq_interface_gicv2_mmio}
+    b.eq    .Lack_host_irq_gicv2\@
+    cmp     x9, #{host_irq_interface_gicv3_sysreg}
+    b.ne    .Lack_host_irq_done\@
+    mrs     x9, ICC_IAR1_EL1
+    str     w9, [sp, {host_pending_irq_ack_offset}]
+    dsb     sy
+    b       .Lack_host_irq_done\@
+.Lack_host_irq_gicv2\@:
+    ldr     x10, [sp, {host_irq_cpu_interface_base_offset}]
+    ldr     w9, [x10, #0xc]
+    str     w9, [sp, {host_pending_irq_ack_offset}]
+    dsb     sy
+.Lack_host_irq_done\@:
 .endm
 
 .macro RESTORE_GUEST_REGS_INTO_EL1
@@ -151,7 +178,9 @@
 .endm
 
 .macro HANDLE_LOWER_IRQ_VCPU
-    SAVE_VCPU_REGS_FROM_EL1
+    SAVE_REGS_FROM_EL1
+    ACK_PENDING_HOST_IRQ
+    SAVE_VCPU_RUNTIME_FROM_EL1
     mov     x0, {exception_irq}
     bl      vmexit_trampoline
     # vmexit_trampoline returns directly to ArmVcpu::run.

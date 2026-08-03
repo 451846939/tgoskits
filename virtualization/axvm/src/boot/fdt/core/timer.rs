@@ -15,6 +15,19 @@ use crate::{
 
 const TIMER_COMPATIBLE: &str = "arm,armv8-timer";
 
+/// Returns whether firmware describes a platform timer replaced by the
+/// machine-owned architectural timer.
+///
+/// Devicetree uses the generic `timer` node name for timer devices. The
+/// compatibility check also catches malformed or legacy architectural timer
+/// nodes that do not follow that naming convention.
+pub(crate) fn is_machine_timer_node(node: &Node) -> bool {
+    node.name().split('@').next() == Some("timer")
+        || node
+            .compatibles()
+            .any(|compatible| matches!(compatible, "arm,armv8-timer" | "arm,armv7-timer"))
+}
+
 /// Reads the host architectural timer's complete interrupt identity.
 pub(crate) fn host_timer_profile(fdt: &Fdt) -> AxVmResult<Option<GuestTimerProfile>> {
     let Some(timer_id) = fdt.iter_node_ids().find(|node_id| {
@@ -141,9 +154,7 @@ pub(crate) fn install_machine_timer(
         .iter_node_ids()
         .filter_map(|node_id| {
             let node = tree.inner().node(node_id)?;
-            node.compatibles()
-                .any(|compatible| matches!(compatible, "arm,armv8-timer" | "arm,armv7-timer"))
-                .then(|| tree.inner().path_of(node_id))
+            is_machine_timer_node(node).then(|| tree.inner().path_of(node_id))
         })
         .collect::<Vec<_>>();
     for path in timer_paths {
@@ -403,5 +414,24 @@ mod tests {
             timer.as_node().compatibles().collect::<Vec<_>>(),
             vec![TIMER_COMPATIBLE]
         );
+    }
+
+    #[test]
+    fn installed_timer_removes_firmware_platform_timer_nodes() {
+        let mut fdt = host_timer_fdt(
+            &[1, 13, 0xf04, 1, 14, 0xf04, 1, 11, 0xf04, 1, 10, 0xf04],
+            None,
+        );
+        let profile = host_timer_profile(&fdt).unwrap().unwrap();
+        let platform_timer = fdt.add_node(fdt.root_id(), Node::new("timer@10002000"));
+        fdt.node_mut(platform_timer)
+            .unwrap()
+            .set_property(prop_string("compatible", "vendor,soc-timer"));
+        let mut tree = FdtTree::from_fdt(fdt);
+
+        install_machine_timer(&mut tree, Some(&profile)).unwrap();
+
+        assert!(tree.inner().get_by_path_id("/timer@10002000").is_none());
+        assert!(tree.inner().get_by_path_id("/timer").is_some());
     }
 }

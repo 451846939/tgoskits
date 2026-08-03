@@ -5,9 +5,10 @@ use arm_gic_driver::v3::{
     ICH_VMCR_EL2, ICH_VTR_EL2, LocalRegisterCopy, Readable, Writeable, ich_lr_el2_get,
     ich_lr_el2_set, ich_lr_el2_write,
 };
+use arm_vcpu::ArmHostIrqConfig;
 use arm_vgic::{
     CpuInterfaceState, GicV3BackendError, GicVcpuId, HostGicVersion, IntId, InterruptState,
-    ListRegisterBacking, ListRegisterState, Priority, VgicBackendCapabilities,
+    ListRegisterBacking, ListRegisterState, PhysicalIrqId, Priority, VgicBackendCapabilities,
 };
 use ax_kspin::SpinNoIrq;
 use spin::Once;
@@ -20,16 +21,24 @@ enum HostCpuInterface {
         hypervisor: SpinNoIrq<arm_gic_driver::v2::HypervisorInterface>,
         trap: arm_gic_driver::v2::TrapOp,
         capabilities: VgicBackendCapabilities,
+        irq_config: ArmHostIrqConfig,
     },
     V3 {
         capabilities: VgicBackendCapabilities,
+        irq_config: ArmHostIrqConfig,
     },
 }
 
 impl HostCpuInterface {
     const fn capabilities(&self) -> VgicBackendCapabilities {
         match self {
-            Self::V2 { capabilities, .. } | Self::V3 { capabilities } => *capabilities,
+            Self::V2 { capabilities, .. } | Self::V3 { capabilities, .. } => *capabilities,
+        }
+    }
+
+    const fn irq_config(&self) -> ArmHostIrqConfig {
+        match self {
+            Self::V2 { irq_config, .. } | Self::V3 { irq_config, .. } => *irq_config,
         }
     }
 }
@@ -47,6 +56,13 @@ fn host_cpu_interface() -> Result<&'static HostCpuInterface, GicV3BackendError> 
 fn discover_host_cpu_interface() -> Result<HostCpuInterface, GicV3BackendError> {
     super::try_with_gic("inspect host VGIC capabilities", |intc| {
         if let Some(gic) = intc.typed_mut::<arm_gic_driver::v2::Gic>() {
+            let irq_config =
+                ArmHostIrqConfig::gicv2_mmio(usize::from(gic.gicc_addr())).map_err(|_| {
+                    GicV3BackendError::new(
+                        "inspect host VGIC capabilities",
+                        "the GICv2 CPU-interface address is invalid",
+                    )
+                })?;
             let interface = gic.hypervisor_interface().ok_or_else(|| {
                 GicV3BackendError::new(
                     "inspect host VGIC capabilities",
@@ -63,6 +79,7 @@ fn discover_host_cpu_interface() -> Result<HostCpuInterface, GicV3BackendError> 
                 hypervisor: SpinNoIrq::new(interface),
                 trap: gic.cpu_interface().trap_operations(),
                 capabilities,
+                irq_config,
             });
         }
         if intc.typed_mut::<arm_gic_driver::v3::Gic>().is_some() {
@@ -73,6 +90,7 @@ fn discover_host_cpu_interface() -> Result<HostCpuInterface, GicV3BackendError> 
                     (ICH_VTR_EL2.read(ICH_VTR_EL2::PRIBITS) + 1) as u8,
                     false,
                 ),
+                irq_config: ArmHostIrqConfig::gicv3_sysreg(),
             });
         }
         Err(GicV3BackendError::new(
@@ -84,6 +102,10 @@ fn discover_host_cpu_interface() -> Result<HostCpuInterface, GicV3BackendError> 
 
 pub(super) fn capabilities() -> Result<VgicBackendCapabilities, GicV3BackendError> {
     host_cpu_interface().map(HostCpuInterface::capabilities)
+}
+
+pub(super) fn host_irq_config() -> Result<ArmHostIrqConfig, GicV3BackendError> {
+    host_cpu_interface().map(HostCpuInterface::irq_config)
 }
 
 pub(super) fn load(
@@ -192,43 +214,56 @@ fn save_v2(
 }
 
 pub(super) fn acknowledge_host_irq() -> Result<Option<usize>, GicV3BackendError> {
-    match host_cpu_interface()? {
+    let host = host_cpu_interface()?;
+    let raw_ack = match host {
+        HostCpuInterface::V2 { trap, .. } => u32::from(trap.ack()),
+        HostCpuInterface::V3 { .. } => arm_gic_driver::v3::ack1().to_u32(),
+    };
+    Ok(finish_pending_host_irq_with(host, raw_ack))
+}
+
+pub(super) fn finish_pending_host_irq(raw_ack: u32) -> Result<Option<usize>, GicV3BackendError> {
+    Ok(finish_pending_host_irq_with(host_cpu_interface()?, raw_ack))
+}
+
+fn finish_pending_host_irq_with(host: &HostCpuInterface, raw_ack: u32) -> Option<usize> {
+    match host {
         HostCpuInterface::V2 { trap, .. } => {
-            let ack = trap.ack();
+            let ack = arm_gic_driver::v2::Ack::from(raw_ack);
             if ack.is_special() {
-                return Ok(None);
+                return None;
             }
             trap.eoi(ack);
-            Ok(Some(match ack {
+            Some(match ack {
                 arm_gic_driver::v2::Ack::Other(intid) => intid.to_u32() as usize,
                 arm_gic_driver::v2::Ack::SGI { intid, cpu_id } => {
-                    V2_SGI_TOKEN
-                        | (usize::from(cpu_id) << V2_SGI_SOURCE_SHIFT)
-                        | intid.to_u32() as usize
+                    V2_SGI_TOKEN | (cpu_id << V2_SGI_SOURCE_SHIFT) | intid.to_u32() as usize
                 }
-            }))
+            })
         }
         HostCpuInterface::V3 { .. } => {
-            let ack = arm_gic_driver::v3::ack1();
+            // SAFETY: the raw IAR value is masked to the architectural 24-bit
+            // INTID field before this checked special-INTID handling.
+            let ack = unsafe { arm_gic_driver::IntId::raw(raw_ack & 0x00ff_ffff) };
             if ack.is_special() {
-                return Ok(None);
+                return None;
             }
             arm_gic_driver::v3::eoi1(ack);
-            Ok(Some(ack.to_u32() as usize))
+            Some(ack.to_u32() as usize)
         }
     }
 }
 
 pub(super) fn deactivate_host_irq(token: usize) -> Result<(), GicV3BackendError> {
     let raw = super::host_irq_intid(token);
-    let intid = arm_gic_driver::checked_intid(raw, 1020).map_err(|_| {
-        GicV3BackendError::new(
-            "deactivate acknowledged host IRQ",
-            alloc::format!("INTID {raw} is outside the assignable GIC range"),
-        )
-    })?;
     match host_cpu_interface()? {
         HostCpuInterface::V2 { trap, .. } => {
+            let intid = arm_gic_driver::checked_intid(raw, 1020).map_err(|_| {
+                GicV3BackendError::new(
+                    "deactivate acknowledged host IRQ",
+                    alloc::format!("INTID {raw} is outside the GICv2 interrupt range"),
+                )
+            })?;
             let ack = if token & V2_SGI_TOKEN != 0 {
                 arm_gic_driver::v2::Ack::SGI {
                     intid,
@@ -239,7 +274,19 @@ pub(super) fn deactivate_host_irq(token: usize) -> Result<(), GicV3BackendError>
             };
             trap.dir(ack);
         }
-        HostCpuInterface::V3 { .. } => arm_gic_driver::v3::dir(intid),
+        HostCpuInterface::V3 { .. } => {
+            // ICC_IAR1_EL1 and ICC_DIR_EL1 carry a 24-bit INTID. Unlike the
+            // Distributor-backed SPI limit, this path must retain host LPIs
+            // so MSI/MSI-X actions dispatched while a vCPU is running can be
+            // deactivated after their leaf handler completes.
+            let intid = arm_gic_driver::checked_intid(raw, 1 << 24).map_err(|_| {
+                GicV3BackendError::new(
+                    "deactivate acknowledged host IRQ",
+                    alloc::format!("INTID {raw} is outside the GICv3 interrupt range"),
+                )
+            })?;
+            arm_gic_driver::v3::dir(intid);
+        }
     }
     Ok(())
 }
@@ -273,8 +320,25 @@ fn encode_v2_list_register(entry: ListRegisterState) -> Result<u32, GicV3Backend
         | (state << 28)
         | (1 << 30);
     match entry.backing() {
-        ListRegisterBacking::Software | ListRegisterBacking::Physical(_) => {
-            raw |= 1 << 19;
+        ListRegisterBacking::Software => {
+            if entry.maintenance_on_eoi() {
+                raw |= 1 << 19;
+            }
+        }
+        ListRegisterBacking::Physical(physical) => {
+            let physical = u32::try_from(physical.raw()).map_err(|_| {
+                GicV3BackendError::new(
+                    "encode GICv2 list register",
+                    alloc::format!("physical IRQ {} does not fit GICH_LR", physical.raw()),
+                )
+            })?;
+            if physical >= 1024 {
+                return Err(GicV3BackendError::new(
+                    "encode GICv2 list register",
+                    alloc::format!("physical IRQ {physical} exceeds the 10-bit GICH_LR field"),
+                ));
+            }
+            raw |= (physical << 10) | (1 << 31);
         }
     }
     Ok(raw)
@@ -294,12 +358,24 @@ fn decode_v2_list_register(
     };
     let intid = decode_intid(index, raw & 0x3ff, "GICv2")?;
     let priority = Priority::new((((raw >> 23) & 0x1f) << 3) as u8);
-    if raw & (1 << 31) != 0 {
-        return Err(unexpected_hardware_backing(index, "GICv2"));
+    if raw & (1 << 31) == 0 {
+        require_software_backing(index, previous, "GICv2")?;
+        return Ok(Some(ListRegisterState::new_software(
+            intid,
+            priority,
+            state,
+            if raw & (1 << 19) != 0 {
+                arm_vgic::TriggerMode::Level
+            } else {
+                arm_vgic::TriggerMode::Edge
+            },
+        )));
     }
-    Ok(Some(decode_resampled_backing(
-        index, previous, intid, priority, state, "GICv2",
-    )?))
+    let physical = PhysicalIrqId::new(u64::from((raw >> 10) & 0x3ff));
+    validate_physical_backing(index, previous, intid, physical, "GICv2")?;
+    Ok(Some(ListRegisterState::new_physical(
+        intid, priority, state, physical,
+    )))
 }
 
 fn load_v3(state: &CpuInterfaceState) -> Result<(), GicV3BackendError> {
@@ -431,8 +507,17 @@ fn write_v3_list_register(index: usize, entry: ListRegisterState) -> Result<(), 
         + ICH_LR_EL2::PRIORITY.val(u64::from(entry.priority().raw()))
         + ICH_LR_EL2::GROUP::SET
         + state;
-    if matches!(entry.backing(), ListRegisterBacking::Physical(_)) {
+    if entry.maintenance_on_eoi() {
         fields = fields + ICH_LR_EL2::EOI::SET;
+    }
+    if let ListRegisterBacking::Physical(physical) = entry.backing() {
+        let pintid = u16::try_from(physical.raw()).map_err(|_| {
+            GicV3BackendError::new(
+                "encode GICv3 list register",
+                alloc::format!("physical IRQ {} does not fit PINTID", physical.raw()),
+            )
+        })?;
+        fields = fields + ICH_LR_EL2::HW::SET + ICH_LR_EL2::PINTID.val(u64::from(pintid));
     }
     ich_lr_el2_write(index, fields);
     Ok(())
@@ -457,12 +542,24 @@ fn read_v3_list_register(
     };
     let intid = decode_intid(index, raw.read(ICH_LR_EL2::VINTID) as u32, "GICv3")?;
     let priority = Priority::new(raw.read(ICH_LR_EL2::PRIORITY) as u8);
-    if raw.is_set(ICH_LR_EL2::HW) {
-        return Err(unexpected_hardware_backing(index, "GICv3"));
+    if !raw.is_set(ICH_LR_EL2::HW) {
+        require_software_backing(index, previous, "GICv3")?;
+        return Ok(Some(ListRegisterState::new_software(
+            intid,
+            priority,
+            state,
+            if raw.is_set(ICH_LR_EL2::EOI) {
+                arm_vgic::TriggerMode::Level
+            } else {
+                arm_vgic::TriggerMode::Edge
+            },
+        )));
     }
-    Ok(Some(decode_resampled_backing(
-        index, previous, intid, priority, state, "GICv3",
-    )?))
+    let physical = PhysicalIrqId::new(raw.read(ICH_LR_EL2::PINTID));
+    validate_physical_backing(index, previous, intid, physical, "GICv3")?;
+    Ok(Some(ListRegisterState::new_physical(
+        intid, priority, state, physical,
+    )))
 }
 
 fn decode_intid(index: usize, raw: u32, version: &'static str) -> Result<IntId, GicV3BackendError> {
@@ -474,43 +571,46 @@ fn decode_intid(index: usize, raw: u32, version: &'static str) -> Result<IntId, 
     })
 }
 
-fn decode_resampled_backing(
+fn require_software_backing(
     index: usize,
     previous: Option<ListRegisterState>,
-    intid: IntId,
-    priority: Priority,
-    state: InterruptState,
     version: &'static str,
-) -> Result<ListRegisterState, GicV3BackendError> {
-    match previous {
-        Some(previous) if previous.intid() == intid => match previous.backing() {
-            ListRegisterBacking::Software => Ok(ListRegisterState::new(intid, priority, state)),
-            ListRegisterBacking::Physical(physical) => Ok(ListRegisterState::new_physical(
-                intid, priority, state, physical,
-            )),
-        },
-        Some(previous) if matches!(previous.backing(), ListRegisterBacking::Physical(_)) => {
-            Err(GicV3BackendError::new(
-                "decode virtual list register",
-                alloc::format!(
-                    "{version} LR{index} changed the INTID of a resampled physical delivery from \
-                     {:?} to {intid:?}",
-                    previous.intid()
-                ),
-            ))
-        }
-        Some(_) | None => Ok(ListRegisterState::new(intid, priority, state)),
+) -> Result<(), GicV3BackendError> {
+    if previous.is_some_and(|entry| matches!(entry.backing(), ListRegisterBacking::Physical(_))) {
+        Err(GicV3BackendError::new(
+            "decode virtual list register",
+            alloc::format!("{version} LR{index} lost its physical backing"),
+        ))
+    } else {
+        Ok(())
     }
 }
 
-fn unexpected_hardware_backing(index: usize, version: &'static str) -> GicV3BackendError {
-    GicV3BackendError::new(
-        "decode virtual list register",
-        alloc::format!(
-            "{version} LR{index} acquired direct hardware backing; assigned interrupts require \
-             software resampling"
-        ),
-    )
+fn validate_physical_backing(
+    index: usize,
+    previous: Option<ListRegisterState>,
+    intid: IntId,
+    physical: PhysicalIrqId,
+    version: &'static str,
+) -> Result<(), GicV3BackendError> {
+    let previous = previous.ok_or_else(|| {
+        GicV3BackendError::new(
+            "decode virtual list register",
+            alloc::format!("{version} LR{index} acquired unexpected physical backing"),
+        )
+    })?;
+    if previous.intid() != intid || previous.backing() != ListRegisterBacking::Physical(physical) {
+        return Err(GicV3BackendError::new(
+            "decode virtual list register",
+            alloc::format!(
+                "{version} LR{index} changed physical identity from {:?}/{:?} to \
+                 {intid:?}/{physical:?}",
+                previous.intid(),
+                previous.backing()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn require_lr_count(

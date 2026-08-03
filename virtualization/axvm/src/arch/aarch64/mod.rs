@@ -7,7 +7,7 @@
 use alloc::sync::Arc;
 
 use arm_vcpu::{
-    ArmAccessWidth, ArmGicCpuInterfaceRegister, ArmGuestPhysAddr, ArmHostOps,
+    ArmAccessWidth, ArmGicCpuInterfaceRegister, ArmGuestPhysAddr, ArmHostIrqGuard, ArmHostOps,
     ArmNestedPagingConfig, ArmPerCpu, ArmSysRegAddr, ArmVcpu, ArmVcpuCreateConfig, ArmVcpuError,
     ArmVcpuResult, ArmVcpuSetupConfig, ArmVmExit,
 };
@@ -29,6 +29,8 @@ pub(crate) mod fdt;
 mod gic;
 mod images;
 mod npt;
+mod shared_mmio;
+mod shared_provider;
 #[path = "../../architecture/sysreg.rs"]
 mod sysreg;
 mod vgic;
@@ -302,8 +304,8 @@ impl ArmHostOps for AxvmArmHostOps {
         Err(ArmVcpuError::Unsupported)
     }
 
-    fn fetch_pending_host_irq() -> Option<usize> {
-        gic::acknowledge_host_irq()
+    fn finish_pending_host_irq(raw_ack: u32) -> Option<usize> {
+        gic::finish_pending_host_irq(raw_ack)
     }
 
     fn handle_current_host_irq() {
@@ -492,10 +494,12 @@ impl VmArchVcpuOps for AxvmArmVcpu {
             .vgic_binding
             .as_ref()
             .ok_or(BackendError::InvalidState)?;
+        let host_irq_guard = ArmHostIrqGuard::mask();
         vgic_backend_result(binding.load())?;
-        let run_result = arm_result(self.inner.run());
+        let run_result = arm_result(self.inner.run(&host_irq_guard));
         let timer_result = self.synchronize_timer();
         let save_result = vgic_backend_result(binding.save());
+        drop(host_irq_guard);
         match run_result {
             Ok(exit) => {
                 timer_result?;

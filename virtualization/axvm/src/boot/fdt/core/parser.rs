@@ -281,7 +281,8 @@ fn protect_machine_owned_firmware_devices(
     let mut host_owned_paths = super::serial::physical_serial_paths(fdt);
     host_owned_paths.extend(fdt.iter_node_ids().filter_map(|node_id| {
         let node = fdt.node(node_id)?;
-        is_machine_interrupt_controller(node).then(|| fdt.path_of(node_id))
+        (is_machine_interrupt_controller(node) || super::timer::is_machine_timer_node(node))
+            .then(|| fdt.path_of(node_id))
     }));
     host_owned_paths.sort();
     host_owned_paths.dedup();
@@ -812,6 +813,52 @@ mod tests {
         fdt.encode().as_ref().to_vec()
     }
 
+    fn fdt_with_platform_timer_and_device_interrupts() -> Vec<u8> {
+        let mut fdt = Fdt::new();
+        let root = fdt.root_id();
+        fdt.node_mut(root)
+            .unwrap()
+            .set_property(prop_u32("#address-cells", 2));
+        fdt.node_mut(root)
+            .unwrap()
+            .set_property(prop_u32("#size-cells", 2));
+
+        let intc = fdt.add_node(root, Node::new("interrupt-controller@0"));
+        fdt.node_mut(intc)
+            .unwrap()
+            .set_property(fdt_edit::Property::new(
+                "interrupt-controller",
+                alloc::vec![],
+            ));
+        fdt.node_mut(intc)
+            .unwrap()
+            .set_property(prop_u32("#interrupt-cells", 1));
+        fdt.node_mut(intc)
+            .unwrap()
+            .set_property(prop_u32("phandle", 1));
+
+        for (name, compatible, base, irq) in [
+            ("timer@10002000", "vendor,soc-timer", 0x1000_2000, 12),
+            ("virtio_mmio@10001000", "virtio,mmio", 0x1000_1000, 11),
+        ] {
+            let node = fdt.add_node(root, Node::new(name));
+            fdt.node_mut(node)
+                .unwrap()
+                .set_property(super::super::tree::prop_string("compatible", compatible));
+            fdt.node_mut(node)
+                .unwrap()
+                .set_property(prop_u32("interrupt-parent", 1));
+            fdt.node_mut(node)
+                .unwrap()
+                .set_property(prop_u32_list("interrupts", &[irq]));
+            fdt.view_typed_mut(node)
+                .unwrap()
+                .set_regs(&[RegInfo::new(base, Some(0x1000))]);
+        }
+
+        fdt.encode().as_ref().to_vec()
+    }
+
     fn fdt_with_selectable_and_machine_owned_devices() -> Vec<u8> {
         let mut fdt = Fdt::new();
         let root = fdt.root_id();
@@ -1103,6 +1150,60 @@ mod tests {
                 .reserved_address_ranges()
                 .iter()
                 .any(|range| range.base_gpa == 0x0c00_0000 && range.length == 0x40_0000)
+        );
+    }
+
+    #[test]
+    fn passthrough_guest_reserves_platform_timers_owned_by_the_machine() {
+        let dtb = fdt_with_platform_timer_and_device_interrupts();
+        let mut vm_cfg = AxVMConfig::new(AxVMConfigParams {
+            id: 4,
+            name: "passthrough".to_string(),
+            phys_cpu_ls: PhysCpuList::new(1, None, None),
+            pass_through_devices: vec![PassThroughDeviceConfig {
+                name: "/".to_string(),
+                ..Default::default()
+            }],
+            address_space_policy: AddressSpacePolicy::Passthrough,
+            ..Default::default()
+        });
+        let mut crate_cfg = GuestConfig::default();
+        crate_cfg.base.guest_type = GuestType::Passthrough;
+
+        reserve_excluded_device_ranges(&mut vm_cfg, &crate_cfg, &dtb).unwrap();
+        parse_vm_interrupt(&mut vm_cfg, &dtb).unwrap();
+        parse_passthrough_devices_address(&mut vm_cfg, &crate_cfg, &dtb).unwrap();
+
+        assert!(
+            vm_cfg
+                .excluded_devices()
+                .iter()
+                .flatten()
+                .any(|path| path == "/timer@10002000")
+        );
+        assert!(
+            vm_cfg
+                .reserved_address_ranges()
+                .iter()
+                .any(|range| range.base_gpa == 0x1000_2000 && range.length == 0x1000)
+        );
+        assert!(
+            vm_cfg
+                .pass_through_devices()
+                .iter()
+                .all(|device| device.base_gpa != 0x1000_2000)
+        );
+        assert!(
+            vm_cfg
+                .pass_through_irqs()
+                .iter()
+                .all(|interrupt| interrupt.source != 12)
+        );
+        assert!(
+            vm_cfg
+                .pass_through_irqs()
+                .iter()
+                .any(|interrupt| interrupt.source == 11)
         );
     }
 

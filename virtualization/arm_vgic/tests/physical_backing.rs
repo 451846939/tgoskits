@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     sync::{Arc, Mutex, Weak, mpsc},
     time::Duration,
 };
@@ -8,8 +8,8 @@ use arm_vgic::{
     CpuInterfaceState, EventId, GicAffinity, GicV3Backend, GicV3BackendError, GicV3Config,
     GicV3Controller, GicV3MmioRegion, GicV3SpiOwnership, GicV3VcpuWake, GicVcpuId, GuestMemory,
     GuestMemoryError, IntId, ItsDeviceId, ListRegisterBacking, LpiId, PhysicalInterruptBinding,
-    PhysicalInterruptCompletion, PhysicalIrqId, PhysicalMsiBinding, PpiId, SgiId, SgiTarget, SpiId,
-    TriggerMode, VgicError, VgicResult,
+    PhysicalIrqId, PhysicalMsiBinding, PpiId, SgiId, SgiTarget, SpiId, TriggerMode, VgicError,
+    VgicResult,
 };
 use axdevice_base::InterruptTrigger;
 use axvm_types::AccessWidth;
@@ -611,7 +611,7 @@ fn physical_spi_is_delivered_by_a_resampled_lr() {
 }
 
 #[test]
-fn virtual_eoi_retires_a_resampled_physical_spi() {
+fn hardware_lr_retirement_does_not_repeat_physical_deactivation() {
     const GICD_CTLR: u64 = 0;
     const GICD_ISENABLER1: u64 = 0x104;
 
@@ -635,47 +635,6 @@ fn virtual_eoi_retires_a_resampled_physical_spi() {
     backend.complete_all(GicVcpuId::new(0));
     binding.save().unwrap();
 
-    let deactivated = backend
-        .records
-        .lock()
-        .unwrap()
-        .deactivated_interrupts
-        .clone();
-    assert_eq!(deactivated.len(), 1);
-    assert_eq!(deactivated[0].host(), physical);
-}
-
-#[test]
-fn asserted_physical_level_is_requeued_without_deactivating_the_host_source() {
-    const GICD_CTLR: u64 = 0;
-    const GICD_ISENABLER1: u64 = 0x104;
-
-    let backend = Arc::new(PhysicalBackend::default());
-    let controller = GicV3Controller::new(config(), backend.clone()).unwrap();
-    let binding = attach(&controller, 0, GicAffinity::new(0, 0, 0, 0));
-    let spi = SpiId::new(40).unwrap();
-    let physical = PhysicalIrqId::new(1040);
-    controller
-        .bind_physical_spi(spi, physical, GicVcpuId::new(0))
-        .unwrap();
-    controller
-        .write_distributor(GICD_ISENABLER1, AccessWidth::Dword, 1 << (spi.raw() - 32))
-        .unwrap();
-    controller
-        .write_distributor(GICD_CTLR, AccessWidth::Dword, 1 << 1)
-        .unwrap();
-
-    backend.set_line_asserted(physical, true);
-    controller.forward_physical_spi(spi).unwrap();
-    binding.load().unwrap();
-    backend.complete_all(GicVcpuId::new(0));
-    binding.save().unwrap();
-
-    assert_eq!(
-        controller.interrupt_state(None, IntId::Spi(spi)).unwrap(),
-        arm_vgic::InterruptState::Pending,
-        "a level source that remains asserted must stay pending after virtual EOI"
-    );
     assert!(
         backend
             .records
@@ -683,17 +642,88 @@ fn asserted_physical_level_is_requeued_without_deactivating_the_host_source() {
             .unwrap()
             .deactivated_interrupts
             .is_empty(),
-        "the host activation must remain owned until the physical line deasserts"
+        "a disappearing HW-backed LR means the physical GIC already retired the activation"
     );
+}
 
-    backend.set_line_asserted(physical, false);
+#[test]
+fn physical_reack_is_preserved_until_stale_hardware_lr_is_harvested() {
+    const GICD_CTLR: u64 = 0;
+    const GICD_ISENABLER1: u64 = 0x104;
+
+    let backend = Arc::new(PhysicalBackend::default());
+    let controller = GicV3Controller::new(config(), backend.clone()).unwrap();
+    let binding = attach(&controller, 0, GicAffinity::new(0, 0, 0, 0));
+    let spi = SpiId::new(40).unwrap();
+    let physical = PhysicalIrqId::new(1040);
+    controller
+        .bind_physical_spi(spi, physical, GicVcpuId::new(0))
+        .unwrap();
+    controller
+        .write_distributor(GICD_ISENABLER1, AccessWidth::Dword, 1 << (spi.raw() - 32))
+        .unwrap();
+    controller
+        .write_distributor(GICD_CTLR, AccessWidth::Dword, 1 << 1)
+        .unwrap();
+
+    controller.forward_physical_spi(spi).unwrap();
     binding.load().unwrap();
+
+    // A hardware-backed LR can retire before the VM-local snapshot is
+    // harvested. A new host acknowledgement in that window must survive the
+    // stale canonical LR instead of being consumed by delivery de-duplication.
     backend.complete_all(GicVcpuId::new(0));
+    controller.forward_physical_spi(spi).unwrap();
     binding.save().unwrap();
+    binding.load().unwrap();
+
+    let entry = {
+        let records = backend.records.lock().unwrap();
+        records
+            .loaded_cpu_interfaces
+            .last()
+            .unwrap()
+            .list_registers()
+            .iter()
+            .flatten()
+            .next()
+            .copied()
+    }
+    .expect("the replacement acknowledgement must refill a hardware-backed LR");
+    assert_eq!(entry.intid(), IntId::Spi(spi));
+    assert_eq!(entry.backing(), ListRegisterBacking::Physical(physical));
+}
+
+#[test]
+fn asserted_physical_level_is_resampled_by_trapped_dir() {
+    const GICD_CTLR: u64 = 0;
+    const GICD_ISENABLER1: u64 = 0x104;
+
+    let backend = Arc::new(PhysicalBackend::default());
+    let controller = GicV3Controller::new(config(), backend.clone()).unwrap();
+    let binding = attach(&controller, 0, GicAffinity::new(0, 0, 0, 0));
+    let spi = SpiId::new(40).unwrap();
+    let physical = PhysicalIrqId::new(1040);
+    controller
+        .bind_physical_spi(spi, physical, GicVcpuId::new(0))
+        .unwrap();
+    controller
+        .write_distributor(GICD_ISENABLER1, AccessWidth::Dword, 1 << (spi.raw() - 32))
+        .unwrap();
+    controller
+        .write_distributor(GICD_CTLR, AccessWidth::Dword, 1 << 1)
+        .unwrap();
+
+    controller.forward_physical_spi(spi).unwrap();
+    binding.load().unwrap();
+    backend.activate_all(GicVcpuId::new(0));
+    binding.save().unwrap();
+    binding.deactivate_saved(IntId::Spi(spi)).unwrap();
 
     assert_eq!(
         controller.interrupt_state(None, IntId::Spi(spi)).unwrap(),
-        arm_vgic::InterruptState::Inactive
+        arm_vgic::InterruptState::Inactive,
+        "guest completion must retire the canonical delivery before the host GIC resamples it"
     );
     assert_eq!(
         backend.records.lock().unwrap().deactivated_interrupts,
@@ -703,7 +733,45 @@ fn asserted_physical_level_is_requeued_without_deactivating_the_host_source() {
             GicVcpuId::new(0),
             GicAffinity::new(0, 0, 0, 0),
             InterruptTrigger::LevelTriggered,
-        )]
+        )],
+        "host DIR must run even while a level source remains asserted"
+    );
+
+    // Host DIR resamples the physical line. A source that remains asserted
+    // consequently produces a new host acknowledgement, which enters through
+    // the same fixed physical-SPI route as the original activation.
+    controller.forward_physical_spi(spi).unwrap();
+    assert_eq!(
+        controller.interrupt_state(None, IntId::Spi(spi)).unwrap(),
+        arm_vgic::InterruptState::Pending
+    );
+    binding.load().unwrap();
+    backend.activate_all(GicVcpuId::new(0));
+    binding.save().unwrap();
+    binding.deactivate_saved(IntId::Spi(spi)).unwrap();
+
+    assert_eq!(
+        controller.interrupt_state(None, IntId::Spi(spi)).unwrap(),
+        arm_vgic::InterruptState::Inactive
+    );
+    assert_eq!(
+        backend.records.lock().unwrap().deactivated_interrupts,
+        vec![
+            PhysicalInterruptBinding::new(
+                IntId::Spi(spi),
+                physical,
+                GicVcpuId::new(0),
+                GicAffinity::new(0, 0, 0, 0),
+                InterruptTrigger::LevelTriggered,
+            ),
+            PhysicalInterruptBinding::new(
+                IntId::Spi(spi),
+                physical,
+                GicVcpuId::new(0),
+                GicAffinity::new(0, 0, 0, 0),
+                InterruptTrigger::LevelTriggered,
+            ),
+        ]
     );
 }
 
@@ -1263,7 +1331,6 @@ struct PhysicalRecords {
     unbound_interrupts: Vec<PhysicalInterruptBinding>,
     unbound_msi: Vec<PhysicalMsiBinding>,
     deactivated_interrupts: Vec<PhysicalInterruptBinding>,
-    asserted_interrupts: BTreeSet<PhysicalIrqId>,
     fail_next_enable: bool,
     fail_next_unbind: bool,
 }
@@ -1311,15 +1378,13 @@ impl GicV3Backend for PhysicalBackend {
         &self,
         _vcpu: GicVcpuId,
         binding: PhysicalInterruptBinding,
-    ) -> Result<PhysicalInterruptCompletion, GicV3BackendError> {
-        let mut records = self.records.lock().unwrap();
-        if binding.trigger() == InterruptTrigger::LevelTriggered
-            && records.asserted_interrupts.contains(&binding.host())
-        {
-            return Ok(PhysicalInterruptCompletion::Asserted);
-        }
-        records.deactivated_interrupts.push(binding);
-        Ok(PhysicalInterruptCompletion::Deactivated)
+    ) -> Result<(), GicV3BackendError> {
+        self.records
+            .lock()
+            .unwrap()
+            .deactivated_interrupts
+            .push(binding);
+        Ok(())
     }
 
     fn bind_physical_interrupt(
@@ -1378,15 +1443,6 @@ impl GicV3Backend for PhysicalBackend {
 }
 
 impl PhysicalBackend {
-    fn set_line_asserted(&self, interrupt: PhysicalIrqId, asserted: bool) {
-        let mut records = self.records.lock().unwrap();
-        if asserted {
-            records.asserted_interrupts.insert(interrupt);
-        } else {
-            records.asserted_interrupts.remove(&interrupt);
-        }
-    }
-
     fn activate_all(&self, vcpu: GicVcpuId) {
         let mut records = self.records.lock().unwrap();
         if let Some(state) = records.current_cpu_interfaces.get_mut(&vcpu) {

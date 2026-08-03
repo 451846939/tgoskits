@@ -86,8 +86,8 @@ impl HostTime for ArceOsHost {
         modules::ax_hal::time::monotonic_time()
     }
 
-    fn set_oneshot_timer(&self, deadline_ns: u64) {
-        crate::arch::set_oneshot_timer(deadline_ns);
+    fn request_timer_deadline(&self, deadline_ns: u64) {
+        crate::arch::request_timer_deadline(deadline_ns);
     }
 }
 

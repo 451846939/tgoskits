@@ -34,9 +34,12 @@ impl GuestBootPlatform for LoongArch64Arch {
 }
 
 impl HostTimePlatform for LoongArch64Arch {
-    fn set_oneshot_timer(_deadline_ns: u64) {}
+    fn request_timer_deadline(_deadline_ns: u64) {}
 
-    fn register_timer_callback(notify: Arc<IrqNotify>) {
+    fn register_timer_source(
+        _deadline_source: Arc<crate::timer::PublishedTimerDeadline>,
+        notify: Arc<IrqNotify>,
+    ) {
         ax_std::os::arceos::modules::ax_task::register_timer_callback(move |_| {
             notify.notify_irq();
         });

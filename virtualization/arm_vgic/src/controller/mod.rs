@@ -227,9 +227,10 @@ impl GicV3Controller {
     pub fn set_ppi_level(&self, vcpu: GicVcpuId, ppi: PpiId, asserted: bool) -> VgicResult {
         let wake = {
             let mut state = self.inner.state.lock();
+            let cpu_interface_loaded = state.active_vcpus.contains(&vcpu);
             state
                 .redistributor_mut(vcpu, "set PPI level")?
-                .set_ppi_level(ppi, asserted);
+                .set_ppi_level(ppi, asserted, cpu_interface_loaded);
             state.queue_local_if_deliverable(vcpu, IntId::Ppi(ppi))?
         };
         wake_vcpu(wake)

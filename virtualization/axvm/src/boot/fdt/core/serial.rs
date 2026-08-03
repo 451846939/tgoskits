@@ -3,15 +3,15 @@
 use alloc::{format, string::String, vec, vec::Vec};
 
 use axdevice_base::AccessWidth;
-use fdt_edit::{Fdt, Node, Property};
+use fdt_edit::{Fdt, Node, Property, RegFixed};
 use fdt_raw::RegInfo;
 
 use super::tree::{FdtTree, prop_string};
 use crate::{
     AxVmResult, ax_err_type,
     machine::{
-        GuestSerialFdtIdentity, GuestSerialFdtInterrupt, GuestSerialModel, GuestSerialProfile,
-        GuestSerialTransport,
+        GuestClockReference, GuestMmioRegion, GuestSerialFdtIdentity, GuestSerialFdtInterrupt,
+        GuestSerialModel, GuestSerialProfile, GuestSerialTransport,
     },
 };
 
@@ -180,6 +180,7 @@ pub(crate) fn host_selected_serial(
         .get_property("phandle")
         .or_else(|| node.get_property("linux,phandle"))
         .and_then(Property::get_u32);
+    let clock_references = serial_clock_references(fdt, node, &path)?;
 
     Ok(Some(HostSelectedSerial {
         profile: GuestSerialProfile {
@@ -199,8 +200,109 @@ pub(crate) fn host_selected_serial(
             interrupt_parent: interrupt.interrupt_parent.raw(),
             interrupt_specifier: interrupt.specifier,
             stdout_path: stdout_selector,
+            clock_references,
         },
     }))
+}
+
+fn serial_clock_references(
+    fdt: &Fdt,
+    serial: &Node,
+    serial_path: &str,
+) -> AxVmResult<Vec<GuestClockReference>> {
+    let Some(clocks) = serial.get_property("clocks") else {
+        return Ok(Vec::new());
+    };
+    if clocks.data.is_empty() || !clocks.data.len().is_multiple_of(4) {
+        return Err(ax_err_type!(
+            InvalidData,
+            format!("host console UART node {serial_path} has a malformed clocks property")
+        ));
+    }
+
+    let cells = clocks.get_u32_iter().collect::<Vec<_>>();
+    let mut references = Vec::new();
+    let mut index = 0;
+    while index < cells.len() {
+        let provider_phandle = cells[index];
+        let provider = fdt.get_by_phandle(provider_phandle.into()).ok_or_else(|| {
+            ax_err_type!(
+                InvalidData,
+                format!(
+                    "host console UART node {serial_path} references missing clock provider \
+                     {provider_phandle:#x}"
+                )
+            )
+        })?;
+        let provider_path = provider.path();
+        let clock_cells = provider
+            .as_node()
+            .get_property("#clock-cells")
+            .and_then(Property::get_u32)
+            .ok_or_else(|| {
+                ax_err_type!(
+                    InvalidData,
+                    format!("clock provider {provider_path} has no valid #clock-cells")
+                )
+            })? as usize;
+        let end = index
+            .checked_add(1)
+            .and_then(|start| start.checked_add(clock_cells))
+            .filter(|end| *end <= cells.len())
+            .ok_or_else(|| {
+                ax_err_type!(
+                    InvalidData,
+                    format!(
+                        "host console UART node {serial_path} has a truncated clock specifier for \
+                         provider {provider_path}"
+                    )
+                )
+            })?;
+        let provider_regions = provider
+            .regs()
+            .into_iter()
+            .map(|reg| guest_clock_provider_region(&provider_path, reg))
+            .collect::<AxVmResult<Vec<_>>>()?;
+        references.push(GuestClockReference {
+            provider_phandle,
+            specifier: cells[index + 1..end].to_vec(),
+            provider_regions,
+        });
+        index = end;
+    }
+    Ok(references)
+}
+
+fn guest_clock_provider_region(provider_path: &str, reg: RegFixed) -> AxVmResult<GuestMmioRegion> {
+    let base = usize::try_from(reg.address).map_err(|_| {
+        ax_err_type!(
+            InvalidData,
+            format!("clock provider {provider_path} address does not fit usize")
+        )
+    })?;
+    let length = reg
+        .size
+        .ok_or_else(|| {
+            ax_err_type!(
+                InvalidData,
+                format!("clock provider {provider_path} register range has no size")
+            )
+        })
+        .and_then(|length| {
+            usize::try_from(length).map_err(|_| {
+                ax_err_type!(
+                    InvalidData,
+                    format!("clock provider {provider_path} range size does not fit usize")
+                )
+            })
+        })?;
+    if length == 0 {
+        return Err(ax_err_type!(
+            InvalidData,
+            format!("clock provider {provider_path} register range is empty")
+        ));
+    }
+    Ok(GuestMmioRegion { base, length })
 }
 
 fn decode_interrupt_id(
@@ -525,6 +627,8 @@ fn prop_string_list(name: &str, values: &[&str]) -> Property {
 
 #[cfg(test)]
 mod tests {
+    use alloc::string::ToString;
+
     use super::*;
 
     fn tree_with_controller(compatible: &str, name: &str) -> FdtTree {
@@ -935,6 +1039,15 @@ mod tests {
         tree.set_property(gic, prop_u32("#interrupt-cells", 3))
             .unwrap();
         tree.set_property(gic, prop_u32("phandle", 1)).unwrap();
+        let cru = tree.add_node(root, Node::new("clock-controller@fd7c0000"));
+        tree.set_property(cru, prop_string("compatible", "rockchip,rk3588-cru"))
+            .unwrap();
+        tree.inner_mut()
+            .view_typed_mut(cru)
+            .unwrap()
+            .set_regs(&[RegInfo::new(0xfd7c_0000, Some(0x5c000))]);
+        tree.set_property(cru, prop_u32("#clock-cells", 1)).unwrap();
+        tree.set_property(cru, prop_u32("phandle", 2)).unwrap();
         let serial = tree.add_node(root, Node::new("serial@feb50000"));
         tree.set_property(
             serial,
@@ -949,6 +1062,8 @@ mod tests {
         tree.set_property(serial, prop_u32("reg-io-width", 4))
             .unwrap();
         tree.set_property(serial, prop_u32_list("interrupts", &[0, 0x14d, 4]))
+            .unwrap();
+        tree.set_property(serial, prop_u32_list("clocks", &[2, 187, 2, 172]))
             .unwrap();
         tree.set_property(serial, prop_u32("phandle", 0x2d1))
             .unwrap();
@@ -996,6 +1111,27 @@ mod tests {
         assert_eq!(resolved.identity.interrupt_parent, 1);
         assert_eq!(resolved.identity.interrupt_specifier, [0, 0x14d, 4]);
         assert_eq!(resolved.identity.stdout_path, "/serial@feb50000:1500000");
+        assert_eq!(
+            resolved.identity.clock_references,
+            [
+                GuestClockReference {
+                    provider_phandle: 2,
+                    specifier: vec![187],
+                    provider_regions: vec![GuestMmioRegion {
+                        base: 0xfd7c_0000,
+                        length: 0x5c000,
+                    }],
+                },
+                GuestClockReference {
+                    provider_phandle: 2,
+                    specifier: vec![172],
+                    provider_regions: vec![GuestMmioRegion {
+                        base: 0xfd7c_0000,
+                        length: 0x5c000,
+                    }],
+                },
+            ]
+        );
 
         let mut tree = FdtTree::from_bytes(&host_dtb).unwrap();
         install_mmio_serial(
@@ -1096,5 +1232,35 @@ mod tests {
         assert_eq!(resolved.identity.node_path, "/serial@fe660000");
         assert_eq!(resolved.identity.interrupt_specifier, [0, 0x76, 4]);
         assert_eq!(resolved.identity.stdout_path, "/serial@fe660000");
+    }
+
+    #[test]
+    fn rejects_truncated_host_serial_clock_specifier() {
+        let mut tree = FdtTree::new();
+        let root = tree.inner().root_id();
+        tree.set_property(root, prop_u32("#address-cells", 2))
+            .unwrap();
+        tree.set_property(root, prop_u32("#size-cells", 2)).unwrap();
+        let provider = tree.add_node(root, Node::new("clock-controller@fdd20000"));
+        tree.inner_mut()
+            .view_typed_mut(provider)
+            .unwrap()
+            .set_regs(&[RegInfo::new(0xfdd2_0000, Some(0x1000))]);
+        tree.set_property(provider, prop_u32("#clock-cells", 1))
+            .unwrap();
+        tree.set_property(provider, prop_u32("phandle", 0x23))
+            .unwrap();
+        let serial = tree.add_node(root, Node::new("serial@fe660000"));
+        tree.set_property(serial, prop_u32_list("clocks", &[0x23]))
+            .unwrap();
+
+        let bytes = tree.finish();
+        let fdt = Fdt::from_bytes(&bytes).unwrap();
+        let serial = fdt.get_by_path("/serial@fe660000").unwrap();
+        let error =
+            serial_clock_references(&fdt, serial.as_node(), "/serial@fe660000").unwrap_err();
+
+        assert!(matches!(error, crate::AxVmError::InvalidConfig { .. }));
+        assert!(error.to_string().contains("truncated clock specifier"));
     }
 }

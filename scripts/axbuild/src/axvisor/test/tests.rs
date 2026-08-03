@@ -24,6 +24,7 @@ struct TestVmKernelConfig {
 
 #[derive(serde::Deserialize)]
 struct TestVmKernel {
+    #[serde(default)]
     cmdline: String,
 }
 
@@ -200,6 +201,23 @@ fn orangepi_linux_guest_keeps_the_host_uart_clock_enabled() {
     assert!(
         config.kernel.cmdline.contains("clk_ignore_unused"),
         "{path} must not let the passthrough guest disable the host-owned UART clock"
+    );
+}
+
+#[test]
+fn rk3568_linux_guest_uses_the_virtual_16550_console() {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let path = "os/axvisor/configs/vms/roc-rk3568-pc/linux-smp1.toml";
+    let content = fs::read_to_string(workspace_root.join(path)).unwrap();
+    let config: TestVmKernelConfig = toml::from_str(&content).unwrap();
+
+    assert!(
+        config.kernel.cmdline.contains("console=ttyS2,1500000"),
+        "{path} must route the login console through the machine-owned virtual 16550"
+    );
+    assert!(
+        !config.kernel.cmdline.contains("console=ttyFIQ0"),
+        "{path} must not route the login console through the removed physical FIQ debugger"
     );
 }
 

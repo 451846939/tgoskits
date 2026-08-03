@@ -7,7 +7,7 @@ Axvisor. It is the ownership and world-switch contract for the implementation;
 changes to timer state, counter offsets, PPI completion, vCPU migration, or
 firmware resources must update this document before merge.
 
-Implementation base: `origin/dev` at `024ecca10a4240a84b2c24bed2dc2361a6043d3e`.
+Implementation base: `origin/dev` at `a6e8f239ea8565888bea1fdf33e192ea130d5815`.
 
 The design applies uniformly to QEMU GICv2, QEMU GICv3, RK3568, RK3588, and
 other AArch64 hosts. It must not be repaired with board-name, SoC-compatible,
@@ -79,6 +79,7 @@ ordering with its own timer wheel and unified VGIC controller.
 | timer output level | vCPU snapshot plus `Aarch64TimerBinding` | published into one private VGIC line |
 | PPI pending/active/enable/EOI | `arm_vgic` | canonical interrupt state |
 | acknowledged host CNTV token | host timer-PPI binding | lock-out resource retained until VGIC retirement |
+| assigned-SPI pending/active state | physical GIC plus HW-backed LR | LR carries the ownership-checked physical INTID |
 | WFI wake event | CPU-owned AxVM timer wheel | hint only; callback never asserts a PPI |
 | FDT interrupt identity | `GuestTimerProfile` | shared by runtime attachment and FDT generation |
 
@@ -86,6 +87,24 @@ No generic channel carries timer IRQ state. `IrqNotify` and the timer wheel
 carry only deferred work or wake hints. A hard IRQ may acknowledge and
 priority-drop its source and publish preallocated notification state; it must
 not look up a VM, allocate, take `rdrive` locks, or invoke a subscriber.
+
+An AArch64 hypervisor host enables split EOI mode in every GICv2 or GICv3 CPU
+interface. `EOIR` therefore performs only the priority drop; `DIR` remains the
+explicit completion boundary. Ordinary host IRQ dispatch preserves its
+one-step behavior by performing both operations from `ActiveIrq::drop`.
+AxVM-owned PPIs and SPIs use the same host mode but retain the acknowledged
+activation until virtual retirement. A timer PPI retains its opaque token in
+the timer binding. An assigned SPI names its physical source through the
+hardware-backed LR instead of maintaining a second software pending state.
+Enabling split EOI only in the AxVM fast path is invalid because the mode is
+CPU-interface state shared with normal host IRQ dispatch.
+
+An acknowledged interrupt that is not guest-owned still follows the ordinary
+host IRQ graph. The raw GIC parent INTID is resolved through the installed
+parent-to-leaf route before dispatch, so an ITS LPI reaches its MSI/MSI-X leaf
+handler. GICv3 completion preserves the complete 24-bit architectural INTID
+when issuing `DIR`; only the separately validated device-passthrough contract
+is limited to assignable SPIs.
 
 VGIC retirement invokes one typed backend operation after releasing the
 controller lock. This is a single-owner lifecycle boundary, not a general
@@ -146,7 +165,14 @@ transaction.
 
 ### Guest exit
 
-The exception assembly performs:
+For a lower-EL IRQ, the exception assembly first reads the host IAR while the
+guest timer level is still asserted and stores only the raw acknowledgement in
+the vCPU's host-runtime slot. GICv2 uses the immutable memory-mapped CPU
+interface address discovered during VGIC construction; GICv3 uses
+`ICC_IAR1_EL1`. This is an assembly-only operation: no Rust, VM lookup,
+allocation, callback, or controller lock runs with guest timer state loaded.
+
+The common exit transaction then performs:
 
 1. read CNTV CTL and CVAL into the vCPU context;
 2. advance the timer generation;
@@ -157,9 +183,17 @@ The exception assembly performs:
 7. mark the timer context unloaded, then ISB;
 8. only then call Rust.
 
-Rust then publishes current CNTV/CNTP levels before saving and merging VGIC
-state. If the exit is a trapped DIR, the guest's preceding CVAL/CTL writes are
-therefore visible before deactivation decides whether a level must repend.
+After the host timer context is restored, Rust validates the captured IAR
+value, performs the split-EOI priority drop, and converts it into an opaque
+completion token. It then publishes current CNTV/CNTP levels before saving and
+merging VGIC state. If the exit is a trapped DIR, the guest's preceding
+CVAL/CTL writes are therefore visible before deactivation decides whether a
+level must repend.
+
+Acknowledging after writing `CNTV_CTL_EL0 = 0` is invalid for a level PPI. The
+line can deassert before `GICC_IAR` or `ICC_IAR1_EL1` is read, producing a
+spurious INTID and an immediate re-entry loop. This ordering is shared by
+GICv2, GICv3, QEMU, and real boards; it is not a platform workaround.
 
 ## Timer PPI Lifecycle
 
@@ -168,13 +202,18 @@ The virtual and non-secure physical timer INTIDs come from
 
 CNTV host interrupt handling is split:
 
-1. the host top half acknowledges and priority-drops the CPU-local PPI;
-2. task context records the opaque token and its owner pCPU;
-3. timer snapshot publication updates the virtual PPI level;
-4. VGIC owns delivery and guest enable/active state;
-5. GICv2 EOI/DIR or GICv3 LR/TDIR retirement reaches the typed backend
+1. AxVM claims the architectural virtual-timer PPI once for the hypervisor
+   lifetime, configures it as level-triggered on every pCPU, and keeps one
+   fixed allocation-free fallback for host-context races;
+2. the host GIC CPU interface is already in split EOI mode;
+3. lower-EL IRQ assembly acknowledges the CPU-local PPI before stopping CNTV;
+4. post-switch Rust priority-drops the captured acknowledgement and records
+   its opaque token plus owner pCPU;
+5. timer snapshot publication updates the virtual PPI level;
+6. VGIC owns delivery and guest enable/active state;
+7. GICv2 EOI/DIR or GICv3 LR/TDIR retirement reaches the typed backend
    retirement boundary after the controller lock is released;
-6. the host token is deactivated on its owner pCPU.
+8. the host token is deactivated on its owner pCPU.
 
 Lowering the timer line does not complete the host activation. This is
 essential when a guest clears CVAL or CTL before writing DIR: the virtual line
@@ -184,6 +223,30 @@ Migration may force completion on the old pCPU before loading the vCPU on a
 new pCPU. Reset, stop, and drop likewise complete and discard the host
 activation after invalidating timer-wheel work. These are explicit lifecycle
 operations, not substitutes for ordinary guest retirement.
+
+## Assigned Physical SPI Lifecycle
+
+An assigned physical SPI uses an ownership-checked hardware-backed LR:
+
+1. the host top half acknowledges the SPI and performs the priority drop;
+2. VGIC queues one canonical delivery carrying the guest INTID and physical
+   INTID;
+3. GICv2 writes `HW` plus the physical ID into `GICH_LR`, while GICv3 writes
+   `HW` and `PINTID` into `ICH_LR_EL2`;
+4. ordinary guest completion retires the physical activation in the GIC
+   hardware, so harvesting the disappeared LR must not issue another host
+   `DIR`;
+5. if a level source is still asserted, physical deactivation resamples it and
+   produces a fresh host acknowledgement through the same ingress route.
+
+A replacement host acknowledgement may arrive before software harvests the
+stale LR snapshot. Delivery de-duplication must retain that acknowledgement
+until refill can create a new HW-backed LR; otherwise a continuously asserted
+device can lose its only replacement activation. A guest DIR that traps before
+hardware retirement, and explicit rollback or teardown, use the typed backend
+to issue host `DIR`. Sampling `GICD_ISPENDR` before `DIR` is not an equivalent
+completion mechanism because physical deactivation is the architectural level
+resample point.
 
 ## WFI, Timer Wheel, and Migration
 
@@ -256,11 +319,19 @@ Deterministic regressions cover:
 
 - disabling CNTV and executing ISB before clearing CNTVOFF;
 - complete entry/exit assembly operation ordering;
+- lower-EL IAR acknowledgement before CNTV is stopped;
 - CVAL/TVAL, ENABLE, IMASK, derived ISTATUS, wraparound, and reset generation;
 - earliest CNTV/CNTP WFI deadline;
 - uniform target-CPU frequency and minimum target-CPU capabilities;
 - owner-aware timer cancellation and stale generation;
+- GICv2 and GICv3 hypervisor host CPU interfaces both enabling split EOI;
 - GICv2 EOI/DIR and GICv3 TDIR retirement;
+- GICv2/GICv3 HW-backed assigned-SPI LR identity and normal hardware
+  retirement without duplicate host deactivation;
+- a replacement physical acknowledgement surviving a stale LR snapshot;
+- trapped DIR always reaching physical deactivation before level resampling;
+- unassigned GICv3 LPIs resolving to their MSI leaf and retaining the full
+  24-bit INTID through host `DIR`;
 - high-level re-pend after EOI and low-level non-repend;
 - host timer-PPI completion only through VGIC retirement;
 - four/five FDT interrupts, malformed cells, PPI class/trigger, frequency,

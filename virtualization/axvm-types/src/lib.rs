@@ -706,6 +706,8 @@ pub enum EmulatedDeviceType {
     Console             = 0x2,
     /// QEMU fw_cfg MMIO device.
     FwCfg               = 0x3,
+    /// Machine-owned mediator for a physical MMIO provider shared with a guest.
+    SharedMmio          = 0x4,
     /// An emulated device that provides Inter-VM Communication (IVC) channel.
     ///
     /// This device is used for communication between different VMs,
@@ -896,6 +898,7 @@ impl Display for EmulatedDeviceType {
         match self {
             EmulatedDeviceType::Console => write!(f, "console"),
             EmulatedDeviceType::FwCfg => write!(f, "fw_cfg"),
+            EmulatedDeviceType::SharedMmio => write!(f, "shared mmio provider"),
             EmulatedDeviceType::InterruptController => write!(f, "interrupt controller"),
             EmulatedDeviceType::GicCpuRegion => write!(f, "gic per-cpu register region"),
             EmulatedDeviceType::GPPTDistributor => write!(f, "gic partial passthrough distributor"),
@@ -920,11 +923,12 @@ impl Display for EmulatedDeviceType {
 
 impl EmulatedDeviceType {
     /// All known emulated device types.
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         EmulatedDeviceType::Dummy,
         EmulatedDeviceType::InterruptController,
         EmulatedDeviceType::Console,
         EmulatedDeviceType::FwCfg,
+        EmulatedDeviceType::SharedMmio,
         EmulatedDeviceType::IVCChannel,
         EmulatedDeviceType::GicCpuRegion,
         EmulatedDeviceType::GPPTDistributor,
@@ -968,6 +972,7 @@ impl EmulatedDeviceType {
             0x1 => Some(EmulatedDeviceType::InterruptController),
             0x2 => Some(EmulatedDeviceType::Console),
             0x3 => Some(EmulatedDeviceType::FwCfg),
+            0x4 => Some(EmulatedDeviceType::SharedMmio),
             0xA => Some(EmulatedDeviceType::IVCChannel),
             0x20 => Some(EmulatedDeviceType::GicCpuRegion),
             0x21 => Some(EmulatedDeviceType::GPPTDistributor),

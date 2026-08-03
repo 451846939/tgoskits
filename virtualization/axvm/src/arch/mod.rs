@@ -81,14 +81,15 @@ pub(crate) type ArchVCpu = <CurrentArch as ArchOps>::VCpu;
 pub(crate) type ArchPerCpu = <CurrentArch as ArchOps>::PerCpu;
 pub(crate) type ArchNestedPageTable = <CurrentArch as ArchOps>::NestedPageTable;
 
-pub(crate) fn register_timer_callback(
+pub(crate) fn register_timer_source(
+    deadline_source: alloc::sync::Arc<crate::timer::PublishedTimerDeadline>,
     notify: alloc::sync::Arc<ax_std::os::arceos::modules::ax_task::IrqNotify>,
 ) {
-    CurrentArch::register_timer_callback(notify);
+    CurrentArch::register_timer_source(deadline_source, notify);
 }
 
-pub(crate) fn set_oneshot_timer(deadline_ns: u64) {
-    CurrentArch::set_oneshot_timer(deadline_ns);
+pub(crate) fn request_timer_deadline(deadline_ns: u64) {
+    CurrentArch::request_timer_deadline(deadline_ns);
 }
 
 pub(crate) fn init_guest_boot_resources() {

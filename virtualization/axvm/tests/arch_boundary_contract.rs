@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[path = "../../../platforms/somehal/src/arch/aarch64/gic/trigger.rs"]
+mod host_gic_trigger;
+
 #[test]
 fn vm_core_does_not_handle_arch_local_exits() {
     let vm_rs = include_str!("../src/vm/mod.rs");
@@ -149,6 +152,42 @@ fn aarch64_enables_the_virtual_gic_interface_before_first_guest_entry() {
 }
 
 #[test]
+fn aarch64_keeps_host_irqs_masked_across_the_complete_vgic_transaction() {
+    let architecture = include_str!("../src/arch/aarch64/mod.rs");
+    let run = architecture
+        .split_once("fn run(&mut self) -> BackendResult<Self::Exit> {")
+        .expect("AArch64 vCPU run implementation must exist")
+        .1
+        .split_once("\n    fn bind(&mut self)")
+        .expect("AArch64 vCPU run implementation must end before bind")
+        .0;
+
+    let mask = run
+        .find("let host_irq_guard = ArmHostIrqGuard::mask();")
+        .expect("host IRQs must be masked before loading the VGIC");
+    let load = run
+        .find("vgic_backend_result(binding.load())?")
+        .expect("the VGIC must be loaded before guest entry");
+    let guest = run
+        .find("self.inner.run(&host_irq_guard)")
+        .expect("guest entry must require proof that host IRQs remain masked");
+    let timer = run
+        .find("self.synchronize_timer()")
+        .expect("timer state must be synchronized after guest exit");
+    let save = run
+        .find("vgic_backend_result(binding.save())")
+        .expect("the VGIC must be saved after guest exit");
+    let unmask = run
+        .find("drop(host_irq_guard)")
+        .expect("host IRQ state must be restored after saving the VGIC");
+
+    assert!(
+        mask < load && load < guest && guest < timer && timer < save && save < unmask,
+        "host IRQs must stay masked for load -> guest -> timer sync -> save"
+    );
+}
+
+#[test]
 fn aarch64_assigned_spis_use_split_eoi_and_explicit_teardown() {
     let gic = include_str!("../src/arch/aarch64/gic.rs");
     let physical_ingress = std::fs::read_to_string(
@@ -243,6 +282,45 @@ fn aarch64_assigned_spi_trigger_and_target_are_applied_and_restored_at_runtime_b
 }
 
 #[test]
+fn aarch64_host_gic_trigger_configuration_supports_spis() {
+    use core::cell::Cell;
+
+    const PRIVATE: u32 = 1;
+    const SPI: u32 = 2;
+    let selected = Cell::new(0);
+    let result = host_gic_trigger::dispatch_trigger_configuration(
+        48,
+        Some(8192),
+        |_| {
+            selected.set(PRIVATE);
+            Ok::<(), &'static str>(())
+        },
+        |_| {
+            selected.set(SPI);
+            Ok(())
+        },
+        || "LPI trigger configuration is unsupported",
+    );
+
+    assert_eq!(result, Ok(()));
+    assert_eq!(
+        selected.get(),
+        SPI,
+        "SPI trigger configuration must use the Distributor path"
+    );
+    assert_eq!(
+        host_gic_trigger::dispatch_trigger_configuration(
+            8192,
+            Some(8192),
+            |_| Ok(()),
+            |_| Ok(()),
+            || "LPI trigger configuration is unsupported",
+        ),
+        Err("LPI trigger configuration is unsupported")
+    );
+}
+
+#[test]
 fn aarch64_virtual_devices_share_controller_owned_level_state() {
     let vgic = include_str!("../src/arch/aarch64/vgic.rs");
     let vm = include_str!("../src/arch/aarch64/vm.rs");
@@ -268,7 +346,7 @@ fn aarch64_software_spis_follow_irouter_while_assigned_spis_keep_fixed_affinity(
     let distributor = include_str!("../../arm_vgic/src/distributor.rs");
 
     assert!(
-        state.contains("let (route, cpu_target_mask)")
+        state.contains("let (route, cpu_target_mask, trigger)")
             && state.contains("redistributor.affinity() == route"),
         "software SPIs must follow the guest-programmed IROUTER affinity"
     );
@@ -608,10 +686,13 @@ fn aarch64_host_time_registers_axvm_timer_callback() {
         "AArch64 must use the common deferred host-timer path"
     );
     assert!(
-        common.contains("fn register_timer_callback(notify: Arc<IrqNotify>)")
+        common.contains("fn register_timer_source(")
+            && common.contains("register_timer_deadline_source")
             && common.contains("ax_task::register_timer_irq_callback")
+            && common.contains("deadline_source.clear_if_elapsed")
             && common.contains("notify.notify_irq()"),
-        "hard IRQ must publish only to IrqNotify; the pinned worker drains the timer wheel"
+        "the common arbiter must observe AxVM deadlines while hard IRQ only clears elapsed \
+         publication and notifies the pinned worker"
     );
 }
 

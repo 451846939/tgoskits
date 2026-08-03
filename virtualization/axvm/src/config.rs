@@ -684,6 +684,7 @@ mod tests {
             interrupt_parent: 1,
             interrupt_specifier: vec![0, 0x14d, 4],
             stdout_path: "/serial@feb50000:1500000".into(),
+            clock_references: Vec::new(),
         };
 
         config

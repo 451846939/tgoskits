@@ -7,7 +7,7 @@ use axdevice::DeviceFactoryRegistry;
 use axvm_types::NestedPagingConfig;
 
 use super::{
-    Aarch64Arch, npt,
+    Aarch64Arch, npt, shared_provider,
     vgic::{self, Aarch64VgicRuntime},
 };
 use crate::{
@@ -41,12 +41,12 @@ impl Aarch64Arch {
         match request {
             VmInitRequest::Default => {
                 let mut factories = default_device_factories(vm)?;
-                let runtime = register_device_factories(vm, &mut factories)?;
-                init_vm_with(vm, &factories, runtime)
+                let bootstrap = register_device_factories(vm, &mut factories)?;
+                init_vm_with(vm, &factories, bootstrap)
             }
             VmInitRequest::Provided { factories } => {
-                let runtime = register_device_factories(vm, factories)?;
-                init_vm_with(vm, factories, runtime)
+                let bootstrap = register_device_factories(vm, factories)?;
+                init_vm_with(vm, factories, bootstrap)
             }
         }
     }
@@ -55,15 +55,26 @@ impl Aarch64Arch {
 fn register_device_factories(
     vm: &AxVM,
     factories: &mut DeviceFactoryRegistry,
-) -> AxVmResult<Arc<Aarch64VgicRuntime>> {
-    vgic::register_device_factories(vm, factories)
+) -> AxVmResult<Aarch64DeviceBootstrap> {
+    let clock_references =
+        vm.with_config(|config| shared_provider::clock_references_for_plan(config));
+    let vgic_runtime = vgic::register_device_factories(vm, factories)?;
+    let extra_device_configs = shared_provider::register_factory(clock_references, factories)?;
+    Ok(Aarch64DeviceBootstrap {
+        vgic_runtime,
+        extra_device_configs,
+    })
 }
 
 fn init_vm_with(
     vm: &AxVM,
     factories: &DeviceFactoryRegistry,
-    vgic_runtime: Arc<Aarch64VgicRuntime>,
+    bootstrap: Aarch64DeviceBootstrap,
 ) -> AxVmResult {
+    let Aarch64DeviceBootstrap {
+        vgic_runtime,
+        extra_device_configs,
+    } = bootstrap;
     let interrupt_controller: Arc<dyn axdevice_base::VirtualInterruptController> =
         vgic_runtime.core().clone();
     complete_vm_init(
@@ -79,6 +90,8 @@ fn init_vm_with(
                 AxVmError::invalid_config("AArch64 machine profile has no architectural timer")
             })?;
             let timer_config = timer_vm_config(&timer_profile, &vcpu_mappings)?;
+            let host_irq_config = super::gic::host_irq_config()
+                .map_err(|error| AxVmError::interrupt("discover host IRQ CPU interface", error))?;
             let dtb_addr = resources
                 .config()
                 .image_config()
@@ -107,7 +120,7 @@ fn init_vm_with(
                 resources,
                 factories,
                 interrupt_controller,
-                &arch_extra_device_configs(),
+                &extra_device_configs,
                 vm.device_access_ports(),
             )?;
             validate_guest_dtb(resources)?;
@@ -115,7 +128,7 @@ fn init_vm_with(
             let owned_regions = guest_owned_regions(resources);
             map_guest_address_space(vm, resources, devices.devices(), &owned_regions)?;
             vcpus.setup(resources, move |_config, _memory_regions| {
-                Ok(ArmVcpuSetupConfig::new(timer_config))
+                Ok(ArmVcpuSetupConfig::new(timer_config, host_irq_config))
             })?;
 
             Ok(PreparedVm::new(vcpus, devices))
@@ -123,8 +136,9 @@ fn init_vm_with(
     )
 }
 
-fn arch_extra_device_configs() -> [axvm_types::EmulatedDeviceConfig; 0] {
-    []
+struct Aarch64DeviceBootstrap {
+    vgic_runtime: Arc<Aarch64VgicRuntime>,
+    extra_device_configs: Vec<axvm_types::EmulatedDeviceConfig>,
 }
 
 fn guest_page_table_levels(vcpu_mappings: &[(usize, Option<usize>, usize)]) -> AxVmResult<usize> {

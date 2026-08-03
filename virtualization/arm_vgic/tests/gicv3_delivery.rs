@@ -572,6 +572,41 @@ fn trapped_dir_harvests_a_hardware_activation_before_deactivation() {
 }
 
 #[test]
+fn loaded_level_deassertion_preserves_guest_eoi_retirement() {
+    let (controller, backend) = controller(1, 1);
+    let vcpu = GicVcpuId::new(0);
+    let binding = attach(&controller, 0, GicAffinity::new(0, 0, 0, 0));
+    let timer = PpiId::new(27).unwrap();
+
+    controller
+        .write_redistributor(
+            vcpu,
+            GICR_SGI_BASE + GICD_ISENABLER,
+            AccessWidth::Dword,
+            1 << timer.raw(),
+        )
+        .unwrap();
+    controller.set_ppi_level(vcpu, timer, true).unwrap();
+    binding.load().unwrap();
+
+    backend.complete_all(0);
+    controller.set_ppi_level(vcpu, timer, false).unwrap();
+    binding.save().unwrap();
+
+    assert_eq!(
+        backend.retired_interrupts(),
+        vec![(vcpu, IntId::Ppi(timer))],
+        "lowering a loaded timer line must not erase the LR identity before guest EOI is harvested"
+    );
+    assert_eq!(
+        controller
+            .interrupt_state(Some(vcpu), IntId::Ppi(timer))
+            .unwrap(),
+        InterruptState::Inactive
+    );
+}
+
+#[test]
 fn eoi_count_deactivates_an_active_interrupt_outside_the_lrs() {
     let (controller, backend) = controller(1, 1);
     let binding = attach(&controller, 0, GicAffinity::new(0, 0, 0, 0));

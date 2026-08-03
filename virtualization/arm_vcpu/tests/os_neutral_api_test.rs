@@ -36,7 +36,7 @@ impl ArmHostOps for DummyHost {
         Ok(())
     }
 
-    fn fetch_pending_host_irq() -> Option<usize> {
+    fn finish_pending_host_irq(_raw_ack: u32) -> Option<usize> {
         None
     }
 

@@ -52,7 +52,7 @@ fn exception_vector_table_uses_sixteen_fixed_width_branch_slots() {
 #[test]
 fn guest_exit_stops_cntv_before_restoring_the_host_counter_domain() {
     let assembly = include_str!("../src/exception.S");
-    let start = assembly.find(".macro SAVE_VCPU_REGS_FROM_EL1").unwrap();
+    let start = assembly.find(".macro SAVE_VCPU_RUNTIME_FROM_EL1").unwrap();
     let end = assembly[start..].find(".endm").unwrap() + start;
     let save = &assembly[start..end];
 
@@ -69,6 +69,54 @@ fn guest_exit_stops_cntv_before_restoring_the_host_counter_domain() {
             "msr     cntkctl_el1, x9",
             "strb    wzr, [sp, {timer_loaded_offset}]",
             "isb",
+        ],
+    );
+}
+
+#[test]
+fn lower_irq_acknowledges_host_source_before_stopping_cntv() {
+    let assembly = include_str!("../src/exception.S");
+    let start = assembly.find(".macro HANDLE_LOWER_IRQ_VCPU").unwrap();
+    let end = assembly[start..].find(".endm").unwrap() + start;
+    let handler = &assembly[start..end];
+
+    ordered(
+        handler,
+        &[
+            "SAVE_REGS_FROM_EL1",
+            "ACK_PENDING_HOST_IRQ",
+            "SAVE_VCPU_RUNTIME_FROM_EL1",
+            "bl      vmexit_trampoline",
+        ],
+    );
+}
+
+#[test]
+fn host_irq_acknowledgement_supports_gicv2_mmio_and_gicv3_sysreg() {
+    let assembly = include_str!("../src/exception.S");
+    let start = assembly.find(".macro ACK_PENDING_HOST_IRQ").unwrap();
+    let end = assembly[start..].find(".endm").unwrap() + start;
+    let acknowledge = &assembly[start..end];
+
+    ordered(
+        acknowledge,
+        &[
+            "mov     w9, #-1",
+            "str     w9, [sp, {host_pending_irq_ack_offset}]",
+            "ldr     x9, [sp, {host_irq_interface_offset}]",
+            "mrs     x9, ICC_IAR1_EL1",
+            "str     w9, [sp, {host_pending_irq_ack_offset}]",
+            "dsb     sy",
+        ],
+    );
+    ordered(
+        acknowledge,
+        &[
+            ".Lack_host_irq_gicv2\\@:",
+            "ldr     x10, [sp, {host_irq_cpu_interface_base_offset}]",
+            "ldr     w9, [x10, #0xc]",
+            "str     w9, [sp, {host_pending_irq_ack_offset}]",
+            "dsb     sy",
         ],
     );
 }

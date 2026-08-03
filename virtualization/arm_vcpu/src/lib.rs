@@ -39,7 +39,7 @@ mod vcpu;
 
 #[cfg(target_arch = "aarch64")]
 pub use self::{
-    host::ArmHostOps,
+    host::{ArmHostIrqConfig, ArmHostIrqGuard, ArmHostOps},
     pcpu::ArmPerCpu,
     vcpu::{
         ARM_VCPU_HOST_SP_EL0_OFFSET, ARM_VCPU_HOST_STACK_TOP_OFFSET, ARM_VCPU_TRAP_FRAME_SIZE,

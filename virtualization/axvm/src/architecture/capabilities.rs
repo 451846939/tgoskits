@@ -1,6 +1,6 @@
 //! Small capability boundaries implemented by the selected guest architecture.
 
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use alloc::{sync::Arc, vec::Vec};
 
 use ax_std::os::arceos::modules::ax_task::IrqNotify;
 
@@ -119,27 +119,23 @@ pub(crate) trait BootImagePlatform {
 
 /// Architecture-specific host timer policy used by the ArceOS adapter.
 pub(crate) trait HostTimePlatform {
-    fn set_oneshot_timer(deadline_ns: u64) {
-        ax_std::os::arceos::modules::ax_hal::time::set_oneshot_timer(deadline_ns);
+    fn request_timer_deadline(deadline_ns: u64) {
+        ax_std::os::arceos::modules::ax_task::request_timer_deadline_nanos(deadline_ns);
     }
 
-    fn register_timer_callback(notify: Arc<IrqNotify>) {
-        register_vm_timer_irq_callback(
-            |callback| {
-                ax_std::os::arceos::modules::ax_task::register_timer_irq_callback(move |_| {
-                    callback();
-                });
-            },
-            move || notify.notify_irq(),
-        );
+    fn register_timer_source(
+        deadline_source: Arc<crate::timer::PublishedTimerDeadline>,
+        notify: Arc<IrqNotify>,
+    ) {
+        let published_deadline = deadline_source.clone();
+        ax_std::os::arceos::modules::ax_task::register_timer_deadline_source(move || {
+            published_deadline.deadline_nanos()
+        });
+        ax_std::os::arceos::modules::ax_task::register_timer_irq_callback(move |now| {
+            deadline_source.clear_if_elapsed(now.as_nanos().min(u64::MAX as u128) as u64);
+            notify.notify_irq();
+        });
     }
-}
-
-fn register_vm_timer_irq_callback(
-    register: impl FnOnce(Box<dyn Fn() + Send + Sync>),
-    callback: impl Fn() + Send + Sync + 'static,
-) {
-    register(Box::new(callback));
 }
 
 #[cfg(test)]
@@ -186,14 +182,5 @@ mod tests {
                 cpu_id: 2,
             })
         );
-    }
-
-    #[test]
-    fn default_host_timer_policy_registers_the_vm_timer_irq_consumer() {
-        let mut installed = false;
-
-        register_vm_timer_irq_callback(|_| installed = true, || {});
-
-        assert!(installed);
     }
 }

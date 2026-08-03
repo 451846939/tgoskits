@@ -8,8 +8,8 @@ use alloc::{
 use arm_gic_driver::v3::Trigger;
 use arm_vgic::{
     CpuInterfaceState, GicV3Backend, GicV3BackendError, GicV3HardwareCapabilities, GicVcpuId,
-    HostGicVersion, IntId, PhysicalInterruptBinding, PhysicalInterruptCompletion, PhysicalIrqId,
-    PpiId, VgicBackendCapabilities, VgicCore, VgicError, VgicResult,
+    HostGicVersion, IntId, PhysicalInterruptBinding, PhysicalIrqId, PpiId, VgicBackendCapabilities,
+    VgicCore, VgicError, VgicResult,
 };
 use ax_kspin::SpinNoIrq;
 use axdevice_base::InterruptTrigger;
@@ -55,25 +55,9 @@ enum PhysicalSpiTarget {
     V3(Option<arm_gic_driver::v3::Affinity>),
 }
 
-#[derive(Clone, Copy)]
-enum PhysicalSpiState {
-    V2(arm_gic_driver::v2::DistributorOperations),
-    V3(arm_gic_driver::v3::DistributorOperations),
-}
-
-impl PhysicalSpiState {
-    fn is_pending(self, intid: arm_gic_driver::IntId) -> bool {
-        match self {
-            Self::V2(distributor) => distributor.is_pending(intid),
-            Self::V3(distributor) => distributor.is_pending(intid),
-        }
-    }
-}
-
 /// Checked bridge from the VM-local controller to the current host GIC.
 pub(crate) struct AxvmVgicBackend {
     capabilities: VgicBackendCapabilities,
-    physical_spi_state: PhysicalSpiState,
     physical_spis: SpinNoIrq<BTreeMap<PhysicalIrqId, PhysicalSpiSnapshot>>,
     timer_ppis: SpinNoIrq<BTreeMap<(GicVcpuId, IntId), Weak<Aarch64TimerBinding>>>,
 }
@@ -81,23 +65,8 @@ pub(crate) struct AxvmVgicBackend {
 impl AxvmVgicBackend {
     /// Discovers immutable host CPU-interface capabilities once.
     pub(crate) fn new() -> Result<Self, GicV3BackendError> {
-        let capabilities = cpu_interface::capabilities()?;
-        let physical_spi_state = try_with_gic("cache host GIC Distributor operations", |gic| {
-            if let Some(gic) = gic.typed_mut::<arm_gic_driver::v2::Gic>() {
-                return Some(PhysicalSpiState::V2(gic.distributor_operations()));
-            }
-            gic.typed_mut::<arm_gic_driver::v3::Gic>()
-                .map(|gic| PhysicalSpiState::V3(gic.distributor_operations()))
-        })?
-        .ok_or_else(|| {
-            GicV3BackendError::new(
-                "cache host GIC Distributor operations",
-                "the registered interrupt controller is neither GICv2 nor GICv3",
-            )
-        })?;
         Ok(Self {
-            capabilities,
-            physical_spi_state,
+            capabilities: cpu_interface::capabilities()?,
             physical_spis: SpinNoIrq::new(BTreeMap::new()),
             timer_ppis: SpinNoIrq::new(BTreeMap::new()),
         })
@@ -270,7 +239,7 @@ impl GicV3Backend for AxvmVgicBackend {
         &self,
         vcpu: GicVcpuId,
         binding: PhysicalInterruptBinding,
-    ) -> Result<PhysicalInterruptCompletion, GicV3BackendError> {
+    ) -> Result<(), GicV3BackendError> {
         if vcpu != binding.target() {
             return Err(GicV3BackendError::new(
                 "complete physical interrupt",
@@ -282,15 +251,10 @@ impl GicV3Backend for AxvmVgicBackend {
             ));
         }
         let intid = self.physical_intid(binding, "complete physical interrupt")?;
-        let completion = physical::complete_assigned_spi(binding.host(), || {
-            if binding.trigger() == InterruptTrigger::LevelTriggered
-                && self.physical_spi_state.is_pending(intid)
-            {
-                return Ok(PhysicalInterruptCompletion::Asserted);
-            }
+        physical::complete_assigned_spi(binding.host(), || {
             cpu_interface::deactivate_spi(intid)?;
             instruction_sync_barrier();
-            Ok(PhysicalInterruptCompletion::Deactivated)
+            Ok(())
         })?
         .ok_or_else(|| {
             GicV3BackendError::new(
@@ -300,8 +264,7 @@ impl GicV3Backend for AxvmVgicBackend {
                     binding.host().raw()
                 ),
             )
-        })?;
-        Ok(completion)
+        })
     }
 
     fn deactivate_physical_interrupt(
@@ -320,12 +283,12 @@ impl GicV3Backend for AxvmVgicBackend {
             ));
         }
         let intid = self.physical_intid(binding, "deactivate physical interrupt")?;
-        let completion = physical::complete_assigned_spi(binding.host(), || {
+        let completed = physical::complete_assigned_spi(binding.host(), || {
             cpu_interface::deactivate_spi(intid)?;
             instruction_sync_barrier();
-            Ok(PhysicalInterruptCompletion::Deactivated)
+            Ok(())
         })?;
-        if completion.is_none() {
+        if completed.is_none() {
             return Err(GicV3BackendError::new(
                 "deactivate physical interrupt",
                 alloc::format!(
@@ -488,6 +451,10 @@ pub(crate) fn backend() -> Result<Arc<AxvmVgicBackend>, GicV3BackendError> {
     AxvmVgicBackend::new().map(Arc::new)
 }
 
+pub(crate) fn host_irq_config() -> Result<arm_vcpu::ArmHostIrqConfig, GicV3BackendError> {
+    cpu_interface::host_irq_config()
+}
+
 pub(crate) fn register_assigned_spi_routes(
     controller: &Arc<VgicCore>,
 ) -> Result<Arc<AssignedSpiRoutes>, GicV3BackendError> {
@@ -524,6 +491,15 @@ pub(crate) fn host_spi_count() -> Result<usize, GicV3BackendError> {
 /// Physical guest-owned SPIs intentionally remain active until guest DIR.
 pub(crate) fn acknowledge_host_irq() -> Option<usize> {
     cpu_interface::acknowledge_host_irq()
+        .inspect_err(|error| warn!("{error}"))
+        .ok()
+        .flatten()
+}
+
+/// Completes an IAR acknowledgement captured before the guest timer was
+/// stopped by the lower-EL IRQ exit assembly.
+pub(crate) fn finish_pending_host_irq(raw_ack: u32) -> Option<usize> {
+    cpu_interface::finish_pending_host_irq(raw_ack)
         .inspect_err(|error| warn!("{error}"))
         .ok()
         .flatten()

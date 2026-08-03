@@ -111,15 +111,6 @@ pub struct PhysicalInterruptBinding {
     trigger: InterruptTrigger,
 }
 
-/// Result of folding one guest EOI/DIR for a physical level source.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PhysicalInterruptCompletion {
-    /// The physical source is no longer asserted and its host activation ended.
-    Deactivated,
-    /// The physical level remains asserted and must be queued to the guest again.
-    Asserted,
-}
-
 impl PhysicalInterruptBinding {
     /// Creates a physical binding. The controller separately validates `guest` as an SPI.
     pub const fn new(
@@ -259,24 +250,25 @@ pub trait GicV3Backend: Send + Sync {
         Ok(())
     }
 
-    /// Completes an owned physical interrupt after a guest EOI/DIR.
+    /// Completes an owned physical interrupt after a trapped guest DIR.
     ///
-    /// Level sources must be sampled before host deactivation. If the line
-    /// remains asserted, return [`PhysicalInterruptCompletion::Asserted`]
-    /// without deactivating the host source; the controller will queue the
-    /// same canonical interrupt again. Edge sources always deactivate.
+    /// A normally retired HW-backed LR is already deactivated by the physical
+    /// GIC and does not call this method. When DIR traps before hardware can
+    /// perform that transition, the backend must issue physical DIR even for
+    /// a level source. That deactivation is the architectural resample point:
+    /// if the line remains asserted, the host GIC produces a new
+    /// acknowledgement through the normal physical-SPI ingress path.
     fn complete_physical_interrupt(
         &self,
         vcpu: GicVcpuId,
         binding: PhysicalInterruptBinding,
-    ) -> Result<PhysicalInterruptCompletion, GicV3BackendError> {
-        self.deactivate_physical_interrupt(vcpu, binding)?;
-        Ok(PhysicalInterruptCompletion::Deactivated)
+    ) -> Result<(), GicV3BackendError> {
+        self.deactivate_physical_interrupt(vcpu, binding)
     }
 
     /// Forcibly deactivates an owned physical interrupt.
     ///
-    /// Normal guest retirement uses [`Self::complete_physical_interrupt`].
+    /// A trapped guest DIR uses [`Self::complete_physical_interrupt`].
     /// This operation is reserved for teardown and rollback, where the source
     /// must be made quiescent regardless of its sampled level.
     fn deactivate_physical_interrupt(

@@ -58,6 +58,17 @@ pub struct GuestSerialProfile {
 
 /// Firmware identity retained when a host UART is replaced by a virtual UART.
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GuestClockReference {
+    /// Firmware phandle of the clock provider.
+    pub provider_phandle: u32,
+    /// Provider-specific clock specifier cells.
+    pub specifier: Vec<u32>,
+    /// Physical register windows owned by this provider.
+    pub provider_regions: Vec<GuestMmioRegion>,
+}
+
+/// Firmware identity retained when a host UART is replaced by a virtual UART.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GuestSerialFdtIdentity {
     /// Absolute path of the firmware-selected UART node.
     pub node_path: String,
@@ -69,6 +80,8 @@ pub struct GuestSerialFdtIdentity {
     pub interrupt_specifier: Vec<u32>,
     /// Original `stdout-path` selector, including any line settings.
     pub stdout_path: String,
+    /// Host clock dependencies that must remain protected after replacement.
+    pub clock_references: Vec<GuestClockReference>,
 }
 
 /// One guest-visible MMIO region selected by a machine profile.

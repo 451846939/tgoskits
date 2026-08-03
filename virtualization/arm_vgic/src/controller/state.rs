@@ -6,7 +6,7 @@ use super::{ControllerState, GicV3VcpuWake, SpiBacking};
 use crate::{
     CpuInterfaceState, GicAffinity, GicVcpuId, IntId, InterruptState, ListRegisterBacking,
     ListRegisterState, LpiId, PhysicalInterruptBinding, QueuedDelivery, RedistributorState,
-    SgiTarget, SpiId, VgicError, VgicResult,
+    SgiTarget, SpiId, TriggerMode, VgicError, VgicResult,
 };
 
 pub(super) enum DeliveryRetirement {
@@ -45,12 +45,16 @@ impl ControllerState {
         &mut self,
         spi: SpiId,
     ) -> VgicResult<Option<Arc<dyn GicV3VcpuWake>>> {
-        let (route, cpu_target_mask) = {
+        let (route, cpu_target_mask, trigger) = {
             let interrupt = self.distributor.interrupt(spi)?;
             if !self.distributor.enabled() || !interrupt.deliverable() {
                 return Ok(None);
             }
-            (interrupt.route(), interrupt.cpu_target_mask())
+            (
+                interrupt.route(),
+                interrupt.cpu_target_mask(),
+                interrupt.trigger(),
+            )
         };
         let target = if let Some(mask) = cpu_target_mask {
             self.redistributors
@@ -79,7 +83,7 @@ impl ControllerState {
             self.distributor.interrupt_mut(spi)?.cancel_inflight();
         }
         let redistributor = self.redistributor_mut(target, "queue SPI")?;
-        redistributor.queue(IntId::Spi(spi));
+        redistributor.queue(IntId::Spi(spi), trigger);
         Ok(Some(redistributor.wake()))
     }
 
@@ -148,12 +152,14 @@ impl ControllerState {
             return Ok(None);
         }
         let redistributor = self.redistributor_mut(binding.target(), "forward physical SPI")?;
-        redistributor.queue_physical(IntId::Spi(spi), binding.host())?;
+        let queued = redistributor.queue_physical(IntId::Spi(spi), binding.host())?;
         let wake = redistributor.wake();
-        *self
-            .physical_spi_acknowledged
-            .get_mut(&spi)
-            .expect("an owned physical SPI must have acknowledgement state") = false;
+        if queued {
+            *self
+                .physical_spi_acknowledged
+                .get_mut(&spi)
+                .expect("an owned physical SPI must have acknowledgement state") = false;
+        }
         Ok(Some(wake))
     }
 
@@ -163,11 +169,15 @@ impl ControllerState {
         intid: IntId,
     ) -> VgicResult<Option<Arc<dyn GicV3VcpuWake>>> {
         let redistributor = self.redistributor_mut(vcpu, "queue local interrupt")?;
-        let deliverable = match intid {
-            IntId::Sgi(_) | IntId::Ppi(_) => redistributor.private(intid)?.deliverable(),
-            IntId::Lpi(lpi) => redistributor
-                .lpi(lpi)
-                .is_some_and(|interrupt| interrupt.deliverable()),
+        let (deliverable, trigger) = match intid {
+            IntId::Sgi(_) | IntId::Ppi(_) => {
+                let interrupt = redistributor.private(intid)?;
+                (interrupt.deliverable(), interrupt.trigger())
+            }
+            IntId::Lpi(lpi) => match redistributor.lpi(lpi) {
+                Some(interrupt) => (interrupt.deliverable(), interrupt.trigger()),
+                None => (false, TriggerMode::Edge),
+            },
             IntId::Spi(_) => {
                 return Err(VgicError::WrongIntIdClass {
                     intid,
@@ -178,7 +188,7 @@ impl ControllerState {
         if !deliverable {
             return Ok(None);
         }
-        redistributor.queue(intid);
+        redistributor.queue(intid, trigger);
         Ok(Some(redistributor.wake()))
     }
 
@@ -346,6 +356,26 @@ impl ControllerState {
         &mut self,
         vcpu: GicVcpuId,
     ) -> VgicResult<CpuInterfaceState> {
+        let acknowledged_physical_spis = self
+            .physical_spi_acknowledged
+            .iter()
+            .filter_map(|(spi, acknowledged)| acknowledged.then_some(*spi))
+            .collect::<Vec<_>>();
+        for spi in acknowledged_physical_spis {
+            let target = match self.spi_backings.get(&spi).copied() {
+                Some(SpiBacking::Physical(binding)) => binding.target(),
+                _ => {
+                    return Err(VgicError::InvalidStateTransition {
+                        intid: IntId::Spi(spi),
+                        operation: "refill CPU interface",
+                        detail: "an acknowledged host interrupt has no physical binding".into(),
+                    });
+                }
+            };
+            if target == vcpu {
+                let _ = self.queue_acknowledged_physical_spi_if_deliverable(spi)?;
+            }
+        }
         let (loaded, snapshot) = {
             let distributor = &self.distributor;
             let redistributor =
@@ -465,9 +495,9 @@ impl ControllerState {
         };
         if repend && delivery.backing() == ListRegisterBacking::Software {
             self.redistributor_mut(vcpu, "requeue software interrupt")?
-                .queue(intid);
+                .requeue_software(intid, delivery.maintenance_on_eoi());
         }
-        self.retirement_for(delivery.backing(), intid)
+        self.retirement_for(delivery.backing(), intid, false)
     }
 
     pub(super) fn deactivate_interrupt(
@@ -513,18 +543,20 @@ impl ControllerState {
         };
         if repend && delivery.backing() == ListRegisterBacking::Software {
             self.redistributor_mut(vcpu, "requeue deactivated interrupt")?
-                .queue(intid);
+                .requeue_software(intid, delivery.maintenance_on_eoi());
         }
-        self.retirement_for(delivery.backing(), intid)
+        self.retirement_for(delivery.backing(), intid, true)
     }
 
     fn retirement_for(
         &self,
         backing: ListRegisterBacking,
         intid: IntId,
+        explicit_deactivation: bool,
     ) -> VgicResult<Option<DeliveryRetirement>> {
         match backing {
             ListRegisterBacking::Software => Ok(Some(DeliveryRetirement::Emulated { intid })),
+            ListRegisterBacking::Physical(_) if !explicit_deactivation => Ok(None),
             ListRegisterBacking::Physical(host) => {
                 let IntId::Spi(spi) = intid else {
                     return Err(VgicError::WrongIntIdClass {

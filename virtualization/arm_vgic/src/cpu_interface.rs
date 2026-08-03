@@ -2,7 +2,7 @@
 
 use alloc::vec;
 
-use crate::{IntId, InterruptState, PhysicalIrqId, Priority};
+use crate::{IntId, InterruptState, PhysicalIrqId, Priority, TriggerMode};
 
 const ICH_HCR_ENABLE: u64 = 1;
 const ICH_HCR_UIE: u64 = 1 << 1;
@@ -21,11 +21,11 @@ const ICH_VMCR_VPMR_MASK: u64 = 0xff << ICH_VMCR_VPMR_SHIFT;
 pub enum ListRegisterBacking {
     /// The hypervisor owns the complete virtual interrupt lifecycle.
     Software,
-    /// The controller owns a physical source that requires virtual EOI resampling.
+    /// The physical GIC owns pending/active state and the LR names its source.
     ///
-    /// The host top half has already acknowledged this source, so the LR is
-    /// software-backed and this identity remains out-of-band until guest EOI
-    /// or DIR retires the physical activation.
+    /// Guest deactivation can consequently retire the physical activation in
+    /// hardware. A trapped DIR still uses this identity to complete the exact
+    /// ownership-checked host source.
     Physical(PhysicalIrqId),
 }
 
@@ -36,6 +36,7 @@ pub struct ListRegisterState {
     priority: Priority,
     state: InterruptState,
     backing: ListRegisterBacking,
+    maintenance_on_eoi: bool,
 }
 
 impl ListRegisterState {
@@ -46,10 +47,41 @@ impl ListRegisterState {
             priority,
             state,
             backing: ListRegisterBacking::Software,
+            maintenance_on_eoi: false,
         }
     }
 
-    /// Creates a resampled entry backed by one ownership-checked physical interrupt.
+    /// Creates a software-backed entry with trigger-aware EOI maintenance.
+    pub const fn new_software(
+        intid: IntId,
+        priority: Priority,
+        state: InterruptState,
+        trigger: TriggerMode,
+    ) -> Self {
+        Self::new_software_with_maintenance(
+            intid,
+            priority,
+            state,
+            matches!(trigger, TriggerMode::Level),
+        )
+    }
+
+    pub(crate) const fn new_software_with_maintenance(
+        intid: IntId,
+        priority: Priority,
+        state: InterruptState,
+        maintenance_on_eoi: bool,
+    ) -> Self {
+        Self {
+            intid,
+            priority,
+            state,
+            backing: ListRegisterBacking::Software,
+            maintenance_on_eoi,
+        }
+    }
+
+    /// Creates a hardware-backed entry for one ownership-checked physical interrupt.
     pub const fn new_physical(
         intid: IntId,
         priority: Priority,
@@ -61,6 +93,7 @@ impl ListRegisterState {
             priority,
             state,
             backing: ListRegisterBacking::Physical(physical),
+            maintenance_on_eoi: false,
         }
     }
 
@@ -84,9 +117,40 @@ impl ListRegisterState {
         self.backing
     }
 
+    /// Returns whether guest deactivation must raise a maintenance interrupt.
+    pub const fn maintenance_on_eoi(self) -> bool {
+        self.maintenance_on_eoi
+    }
+
     /// Updates the saved delivery state.
     pub fn set_state(&mut self, state: InterruptState) {
         self.state = state;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ListRegisterState;
+    use crate::{IntId, InterruptState, PpiId, Priority, TriggerMode};
+
+    #[test]
+    fn only_software_level_delivery_requests_eoi_maintenance() {
+        let intid = IntId::Ppi(PpiId::new(27).unwrap());
+        let level = ListRegisterState::new_software(
+            intid,
+            Priority::DEFAULT,
+            InterruptState::Pending,
+            TriggerMode::Level,
+        );
+        let edge = ListRegisterState::new_software(
+            intid,
+            Priority::DEFAULT,
+            InterruptState::Pending,
+            TriggerMode::Edge,
+        );
+
+        assert!(level.maintenance_on_eoi());
+        assert!(!edge.maintenance_on_eoi());
     }
 }
 

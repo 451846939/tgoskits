@@ -6,9 +6,8 @@ use axdevice_base::{InterruptTrigger, ItsId};
 
 use super::{ControllerInner, ControllerState, GicV3Controller, MsiBacking, SpiBacking};
 use crate::{
-    EventId, GicVcpuId, IntId, ItsDeviceId, LpiId, PhysicalInterruptBinding,
-    PhysicalInterruptCompletion, PhysicalIrqId, PhysicalMsiBinding, RedistributorState, SpiId,
-    VgicError, VgicResult, backend_result,
+    EventId, GicVcpuId, IntId, ItsDeviceId, LpiId, PhysicalInterruptBinding, PhysicalIrqId,
+    PhysicalMsiBinding, RedistributorState, SpiId, VgicError, VgicResult, backend_result,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -60,66 +59,16 @@ impl GicV3Controller {
         Ok(())
     }
 
-    pub(super) fn resample_physical_spi(&self, binding: PhysicalInterruptBinding) -> VgicResult {
-        let IntId::Spi(spi) = binding.guest() else {
-            return Err(VgicError::WrongIntIdClass {
-                intid: binding.guest(),
-                operation: "resample physical SPI",
-            });
-        };
-        let wake = {
-            let mut state = self.inner.state.lock();
-            match state.spi_backings.get(&spi).copied() {
-                Some(SpiBacking::Physical(owned)) if owned == binding => {}
-                Some(SpiBacking::Physical(_)) => {
-                    return Err(VgicError::InvalidStateTransition {
-                        intid: binding.guest(),
-                        operation: "resample physical SPI",
-                        detail: "the physical binding changed during completion".into(),
-                    });
-                }
-                _ => {
-                    return Err(VgicError::ResourceNotFound {
-                        resource: alloc::format!("physical backing for SPI {}", spi.raw()),
-                        operation: "resample physical SPI",
-                    });
-                }
-            }
-            state.queue_physical_spi(spi, binding)?
-        };
-        if let Some(wake) = wake {
-            wake.wake()?;
-        }
-        Ok(())
-    }
-
     pub(super) fn complete_physical_spi(
         &self,
         vcpu: GicVcpuId,
         binding: PhysicalInterruptBinding,
     ) -> VgicResult {
-        let completion = backend_result(
+        backend_result(
             self.inner
                 .backend
                 .complete_physical_interrupt(vcpu, binding),
-        )?;
-        if completion == PhysicalInterruptCompletion::Asserted
-            && let Err(error) = self.resample_physical_spi(binding)
-        {
-            if let Err(rollback_error) = backend_result(
-                self.inner
-                    .backend
-                    .deactivate_physical_interrupt(vcpu, binding),
-            ) {
-                log::warn!(
-                    "failed to deactivate physical SPI {:?} after resampling failed: \
-                     {rollback_error}",
-                    binding.host()
-                );
-            }
-            return Err(error);
-        }
-        Ok(())
+        )
     }
 
     /// Binds a guest SPI to an owned physical interrupt and fixed vCPU affinity.

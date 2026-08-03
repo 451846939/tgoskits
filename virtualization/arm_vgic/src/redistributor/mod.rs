@@ -19,14 +19,25 @@ pub(crate) struct QueuedDelivery {
     intid: IntId,
     backing: ListRegisterBacking,
     state: InterruptState,
+    maintenance_on_eoi: bool,
 }
 
 impl QueuedDelivery {
-    const fn software(intid: IntId) -> Self {
+    const fn software(intid: IntId, trigger: TriggerMode) -> Self {
         Self {
             intid,
             backing: ListRegisterBacking::Software,
             state: InterruptState::Pending,
+            maintenance_on_eoi: matches!(trigger, TriggerMode::Level),
+        }
+    }
+
+    const fn software_with_maintenance(intid: IntId, maintenance_on_eoi: bool) -> Self {
+        Self {
+            intid,
+            backing: ListRegisterBacking::Software,
+            state: InterruptState::Pending,
+            maintenance_on_eoi,
         }
     }
 
@@ -35,6 +46,7 @@ impl QueuedDelivery {
             intid,
             backing: ListRegisterBacking::Physical(physical),
             state: InterruptState::Pending,
+            maintenance_on_eoi: false,
         }
     }
 
@@ -43,14 +55,18 @@ impl QueuedDelivery {
             intid: entry.intid(),
             backing: entry.backing(),
             state: entry.state(),
+            maintenance_on_eoi: entry.maintenance_on_eoi(),
         }
     }
 
     const fn list_register(self, priority: Priority) -> ListRegisterState {
         match self.backing {
-            ListRegisterBacking::Software => {
-                ListRegisterState::new(self.intid, priority, self.state)
-            }
+            ListRegisterBacking::Software => ListRegisterState::new_software_with_maintenance(
+                self.intid,
+                priority,
+                self.state,
+                self.maintenance_on_eoi,
+            ),
             ListRegisterBacking::Physical(physical) => {
                 ListRegisterState::new_physical(self.intid, priority, self.state, physical)
             }
@@ -67,6 +83,10 @@ impl QueuedDelivery {
 
     pub(crate) const fn state(self) -> InterruptState {
         self.state
+    }
+
+    pub(crate) const fn maintenance_on_eoi(self) -> bool {
+        self.maintenance_on_eoi
     }
 
     const fn is_pending_non_active(self) -> bool {
@@ -199,11 +219,28 @@ impl RedistributorState {
         self.lpis.get(&lpi)
     }
 
-    pub(crate) fn queue(&mut self, intid: IntId) {
-        self.queue_delivery(QueuedDelivery::software(intid));
+    pub(crate) fn queue(&mut self, intid: IntId, trigger: TriggerMode) {
+        self.queue_delivery(QueuedDelivery::software(intid, trigger));
     }
 
-    pub(crate) fn queue_physical(&mut self, intid: IntId, physical: PhysicalIrqId) -> VgicResult {
+    pub(crate) fn requeue_software(&mut self, intid: IntId, maintenance_on_eoi: bool) {
+        self.queue_delivery(QueuedDelivery::software_with_maintenance(
+            intid,
+            maintenance_on_eoi,
+        ));
+    }
+
+    /// Queues a hardware-backed delivery.
+    ///
+    /// Returns `true` only when this acknowledgement reserves a new delivery
+    /// slot. A matching queued or loaded LR remains the canonical owner, so
+    /// callers must retain any replacement acknowledgement until that stale
+    /// delivery is harvested.
+    pub(crate) fn queue_physical(
+        &mut self,
+        intid: IntId,
+        physical: PhysicalIrqId,
+    ) -> VgicResult<bool> {
         let delivery = QueuedDelivery::physical(intid, physical);
         if self.prepare_queued_delivery(delivery) {
             if self.queued_deliveries.len() == self.queued_deliveries.capacity() {
@@ -213,8 +250,9 @@ impl RedistributorState {
                 });
             }
             self.queued_deliveries.push_back(delivery);
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
     pub(crate) fn has_physical_delivery(&self, intid: IntId, physical: PhysicalIrqId) -> bool {
@@ -623,10 +661,13 @@ impl RedistributorState {
         );
     }
 
-    pub(crate) fn set_ppi_level(&mut self, ppi: PpiId, asserted: bool) {
+    pub(crate) fn set_ppi_level(&mut self, ppi: PpiId, asserted: bool, cpu_interface_loaded: bool) {
         let index = ppi.raw() as usize;
         self.private_interrupts[index].set_level(asserted);
-        if !asserted && self.clear_pending_delivery(IntId::Ppi(ppi)) {
+        // While a vCPU is loaded, the hardware LRs own their delivery state.
+        // Keep the saved LR identity intact until `save` harvests guest EOI;
+        // only the input level may change at this point.
+        if !asserted && !cpu_interface_loaded && self.clear_pending_delivery(IntId::Ppi(ppi)) {
             self.private_interrupts[index].cancel_inflight();
         }
     }
@@ -713,6 +754,44 @@ mod tests {
     }
 
     #[test]
+    fn software_level_delivery_preserves_eoi_maintenance_in_list_register() {
+        let mut redistributor = RedistributorState::new(
+            GicVcpuId::new(0),
+            GicAffinity::new(0, 0, 0, 0),
+            4,
+            0,
+            Arc::new(NoopWake),
+        )
+        .unwrap();
+        let timer = IntId::new(27).unwrap();
+        let software_edge = IntId::new(1).unwrap();
+
+        redistributor.queue(timer, TriggerMode::Level);
+        redistributor.queue(software_edge, TriggerMode::Edge);
+        redistributor
+            .refill_list_registers(|_| unreachable!("private interrupts have local priorities"))
+            .unwrap();
+
+        let timer_entry = redistributor
+            .cpu_interface()
+            .list_registers()
+            .iter()
+            .flatten()
+            .find(|entry| entry.intid() == timer)
+            .unwrap();
+        let edge_entry = redistributor
+            .cpu_interface()
+            .list_registers()
+            .iter()
+            .flatten()
+            .find(|entry| entry.intid() == software_edge)
+            .unwrap();
+
+        assert!(timer_entry.maintenance_on_eoi());
+        assert!(!edge_entry.maintenance_on_eoi());
+    }
+
+    #[test]
     fn physical_delivery_uses_only_preallocated_queue_slots() {
         let mut redistributor = RedistributorState::new(
             GicVcpuId::new(0),
@@ -725,7 +804,12 @@ mod tests {
         let capacity = redistributor.queued_deliveries.capacity();
 
         for raw in 0..32 {
-            redistributor.queue(IntId::new(raw).unwrap());
+            let trigger = if raw < 16 {
+                TriggerMode::Edge
+            } else {
+                TriggerMode::Level
+            };
+            redistributor.queue(IntId::new(raw).unwrap(), trigger);
         }
         for raw in 32..36 {
             redistributor

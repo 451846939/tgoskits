@@ -18,8 +18,9 @@ use aarch64_cpu::registers::*;
 use aarch64_sysreg::SystemRegType;
 
 use crate::{
-    ArmGuestPhysAddr, ArmHostOps, ArmNestedPagingConfig, ArmSysRegAddr, ArmTimerKind,
-    ArmTimerSnapshot, ArmTimerVmConfig, ArmVcpuResult, ArmVcpuTimer, ArmVmExit, TrapFrame,
+    ArmGuestPhysAddr, ArmHostIrqConfig, ArmHostIrqGuard, ArmHostOps, ArmNestedPagingConfig,
+    ArmSysRegAddr, ArmTimerKind, ArmTimerSnapshot, ArmTimerVmConfig, ArmVcpuResult, ArmVcpuTimer,
+    ArmVmExit, TrapFrame,
     context_frame::GuestSystemRegisters,
     exception::{TrapKind, handle_exception_sync},
     exception_utils::exception_class_value,
@@ -44,6 +45,10 @@ struct HostRuntimeContext {
     stack_top: u64,
     sp_el0: u64,
     tpidr_el0: u64,
+    irq_interface: u64,
+    irq_cpu_interface_base: usize,
+    pending_irq_ack: u32,
+    _reserved: u32,
 }
 
 /// A virtual CPU within a guest.
@@ -68,7 +73,7 @@ impl ArmHostOps for AssemblyLayoutHost {
         Err(crate::ArmVcpuError::BadState)
     }
 
-    fn fetch_pending_host_irq() -> Option<usize> {
+    fn finish_pending_host_irq(_raw_ack: u32) -> Option<usize> {
         None
     }
 
@@ -89,6 +94,15 @@ pub const ARM_VCPU_HOST_SP_EL0_OFFSET: usize = core::mem::offset_of!(AssemblyArm
 pub(crate) const ARM_VCPU_HOST_TPIDR_EL0_OFFSET: usize =
     core::mem::offset_of!(AssemblyArmVcpu, host)
         + core::mem::offset_of!(HostRuntimeContext, tpidr_el0);
+pub(crate) const ARM_VCPU_HOST_IRQ_INTERFACE_OFFSET: usize =
+    core::mem::offset_of!(AssemblyArmVcpu, host)
+        + core::mem::offset_of!(HostRuntimeContext, irq_interface);
+pub(crate) const ARM_VCPU_HOST_IRQ_CPU_INTERFACE_BASE_OFFSET: usize =
+    core::mem::offset_of!(AssemblyArmVcpu, host)
+        + core::mem::offset_of!(HostRuntimeContext, irq_cpu_interface_base);
+pub(crate) const ARM_VCPU_HOST_PENDING_IRQ_ACK_OFFSET: usize =
+    core::mem::offset_of!(AssemblyArmVcpu, host)
+        + core::mem::offset_of!(HostRuntimeContext, pending_irq_ack);
 /// Offset of the guest-owned `TPIDR_EL0` slot within [`ArmVcpu`].
 pub(crate) const ARM_VCPU_GUEST_TPIDR_EL0_OFFSET: usize =
     core::mem::offset_of!(AssemblyArmVcpu, guest_system_regs)
@@ -123,6 +137,11 @@ const _: () = {
     assert!(
         ARM_VCPU_HOST_TPIDR_EL0_OFFSET == ARM_VCPU_HOST_SP_EL0_OFFSET + core::mem::size_of::<u64>()
     );
+    assert!(ARM_VCPU_HOST_IRQ_INTERFACE_OFFSET.is_multiple_of(core::mem::align_of::<u64>()));
+    assert!(
+        ARM_VCPU_HOST_IRQ_CPU_INTERFACE_BASE_OFFSET.is_multiple_of(core::mem::align_of::<usize>())
+    );
+    assert!(ARM_VCPU_HOST_PENDING_IRQ_ACK_OFFSET.is_multiple_of(core::mem::align_of::<u32>()));
     assert!(
         ARM_VCPU_GUEST_TPIDR_EL0_OFFSET
             >= ARM_VCPU_HOST_TPIDR_EL0_OFFSET + core::mem::size_of::<u64>()
@@ -153,19 +172,26 @@ pub struct ArmVcpuCreateConfig {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArmVcpuSetupConfig {
     timer: ArmTimerVmConfig,
+    host_irq: ArmHostIrqConfig,
 }
 
 impl ArmVcpuSetupConfig {
-    /// Creates setup state with the VM-wide timer configuration.
+    /// Creates setup state with the VM-wide timer configuration and immutable
+    /// host interrupt-controller interface.
     ///
     /// Every vCPU in one VM must receive the same immutable configuration.
-    pub const fn new(timer: ArmTimerVmConfig) -> Self {
-        Self { timer }
+    pub const fn new(timer: ArmTimerVmConfig, host_irq: ArmHostIrqConfig) -> Self {
+        Self { timer, host_irq }
     }
 
     /// Returns the VM-wide timer configuration.
     pub const fn timer(self) -> ArmTimerVmConfig {
         self.timer
+    }
+
+    /// Returns the host IRQ interface consumed by the world-switch assembly.
+    pub const fn host_irq(self) -> ArmHostIrqConfig {
+        self.host_irq
     }
 }
 
@@ -216,12 +242,11 @@ impl<H: ArmHostOps> ArmVcpu<H> {
         self.timer.snapshot()
     }
 
-    /// Runs the vCPU until a VM exit.
-    pub fn run(&mut self) -> ArmVcpuResult<ArmVmExit> {
-        unsafe {
-            core::arch::asm!("msr daifset, #2");
-        }
-
+    /// Runs the vCPU until a VM exit while the caller holds the host IRQ mask.
+    ///
+    /// Requiring the guard keeps architecture-external VGIC load/save hooks in
+    /// the same IRQ-atomic transaction as guest execution.
+    pub fn run(&mut self, _host_irq_guard: &ArmHostIrqGuard) -> ArmVcpuResult<ArmVmExit> {
         let exit_reason = unsafe {
             if !self.timer.is_configured() || self.timer.is_loaded() {
                 return Err(crate::ArmVcpuError::BadState);
@@ -234,13 +259,7 @@ impl<H: ArmHostOps> ArmVcpu<H> {
             return Err(crate::ArmVcpuError::BadState);
         }
         let trap_kind = TrapKind::try_from(exit_reason as u8).expect("Invalid TrapKind");
-        let result = self.vmexit_handler(trap_kind);
-
-        unsafe {
-            core::arch::asm!("msr daifclr, #2");
-        }
-
-        result
+        self.vmexit_handler(trap_kind)
     }
 
     /// Binds this vCPU to the current physical CPU.
@@ -289,6 +308,9 @@ impl<H: ArmHostOps> ArmVcpu<H> {
         let guest_hypervisor_control =
             (CNTHCTL_EL2::EL1PCEN::CLEAR + CNTHCTL_EL2::EL1PCTEN::CLEAR).into();
         self.timer = ArmVcpuTimer::new(config.timer(), guest_hypervisor_control);
+        self.host.irq_interface = config.host_irq().interface();
+        self.host.irq_cpu_interface_base = config.host_irq().cpu_interface_base();
+        self.host.pending_irq_ack = u32::MAX;
 
         self.guest_system_regs.sctlr_el1 = 0x30C50830;
         self.guest_system_regs.pmcr_el0 = 0;
@@ -426,9 +448,14 @@ impl<H: ArmHostOps> ArmVcpu<H> {
 
         let result = match exit_reason {
             TrapKind::Synchronous => handle_exception_sync(&mut self.ctx),
-            TrapKind::Irq => Ok(ArmVmExit::ExternalInterrupt {
-                token: H::fetch_pending_host_irq(),
-            }),
+            TrapKind::Irq => {
+                let raw_ack = core::mem::replace(&mut self.host.pending_irq_ack, u32::MAX);
+                Ok(ArmVmExit::ExternalInterrupt {
+                    token: (raw_ack != u32::MAX)
+                        .then(|| H::finish_pending_host_irq(raw_ack))
+                        .flatten(),
+                })
+            }
             _ => panic!("Unhandled exception {:?}", exit_reason),
         };
 

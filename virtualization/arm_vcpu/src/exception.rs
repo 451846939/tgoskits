@@ -66,6 +66,12 @@ core::arch::global_asm!(
     trap_frame_size = const crate::ARM_VCPU_TRAP_FRAME_SIZE,
     guest_tpidr_el0_offset = const crate::vcpu::ARM_VCPU_GUEST_TPIDR_EL0_OFFSET,
     host_tpidr_el0_offset = const crate::vcpu::ARM_VCPU_HOST_TPIDR_EL0_OFFSET,
+    host_irq_interface_offset = const crate::vcpu::ARM_VCPU_HOST_IRQ_INTERFACE_OFFSET,
+    host_irq_cpu_interface_base_offset =
+        const crate::vcpu::ARM_VCPU_HOST_IRQ_CPU_INTERFACE_BASE_OFFSET,
+    host_pending_irq_ack_offset = const crate::vcpu::ARM_VCPU_HOST_PENDING_IRQ_ACK_OFFSET,
+    host_irq_interface_gicv2_mmio = const crate::host::HOST_IRQ_INTERFACE_GICV2_MMIO,
+    host_irq_interface_gicv3_sysreg = const crate::host::HOST_IRQ_INTERFACE_GICV3_SYSREG,
     timer_virtual_offset_offset = const crate::vcpu::ARM_VCPU_TIMER_VIRTUAL_OFFSET_OFFSET,
     timer_virtual_compare_offset = const crate::vcpu::ARM_VCPU_TIMER_VIRTUAL_COMPARE_OFFSET,
     timer_virtual_control_offset = const crate::vcpu::ARM_VCPU_TIMER_VIRTUAL_CONTROL_OFFSET,

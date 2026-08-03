@@ -16,7 +16,10 @@ use axdevice::{
 use axdevice_base::{HostIrqId, VirtualInterruptController};
 use axvm_types::{EmulatedDeviceConfig, EmulatedDeviceType};
 
-use super::gic::{self, AssignedSpiRoutes};
+use super::{
+    gic::{self, AssignedSpiRoutes},
+    vtimer,
+};
 use crate::{AxVmError, AxVmResult, irq::deferred::DeferredVcpuKick, machine::GuestTimerProfile};
 
 const REDISTRIBUTOR_STRIDE: u64 = 0x2_0000;
@@ -52,15 +55,22 @@ pub(crate) struct Aarch64VgicRuntime {
     core: Arc<VgicCore>,
     backend: Arc<gic::AxvmVgicBackend>,
     kick: Arc<DeferredVcpuKick>,
+    host_virtual_timer_intid: u32,
     phase: SpinNoIrq<RuntimePhase>,
 }
 
 impl Aarch64VgicRuntime {
-    fn new(vm_id: usize, core: Arc<VgicCore>, backend: Arc<gic::AxvmVgicBackend>) -> Arc<Self> {
+    fn new(
+        vm_id: usize,
+        core: Arc<VgicCore>,
+        backend: Arc<gic::AxvmVgicBackend>,
+        host_virtual_timer_intid: u32,
+    ) -> Arc<Self> {
         Arc::new(Self {
             core,
             backend,
             kick: DeferredVcpuKick::new(vm_id),
+            host_virtual_timer_intid,
             phase: SpinNoIrq::new(RuntimePhase::Inactive),
         })
     }
@@ -113,6 +123,11 @@ impl Aarch64VgicRuntime {
                     ));
                 }
             }
+        }
+
+        if let Err(error) = vtimer::ensure_host_timer_ppi(self.host_virtual_timer_intid) {
+            *self.phase.lock() = RuntimePhase::Inactive;
+            return Err(error);
         }
 
         self.kick.start();
@@ -331,14 +346,16 @@ pub(crate) fn register_device_factories(
     vm: &crate::vm::AxVM,
     registry: &mut DeviceFactoryRegistry,
 ) -> AxVmResult<Arc<Aarch64VgicRuntime>> {
-    let (configs, placements, passthrough_irqs, gic_profile) = vm.with_config(|config| {
-        (
-            config.emu_devices().clone(),
-            config.phys_cpu_ls.get_vcpu_affinities_pcpu_ids(),
-            config.pass_through_irqs().to_vec(),
-            config.gic_profile().cloned(),
-        )
-    });
+    let (configs, placements, passthrough_irqs, gic_profile, timer_profile) =
+        vm.with_config(|config| {
+            (
+                config.emu_devices().clone(),
+                config.phys_cpu_ls.get_vcpu_affinities_pcpu_ids(),
+                config.pass_through_irqs().to_vec(),
+                config.gic_profile().cloned(),
+                config.timer_profile().cloned(),
+            )
+        });
     let distributor = unique_config(
         &configs,
         EmulatedDeviceType::InterruptController,
@@ -437,7 +454,12 @@ pub(crate) fn register_device_factories(
         VgicCore::new(vgic_config, backend.clone())
             .map_err(|error| AxVmError::interrupt("create AArch64 virtual GIC", error))?,
     );
-    let runtime = Aarch64VgicRuntime::new(vm.id(), core, backend);
+    let host_virtual_timer_intid = timer_profile
+        .ok_or_else(|| {
+            AxVmError::invalid_config("AArch64 machine profile has no architectural timer")
+        })?
+        .virtual_intid;
+    let runtime = Aarch64VgicRuntime::new(vm.id(), core, backend, host_virtual_timer_intid);
 
     registry.register(Arc::new(Aarch64VgicFactory {
         vm_id: vm.id(),

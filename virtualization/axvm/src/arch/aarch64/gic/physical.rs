@@ -11,7 +11,7 @@ use core::{
     sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering},
 };
 
-use arm_vgic::{GicV3BackendError, PhysicalInterruptCompletion, PhysicalIrqId, VgicCore};
+use arm_vgic::{GicV3BackendError, PhysicalIrqId, VgicCore};
 use ax_kspin::SpinNoIrq;
 use axdevice_base::HostIrqId;
 
@@ -117,17 +117,10 @@ impl AssignedSpiBinding {
             deactivate_host_irq(token);
             return true;
         }
-        if *delivery != AssignedSpiDelivery::Idle {
-            // The source cannot legally be acknowledged again before guest
-            // EOI/DIR retires the already published activation.
-            deactivate_host_irq(token);
-            return true;
-        }
-        if !self.accepting.load(Ordering::Acquire) {
-            deactivate_host_irq(token);
-            return true;
-        }
-
+        // With a HW-backed LR, normal guest deactivation is performed by the
+        // physical GIC and does not call the backend completion hook. A new
+        // host acknowledgement is therefore the architectural proof that an
+        // older `Active` marker has already retired and may be replaced.
         // Keep local IRQs and preemption disabled until canonical forwarding
         // and host activation ownership agree. Completion takes the same gate
         // across DIR, so a level source cannot publish a new activation into
@@ -147,26 +140,23 @@ impl AssignedSpiBinding {
 
     fn complete(
         &self,
-        finish: impl FnOnce() -> Result<PhysicalInterruptCompletion, GicV3BackendError>,
-    ) -> Result<Option<PhysicalInterruptCompletion>, GicV3BackendError> {
+        finish: impl FnOnce() -> Result<(), GicV3BackendError>,
+    ) -> Result<bool, GicV3BackendError> {
         let mut delivery = self.delivery.lock();
         if *delivery != AssignedSpiDelivery::Active {
-            return Ok(None);
+            return Ok(false);
         }
         *delivery = AssignedSpiDelivery::Completing;
-        let completion = match finish() {
-            Ok(completion) => completion,
+        match finish() {
+            Ok(()) => {}
             Err(error) => {
                 *delivery = AssignedSpiDelivery::Active;
                 return Err(error);
             }
         };
-        *delivery = match completion {
-            PhysicalInterruptCompletion::Deactivated => AssignedSpiDelivery::Idle,
-            PhysicalInterruptCompletion::Asserted => AssignedSpiDelivery::Active,
-        };
+        *delivery = AssignedSpiDelivery::Idle;
         drop(delivery);
-        Ok(Some(completion))
+        Ok(true)
     }
 
     fn wait_for_publication(&self) {
@@ -280,8 +270,8 @@ pub(super) fn route_acknowledged_host_irq(token: usize) -> Result<(), GicV3Backe
 
 pub(super) fn complete_assigned_spi(
     irq: PhysicalIrqId,
-    finish: impl FnOnce() -> Result<PhysicalInterruptCompletion, GicV3BackendError>,
-) -> Result<Option<PhysicalInterruptCompletion>, GicV3BackendError> {
+    finish: impl FnOnce() -> Result<(), GicV3BackendError>,
+) -> Result<Option<()>, GicV3BackendError> {
     let Some(route) = usize::try_from(irq.raw())
         .ok()
         .and_then(|intid| ASSIGNED_SPI_ROUTES.get(intid))
@@ -290,5 +280,6 @@ pub(super) fn complete_assigned_spi(
     };
     route
         .with_binding(|binding| binding.complete(finish))
-        .unwrap_or(Ok(None))
+        .unwrap_or(Ok(false))
+        .map(|completed| completed.then_some(()))
 }

@@ -1,5 +1,5 @@
 use ax_plat::irq::{
-    CpuId, IrqAffinity, IrqError, IrqId, IrqIf, IrqSource, TrapVector, dispatch_irq_on,
+    CpuId, IrqAffinity, IrqError, IrqId, IrqIf, IrqSource, IrqTrigger, TrapVector, dispatch_irq_on,
 };
 
 #[cfg(all(target_arch = "loongarch64", feature = "hv"))]
@@ -28,6 +28,22 @@ impl IrqIf for IrqIfImpl {
     /// Enables or disables the given IRQ.
     fn set_enable(irq: IrqId, enabled: bool) -> Result<(), IrqError> {
         somehal::irq::irq_set_enable(irq, enabled)
+    }
+
+    fn set_trigger(irq: IrqId, trigger: IrqTrigger) -> Result<(), IrqError> {
+        #[cfg(target_arch = "aarch64")]
+        {
+            let trigger = match trigger {
+                IrqTrigger::Edge => somehal::irq::IrqTrigger::Edge,
+                IrqTrigger::Level => somehal::irq::IrqTrigger::Level,
+            };
+            somehal::arch::gic::irq_set_trigger(irq, trigger)
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let _ = (irq, trigger);
+            Err(IrqError::Unsupported)
+        }
     }
 
     fn set_affinity(irq: IrqId, affinity: IrqAffinity) -> Result<(), IrqError> {
@@ -105,7 +121,8 @@ impl IrqIf for IrqIfImpl {
     fn resolve_percpu(hwirq: ax_plat::irq::HwIrq) -> Result<IrqId, IrqError> {
         #[cfg(target_arch = "aarch64")]
         {
-            somehal::irq::aarch64_gic_irq_id_checked(hwirq)
+            let parent = somehal::irq::aarch64_gic_irq_id_checked(hwirq)?;
+            Ok(somehal::irq::resolve_irq_route(parent))
         }
         #[cfg(any(target_arch = "loongarch64", target_arch = "x86_64"))]
         {

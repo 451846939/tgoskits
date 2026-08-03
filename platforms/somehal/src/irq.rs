@@ -11,7 +11,7 @@ use rdif_intc::Intc;
 pub type ControllerIrqId = irq_framework::IrqId;
 pub use irq_framework::{
     AcpiGsiController, AcpiGsiRoute, AcpiIrqPolarity, AcpiIrqTrigger, HwIrq, IrqDomainId, IrqError,
-    IrqId, IrqSource,
+    IrqId, IrqSource, IrqTrigger,
 };
 use rdrive::{Device, DeviceId};
 

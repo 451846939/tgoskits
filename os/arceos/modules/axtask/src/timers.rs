@@ -15,6 +15,7 @@ percpu_static! {
     TIMER_LIST: TimerList<TaskWakeupEvent> = TimerList::new(),
     TIMER_CALLBACKS: Vec<Box<dyn Fn(TimeValue) + Send + Sync>> = Vec::new(),
     TIMER_IRQ_CALLBACKS: Vec<Box<dyn Fn(TimeValue) + Send + Sync>> = Vec::new(),
+    TIMER_DEADLINE_SOURCES: Vec<Box<dyn Fn() -> Option<u64> + Send + Sync>> = Vec::new(),
     PROGRAMMED_DEADLINE_NANOS: u64 = 0,
 }
 
@@ -82,6 +83,19 @@ where
     });
 }
 
+/// Registers a lock-free source of one-shot timer deadlines for this CPU.
+///
+/// The source is queried from the hardware timer IRQ path and must not
+/// allocate, sleep, or acquire a sleepable lock.
+pub fn register_timer_deadline_source<F>(source: F)
+where
+    F: Fn() -> Option<u64> + Send + Sync + 'static,
+{
+    with_local_exclusive(|exclusive| {
+        TIMER_DEADLINE_SOURCES.with_current_mut(exclusive, |sources| sources.push(Box::new(source)))
+    });
+}
+
 fn check_callbacks() {
     with_local_pin(|pin| {
         TIMER_CALLBACKS.with_current(pin, |callbacks| {
@@ -110,15 +124,31 @@ pub(crate) fn note_programmed_deadline_nanos(deadline_nanos: u64) {
     with_local_pin(|pin| PROGRAMMED_DEADLINE_NANOS.write_current(pin, deadline_nanos));
 }
 
+fn timer_request_requires_reprogramming(
+    programmed_deadline_nanos: u64,
+    requested_deadline_nanos: u64,
+    now_nanos: u64,
+) -> bool {
+    programmed_deadline_nanos == 0
+        || programmed_deadline_nanos <= now_nanos
+        || requested_deadline_nanos < programmed_deadline_nanos
+}
+
 pub(crate) fn maybe_reprogram_timer(deadline: TimeValue) {
     let deadline_nanos = deadline_to_nanos(deadline);
     with_local_pin(|pin| {
         let programmed = PROGRAMMED_DEADLINE_NANOS.read_current(pin);
-        if programmed == 0 || deadline_nanos < programmed {
+        let now_nanos = ax_hal::time::monotonic_time_nanos();
+        let reprogram = timer_request_requires_reprogramming(programmed, deadline_nanos, now_nanos);
+        if reprogram {
             PROGRAMMED_DEADLINE_NANOS.write_current(pin, deadline_nanos);
             ax_hal::time::set_oneshot_timer(deadline_nanos);
         }
     });
+}
+
+pub(crate) fn request_deadline_nanos(deadline_nanos: u64) {
+    maybe_reprogram_timer(TimeValue::from_nanos(deadline_nanos));
 }
 
 pub(crate) fn next_deadline_nanos() -> Option<u64> {
@@ -126,10 +156,20 @@ pub(crate) fn next_deadline_nanos() -> Option<u64> {
         TIMER_LIST.with_current_mut(exclusive, |timer_list| timer_list.next_deadline())
     });
     let future_deadline = crate::future::next_timer_deadline();
-
-    match (timer_list_deadline, future_deadline) {
+    let task_deadline = match (timer_list_deadline, future_deadline) {
         (Some(a), Some(b)) => Some(deadline_to_nanos(core::cmp::min(a, b))),
         (Some(deadline), None) | (None, Some(deadline)) => Some(deadline_to_nanos(deadline)),
+        (None, None) => None,
+    };
+    let external_deadline = with_local_pin(|pin| {
+        TIMER_DEADLINE_SOURCES.with_current(pin, |sources| {
+            sources.iter().filter_map(|source| source()).min()
+        })
+    });
+
+    match (task_deadline, external_deadline) {
+        (Some(task), Some(external)) => Some(core::cmp::min(task, external)),
+        (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
         (None, None) => None,
     }
 }
@@ -187,4 +227,14 @@ fn with_local_exclusive<R>(
         ax_hal::percpu::with_cpu_pin(|pin| ax_hal::percpu::with_exclusive_cpu(pin, operation))
     }
     .expect("timer access requires an installed CPU-local area")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::timer_request_requires_reprogramming;
+
+    #[test]
+    fn elapsed_programming_does_not_block_a_later_live_deadline() {
+        assert!(timer_request_requires_reprogramming(100, 200, 150));
+    }
 }
