@@ -122,6 +122,33 @@ mod tests {
     }
 
     #[test]
+    fn uart16550_thr_write_rearms_empty_irq_after_tx_completion() {
+        let backend = Arc::new(TestBackend::default());
+        let sink = Arc::new(TestIrqSink::default());
+        let uart = Uart16550::new(backend.clone(), level_irq(sink.clone(), 4));
+
+        uart.write(1, AccessWidth::Byte, 1 << 1).unwrap();
+        assert_eq!(sink.levels.lock().unwrap().as_slice(), [true]);
+
+        uart.write(0, AccessWidth::Byte, b'P' as u64).unwrap();
+        assert_eq!(backend.output.lock().unwrap().as_slice(), b"P");
+        let levels_after_write = sink.levels.lock().unwrap().clone();
+        assert_eq!(
+            levels_after_write,
+            [true, false, true],
+            "synchronous TX must consume and then rearm THRE for an edge-routed ISA IRQ"
+        );
+
+        uart.poll().unwrap();
+        let levels_after_completion = sink.levels.lock().unwrap().clone();
+        assert_eq!(
+            levels_after_completion,
+            [true, false, true],
+            "TX completion must not depend on an unrelated backend input poll"
+        );
+    }
+
+    #[test]
     fn pl011_exposes_ids_fifo_and_masked_level_irq() {
         let backend = Arc::new(TestBackend::default());
         let sink = Arc::new(TestIrqSink::default());

@@ -24,7 +24,9 @@ const IIR_THR_EMPTY: u8 = 0x02;
 const IIR_RX_AVAILABLE: u8 = 0x04;
 const IIR_FIFO_16550A: u8 = 0xc0;
 
+const FCR_ENABLE_FIFO: u8 = 1 << 0;
 const FCR_CLEAR_RX: u8 = 1 << 1;
+const FCR_CLEAR_TX: u8 = 1 << 2;
 const LCR_DLAB: u8 = 1 << 7;
 const MCR_LOOPBACK: u8 = 1 << 4;
 
@@ -87,6 +89,14 @@ impl Uart16550State {
             status |= LSR_OVERRUN_ERROR;
         }
         status
+    }
+
+    const fn fifo_interrupt_bits(&self) -> u8 {
+        if self.fcr & FCR_ENABLE_FIFO != 0 {
+            IIR_FIFO_16550A
+        } else {
+            0
+        }
     }
 
     const fn pending_interrupt(&self) -> u8 {
@@ -156,7 +166,7 @@ impl Uart16550 {
                     if interrupt == IIR_THR_EMPTY {
                         state.tx_interrupt_pending = false;
                     }
-                    IIR_FIFO_16550A | interrupt
+                    state.fifo_interrupt_bits() | interrupt
                 }
                 REG_LCR => state.lcr,
                 REG_MCR => state.mcr,
@@ -181,25 +191,27 @@ impl Uart16550 {
         }
 
         let byte = value as u8;
-        let (output, asserted) = {
+        let (output, completes_tx, asserted) = {
             let mut state = self.state.lock();
             let mut output = None;
+            let mut completes_tx = false;
             match register {
                 REG_RBR_THR_DLL if state.dlab() => state.dll = byte,
                 REG_RBR_THR_DLL => {
+                    state.tx_interrupt_pending = false;
+                    completes_tx = true;
                     if state.mcr & MCR_LOOPBACK != 0 {
                         state.push_rx(byte);
                     } else {
                         output = Some(byte);
                     }
-                    state.tx_interrupt_pending = true;
                 }
                 REG_IER_DLM if state.dlab() => state.dlm = byte,
                 REG_IER_DLM => {
                     let old = state.ier;
                     state.ier = byte & 0x0f;
-                    if old & IER_THR_EMPTY == 0 && state.ier & IER_THR_EMPTY != 0 {
-                        state.tx_interrupt_pending = true;
+                    if (old ^ state.ier) & IER_THR_EMPTY != 0 {
+                        state.tx_interrupt_pending = state.ier & IER_THR_EMPTY != 0;
                     }
                 }
                 REG_IIR_FCR => {
@@ -208,6 +220,9 @@ impl Uart16550 {
                         state.rx_fifo.clear();
                         state.overrun = false;
                     }
+                    if byte & FCR_CLEAR_TX != 0 {
+                        state.tx_interrupt_pending = true;
+                    }
                 }
                 REG_LCR => state.lcr = byte,
                 REG_MCR => state.mcr = byte,
@@ -215,13 +230,30 @@ impl Uart16550 {
                 REG_SCR => state.scr = byte,
                 _ => {}
             }
-            (output, state.irq_asserted())
+            (output, completes_tx, state.irq_asserted())
         };
 
+        let consumed_result = self.signal_irq(asserted);
         if let Some(byte) = output {
             self.backend.write(core::slice::from_ref(&byte));
         }
-        self.signal_irq(asserted)
+        if !completes_tx {
+            return consumed_result;
+        }
+
+        // SerialBackend::write is synchronous and has no completion callback. Treat its
+        // return (or the loopback enqueue above) as the transmit-complete boundary. The
+        // explicit low/high sequence is required even though no guest instruction runs
+        // between the two phases: an edge-configured IOAPIC must observe THRE being
+        // consumed before it can deliver the next empty interrupt. Deferring this phase
+        // to DeviceRuntime::poll would make TX progress depend on unrelated RX polling.
+        let completed_asserted = {
+            let mut state = self.state.lock();
+            state.tx_interrupt_pending = true;
+            state.irq_asserted()
+        };
+        let completed_result = self.signal_irq(completed_asserted);
+        consumed_result.and(completed_result)
     }
 
     fn signal_irq(&self, asserted: bool) -> DeviceResult {
