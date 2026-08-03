@@ -11,7 +11,8 @@ use alloc::{
 
 use anyhow::{Result, bail};
 use ax_kspin::SpinRaw as Mutex;
-use axvm::{SerialBackend, VMId, VmStatus};
+use ax_std::os::arceos::modules::ax_task;
+use axvm::{AxVMRef, SerialBackend, VMId, VmStatus};
 use spin::LazyLock;
 
 const CTRL_A: u8 = 0x01;
@@ -409,6 +410,90 @@ pub fn serial_backend(vm_id: VMId) -> Arc<dyn SerialBackend> {
     GUEST_CONSOLE_MUX.serial_backend(vm_id)
 }
 
+fn console_reader_isolation_cpu(
+    host_cpu_count: usize,
+    vcpu_masks: impl IntoIterator<Item = Option<usize>>,
+) -> Option<usize> {
+    let tracked_cpu_count = host_cpu_count.min(usize::BITS as usize);
+    if tracked_cpu_count == 0 {
+        return None;
+    }
+
+    let online_bits = if tracked_cpu_count == usize::BITS as usize {
+        usize::MAX
+    } else {
+        (1usize << tracked_cpu_count) - 1
+    };
+    let guest_bits = vcpu_masks.into_iter().fold(0usize, |used, mask| {
+        let requested = mask.unwrap_or(online_bits) & online_bits;
+        // A missing, empty, or offline-only mask lets the runtime choose a
+        // fallback CPU, so no CPU can be proven host-only in that case.
+        used | if requested == 0 {
+            online_bits
+        } else {
+            requested
+        }
+    });
+    let host_only_bits = online_bits & !guest_bits;
+    (host_only_bits != 0).then(|| host_only_bits.trailing_zeros() as usize)
+}
+
+/// Configures the polling owner for physical host-console input.
+///
+/// The console multiplexer remains the only physical UART reader. Input IRQs
+/// stay disabled until the host UART IRQ contract can transfer received bytes
+/// to that owner without introducing a second reader.
+pub fn configure_host_console_reader(vms: &[AxVMRef]) -> Result<()> {
+    ax_hal::console::set_input_irq_enabled(false);
+
+    let isolation_cpu = console_reader_isolation_cpu(
+        ax_hal::cpu_num(),
+        vms.iter()
+            .flat_map(|vm| vm.vcpu_snapshots())
+            .map(|vcpu| vcpu.phys_cpu_set),
+    );
+
+    // Temporary polling and scheduler-isolation workaround.
+    //
+    // Trigger: a pinned, continuously runnable vCPU can starve the polling
+    // console reader on the cooperative FIFO scheduler. The current raw UART
+    // IRQ contract only observes interrupt status; it neither drains RX into a
+    // mux-owned queue nor wakes this task. Enabling that IRQ can therefore
+    // leave a level source asserted and starve the only code allowed to consume
+    // the receive register. Keep RX IRQs disabled and, when the validated VM
+    // topology leaves a CPU outside every explicit vCPU mask, place the reader
+    // there before any vCPU task starts.
+    //
+    // Cost and safety boundary: host input remains polling-driven, and the
+    // Axvisor management task loses migration freedom on a topology-proven
+    // host-only CPU. The workaround never rewrites a vCPU mask, never takes a
+    // CPU that a vCPU may use, and leaves the task affinity unchanged when any
+    // vCPU has no usable explicit mask. It also does not switch the scheduler
+    // globally, which would affect unrelated architectures and expose existing
+    // scheduler defects.
+    //
+    // Removal conditions: re-enable UART RX IRQs only after its top half drains
+    // RX into a bounded mux-owned queue and performs an IRQ-safe task wake.
+    // Remove the CPU placement once same-CPU FIFO fairness guarantees progress
+    // for a polling host service alongside a runnable vCPU.
+    let Some(owner_cpu) = isolation_cpu else {
+        return Ok(());
+    };
+    let owner_affinity = ax_task::AxCpuMask::one_shot(owner_cpu);
+    if !ax_task::set_current_affinity(owner_affinity) {
+        bail!("failed to pin the host console reader to CPU {owner_cpu}");
+    }
+    let actual_owner_cpu = ax_hal::percpu::this_cpu_id();
+    if actual_owner_cpu != owner_cpu {
+        bail!(
+            "host console reader affinity selected CPU {owner_cpu}, but migration ended on CPU \
+             {actual_owner_cpu}"
+        );
+    }
+
+    Ok(())
+}
+
 /// Read at most one byte from the physical host console.
 ///
 /// No other Axvisor component may call the platform console input API.
@@ -550,5 +635,21 @@ mod tests {
             mux.core.format_guest_output(1, b"> \n"),
             b"> \n[VM 2] other\n"
         );
+    }
+
+    #[test]
+    fn console_owner_prefers_a_cpu_excluded_by_every_vcpu() {
+        assert_eq!(console_reader_isolation_cpu(4, [Some(0b0001)]), Some(1));
+        assert_eq!(
+            console_reader_isolation_cpu(4, [Some(0b0010), Some(0b1000)]),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn console_owner_is_not_pinned_when_no_host_only_cpu_is_proven() {
+        assert_eq!(console_reader_isolation_cpu(4, [None]), None);
+        assert_eq!(console_reader_isolation_cpu(4, [Some(0)]), None);
+        assert_eq!(console_reader_isolation_cpu(4, [Some(usize::MAX)]), None);
     }
 }
