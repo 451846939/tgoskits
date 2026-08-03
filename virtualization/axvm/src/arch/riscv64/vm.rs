@@ -66,9 +66,7 @@ fn register_device_factory(
     let physical_target_cpu = placements
         .first()
         .map(|(_, _, physical_id)| *physical_id)
-        .ok_or_else(|| {
-            crate::AxVmError::invalid_config("a RISC-V VM must contain at least one vCPU")
-        })?;
+        .ok_or_else(|| AxVmError::invalid_config("a RISC-V VM must contain at least one vCPU"))?;
     irq::register_device_factory(
         vm.id(),
         placements.len(),

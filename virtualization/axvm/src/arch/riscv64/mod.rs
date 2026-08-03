@@ -40,11 +40,6 @@ pub(crate) enum RiscvDeferredRunWork {
 }
 
 impl CpuUpOps for Riscv64Arch {
-    fn set_vcpu_on_args(vcpu: &crate::vm::AxVCpuRef<Self::VCpu>, vcpu_id: usize, arg: usize) {
-        vcpu.set_gpr(RiscvGprIndex::A0 as usize, vcpu_id);
-        vcpu.set_gpr(RiscvGprIndex::A1 as usize, arg);
-    }
-
     fn set_cpu_up_success(vcpu: &crate::vm::AxVCpuRef<Self::VCpu>) {
         vcpu.set_gpr(RiscvGprIndex::A0 as usize, 0);
     }
@@ -55,6 +50,11 @@ impl ArchOps for Riscv64Arch {
     type PerCpu = AxvmRiscvPerCpu;
     type DeferredRunWork = RiscvDeferredRunWork;
     type NestedPageTable = npt::NestedPageTable<crate::HostPagingHandler>;
+
+    fn set_vcpu_on_args(vcpu: &crate::vm::AxVCpuRef<Self::VCpu>, vcpu_id: usize, arg: usize) {
+        vcpu.set_gpr(RiscvGprIndex::A0 as usize, vcpu_id);
+        vcpu.set_gpr(RiscvGprIndex::A1 as usize, arg);
+    }
 
     fn has_hardware_support() -> bool {
         riscv_vcpu::has_hardware_support()
