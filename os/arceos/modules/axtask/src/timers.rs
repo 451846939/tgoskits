@@ -124,22 +124,30 @@ pub(crate) fn note_programmed_deadline_nanos(deadline_nanos: u64) {
     with_local_pin(|pin| PROGRAMMED_DEADLINE_NANOS.write_current(pin, deadline_nanos));
 }
 
+pub(crate) fn begin_hardware_timer_irq() {
+    // Temporary compatibility guard: the scheduler timer path does not yet
+    // track the hardware comparator's programmed, pending, and active states
+    // separately. Until that state machine exists, a nonzero deadline remains
+    // outstanding even after wall time passes; replacing it can clear the
+    // pending interrupt before its events run. Clear the record only after
+    // control reaches the matching timer IRQ entry. Remove this guard only when
+    // the IRQ acknowledge path explicitly consumes the comparator's pending
+    // state without relying on a comparator rewrite.
+    note_programmed_deadline_nanos(0);
+}
+
 fn timer_request_requires_reprogramming(
     programmed_deadline_nanos: u64,
     requested_deadline_nanos: u64,
-    now_nanos: u64,
 ) -> bool {
-    programmed_deadline_nanos == 0
-        || programmed_deadline_nanos <= now_nanos
-        || requested_deadline_nanos < programmed_deadline_nanos
+    programmed_deadline_nanos == 0 || requested_deadline_nanos < programmed_deadline_nanos
 }
 
 pub(crate) fn maybe_reprogram_timer(deadline: TimeValue) {
     let deadline_nanos = deadline_to_nanos(deadline);
     with_local_pin(|pin| {
         let programmed = PROGRAMMED_DEADLINE_NANOS.read_current(pin);
-        let now_nanos = ax_hal::time::monotonic_time_nanos();
-        let reprogram = timer_request_requires_reprogramming(programmed, deadline_nanos, now_nanos);
+        let reprogram = timer_request_requires_reprogramming(programmed, deadline_nanos);
         if reprogram {
             PROGRAMMED_DEADLINE_NANOS.write_current(pin, deadline_nanos);
             ax_hal::time::set_oneshot_timer(deadline_nanos);
@@ -234,7 +242,12 @@ mod tests {
     use super::timer_request_requires_reprogramming;
 
     #[test]
-    fn elapsed_programming_does_not_block_a_later_live_deadline() {
-        assert!(timer_request_requires_reprogramming(100, 200, 150));
+    fn elapsed_deadline_remains_owned_until_the_timer_irq_is_consumed() {
+        assert!(!timer_request_requires_reprogramming(100, 200));
+    }
+
+    #[test]
+    fn consumed_timer_irq_allows_a_later_live_deadline() {
+        assert!(timer_request_requires_reprogramming(0, 200));
     }
 }

@@ -190,6 +190,7 @@ pub fn on_timer_tick() {
 #[cfg_attr(doc, doc(cfg(feature = "irq")))]
 pub fn on_timer_irq(scheduler_tick: bool) {
     use ax_kernel_guard::NoOp;
+    crate::timers::begin_hardware_timer_irq();
     crate::timers::check_events(scheduler_tick);
     if scheduler_tick {
         // Since irq and preemption are both disabled here,
