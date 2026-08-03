@@ -192,15 +192,21 @@ fn orangepi_guest_board_cases_use_matching_vm_configs() {
 }
 
 #[test]
-fn orangepi_linux_guest_keeps_the_host_uart_clock_enabled() {
+fn orangepi_linux_guest_does_not_use_uart_clock_workaround() {
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let path = "os/axvisor/configs/vms/orangepi-5-plus/linux-smp1.toml";
     let content = fs::read_to_string(workspace_root.join(path)).unwrap();
     let config: TestVmKernelConfig = toml::from_str(&content).unwrap();
 
+    // The Rockchip assignment and AxVM shared-MMIO tests pin the protection itself. This
+    // board-level contract prevents the guest config from silently bypassing that path.
     assert!(
-        config.kernel.cmdline.contains("clk_ignore_unused"),
-        "{path} must not let the passthrough guest disable the host-owned UART clock"
+        !config.kernel.cmdline.contains("clk_ignore_unused"),
+        "{path} must protect the host-owned UART clock through shared-provider mediation"
+    );
+    assert!(
+        config.kernel.cmdline.contains("console=ttyS2,1500000"),
+        "{path} must route the guest console through the machine-owned virtual UART"
     );
 }
 

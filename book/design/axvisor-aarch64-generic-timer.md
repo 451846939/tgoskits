@@ -1,347 +1,236 @@
-# Axvisor AArch64 Generic Timer Virtualization
+# Axvisor AArch64 通用定时器虚拟化设计
 
-## Status
+## 状态
 
-This document defines the incompatible AArch64 generic-timer model used by
-Axvisor. It is the ownership and world-switch contract for the implementation;
-changes to timer state, counter offsets, PPI completion, vCPU migration, or
-firmware resources must update this document before merge.
+本文定义 Axvisor 使用的、不兼容旧实现的 AArch64 通用定时器模型，也是实现必须遵守的所有权与 world switch 契约。凡修改定时器状态、计数器 offset、PPI 完成、vCPU 迁移或固件资源，均须在合入前同步更新本文。
 
-Implementation base: `origin/dev` at `a6e8f239ea8565888bea1fdf33e192ea130d5815`.
+实现基线：`origin/dev` 的 `e2fe59dd65a2283ce6e2fb70f828f0df810d3724`。
 
-The design applies uniformly to QEMU GICv2, QEMU GICv3, RK3568, RK3588, and
-other AArch64 hosts. It must not be repaired with board-name, SoC-compatible,
-or GIC-version special cases.
+本设计统一适用于 QEMU GICv2、QEMU GICv3、RK3568、RK3588 及其他 AArch64 host。不得通过板卡名称、SoC compatible 或 GIC 版本特判修复问题。
 
-## Problem
+## 问题
 
-The previous implementation split one architectural timer across unrelated
-owners:
+旧实现把同一个架构定时器拆给多个互不相关的所有者：
 
-- guest timer registers lived partly in `GuestSystemRegisters`;
-- a VM-level relay copied some `CNTV` state;
-- a bus-shaped emulated timer device owned another software model;
-- the WFI timer wheel independently inferred a wakeup;
-- the virtual GIC received a PPI level without owning the complete
-  pending/active/EOI lifecycle;
-- `CNTVOFF_EL2` was cleared while `CNTV_CTL_EL0` could still be enabled.
+- 客户机定时器寄存器部分保存在 `GuestSystemRegisters`；
+- VM 级 relay 复制部分 `CNTV` 状态；
+- 一个总线设备形态的模拟定时器又拥有另一份软件模型；
+- WFI timer wheel 独立推断唤醒；
+- 虚拟 GIC 接收 PPI level，却不拥有完整的 pending/active/EOI 生命周期；
+- `CNTV_CTL_EL0` 仍可能启用时就清除了 `CNTVOFF_EL2`。
 
-The last ordering error temporarily moved a guest CVAL into the host physical
-counter epoch. On RK3568, the guest-visible time moved from approximately
-3.96 seconds to 78.86 seconds and the boot later timed out. RK3568 and RK3588
-both use GICv3, so a GIC-version branch cannot explain or correctly repair this
-failure.
+最后一个顺序错误会暂时把客户机 CVAL 移入 host 物理计数器的 epoch。RK3568 上，客户机可见时间会从约 3.96 秒跳至 78.86 秒，随后启动超时。RK3568 与 RK3588 都使用 GICv3，因此 GIC 版本分支无法解释或正确修复该问题。
 
-The replacement must provide these observable properties:
+替代实现必须提供以下可观察属性：
 
-1. Every vCPU has one canonical virtual and physical timer context.
-2. Every vCPU in a VM shares the same immutable counter frequency and offsets.
-3. No Rust host code runs while the guest timer or guest counter offset remains
-   installed.
-4. Timer output is a level input; VGIC exclusively owns pending, active,
-   enable, route, EOI, and DIR state.
-5. An acknowledged host CNTV PPI is deactivated only after the matching guest
-   delivery retires, except for explicit migration or teardown.
-6. WFI uses the earliest deliverable timer deadline and never turns a stale
-   callback directly into a forced PPI.
-7. Host firmware and runtime consume one validated timer profile.
+1. 每个 vCPU 只有一份权威的虚拟定时器和物理定时器 context。
+2. 同一 VM 的所有 vCPU 共享相同且不可变的计数器频率与 offset。
+3. 客户机定时器或客户机计数器 offset 仍安装在硬件中时，不得运行任何 host Rust 代码。
+4. 定时器输出是 level input；pending、active、enable、route、EOI 和 DIR 状态全部由 VGIC 独占。
+5. 已 acknowledge 的 host CNTV PPI 只有在对应客户机投递退休后才 deactivate，显式迁移或 teardown 除外。
+6. WFI 使用最早的可投递定时器 deadline，绝不把 stale callback 直接转成强制 PPI。
+7. Host 固件与 runtime 消费同一份经过校验的定时器 profile。
 
-## Reference Model
+## 参考模型
 
-The implementation follows the KVM nVHE ownership model in Linux commit
-`8cd9520d35a6c38db6567e97dd93b1f11f185dc6`:
+实现遵循 Linux commit `8cd9520d35a6c38db6567e97dd93b1f11f185dc6` 中 KVM nVHE 的所有权模型：
 
-- [`struct arch_timer_vm_data` and `struct arch_timer_context`](https://github.com/torvalds/linux/blob/8cd9520d35a6c38db6567e97dd93b1f11f185dc6/include/kvm/arm_arch_timer.h)
-  separate VM offsets from per-vCPU timer contexts and track whether a context
-  is loaded in hardware.
-- [`timer_save_state`](https://github.com/torvalds/linux/blob/8cd9520d35a6c38db6567e97dd93b1f11f185dc6/arch/arm64/kvm/arch_timer.c)
-  reads CTL/CVAL, disables the timer, executes an ISB, and only then clears the
-  counter offset.
-- `timer_restore_state` installs the offset and CVAL before enabling CTL.
-- `kvm_timer_blocking` schedules the earliest timer capable of waking a
-  blocked vCPU.
-- `kvm_timer_vcpu_load_gic` reconciles the timer output with the virtual GIC
-  active state instead of treating the host PPI as an independent software
-  interrupt.
+- [`struct arch_timer_vm_data` 与 `struct arch_timer_context`](https://github.com/torvalds/linux/blob/8cd9520d35a6c38db6567e97dd93b1f11f185dc6/include/kvm/arm_arch_timer.h) 将 VM offset 与每 vCPU 定时器 context 分离，并跟踪 context 是否已装载到硬件。
+- [`timer_save_state`](https://github.com/torvalds/linux/blob/8cd9520d35a6c38db6567e97dd93b1f11f185dc6/arch/arm64/kvm/arch_timer.c) 先读取 CTL/CVAL、禁用定时器并执行 ISB，之后才清除计数器 offset。
+- `timer_restore_state` 先安装 offset 和 CVAL，再启用 CTL。
+- `kvm_timer_blocking` 调度最早能够唤醒阻塞 vCPU 的定时器。
+- `kvm_timer_vcpu_load_gic` 根据虚拟 GIC 的 active 状态协调定时器输出，而不是把 host PPI 当成独立的软件中断。
 
-Axvisor does not import Linux hrtimers, nested virtualization, VHE-specific
-switches, or userspace irqchip fallbacks. It preserves the same ownership and
-ordering with its own timer wheel and unified VGIC controller.
+Axvisor 不引入 Linux hrtimer、nested virtualization、VHE 专用切换或 userspace irqchip fallback。它使用自身 timer wheel 和统一 VGIC controller 保持相同的所有权与顺序。
 
-## State Ownership
+## 状态所有权
 
-| State | Owner | Notes |
+| 状态 | 所有者 | 说明 |
 | --- | --- | --- |
-| counter frequency and offsets | `ArmTimerVmConfig` | immutable and identical for all VM vCPUs |
-| CNTV CVAL, ENABLE, IMASK | vCPU `ArmTimerContext` | loaded directly into hardware |
-| CNTP CVAL, ENABLE, IMASK | vCPU `ArmTimerContext` | accessed through trapped software emulation |
-| ISTATUS | derived | computed from current counter and CVAL; never writable or saved |
-| timer output level | vCPU snapshot plus `Aarch64TimerBinding` | published into one private VGIC line |
-| PPI pending/active/enable/EOI | `arm_vgic` | canonical interrupt state |
-| acknowledged host CNTV token | host timer-PPI binding | lock-out resource retained until VGIC retirement |
-| assigned-SPI pending/active state | physical GIC plus HW-backed LR | LR carries the ownership-checked physical INTID |
-| WFI wake event | CPU-owned AxVM timer wheel | hint only; callback never asserts a PPI |
-| FDT interrupt identity | `GuestTimerProfile` | shared by runtime attachment and FDT generation |
+| 计数器频率与 offset | `ArmTimerVmConfig` | 不可变，且同一 VM 的所有 vCPU 一致 |
+| CNTV CVAL、ENABLE、IMASK | vCPU `ArmTimerContext` | 直接装载到硬件 |
+| CNTP CVAL、ENABLE、IMASK | vCPU `ArmTimerContext` | 通过陷入的软件模拟访问 |
+| ISTATUS | 派生状态 | 根据当前 counter 和 CVAL 计算；不可写也不保存 |
+| 定时器输出 level | vCPU snapshot 与 `Aarch64TimerBinding` | 发布到一条私有 VGIC line |
+| PPI pending/active/enable/EOI | `arm_vgic` | 权威中断状态 |
+| 已 acknowledge 的 host CNTV token | host timer-PPI binding | 排他资源，保留至 VGIC 退休 |
+| assigned-SPI pending/active 状态 | 物理 GIC 与 HW-backed LR | LR 携带经过所有权校验的物理 INTID |
+| WFI 唤醒事件 | CPU-owned AxVM timer wheel | 仅为 hint；callback 不 assert PPI |
+| FDT 中断身份 | `GuestTimerProfile` | runtime 绑定与 FDT 生成共同使用 |
 
-No generic channel carries timer IRQ state. `IrqNotify` and the timer wheel
-carry only deferred work or wake hints. A hard IRQ may acknowledge and
-priority-drop its source and publish preallocated notification state; it must
-not look up a VM, allocate, take `rdrive` locks, or invoke a subscriber.
+通用 channel 不承载定时器 IRQ 状态。`IrqNotify` 与 timer wheel 只传递延迟工作或唤醒 hint。Hard IRQ 可以 acknowledge 并 priority-drop 中断源，再发布预分配的通知状态；不得查找 VM、分配内存、获取 `rdrive` 锁或调用 subscriber。
 
-An AArch64 hypervisor host enables split EOI mode in every GICv2 or GICv3 CPU
-interface. `EOIR` therefore performs only the priority drop; `DIR` remains the
-explicit completion boundary. Ordinary host IRQ dispatch preserves its
-one-step behavior by performing both operations from `ActiveIrq::drop`.
-AxVM-owned PPIs and SPIs use the same host mode but retain the acknowledged
-activation until virtual retirement. A timer PPI retains its opaque token in
-the timer binding. An assigned SPI names its physical source through the
-hardware-backed LR instead of maintaining a second software pending state.
-Enabling split EOI only in the AxVM fast path is invalid because the mode is
-CPU-interface state shared with normal host IRQ dispatch.
+AArch64 hypervisor host 会在每个 GICv2 或 GICv3 CPU interface 上启用 split EOI 模式。因此 `EOIR` 只执行 priority drop，`DIR` 才是显式完成边界。普通 host IRQ dispatch 通过 `ActiveIrq::drop` 同时完成这两个操作，从而保持原有单阶段行为。AxVM 所有的 PPI 和 SPI 使用同一 host 模式，但会把已 acknowledge 的 activation 保留至虚拟中断退休。Timer PPI 把 opaque token 保存在 timer binding 中；assigned SPI 则通过 HW-backed LR 指明物理中断源，不再维护第二份软件 pending 状态。只在 AxVM fast path 启用 split EOI 是错误的，因为该模式属于 CPU interface 状态，并与普通 host IRQ dispatch 共享。
 
-An acknowledged interrupt that is not guest-owned still follows the ordinary
-host IRQ graph. The raw GIC parent INTID is resolved through the installed
-parent-to-leaf route before dispatch, so an ITS LPI reaches its MSI/MSI-X leaf
-handler. GICv3 completion preserves the complete 24-bit architectural INTID
-when issuing `DIR`; only the separately validated device-passthrough contract
-is limited to assignable SPIs.
+不属于客户机的已 acknowledge 中断仍沿普通 host IRQ 图处理。Raw GIC parent INTID 会先经已安装的 parent-to-leaf route 解析，再执行 dispatch，因此 ITS LPI 能到达其 MSI/MSI-X leaf handler。GICv3 发出 `DIR` 时保留完整的 24-bit 架构 INTID；只有经过独立校验的设备直通契约限制为可分配 SPI。
 
-VGIC retirement invokes one typed backend operation after releasing the
-controller lock. This is a single-owner lifecycle boundary, not a general
-callback registry or a second pending queue.
+VGIC 退休会在释放 controller lock 后调用一个 typed backend 操作。这是单一所有者的生命周期边界，不是通用 callback registry，也不是第二条 pending queue。
 
-## VM Configuration and Counter Domains
+## VM 配置与计数器域
 
-`ArmTimerVmConfig` contains:
+`ArmTimerVmConfig` 包含：
 
-- one guest-visible frequency;
-- one VM-wide virtual offset;
-- one physical offset.
+- 一个客户机可见频率；
+- 一个 VM-wide virtual offset；
+- 一个 physical offset。
 
-AxVM records the hardware `CNTFRQ_EL0` value on every enabled physical CPU.
-VM creation collects every CPU named by vCPU placement or affinity masks and
-rejects:
+AxVM 记录每个已启用物理 CPU 的硬件 `CNTFRQ_EL0`。创建 VM 时，收集 vCPU placement 或 affinity mask 指定的所有 CPU，并拒绝：
 
-- an empty target set;
-- a target CPU without a published capability snapshot;
-- zero counter frequency;
-- heterogeneous counter frequencies.
+- 空的目标 CPU 集合；
+- 没有发布 capability snapshot 的目标 CPU；
+- 为零的计数器频率；
+- 不一致的计数器频率。
 
-If the host `arm,armv8-timer` node supplies a valid `clock-frequency`, that
-firmware value is the guest-visible correction. It does not waive the
-requirement that all target CPUs report one uniform hardware frequency.
+如果 host `arm,armv8-timer` 节点提供有效的 `clock-frequency`，该固件值作为客户机可见频率的纠正值；但所有目标 CPU 的硬件频率仍必须一致。
 
-The ordinary EL1 guest model is:
+普通 EL1 客户机模型为：
 
-- `CNTVCT = CNTPCT - virtual_offset`;
-- CNTV runs directly in hardware;
-- CNTP/CNTPCT accesses trap and use `physical_offset`, currently zero;
-- pause, deschedule, and restart do not rewrite the offset, so guest time keeps
-  advancing;
-- nested virtualization and guest EL2 timers are unsupported.
+- `CNTVCT = CNTPCT - virtual_offset`；
+- CNTV 直接在硬件运行；
+- CNTP/CNTPCT 访问陷入，并使用当前为零的 `physical_offset`；
+- pause、deschedule 和 restart 不重写 offset，因此客户机时间持续推进；
+- 不支持 nested virtualization 和客户机 EL2 timer。
 
-The stage-2 page-table level and IPA width use the minimum capability recorded
-across all possible target CPUs. Timer and page-table selection therefore use
-the same complete placement set and cannot silently fall back to the CPU that
-happened to create the VM.
+Stage-2 页表级数和 IPA 位宽取所有可能目标 CPU capability 的最小值。定时器和页表选择因而使用同一个完整 placement 集合，不能静默退化为创建 VM 时恰好所在 CPU 的能力。
 
-## World-Switch Transaction
+## World Switch 事务
 
-### Guest entry
+### 进入客户机
 
-The final assembly-only window performs:
+最终的纯汇编窗口执行：
 
-1. save host `CNTHCTL_EL2` and `CNTKCTL_EL1`;
-2. write `CNTV_CTL_EL0 = 0`, then ISB;
-3. install VM `CNTVOFF_EL2`;
-4. install the guest timer trap policy and guest `CNTKCTL_EL1`;
-5. install `CNTV_CVAL_EL0`, then ISB;
-6. install writable `CNTV_CTL_EL0`;
-7. mark the timer context loaded, then ISB;
-8. restore guest registers and ERET without calling Rust.
+1. 保存 host `CNTHCTL_EL2` 与 `CNTKCTL_EL1`；
+2. 写 `CNTV_CTL_EL0 = 0`，随后执行 ISB；
+3. 安装 VM `CNTVOFF_EL2`；
+4. 安装客户机 timer trap policy 与客户机 `CNTKCTL_EL1`；
+5. 安装 `CNTV_CVAL_EL0`，随后执行 ISB；
+6. 安装可写的 `CNTV_CTL_EL0`；
+7. 标记 timer context 已装载，随后执行 ISB；
+8. 恢复客户机寄存器并 ERET，期间不调用 Rust。
 
-VGIC state and the current pCPU timer-PPI route are prepared before this
-transaction.
+VGIC 状态和当前 pCPU 的 timer-PPI route 在该事务前准备完成。
 
-### Guest exit
+### 退出客户机
 
-For a lower-EL IRQ, the exception assembly first reads the host IAR while the
-guest timer level is still asserted and stores only the raw acknowledgement in
-the vCPU's host-runtime slot. GICv2 uses the immutable memory-mapped CPU
-interface address discovered during VGIC construction; GICv3 uses
-`ICC_IAR1_EL1`. This is an assembly-only operation: no Rust, VM lookup,
-allocation, callback, or controller lock runs with guest timer state loaded.
+对于 lower-EL IRQ，异常汇编会在客户机定时器 level 仍 asserted 时先读取 host IAR，并只把 raw acknowledgement 保存到 vCPU 的 host-runtime slot。GICv2 使用 VGIC 构建期间发现的、不可变的 memory-mapped CPU interface 地址；GICv3 使用 `ICC_IAR1_EL1`。这是一个纯汇编操作：客户机定时器状态仍装载时，不运行 Rust、不查找 VM、不分配、不调用 callback，也不获取 controller lock。
 
-The common exit transaction then performs:
+随后，公共退出事务执行：
 
-1. read CNTV CTL and CVAL into the vCPU context;
-2. advance the timer generation;
-3. save guest `CNTKCTL_EL1`;
-4. write `CNTV_CTL_EL0 = 0`, then ISB;
-5. clear `CNTVOFF_EL2`;
-6. restore host `CNTHCTL_EL2` and `CNTKCTL_EL1`;
-7. mark the timer context unloaded, then ISB;
-8. only then call Rust.
+1. 把 CNTV CTL 和 CVAL 读入 vCPU context；
+2. 推进 timer generation；
+3. 保存客户机 `CNTKCTL_EL1`；
+4. 写 `CNTV_CTL_EL0 = 0`，随后执行 ISB；
+5. 清除 `CNTVOFF_EL2`；
+6. 恢复 host `CNTHCTL_EL2` 与 `CNTKCTL_EL1`；
+7. 标记 timer context 已卸载，随后执行 ISB；
+8. 只有完成上述步骤后才调用 Rust。
 
-After the host timer context is restored, Rust validates the captured IAR
-value, performs the split-EOI priority drop, and converts it into an opaque
-completion token. It then publishes current CNTV/CNTP levels before saving and
-merging VGIC state. If the exit is a trapped DIR, the guest's preceding
-CVAL/CTL writes are therefore visible before deactivation decides whether a
-level must repend.
+恢复 host timer context 后，Rust 校验捕获的 IAR 值，执行 split-EOI priority drop，并把它转换为 opaque completion token。然后先发布当前 CNTV/CNTP level，再保存并合并 VGIC 状态。如果该退出源于 trapped DIR，那么客户机此前对 CVAL/CTL 的写入会在 deactivation 判断 level 是否需要重新 pending 前生效。
 
-Acknowledging after writing `CNTV_CTL_EL0 = 0` is invalid for a level PPI. The
-line can deassert before `GICC_IAR` or `ICC_IAR1_EL1` is read, producing a
-spurious INTID and an immediate re-entry loop. This ordering is shared by
-GICv2, GICv3, QEMU, and real boards; it is not a platform workaround.
+对于 level PPI，在写 `CNTV_CTL_EL0 = 0` 后才 acknowledge 是错误的。读取 `GICC_IAR` 或 `ICC_IAR1_EL1` 前，line 可能已经 deassert，造成 spurious INTID 和立即重新进入客户机的循环。该顺序对 GICv2、GICv3、QEMU 和真实开发板相同，不是平台 workaround。
 
-## Timer PPI Lifecycle
+## Timer PPI 生命周期
 
-The virtual and non-secure physical timer INTIDs come from
-`GuestTimerProfile`; they are not fixed constants in runtime code.
+虚拟定时器和 non-secure physical timer INTID 来自 `GuestTimerProfile`，runtime 代码不使用固定常量。
 
-CNTV host interrupt handling is split:
+CNTV host 中断处理分为以下阶段：
 
-1. AxVM claims the architectural virtual-timer PPI once for the hypervisor
-   lifetime, configures it as level-triggered on every pCPU, and keeps one
-   fixed allocation-free fallback for host-context races;
-2. the host GIC CPU interface is already in split EOI mode;
-3. lower-EL IRQ assembly acknowledges the CPU-local PPI before stopping CNTV;
-4. post-switch Rust priority-drops the captured acknowledgement and records
-   its opaque token plus owner pCPU;
-5. timer snapshot publication updates the virtual PPI level;
-6. VGIC owns delivery and guest enable/active state;
-7. GICv2 EOI/DIR or GICv3 LR/TDIR retirement reaches the typed backend
-   retirement boundary after the controller lock is released;
-8. the host token is deactivated on its owner pCPU.
+1. AxVM 在 hypervisor 生命周期内只 claim 一次架构 virtual-timer PPI，在每个 pCPU 上把它配置为 level-triggered，并为 host context race 保留一个固定且无分配的 fallback；
+2. host GIC CPU interface 已处于 split EOI 模式；
+3. lower-EL IRQ 汇编在停止 CNTV 前 acknowledge CPU-local PPI；
+4. 切回 host 后的 Rust 对捕获的 acknowledgement 执行 priority drop，并记录其 opaque token 与 owner pCPU；
+5. timer snapshot publication 更新 virtual PPI level；
+6. VGIC 拥有投递以及客户机 enable/active 状态；
+7. GICv2 EOI/DIR 或 GICv3 LR/TDIR 退休会在 controller lock 释放后到达 typed backend 退休边界；
+8. host token 在 owner pCPU 上 deactivate。
 
-Lowering the timer line does not complete the host activation. This is
-essential when a guest clears CVAL or CTL before writing DIR: the virtual line
-may be low while its prior delivery is still architecturally active.
+拉低 timer line 不会完成 host activation。当客户机先清除 CVAL 或 CTL、再写 DIR 时，virtual line 可能已为低电平，但此前的投递在架构上仍是 active；因此这一点不可省略。
 
-Migration may force completion on the old pCPU before loading the vCPU on a
-new pCPU. Reset, stop, and drop likewise complete and discard the host
-activation after invalidating timer-wheel work. These are explicit lifecycle
-operations, not substitutes for ordinary guest retirement.
+迁移可以在新 pCPU 装载 vCPU 前，强制完成旧 pCPU 上的 activation。Reset、stop 和 drop 同样会先使 timer-wheel 工作失效，再完成并丢弃 host activation。这些是显式生命周期操作，不可替代普通客户机退休路径。
 
-## Assigned Physical SPI Lifecycle
+## Assigned Physical SPI 生命周期
 
-An assigned physical SPI uses an ownership-checked hardware-backed LR:
+Assigned physical SPI 使用经过所有权校验的 HW-backed LR：
 
-1. the host top half acknowledges the SPI and performs the priority drop;
-2. VGIC queues one canonical delivery carrying the guest INTID and physical
-   INTID;
-3. GICv2 writes `HW` plus the physical ID into `GICH_LR`, while GICv3 writes
-   `HW` and `PINTID` into `ICH_LR_EL2`;
-4. ordinary guest completion retires the physical activation in the GIC
-   hardware, so harvesting the disappeared LR must not issue another host
-   `DIR`;
-5. if a level source is still asserted, physical deactivation resamples it and
-   produces a fresh host acknowledgement through the same ingress route.
+1. host top half acknowledge SPI 并执行 priority drop；
+2. VGIC 排入一项权威投递，其中携带 guest INTID 与 physical INTID；
+3. GICv2 把 `HW` 和 physical ID 写入 `GICH_LR`，GICv3 则把 `HW` 和 `PINTID` 写入 `ICH_LR_EL2`；
+4. 普通客户机完成会让 GIC 硬件退休 physical activation，因此回收已经消失的 LR 时不得再次发出 host `DIR`；
+5. 如果 level source 仍 asserted，physical deactivation 会重新采样并通过同一 ingress route 产生新的 host acknowledgement。
 
-A replacement host acknowledgement may arrive before software harvests the
-stale LR snapshot. Delivery de-duplication must retain that acknowledgement
-until refill can create a new HW-backed LR; otherwise a continuously asserted
-device can lose its only replacement activation. A guest DIR that traps before
-hardware retirement, and explicit rollback or teardown, use the typed backend
-to issue host `DIR`. Sampling `GICD_ISPENDR` before `DIR` is not an equivalent
-completion mechanism because physical deactivation is the architectural level
-resample point.
+软件回收 stale LR snapshot 前，替代的 host acknowledgement 可能已经到达。Delivery de-duplication 必须保留该 acknowledgement，直到 refill 能创建新的 HW-backed LR；否则持续 asserted 的设备可能丢失唯一的替代 activation。硬件退休前发生的 trapped guest DIR，以及显式 rollback 或 teardown，会通过 typed backend 发出 host `DIR`。在 `DIR` 前采样 `GICD_ISPENDR` 不是等价的完成机制，因为 physical deactivation 才是架构定义的 level resample 点。
 
-## WFI, Timer Wheel, and Migration
+## WFI、Timer Wheel 与迁移
 
-For WFI, `ArmTimerSnapshot::earliest_deadline` considers both CNTV and CNTP.
-Disabled, masked, or already-expired timers do not schedule a future wakeup.
+对于 WFI，`ArmTimerSnapshot::earliest_deadline` 同时考虑 CNTV 与 CNTP。Disabled、masked 或已经过期的 timer 不调度未来唤醒。
 
-Each scheduled callback carries:
+每个已调度 callback 携带：
 
-- a vCPU timer generation;
-- a `VmTimerHandle` containing the owner CPU and timer token.
+- 一个 vCPU timer generation；
+- 一个包含 owner CPU 和 timer token 的 `VmTimerHandle`。
 
-The callback only validates its generation and wakes the vCPU. In task
-context, the vCPU reads the current physical counter, republishes timer levels,
-and rearms if the event arrived early. It never asserts a PPI based solely on a
-timer-wheel callback.
+Callback 只校验 generation 并唤醒 vCPU。在 task context 中，vCPU 重新读取当前 physical counter、发布 timer level，并在事件过早到达时重新 arm。它绝不只根据 timer-wheel callback assert PPI。
 
-Cancellation uses the handle's recorded owner CPU. Remote cancellation runs on
-that owner and reprograms its one-shot comparator, preventing migration from
-canceling the wrong CPU queue or accumulating long-lived stale events.
+取消操作使用 handle 中记录的 owner CPU。远程取消在该 owner 上执行并重新编程它的 one-shot comparator，避免迁移后取消错误 CPU 的 queue，或积累长期 stale event。
 
-Reset advances, rather than reinitializes, each timer generation. A generation
-value used before reset can therefore never become valid again merely because
-the timer contexts were cleared.
+Reset 会推进而不是重新初始化每个 timer generation。这样，reset 前使用的 generation 不会仅因为 timer context 被清空而再次有效。
 
-## Firmware Contract
+## 固件契约
 
-With a host FDT, AxVM requires a valid `arm,armv8-timer` node and parses:
+存在 host FDT 时，AxVM 要求其中有有效的 `arm,armv8-timer` 节点，并解析：
 
-- effective `interrupt-parent`;
-- exactly four or five three-cell GIC PPI specifiers;
-- level trigger flags, including retained legacy PPI CPU-mask bits;
-- mandatory secure physical, non-secure physical, virtual, and hypervisor
-  interrupt order;
-- optional nonzero `clock-frequency`;
-- optional timer phandle.
+- effective `interrupt-parent`；
+- 恰好四项或五项 three-cell GIC PPI specifier；
+- level trigger flag，包括保留的 legacy PPI CPU-mask bits；
+- secure physical、non-secure physical、virtual、hypervisor 的固定中断顺序；
+- 可选且非零的 `clock-frequency`；
+- 可选的 timer phandle。
 
-The guest FDT removes existing Arm timer nodes and creates one standard
-`arm,armv8-timer` node. It preserves interrupt order, parent identity, raw
-specifier flags, optional phandle, and an explicitly valid frequency. Host
-errata and suspend properties are not copied.
+客户机 FDT 会删除已有 Arm timer 节点，并创建一个标准 `arm,armv8-timer` 节点。它保留中断顺序、parent identity、raw specifier flag、可选 phandle，以及显式有效的频率；不复制 host errata 或 suspend 属性。
 
-Runtime vCPU attachment and FDT installation validate and consume the same
-`GuestTimerProfile`; a developer-supplied DTB cannot introduce an independent
-timer resource definition.
+Runtime vCPU 绑定和 FDT 安装校验并消费同一份 `GuestTimerProfile`；开发者提供的 DTB 不能引入独立的定时器资源定义。
 
-When there is no host FDT, the fixed QEMU machine profile supplies the standard
-four PPIs. A present but malformed host timer node is an error; AxVM does not
-guess board resources.
+没有 host FDT 时，固定 QEMU machine profile 提供标准四项 PPI。Host timer 节点一旦存在但 malformed 就返回错误，AxVM 不猜测板级资源。
 
-## Failure and Teardown
+## 失败与 Teardown
 
-Unsupported or inconsistent timer capabilities fail VM construction. The
-implementation does not:
+不支持或不一致的 timer capability 会使 VM 构建失败。实现不会：
 
-- continue with the current CPU's frequency or IPA width;
-- mask a PPI indefinitely as a substitute for deferred deactivate;
-- convert a timer PPI into an assigned SPI;
-- infer an IRQ number from a board name;
-- preserve stale timer-wheel work across reset;
-- retain a second timer device or relay compatibility path.
+- 继续使用当前 CPU 的频率或 IPA 位宽；
+- 无限期 mask PPI 来替代 deferred deactivate；
+- 把 timer PPI 转换为 assigned SPI；
+- 根据板卡名称推断 IRQ；
+- 在 reset 后保留 stale timer-wheel 工作；
+- 保留第二个 timer device 或 relay 兼容路径。
 
-Registration is transactional. A failed duplicate timer-PPI registration does
-not unregister the existing binding. Teardown removes the retirement route
-before releasing the final binding and always attempts to complete an owned
-host activation.
+注册是事务化的。重复注册 timer-PPI 失败时，不会 unregister 已有 binding。Teardown 在释放最终 binding 前移除 retirement route，并始终尝试完成自身拥有的 host activation。
 
-## Validation
+## 验证
 
-Deterministic regressions cover:
+确定性回归覆盖：
 
-- disabling CNTV and executing ISB before clearing CNTVOFF;
-- complete entry/exit assembly operation ordering;
-- lower-EL IAR acknowledgement before CNTV is stopped;
-- CVAL/TVAL, ENABLE, IMASK, derived ISTATUS, wraparound, and reset generation;
-- earliest CNTV/CNTP WFI deadline;
-- uniform target-CPU frequency and minimum target-CPU capabilities;
-- owner-aware timer cancellation and stale generation;
-- GICv2 and GICv3 hypervisor host CPU interfaces both enabling split EOI;
-- GICv2 EOI/DIR and GICv3 TDIR retirement;
-- GICv2/GICv3 HW-backed assigned-SPI LR identity and normal hardware
-  retirement without duplicate host deactivation;
-- a replacement physical acknowledgement surviving a stale LR snapshot;
-- trapped DIR always reaching physical deactivation before level resampling;
-- unassigned GICv3 LPIs resolving to their MSI leaf and retaining the full
-  24-bit INTID through host `DIR`;
-- high-level re-pend after EOI and low-level non-repend;
-- host timer-PPI completion only through VGIC retirement;
-- four/five FDT interrupts, malformed cells, PPI class/trigger, frequency,
-  parent, phandle, and interrupt order.
+- 清除 CNTVOFF 前禁用 CNTV 并执行 ISB；
+- 完整 entry/exit 汇编操作顺序；
+- 停止 CNTV 前完成 lower-EL IAR acknowledgement；
+- CVAL/TVAL、ENABLE、IMASK、派生 ISTATUS、wraparound 和 reset generation；
+- 最早的 CNTV/CNTP WFI deadline；
+- 目标 CPU 频率一致，以及目标 CPU capability 取最小值；
+- owner-aware timer cancel 与 stale generation；
+- GICv2 和 GICv3 hypervisor host CPU interface 都启用 split EOI；
+- GICv2 EOI/DIR 与 GICv3 TDIR 退休；
+- GICv2/GICv3 HW-backed assigned-SPI LR identity，以及普通硬件退休不重复 host deactivation；
+- 替代 physical acknowledgement 能跨越 stale LR snapshot 保留；
+- trapped DIR 总在 level resampling 前到达 physical deactivation；
+- 未分配的 GICv3 LPI 能解析到 MSI leaf，并在 host `DIR` 中保留完整 24-bit INTID；
+- EOI 后高电平重新 pending，低电平不重新 pending；
+- host timer-PPI 只通过 VGIC retirement 完成；
+- 四项/五项 FDT interrupts，以及 malformed cell、PPI class/trigger、frequency、parent、phandle 和 interrupt order。
 
-Before merge, the validation matrix must additionally complete:
+合入前，验证矩阵还必须完成：
 
-- QEMU AArch64 GICv2 and GICv3 timer stress with SMP, WFI, and repeated sleeps;
-- existing x86 VMX/SVM, RISC-V, and Phytium smoke;
-- three consecutive RK3568 boots to the guest marker without epoch jumps;
-- repeated RK3588/OrangePi-5-Plus success to guard the existing path;
-- targeted `arm_vcpu`, `arm_vgic`, and `axvm` clippy with no new warnings;
-- removal of all temporary timer/IRQ diagnostics.
+- QEMU AArch64 GICv2 与 GICv3 timer stress，覆盖 SMP、WFI 和重复 sleep；
+- 现有 x86 VMX/SVM、RISC-V 与 Phytium smoke；
+- RK3568 连续三次启动到达客户机 marker，且不发生 epoch jump；
+- RK3588/OrangePi-5-Plus 重复通过，防止破坏既有路径；
+- `arm_vcpu`、`arm_vgic` 与 `axvm` 定向 clippy 无新增 warning；
+- 删除全部临时 timer/IRQ 诊断。
