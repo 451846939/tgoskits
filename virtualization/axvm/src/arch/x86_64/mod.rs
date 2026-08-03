@@ -109,9 +109,12 @@ impl ArchOps for X86_64Arch {
         exit: <Self::VCpu as VmArchVcpuOps>::Exit,
     ) -> AxVmResult<BoundVcpuExit<Self::DeferredRunWork>> {
         match exit {
-            X86VmExit::Hypercall { nr, args } => {
-                super::handle_hypercall(vm, vcpu, HypercallExit { nr, args })
-            }
+            X86VmExit::Hypercall { nr, args } => super::handle_hypercall(
+                vm,
+                vcpu,
+                HypercallExit { nr, args },
+                crate::runtime::hvc::HyperCallAbi::Generic,
+            ),
             X86VmExit::PortIoRead { port, width } => exit::handle_io_read(
                 vm,
                 vcpu,
@@ -126,6 +129,8 @@ impl ArchOps for X86_64Arch {
                     Ok(BoundVcpuExit::Complete(VcpuRunAction {
                         waits_for_event: false,
                         stop_reason: Some(StopReason::SystemDown),
+                        resets_vm: false,
+                        exits_vcpu: false,
                     }))
                 } else {
                     exit::handle_io_write(
@@ -204,6 +209,8 @@ impl ArchOps for X86_64Arch {
                 Ok(BoundVcpuExit::Complete(VcpuRunAction {
                     waits_for_event: false,
                     stop_reason: None,
+                    resets_vm: false,
+                    exits_vcpu: false,
                 }))
             }
             X86VmExit::SystemDown => {
@@ -211,6 +218,8 @@ impl ArchOps for X86_64Arch {
                 Ok(BoundVcpuExit::Complete(VcpuRunAction {
                     waits_for_event: false,
                     stop_reason: Some(StopReason::SystemDown),
+                    resets_vm: false,
+                    exits_vcpu: false,
                 }))
             }
             X86VmExit::FailEntry {
@@ -224,6 +233,8 @@ impl ArchOps for X86_64Arch {
                 Ok(BoundVcpuExit::Complete(VcpuRunAction {
                     waits_for_event: false,
                     stop_reason: None,
+                    resets_vm: false,
+                    exits_vcpu: false,
                 }))
             }
             X86VmExit::Nothing => Ok(BoundVcpuExit::Continue),
@@ -805,6 +816,8 @@ fn handle_x86_nested_page_fault(
         return Ok(BoundVcpuExit::Complete(VcpuRunAction {
             waits_for_event: false,
             stop_reason: None,
+            resets_vm: false,
+            exits_vcpu: false,
         }));
     }
 
@@ -820,6 +833,8 @@ fn handle_x86_nested_page_fault(
         Ok(BoundVcpuExit::Complete(VcpuRunAction {
             waits_for_event: false,
             stop_reason: None,
+            resets_vm: false,
+            exits_vcpu: false,
         }))
     }
 }

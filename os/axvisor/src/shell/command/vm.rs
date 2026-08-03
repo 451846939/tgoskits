@@ -752,6 +752,7 @@ fn vm_list(cmd: &ParsedCommand) {
                     VmVcpuState::Invalid => "Inv",
                     VmVcpuState::Created => "Cre",
                     VmVcpuState::Ready => "Rdy",
+                    VmVcpuState::Starting => "Sta",
                 };
                 *state_counts.entry(state).or_insert(0) += 1;
             }
@@ -855,6 +856,7 @@ fn show_vm_basic_details(vm_id: usize, show_config: bool, show_stats: bool) {
                 VmVcpuState::Invalid => "Invalid",
                 VmVcpuState::Created => "Created",
                 VmVcpuState::Ready => "Ready",
+                VmVcpuState::Starting => "Starting",
             };
             *state_counts.entry(state).or_insert(0) += 1;
         }
@@ -963,6 +965,7 @@ fn show_vm_full_details(vm_id: usize) {
                 VmVcpuState::Invalid => "Invalid",
                 VmVcpuState::Created => "Created",
                 VmVcpuState::Ready => "Ready",
+                VmVcpuState::Starting => "Starting",
             };
             *state_counts.entry(state).or_insert(0) += 1;
         }
@@ -983,6 +986,7 @@ fn show_vm_full_details(vm_id: usize) {
                 VmVcpuState::Invalid => "Invalid",
                 VmVcpuState::Created => "Created",
                 VmVcpuState::Ready => "Ready",
+                VmVcpuState::Starting => "Starting",
             };
 
             if let Some(phys_cpu_set) = vcpu.phys_cpu_set {
