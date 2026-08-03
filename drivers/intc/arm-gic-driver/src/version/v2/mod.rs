@@ -127,6 +127,7 @@ impl Gic {
             "Initializing GICv2 Distributor@{:#p}...",
             self.gicd.as_ptr::<u8>()
         );
+        let bsp_target = self.cpu_interface().current_cpu_target();
         // 1. Disable the Distributor first
         self.gicd().disable();
 
@@ -150,8 +151,11 @@ impl Gic {
         self.gicd().set_default_spi_priorities(max_spi);
 
         // 8. Configure interrupt targets (for SPIs)
-        self.gicd().configure_interrupt_targets(max_spi);
-        trace!("[GICv2] Configure all SPIs to target cpu 0");
+        self.gicd().configure_interrupt_targets(max_spi, bsp_target);
+        trace!(
+            "[GICv2] Configure all SPIs to target BSP mask {:#04x}",
+            bsp_target.as_u8()
+        );
         // 9. Configure interrupt configuration (edge/level trigger)
         self.gicd().configure_interrupt_config(max_spi);
 
@@ -310,6 +314,11 @@ pub enum SGITarget {
 pub struct TargetList(u8);
 
 impl TargetList {
+    /// Creates a target list from the CPU target mask reported by GICv2.
+    pub const fn from_raw(raw: u8) -> Self {
+        Self(raw)
+    }
+
     /// Create a new TargetList with a specific CPU target list. list is Cpu interface IDs.
     pub fn new(list: impl Iterator<Item = usize>) -> Self {
         let mut raw = 0;
@@ -396,6 +405,11 @@ impl CpuInterface {
 
     fn gicd(&self) -> &DistributorReg {
         unsafe { &*self.gicd }
+    }
+
+    /// Returns the banked CPU target mask for the current CPU interface.
+    pub fn current_cpu_target(&self) -> TargetList {
+        TargetList::from_raw(self.gicd().ITARGETSR[0].get())
     }
 
     /// Initialize the CPU interface for the current CPU
@@ -1072,13 +1086,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn distributor_initializes_all_spi_byte_registers() {
-        let mut regs = std::boxed::Box::new([0u8; 0x1000]);
-        let gic = unsafe { Gic::new(VirtAddr::from(regs.as_mut_ptr()), VirtAddr::new(0), None) };
+    fn target_list_preserves_banked_cpu_target_mask() {
+        let target = TargetList::from_raw(0x20);
 
-        let max_interrupts = 64;
-        gic.gicd().set_default_spi_priorities(max_interrupts);
-        gic.gicd().configure_interrupt_targets(max_interrupts);
+        assert_eq!(target.as_u8(), 0x20);
+        assert_eq!(target.cpu_id_list().collect::<std::vec::Vec<_>>(), [5]);
+    }
+
+    #[test]
+    fn cpu_interface_reads_current_banked_target_mask() {
+        let mut distributor = std::boxed::Box::new([0u8; 0x1000]);
+        let mut cpu_registers = std::boxed::Box::new([0u8; 0x1000]);
+        let cpu = CpuInterface {
+            gicd: distributor.as_mut_ptr().cast(),
+            gicc: cpu_registers.as_mut_ptr().cast(),
+        };
+        cpu.gicd().ITARGETSR[0].set(0x40);
+
+        assert_eq!(cpu.current_cpu_target().as_u8(), 0x40);
+    }
+
+    #[test]
+    fn distributor_initializes_spis_with_bsp_target_mask() {
+        let mut regs = std::boxed::Box::new([0u8; 0x1000]);
+        regs[4..8].copy_from_slice(&1u32.to_ne_bytes());
+        regs[0x800] = 0x40;
+        let mut gic = unsafe {
+            Gic::new(
+                VirtAddr::from(regs.as_mut_ptr()),
+                VirtAddr::from(regs.as_mut_ptr()),
+                None,
+            )
+        };
+
+        let bsp_target = TargetList::from_raw(0x40);
+        gic.init();
 
         let regs = gic.gicd();
         assert_eq!(regs.IPRIORITYR[31].get(), 0);
@@ -1087,8 +1129,8 @@ mod tests {
         assert_eq!(regs.IPRIORITYR[64].get(), 0);
 
         assert_eq!(regs.ITARGETSR[31].get(), 0);
-        assert_eq!(regs.ITARGETSR[32].get(), 0x01);
-        assert_eq!(regs.ITARGETSR[63].get(), 0x01);
+        assert_eq!(regs.ITARGETSR[32].get(), bsp_target.as_u8());
+        assert_eq!(regs.ITARGETSR[63].get(), bsp_target.as_u8());
         assert_eq!(regs.ITARGETSR[64].get(), 0);
     }
 }
