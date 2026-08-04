@@ -235,6 +235,53 @@ impl RuntimeCpuId {
     }
 }
 
+/// Runtime-owned capability snapshot for one pinned scheduler CPU.
+///
+/// The three fields are captured in one runtime operation, mirroring Linux's
+/// direct `this_rq()` lookup. Keeping the logical identity together with the
+/// owner-only and remote endpoints prevents the scheduler from resolving its
+/// current CPU back through the global registry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C)]
+pub struct CurrentCpuOwnerHandles {
+    cpu: RuntimeCpuId,
+    local: CurrentCpuLocalHandle,
+    remote: CpuRemoteHandle,
+}
+
+impl CurrentCpuOwnerHandles {
+    /// Creates one pinned current-CPU capability snapshot.
+    ///
+    /// # Safety
+    ///
+    /// `local` and `remote` must identify the owner-only and Arc-backed
+    /// scheduler endpoints for `cpu`. Every non-empty handle must remain live
+    /// until shutdown, and the caller must keep migration excluded while the
+    /// snapshot is used.
+    pub const unsafe fn new(
+        cpu: RuntimeCpuId,
+        local: CurrentCpuLocalHandle,
+        remote: CpuRemoteHandle,
+    ) -> Self {
+        Self { cpu, local, remote }
+    }
+
+    /// Returns the logical CPU identity bound to both handles.
+    pub const fn cpu(self) -> RuntimeCpuId {
+        self.cpu
+    }
+
+    /// Returns the current CPU's owner-only scheduler handle.
+    pub const fn local(self) -> CurrentCpuLocalHandle {
+        self.local
+    }
+
+    /// Returns the current CPU's Arc-backed remote endpoint.
+    pub const fn remote(self) -> CpuRemoteHandle {
+        self.remote
+    }
+}
+
 /// Stable runtime operation status used across the trait-ffi boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
@@ -535,7 +582,7 @@ pub trait TaskRuntime {
     /// root for this raw handle; callers cannot validate it dynamically.
     unsafe fn task_system_handle() -> TaskSystemHandle;
 
-    /// Returns the pinned CPU-local object for the calling CPU.
+    /// Captures the complete pinned scheduler capability for the calling CPU.
     ///
     /// This is a CPU-owned capability, not a migration-stable task handle. The
     /// caller must retain an IRQ guard or scheduler-frame baton from before this
@@ -543,14 +590,14 @@ pub trait TaskRuntime {
     ///
     /// # Safety
     ///
-    /// A non-`NONE` result must identify the pinned [`crate::CpuLocal`] owned by
-    /// the calling CPU and kept live until shutdown. Its address must originate
+    /// The returned identity, owner-only [`crate::CpuLocal`] handle and
+    /// Arc-backed [`crate::CpuRemote`] handle must all describe the same calling
+    /// CPU and remain live until shutdown. The local address must originate
     /// from the allocation's mutable owner capability, not from a shared
     /// `CpuLocal` borrow. Before reconstructing a reference, the caller must
-    /// claim the matching [`crate::CpuRemote`] gate and retain both that claim
-    /// and its CPU pin for the complete derived-borrow lifetime. Runtime-side
-    /// direct owner accesses must use the same gate as the ax-task facade.
-    unsafe fn current_cpu_local_handle() -> CurrentCpuLocalHandle;
+    /// claim the returned remote endpoint's owner gate and retain both that
+    /// claim and its CPU pin for the complete derived-borrow lifetime.
+    unsafe fn current_cpu_owner_handles() -> CurrentCpuOwnerHandles;
 
     /// Returns the Arc-backed [`crate::CpuRemote`] endpoint for the calling CPU.
     ///

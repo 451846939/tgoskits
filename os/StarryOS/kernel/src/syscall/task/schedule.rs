@@ -502,6 +502,7 @@ fn map_task_error(error: scheduler::TaskError) -> AxError {
         | TaskError::NoRunnableThread
         | TaskError::InvalidPiState
         | TaskError::PiCycle
+        | TaskError::PiChainLimit { .. }
         | TaskError::RuntimeFailure(_) => AxError::BadState,
     }
 }

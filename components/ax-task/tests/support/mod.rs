@@ -109,12 +109,21 @@ impl_trait! {
             })
         }
 
-        unsafe fn current_cpu_local_handle() -> CurrentCpuLocalHandle {
-            let index = CURRENT_CPU.with(|cpu| cpu.get() as usize);
-            let raw = CPU_LOCALS.with(|handles| handles.borrow().get(index).copied().unwrap_or(0));
+        unsafe fn current_cpu_owner_handles() -> CurrentCpuOwnerHandles {
+            let cpu = CURRENT_CPU.with(Cell::get);
+            let index = cpu as usize;
+            let local = CPU_LOCALS.with(|handles| handles.borrow().get(index).copied().unwrap_or(0));
+            let remote = CPU_REMOTES.with(|handles| handles.borrow().get(index).copied().unwrap_or(0));
             // SAFETY: the fixture publishes only the selected CPU's pinned
-            // CpuLocal and clears every entry before destroying the objects.
-            unsafe { CurrentCpuLocalHandle::from_raw(raw) }
+            // CpuLocal and matching Arc-backed remote endpoint, and clears
+            // every entry before destroying the objects.
+            unsafe {
+                CurrentCpuOwnerHandles::new(
+                    RuntimeCpuId::new(cpu),
+                    CurrentCpuLocalHandle::from_raw(local),
+                    CpuRemoteHandle::from_raw(remote),
+                )
+            }
         }
 
         unsafe fn current_cpu_remote_handle() -> CpuRemoteHandle {

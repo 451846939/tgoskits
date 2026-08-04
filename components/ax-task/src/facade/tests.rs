@@ -926,8 +926,8 @@ mod tests {
         assert!(decision.requires_context_switch());
         assert_eq!(
             test_runtime::cpu_handle_reads(),
-            (2, 2),
-            "scheduler entry must capture once and switch return must refresh once"
+            (2, 0),
+            "scheduler entry and switch return must use current-CPU owner snapshots without resolving the current endpoint through the global registry"
         );
         assert_eq!(
             test_runtime::scheduler_frame_state(),

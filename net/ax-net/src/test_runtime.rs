@@ -22,9 +22,18 @@ impl_task_runtime! {
             // SAFETY: the test guard keeps the pointed-to system alive.
             unsafe { TaskSystemHandle::from_raw(TASK_SYSTEM.load(Ordering::Acquire)) }
         }
-        unsafe fn current_cpu_local_handle() -> CurrentCpuLocalHandle {
-            // SAFETY: the test guard keeps the pinned CPU-local state alive.
-            unsafe { CurrentCpuLocalHandle::from_raw(CPU_LOCAL.load(Ordering::Acquire)) }
+        unsafe fn current_cpu_owner_handles() -> CurrentCpuOwnerHandles {
+            let local = CPU_LOCAL.load(Ordering::Acquire);
+            let remote = CPU_REMOTE.load(Ordering::Acquire);
+            // SAFETY: InstalledTestRuntime publishes the paired handles for
+            // modeled CPU 0 and keeps their TaskSystem alive.
+            unsafe {
+                CurrentCpuOwnerHandles::new(
+                    RuntimeCpuId::new(0),
+                    CurrentCpuLocalHandle::from_raw(local),
+                    CpuRemoteHandle::from_raw(remote),
+                )
+            }
         }
         unsafe fn current_cpu_remote_handle() -> CpuRemoteHandle {
             // SAFETY: the test runtime retains the TaskSystem that owns this

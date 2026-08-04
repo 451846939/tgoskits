@@ -42,14 +42,11 @@ impl_task_runtime! {
             })
         }
 
-        unsafe fn current_cpu_local_handle() -> CurrentCpuLocalHandle {
-            // SAFETY: the ax-task caller already owns a CPU pin, and the slot
-            // is initialized from the unique pinned CpuLocal allocation before
-            // that CPU becomes visible to scheduler entry paths.
-            let raw = unsafe { with_current_cpu_pin(current_cpu_local_owner_handle) };
-            // SAFETY: zero denotes pre-initialization; every nonzero value is
-            // the shutdown-lifetime owner capability installed above.
-            unsafe { CurrentCpuLocalHandle::from_raw(raw) }
+        unsafe fn current_cpu_owner_handles() -> CurrentCpuOwnerHandles {
+            // SAFETY: the ax-task caller already owns a migration pin. The
+            // callback captures the ID and both endpoints from that same CPU
+            // area in one transaction.
+            unsafe { with_current_cpu_pin(current_cpu_owner_handles) }
         }
 
         unsafe fn current_cpu_remote_handle() -> CpuRemoteHandle {

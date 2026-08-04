@@ -9,11 +9,11 @@ use ax_task::{
     runtime::{
         AddressSpaceActivation, AddressSpaceDestroyOutcome, AddressSpaceHandle,
         AddressSpaceReclaimArmOutcome, ContextThreadBinding, CpuRemoteHandle,
-        CurrentCpuLocalHandle, ExecutionContextHandle, IrqGuardToken, KernelContextRequest,
-        PreemptGuardToken, RuntimeCpuId, RuntimeHandleResult, RuntimeScheduleOrigin,
-        RuntimeSchedulerEntry, RuntimeSchedulerReturn, RuntimeStatus, SchedSwitchRecord,
-        StackHandle, StackRequest, TaskDeadlineUpdate, TaskRuntime, TaskSystemHandle,
-        ThreadIdentityV1, TlsHandle, TlsRequest, UserContextRequest,
+        CurrentCpuLocalHandle, CurrentCpuOwnerHandles, ExecutionContextHandle, IrqGuardToken,
+        KernelContextRequest, PreemptGuardToken, RuntimeCpuId, RuntimeHandleResult,
+        RuntimeScheduleOrigin, RuntimeSchedulerEntry, RuntimeSchedulerReturn, RuntimeStatus,
+        SchedSwitchRecord, StackHandle, StackRequest, TaskDeadlineUpdate, TaskRuntime,
+        TaskSystemHandle, ThreadIdentityV1, TlsHandle, TlsRequest, UserContextRequest,
     },
 };
 
@@ -68,9 +68,18 @@ impl_task_runtime! {
             // SAFETY: install/clear bracket the pinned fixture TaskSystem.
             unsafe { TaskSystemHandle::from_raw(TASK_SYSTEM.with(Cell::get)) }
         }
-        unsafe fn current_cpu_local_handle() -> CurrentCpuLocalHandle {
-            // SAFETY: install/clear bracket the pinned owner CpuLocal fixture.
-            unsafe { CurrentCpuLocalHandle::from_raw(CPU_LOCAL.with(Cell::get)) }
+        unsafe fn current_cpu_owner_handles() -> CurrentCpuOwnerHandles {
+            let local = CPU_LOCAL.with(Cell::get);
+            let remote = CPU_REMOTE.with(Cell::get);
+            // SAFETY: install/clear publish the paired owner and remote handles
+            // for modeled CPU 0 and keep their TaskSystem alive.
+            unsafe {
+                CurrentCpuOwnerHandles::new(
+                    RuntimeCpuId::new(0),
+                    CurrentCpuLocalHandle::from_raw(local),
+                    CpuRemoteHandle::from_raw(remote),
+                )
+            }
         }
         unsafe fn current_cpu_remote_handle() -> CpuRemoteHandle {
             // SAFETY: install/clear bracket the fixture TaskSystem that owns

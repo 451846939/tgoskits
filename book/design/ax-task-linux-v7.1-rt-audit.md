@@ -979,6 +979,27 @@ flush。最终同一命令完成 13/13 阶段，guest elapsed 2 秒、QEMU run 4
 `STARRY_GROUPED_TESTS_PASSED`。该证据同时约束正确性和“新 PTE 安装不得发送无意义
 shootdown”的性能边界。
 
+### 2026-08-04 当前 CPU owner snapshot
+
+Linux v7.1 的 `__schedule()` 在抢占与 IRQ 已受控后，通过一次
+`smp_processor_id()` 与 `cpu_rq(cpu)` 取得当前 rq；切换返回后的
+`finish_task_switch()` 才重新执行 `this_rq()`，因为挂起的 continuation 可能已经在另一
+CPU 恢复。TGOSKits 保留同样的两次捕获边界，但删除旧 `TaskRuntime` 中“先读当前 CPU
+ID，再通过全局 `TaskSystem` registry 解析当前 remote endpoint，最后单独读取 owner
+handle”的分裂接口。
+
+新的 `CurrentCpuOwnerHandles` 在一个受 pin 保护的 runtime 调用中同时返回 CPU ID、
+owner-only `CpuLocal` handle 和 Arc-backed `CpuRemote` handle。调度帧在切换前捕获一次，
+raw switch 返回后重新捕获一次；trace 直接复用帧内 CPU ID。当前 CPU 的普通
+reschedule 快路径仍保留专用 ID/remote 查询，避免为了只读一个字段而构造完整 owner
+snapshot。四架构共享这一前端模型，差异只留在 CPU-local 寄存器读取与裸
+`switch_to` 后端。
+
+确定性回归把一次真实切换的 owner handle 捕获固定为 2 次，并要求通用 remote
+registry lookup 为 0。旧实现稳定得到 `(2, 2)`，新实现得到 `(2, 0)`。这一步只报告
+调用路径缩减，不把未复测的端到端延迟声明为性能提升；后续仍用同一 Q35/TCG
+wakeup-latency workload 与 Linux PREEMPT_RT 对比。
+
 ## 模块化结果
 
 - `TaskSystem` orchestration 只负责编排，registry/reap、placement、owner scheduling、deadline、PI、balance、deferred work 分模块；

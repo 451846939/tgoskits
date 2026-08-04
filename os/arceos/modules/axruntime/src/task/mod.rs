@@ -30,9 +30,9 @@ use ax_task::{
     runtime::{
         AddressSpaceActivation, AddressSpaceDestroyOutcome, AddressSpaceHandle,
         AddressSpaceReclaimArmOutcome, ContextThreadBinding, CpuRemoteHandle,
-        CurrentCpuLocalHandle, ExecutionContextHandle, IrqGuardToken, KernelContextRequest,
-        RuntimeCpuId, RuntimeHandleResult, RuntimeStatus, StackHandle, StackRequest, TaskRuntime,
-        TaskSystemHandle, TlsHandle, TlsRequest, UserContextRequest,
+        CurrentCpuLocalHandle, CurrentCpuOwnerHandles, ExecutionContextHandle, IrqGuardToken,
+        KernelContextRequest, RuntimeCpuId, RuntimeHandleResult, RuntimeStatus, StackHandle,
+        StackRequest, TaskRuntime, TaskSystemHandle, TlsHandle, TlsRequest, UserContextRequest,
     },
 };
 
@@ -64,7 +64,7 @@ pub(crate) use bootstrap::{
     start_deferred_task_work_service,
 };
 use bootstrap::{
-    cpu_remote, current_cpu_local_owner_handle, idle_context_entry, primary_bootstrap_thread,
+    cpu_remote, current_cpu_owner_handles, idle_context_entry, primary_bootstrap_thread,
     scheduler_current_cpu_remote_handle, task_system, with_current_cpu_local_mut_owner,
     with_current_cpu_pin,
 };

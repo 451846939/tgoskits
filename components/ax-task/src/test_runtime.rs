@@ -114,13 +114,21 @@ impl TaskRuntime for UnitTestRuntime {
             unsafe { TaskSystemHandle::from_raw(handle.get()) }
         })
     }
-    unsafe fn current_cpu_local_handle() -> CurrentCpuLocalHandle {
+    unsafe fn current_cpu_owner_handles() -> CurrentCpuOwnerHandles {
         CPU_LOCAL_HANDLE_READS.with(|reads| reads.set(reads.get() + 1));
-        CPU_LOCAL_HANDLE.with(|handle| {
+        let local = CPU_LOCAL_HANDLE.with(|handle| {
             // SAFETY: unit fixtures install only the current thread's pinned
             // CpuLocal and clear the handle before destroying it.
             unsafe { CurrentCpuLocalHandle::from_raw(handle.get()) }
-        })
+        });
+        let remote = CURRENT_CPU_REMOTE_HANDLE.with(|handle| {
+            // SAFETY: the fixture retains the TaskSystem that owns this
+            // current-CPU endpoint until the snapshot is no longer usable.
+            unsafe { CpuRemoteHandle::from_raw(handle.get()) }
+        });
+        // SAFETY: both handles are installed together for modeled CPU 0 and
+        // remain live for the surrounding test runtime scope.
+        unsafe { CurrentCpuOwnerHandles::new(RuntimeCpuId::new(0), local, remote) }
     }
     unsafe fn current_cpu_remote_handle() -> CpuRemoteHandle {
         CURRENT_CPU_REMOTE_HANDLE.with(|handle| {

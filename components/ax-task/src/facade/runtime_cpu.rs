@@ -60,20 +60,18 @@ struct RuntimeCpuHandles {
 impl RuntimeCpuHandles {
     fn capture() -> Self {
         // SAFETY: every capture is owned by a live RuntimeIrqGuard or
-        // RuntimeSchedulerFrameGuard that prevents migration.
-        let runtime_cpu = unsafe { task_runtime::current_cpu_id() };
-        // SAFETY: a RuntimeCpuPin is created only after its runtime guard has
-        // disabled migration. The provider returns shutdown-lifetime handles
-        // for the CPU selected by that same pinned context.
-        let cpu_remote = unsafe { task_runtime::cpu_remote_handle(runtime_cpu) };
-        // SAFETY: the same guard pins the current CPU while the runtime reads
-        // and validates its architecture-owned CPU-local registers.
-        let cpu_local = unsafe { task_runtime::current_cpu_local_handle() };
+        // RuntimeSchedulerFrameGuard that prevents migration. The runtime
+        // snapshots all three values from that one pinned CPU.
+        let handles = unsafe { task_runtime::current_cpu_owner_handles() };
         Self {
-            runtime_cpu,
-            cpu_local,
-            cpu_remote,
+            runtime_cpu: handles.cpu(),
+            cpu_local: handles.local(),
+            cpu_remote: handles.remote(),
         }
+    }
+
+    const fn cpu_id(self) -> RuntimeCpuId {
+        self.runtime_cpu
     }
 
     fn claim(self) -> Result<CpuLocalOwnerBorrow<'static>, TaskError> {
@@ -255,6 +253,10 @@ impl RuntimeSchedulerFrameGuard {
         // Capture the target CPU once before switch-tail owner access; all
         // later borrows in this frame reuse that validated identity.
         self.cpu = RuntimeCpuHandles::capture();
+    }
+
+    pub(super) const fn cpu_id(&self) -> RuntimeCpuId {
+        self.cpu.cpu_id()
     }
 }
 

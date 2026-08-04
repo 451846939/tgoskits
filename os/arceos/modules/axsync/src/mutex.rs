@@ -719,6 +719,7 @@ fn owner_spin_eligible(
     owner_from_state(state) == Some(owner) && owner_on_cpu && waiter_is_top && !need_resched
 }
 
+#[track_caller]
 fn task_result<T>(result: Result<T, TaskError>, operation: &'static str) -> T {
     result.unwrap_or_else(|error| panic!("{operation} failed: {error}"))
 }

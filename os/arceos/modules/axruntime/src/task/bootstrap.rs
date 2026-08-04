@@ -350,8 +350,21 @@ pub(super) fn cpu_remote(cpu: RuntimeCpuId) -> Option<&'static CpuRemote> {
     task_system()?.cpu_remote(CpuId::new(cpu.as_u32()))
 }
 
-pub(super) fn current_cpu_local_owner_handle(cpu_pin: &CpuPin) -> usize {
-    CPU_LOCAL_OWNER_HANDLE.read_current(cpu_pin)
+pub(super) fn current_cpu_owner_handles(cpu_pin: &CpuPin) -> CurrentCpuOwnerHandles {
+    let cpu = u32::try_from(ax_hal::percpu::this_cpu_id_pinned(cpu_pin))
+        .expect("logical CPU ID must fit the TaskRuntime ABI");
+    let local = CPU_LOCAL_OWNER_HANDLE.read_current(cpu_pin);
+    let remote = CPU_REMOTE_HANDLE.with_current(cpu_pin, |slot| slot.get().copied().unwrap_or(0));
+    // SAFETY: initialization publishes all three values from one exclusive CPU
+    // transaction before that CPU is admitted to scheduler traffic. The
+    // containing runtime keeps both endpoint allocations live until shutdown.
+    unsafe {
+        CurrentCpuOwnerHandles::new(
+            RuntimeCpuId::new(cpu),
+            CurrentCpuLocalHandle::from_raw(local),
+            CpuRemoteHandle::from_raw(remote),
+        )
+    }
 }
 
 /// Reads the current CPU's cached remote endpoint without constructing a pin.
