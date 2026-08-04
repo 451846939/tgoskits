@@ -1,4 +1,4 @@
-//! Loom models for the ax-sync/ax-task PI transaction boundary.
+//! Loom models for the single-owner ax-task PI mutex core.
 
 use loom::{
     sync::{
@@ -13,52 +13,57 @@ const OWNER_TWO: usize = 4;
 const HAS_WAITERS: usize = 1;
 
 #[derive(Debug)]
-struct LocalState {
-    owner: usize,
-    sequence: usize,
-    queued: bool,
-    granted: bool,
-    acquired_directly: bool,
+struct CoreState {
+    waiter_two: bool,
+    waiter_three: bool,
+    selected: usize,
+    granted: usize,
+    donation_owner: usize,
 }
 
-#[derive(Debug)]
-struct SchedulerState {
-    donation_owner: usize,
-    token_granted: bool,
-    reject_release: bool,
+impl CoreState {
+    fn owned_by_one() -> Self {
+        Self {
+            waiter_two: false,
+            waiter_three: false,
+            selected: 0,
+            granted: 0,
+            donation_owner: 0,
+        }
+    }
 }
 
 #[test]
 fn owner_waiters_bit_closes_fast_unlock_registration_race() {
     loom::model(|| {
         let owner = Arc::new(AtomicUsize::new(OWNER_ONE));
-        let local = Arc::new(Mutex::new(LocalState {
-            owner: 1,
-            sequence: 0,
-            queued: false,
-            granted: false,
-            acquired_directly: false,
-        }));
+        let core = Arc::new(Mutex::new(CoreState::owned_by_one()));
 
         let waiter = {
             let owner = Arc::clone(&owner);
-            let local = Arc::clone(&local);
+            let core = Arc::clone(&core);
             thread::spawn(move || {
-                let mut local = local.lock().unwrap();
-                let previous = owner.fetch_or(HAS_WAITERS, Ordering::AcqRel);
-                if previous & !HAS_WAITERS == 0 {
+                let mut core = core.lock().unwrap();
+                let snapshot = owner.load(Ordering::Acquire);
+                if snapshot == 0
+                    && owner
+                        .compare_exchange(0, OWNER_TWO, Ordering::Acquire, Ordering::Relaxed)
+                        .is_ok()
+                {
+                    return;
+                }
+                let snapshot = owner.fetch_or(HAS_WAITERS, Ordering::AcqRel);
+                if snapshot == 0 {
                     owner.store(OWNER_TWO, Ordering::Release);
-                    local.owner = 2;
-                    local.acquired_directly = true;
                 } else {
-                    assert_eq!(previous & !HAS_WAITERS, OWNER_ONE);
-                    local.queued = true;
+                    core.waiter_two = true;
+                    core.donation_owner = OWNER_ONE;
                 }
             })
         };
         let unlock = {
             let owner = Arc::clone(&owner);
-            let local = Arc::clone(&local);
+            let core = Arc::clone(&core);
             thread::spawn(move || {
                 if owner
                     .compare_exchange(OWNER_ONE, 0, Ordering::Release, Ordering::Relaxed)
@@ -66,225 +71,192 @@ fn owner_waiters_bit_closes_fast_unlock_registration_race() {
                 {
                     return;
                 }
-
-                let mut local = local.lock().unwrap();
-                assert!(local.queued);
-                local.queued = false;
-                local.owner = 2;
-                local.granted = true;
-                owner.store(OWNER_TWO, Ordering::Release);
+                let mut core = core.lock().unwrap();
+                assert!(core.waiter_two);
+                core.selected = OWNER_TWO;
+                core.donation_owner = 0;
+                owner.store(HAS_WAITERS, Ordering::Release);
             })
         };
 
         waiter.join().unwrap();
         unlock.join().unwrap();
 
-        let local = local.lock().unwrap();
-        assert_eq!(owner.load(Ordering::Acquire), OWNER_TWO);
-        assert_eq!(local.owner, 2);
-        assert!(!local.queued);
-        assert_ne!(local.granted, local.acquired_directly);
-    });
-}
-
-#[test]
-fn registration_and_unlock_share_the_local_metadata_transaction() {
-    loom::model(|| {
-        let local = Arc::new(Mutex::new(LocalState {
-            owner: 1,
-            sequence: 0,
-            queued: false,
-            granted: false,
-            acquired_directly: false,
-        }));
-        let scheduler = Arc::new(Mutex::new(SchedulerState {
-            donation_owner: 0,
-            token_granted: false,
-            reject_release: false,
-        }));
-
-        let waiter = {
-            let local = Arc::clone(&local);
-            let scheduler = Arc::clone(&scheduler);
-            thread::spawn(move || {
-                let snapshot = {
-                    let mut local = local.lock().unwrap();
-                    if local.owner == 0 {
-                        local.owner = 2;
-                        local.acquired_directly = true;
-                        return;
-                    }
-                    assert_eq!(local.owner, 1);
-                    (local.owner, local.sequence)
-                };
-
-                // Preparation owns the scheduler transaction but has not yet
-                // published a donation edge.
-                let mut scheduler = scheduler.lock().unwrap();
-                assert_eq!(scheduler.donation_owner, 0);
-                {
-                    let mut local_state = local.lock().unwrap();
-                    if (local_state.owner, local_state.sequence) != snapshot {
-                        drop(local_state);
-                        drop(scheduler);
-                        let mut local_state = local.lock().unwrap();
-                        if local_state.owner == 0 {
-                            local_state.owner = 2;
-                            local_state.acquired_directly = true;
-                            local_state.sequence += 1;
-                        }
-                        return;
-                    }
-                    local_state.queued = true;
-                    local_state.sequence += 1;
-                }
-                scheduler.donation_owner = snapshot.0;
-            })
-        };
-        let unlock = {
-            let local = Arc::clone(&local);
-            let scheduler = Arc::clone(&scheduler);
-            thread::spawn(move || {
-                let snapshot = {
-                    let mut local = local.lock().unwrap();
-                    assert_eq!(local.owner, 1);
-                    if !local.queued {
-                        local.owner = 0;
-                        local.sequence += 1;
-                        return;
-                    }
-                    local.sequence
-                };
-                let mut scheduler = scheduler.lock().unwrap();
-                let mut local = local.lock().unwrap();
-                if local.owner != 1 || !local.queued || local.sequence != snapshot {
-                    return;
-                }
-                assert_eq!(scheduler.donation_owner, 1);
-                local.owner = 2;
-                local.queued = false;
-                local.granted = true;
-                local.sequence += 1;
-                scheduler.donation_owner = 0;
-                scheduler.token_granted = true;
-            })
-        };
-
-        waiter.join().unwrap();
-        unlock.join().unwrap();
-
-        let local = local.lock().unwrap();
-        let scheduler = scheduler.lock().unwrap();
-        assert_eq!(local.owner, 2);
-        assert!(!local.queued);
-        assert_eq!(scheduler.donation_owner, 0);
-        assert_eq!(local.granted, scheduler.token_granted);
-        assert_ne!(local.granted, local.acquired_directly);
-    });
-}
-
-#[test]
-fn failed_release_preflight_cannot_publish_only_the_local_grant() {
-    loom::model(|| {
-        let local = Arc::new(Mutex::new(LocalState {
-            owner: 1,
-            sequence: 0,
-            queued: true,
-            granted: false,
-            acquired_directly: false,
-        }));
-        let scheduler = Arc::new(Mutex::new(SchedulerState {
-            donation_owner: 1,
-            token_granted: false,
-            reject_release: false,
-        }));
-        let wake = Arc::new(AtomicBool::new(false));
-
-        let injector = {
-            let scheduler = Arc::clone(&scheduler);
-            thread::spawn(move || scheduler.lock().unwrap().reject_release = true)
-        };
-        let unlock = {
-            let local = Arc::clone(&local);
-            let scheduler = Arc::clone(&scheduler);
-            let wake = Arc::clone(&wake);
-            thread::spawn(move || {
-                let mut local = local.lock().unwrap();
-                let mut scheduler = scheduler.lock().unwrap();
-                if scheduler.reject_release {
-                    return;
-                }
-
-                // The scheduler lock is the prepared transaction. It remains
-                // held across local publication and scheduler commit.
-                local.owner = 2;
-                local.queued = false;
-                local.granted = true;
-                scheduler.donation_owner = 0;
-                scheduler.token_granted = true;
-                drop(scheduler);
-                drop(local);
-                wake.store(true, Ordering::Release);
-            })
-        };
-
-        injector.join().unwrap();
-        unlock.join().unwrap();
-
-        let local = local.lock().unwrap();
-        let scheduler = scheduler.lock().unwrap();
-        if scheduler.token_granted {
-            assert_eq!(local.owner, 2);
-            assert!(!local.queued);
-            assert!(local.granted);
-            assert_eq!(scheduler.donation_owner, 0);
-            assert!(wake.load(Ordering::Acquire));
-        } else {
-            assert_eq!(local.owner, 1);
-            assert!(local.queued);
-            assert!(!local.granted);
-            assert_eq!(scheduler.donation_owner, 1);
-            assert!(!wake.load(Ordering::Acquire));
+        let core = core.lock().unwrap();
+        match owner.load(Ordering::Acquire) {
+            OWNER_TWO => assert!(!core.waiter_two),
+            HAS_WAITERS => {
+                assert!(core.waiter_two);
+                assert_eq!(core.selected, OWNER_TWO);
+                assert_eq!(core.donation_owner, 0);
+            }
+            owner => panic!("registration/unlock race lost owner state {owner}"),
         }
     });
 }
 
 #[test]
-fn deboost_and_both_grants_are_published_before_wake() {
+fn selection_deboost_and_ownerless_state_publish_before_wake() {
     loom::model(|| {
-        let old_owner_boosted = Arc::new(AtomicBool::new(true));
-        let local_granted = Arc::new(AtomicBool::new(false));
-        let scheduler_granted = Arc::new(AtomicBool::new(false));
+        let owner = Arc::new(AtomicUsize::new(OWNER_ONE | HAS_WAITERS));
+        let core = Arc::new(Mutex::new(CoreState {
+            waiter_two: true,
+            waiter_three: false,
+            selected: 0,
+            granted: 0,
+            donation_owner: OWNER_ONE,
+        }));
         let wake = Arc::new(AtomicBool::new(false));
 
         let unlock = {
-            let old_owner_boosted = Arc::clone(&old_owner_boosted);
-            let local_granted = Arc::clone(&local_granted);
-            let scheduler_granted = Arc::clone(&scheduler_granted);
+            let owner = Arc::clone(&owner);
+            let core = Arc::clone(&core);
             let wake = Arc::clone(&wake);
             thread::spawn(move || {
-                local_granted.store(true, Ordering::Relaxed);
-                old_owner_boosted.store(false, Ordering::Relaxed);
-                scheduler_granted.store(true, Ordering::Relaxed);
+                let mut core = core.lock().unwrap();
+                core.selected = OWNER_TWO;
+                core.donation_owner = 0;
+                owner.store(HAS_WAITERS, Ordering::Release);
+                drop(core);
                 wake.store(true, Ordering::Release);
             })
         };
         let waiter = {
-            let old_owner_boosted = Arc::clone(&old_owner_boosted);
-            let local_granted = Arc::clone(&local_granted);
-            let scheduler_granted = Arc::clone(&scheduler_granted);
+            let owner = Arc::clone(&owner);
+            let core = Arc::clone(&core);
             let wake = Arc::clone(&wake);
             thread::spawn(move || {
                 while !wake.load(Ordering::Acquire) {
                     thread::yield_now();
                 }
-                assert!(!old_owner_boosted.load(Ordering::Relaxed));
-                assert!(local_granted.load(Ordering::Relaxed));
-                assert!(scheduler_granted.load(Ordering::Relaxed));
+                let mut core = core.lock().unwrap();
+                assert_eq!(owner.load(Ordering::Acquire), HAS_WAITERS);
+                assert_eq!(core.selected, OWNER_TWO);
+                assert_eq!(core.donation_owner, 0);
+                core.waiter_two = false;
+                core.selected = 0;
+                core.granted = OWNER_TWO;
+                owner.store(OWNER_TWO, Ordering::Release);
             })
         };
 
         unlock.join().unwrap();
         waiter.join().unwrap();
+        let core = core.lock().unwrap();
+        assert_eq!(owner.load(Ordering::Acquire), OWNER_TWO);
+        assert_eq!(core.granted, OWNER_TWO);
+        assert!(!core.waiter_two);
+    });
+}
+
+#[test]
+fn ownerless_newcomer_cannot_steal_the_selected_claim() {
+    loom::model(|| {
+        let owner = Arc::new(AtomicUsize::new(HAS_WAITERS));
+        let core = Arc::new(Mutex::new(CoreState {
+            waiter_two: true,
+            waiter_three: false,
+            selected: OWNER_TWO,
+            granted: 0,
+            donation_owner: 0,
+        }));
+
+        let claimant = {
+            let owner = Arc::clone(&owner);
+            let core = Arc::clone(&core);
+            thread::spawn(move || {
+                let mut core = core.lock().unwrap();
+                assert_eq!(owner.load(Ordering::Acquire), HAS_WAITERS);
+                assert_eq!(core.selected, OWNER_TWO);
+                core.waiter_two = false;
+                core.selected = 0;
+                core.granted = OWNER_TWO;
+                let has_waiters = core.waiter_three;
+                owner.store(
+                    OWNER_TWO | if has_waiters { HAS_WAITERS } else { 0 },
+                    Ordering::Release,
+                );
+                if has_waiters {
+                    core.donation_owner = OWNER_TWO;
+                }
+            })
+        };
+        let newcomer = {
+            let owner = Arc::clone(&owner);
+            let core = Arc::clone(&core);
+            thread::spawn(move || {
+                let mut core = core.lock().unwrap();
+                assert_ne!(owner.load(Ordering::Acquire), 0);
+                owner.fetch_or(HAS_WAITERS, Ordering::AcqRel);
+                core.waiter_three = true;
+                core.donation_owner = OWNER_TWO;
+            })
+        };
+
+        claimant.join().unwrap();
+        newcomer.join().unwrap();
+        let core = core.lock().unwrap();
+        assert_eq!(owner.load(Ordering::Acquire), OWNER_TWO | HAS_WAITERS);
+        assert_eq!(core.granted, OWNER_TWO);
+        assert!(core.waiter_three);
+        assert_eq!(core.donation_owner, OWNER_TWO);
+    });
+}
+
+#[test]
+fn cancellation_and_release_have_one_serialized_winner() {
+    loom::model(|| {
+        let owner = Arc::new(AtomicUsize::new(OWNER_ONE | HAS_WAITERS));
+        let core = Arc::new(Mutex::new(CoreState {
+            waiter_two: true,
+            waiter_three: false,
+            selected: 0,
+            granted: 0,
+            donation_owner: OWNER_ONE,
+        }));
+        let wake = Arc::new(AtomicBool::new(false));
+
+        let cancel = {
+            let owner = Arc::clone(&owner);
+            let core = Arc::clone(&core);
+            thread::spawn(move || {
+                let mut core = core.lock().unwrap();
+                if core.selected == 0 {
+                    core.waiter_two = false;
+                    core.donation_owner = 0;
+                    owner.store(OWNER_ONE, Ordering::Release);
+                }
+            })
+        };
+        let release = {
+            let owner = Arc::clone(&owner);
+            let core = Arc::clone(&core);
+            let wake = Arc::clone(&wake);
+            thread::spawn(move || {
+                let mut core = core.lock().unwrap();
+                if !core.waiter_two {
+                    return;
+                }
+                core.selected = OWNER_TWO;
+                core.donation_owner = 0;
+                owner.store(HAS_WAITERS, Ordering::Release);
+                drop(core);
+                wake.store(true, Ordering::Release);
+            })
+        };
+
+        cancel.join().unwrap();
+        release.join().unwrap();
+        let core = core.lock().unwrap();
+        if core.waiter_two {
+            assert_eq!(core.selected, OWNER_TWO);
+            assert_eq!(owner.load(Ordering::Acquire), HAS_WAITERS);
+            assert!(wake.load(Ordering::Acquire));
+        } else {
+            assert_eq!(core.selected, 0);
+            assert_eq!(owner.load(Ordering::Acquire), OWNER_ONE);
+            assert!(!wake.load(Ordering::Acquire));
+        }
+        assert_eq!(core.donation_owner, 0);
     });
 }

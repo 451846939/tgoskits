@@ -462,7 +462,12 @@ impl TaskSystemState {
             if !lock_state.waiters.contains(registration.key) {
                 return Err(TaskError::InvalidPiState);
             }
-            let Some(next_owner) = lock_state.owner else {
+            let Some(next_owner) = (unsafe {
+                // SAFETY: the live registration retains the mutex-core lifetime.
+                registration.lock.core()
+            })
+            .owner_snapshot()
+            .owner() else {
                 return Ok(());
             };
             if depth == chain_limit {
@@ -654,7 +659,12 @@ impl TaskSystemState {
             if !lock_state.waiters.contains(registration.key) {
                 return Err(TaskError::InvalidPiState);
             }
-            let Some(owner) = lock_state.owner else {
+            let Some(owner) = (unsafe {
+                // SAFETY: the live registration retains the mutex-core lifetime.
+                registration.lock.core()
+            })
+            .owner_snapshot()
+            .owner() else {
                 return Ok(PiRecomputeProof { start, depth });
             };
             if depth == chain_limit {
@@ -916,7 +926,7 @@ impl DetachedThreadRecord {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct PiWaitRegistration {
-    pub(super) lock: PiLockRaw,
+    pub(super) lock: PiMutexRaw,
     pub(super) key: PiWaitKey,
     pub(super) generation: u64,
 }

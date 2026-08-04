@@ -56,10 +56,16 @@ fn nested_preempt_exit_does_not_reenter_context_queries() {
     let state = RuntimeGuardState::new();
     let irq_queries = Cell::new(0);
 
-    assert!(!preempt_exit_needs_schedule(&state, 2, true, false, || {
-        irq_queries.set(irq_queries.get() + 1);
-        false
-    },));
+    assert!(!preempt_exit_needs_schedule(
+        &state,
+        2,
+        PreemptExitOrigin::IrqReturn,
+        false,
+        || {
+            irq_queries.set(irq_queries.get() + 1);
+            false
+        },
+    ));
     assert_eq!(
         irq_queries.get(),
         0,
@@ -71,9 +77,39 @@ fn nested_preempt_exit_does_not_reenter_context_queries() {
 fn final_preempt_exit_does_not_requery_the_reschedule_endpoint() {
     let state = RuntimeGuardState::new();
 
-    assert!(preempt_exit_needs_schedule(&state, 1, false, true, || {
-        false
-    },));
+    assert!(preempt_exit_needs_schedule(
+        &state,
+        1,
+        PreemptExitOrigin::Task,
+        true,
+        || false,
+    ));
+}
+
+#[test]
+fn task_preempt_exit_defers_while_hardware_irqs_are_disabled() {
+    let state = RuntimeGuardState::new();
+
+    assert!(!preempt_exit_needs_schedule(
+        &state,
+        1,
+        PreemptExitOrigin::Task,
+        false,
+        || false,
+    ));
+}
+
+#[test]
+fn explicit_irq_return_may_schedule_with_hardware_irqs_disabled() {
+    let state = RuntimeGuardState::new();
+
+    assert!(preempt_exit_needs_schedule(
+        &state,
+        1,
+        PreemptExitOrigin::IrqReturn,
+        false,
+        || false,
+    ));
 }
 
 #[test]

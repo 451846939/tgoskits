@@ -17,6 +17,8 @@ struct KernelGuardIfImpl;
 impl ax_kernel_guard::KernelGuardIf for KernelGuardIfImpl {
     fn enable_preempt() {}
 
+    fn enable_preempt_from_irq_return() {}
+
     fn disable_preempt() {}
 }
 

@@ -2,7 +2,7 @@
 
 extern crate alloc;
 
-use alloc::{collections::BTreeSet, format, vec::Vec};
+use alloc::{format, vec::Vec};
 
 /// Tracks the guest that owns the currently unterminated host-console line.
 ///
@@ -17,21 +17,10 @@ pub(crate) struct GuestOutputMux {
 }
 
 impl GuestOutputMux {
-    /// Invalidates a continuation whose guest is no longer running.
-    pub(crate) fn reconcile_running(&mut self, running: &BTreeSet<usize>) {
-        if self
-            .host_line_owner
-            .is_some_and(|vm_id| !running.contains(&vm_id))
-        {
-            self.host_line_prefixed = false;
-        }
-    }
-
-    /// Invalidates continuation state for a replaced or stopped backend.
-    pub(crate) fn reset_guest(&mut self, vm_id: usize) {
-        if self.host_line_owner == Some(vm_id) {
-            self.host_line_prefixed = false;
-        }
+    /// Drops all line-continuation state after a control-plane transition.
+    pub(crate) fn reset_all(&mut self) {
+        self.host_line_owner = None;
+        self.host_line_prefixed = false;
     }
 
     /// Formats one serialized backend write for the physical host console.

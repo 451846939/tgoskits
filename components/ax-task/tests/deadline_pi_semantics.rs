@@ -1,5 +1,5 @@
 use ax_task::{
-    CpuId, DeadlineFlags, DeadlinePolicy, FairMode, Nice, PiLockIdentity, PiWaitOwner,
+    CpuId, DeadlineFlags, DeadlinePolicy, FairMode, Nice, PiMutexAcquire, PiMutexCore,
     PiWaitStateError, RtPriority, SchedulePolicy, TaskError, TaskSystem, TaskSystemConfig,
     ThreadId, ThreadSpec,
 };
@@ -16,7 +16,7 @@ fn pi_orders_equal_relative_deadlines_by_the_active_absolute_job_deadline() {
     // PI compared only the shared relative policy deadline.
     let late = ready_thread(&system, deadline(1, 10, 100));
     let early = ready_thread(&system, deadline(1, 10, 100));
-    let lock = PiLockIdentity::new();
+    let lock = PiMutexCore::new();
 
     system.enqueue(cpu.as_mut(), early.id(), 0).unwrap();
     assert_eq!(system.schedule(cpu.as_mut(), 0).unwrap().next(), early.id());
@@ -37,15 +37,13 @@ fn pi_orders_equal_relative_deadlines_by_the_active_absolute_job_deadline() {
         Some(early.id())
     );
 
-    let release = system
-        .prepare_pi_mutex_release(lock.lock_ref().unwrap(), owner.id())
-        .unwrap();
-    // SAFETY: this scheduler-level test models the mutex ownerless publication.
-    unsafe { release.commit_after_local_release() };
+    drop(
+        system
+            .pi_mutex_release(lock.mutex_ref().unwrap(), owner.id())
+            .unwrap(),
+    );
     assert!(early_wait.is_selected());
-    let claim = system.prepare_pi_mutex_claim(&early_wait).unwrap();
-    // SAFETY: this scheduler-level test models the claimant owner publication.
-    unsafe { claim.commit_after_local_claim() };
+    system.pi_mutex_claim(&early_wait).unwrap();
     assert!(early_wait.is_granted());
     assert!(!late_wait.is_granted());
     assert_eq!(system.deadline_runtime(early.id()).unwrap().donor(), None);
@@ -88,8 +86,8 @@ fn exhausted_deadline_donation_rescues_every_contended_owner_in_the_chain() {
         )))
         .unwrap();
     let donor = ready_thread(&system, deadline(1, 10, 100));
-    let first_lock = PiLockIdentity::new();
-    let second_lock = PiLockIdentity::new();
+    let first_lock = PiMutexCore::new();
+    let second_lock = PiMutexCore::new();
 
     system.enqueue(cpu.as_mut(), donor.id(), 0).unwrap();
     assert_eq!(system.schedule(cpu.as_mut(), 0).unwrap().next(), donor.id());
@@ -128,7 +126,7 @@ fn queued_owner_receives_an_exhausted_donor_as_runnable_rescue_work() {
     let (system, mut cpu) = online_system();
     let owner = ready_thread(&system, SchedulePolicy::default());
     let donor = ready_thread(&system, deadline(1, 10, 100));
-    let lock = PiLockIdentity::new();
+    let lock = PiMutexCore::new();
 
     system.enqueue(cpu.as_mut(), donor.id(), 0).unwrap();
     assert_eq!(system.schedule(cpu.as_mut(), 0).unwrap().next(), donor.id());
@@ -186,7 +184,7 @@ fn withdrawing_an_rt_boost_preserves_the_owners_base_rr_quantum() {
         )))
         .unwrap();
     system.enqueue(cpu.as_mut(), owner.id(), 0).unwrap();
-    let lock = PiLockIdentity::new();
+    let lock = PiMutexCore::new();
     let wait = support::commit_pi_wait(&system, &lock, donor.id(), owner.id()).unwrap();
     system.drain_policy_updates(cpu.as_mut(), 0).unwrap();
     assert_eq!(system.schedule(cpu.as_mut(), 0).unwrap().next(), owner.id());
@@ -225,7 +223,7 @@ fn owner_and_waiter_policy_updates_recompute_the_pi_chain() {
             RtPriority::new(50).unwrap(),
         )))
         .unwrap();
-    let lock = PiLockIdentity::new();
+    let lock = PiMutexCore::new();
     let wait = support::commit_pi_wait(&system, &lock, waiter.id(), owner.id()).unwrap();
 
     let owner_base = SchedulePolicy::default();
@@ -247,8 +245,8 @@ fn a_pi_wait_cycle_returns_a_typed_error_without_mutating_the_graph() {
     let second = system
         .create_thread(ThreadSpec::new(SchedulePolicy::default()))
         .unwrap();
-    let first_lock = PiLockIdentity::new();
-    let second_lock = PiLockIdentity::new();
+    let first_lock = PiMutexCore::new();
+    let second_lock = PiMutexCore::new();
     let edge = support::commit_pi_wait(&system, &first_lock, second.id(), first.id()).unwrap();
 
     assert!(matches!(
@@ -287,8 +285,8 @@ fn pi_chain_limit_rejects_the_new_edge_without_mutating_existing_donations() {
             RtPriority::new(99).unwrap(),
         )))
         .unwrap();
-    let first_lock = PiLockIdentity::new();
-    let second_lock = PiLockIdentity::new();
+    let first_lock = PiMutexCore::new();
+    let second_lock = PiMutexCore::new();
     let existing =
         support::commit_pi_wait(&system, &first_lock, second_owner.id(), first_owner.id()).unwrap();
     let first_policy = first_owner.effective_policy();
@@ -305,7 +303,7 @@ fn pi_chain_limit_rejects_the_new_edge_without_mutating_existing_donations() {
 }
 
 #[test]
-fn dropped_pi_wait_preparation_does_not_publish_a_donation_edge() {
+fn failed_pi_wait_registration_does_not_publish_a_donation_edge() {
     let (system, _cpu) = online_system();
     let owner = system
         .create_thread(ThreadSpec::new(SchedulePolicy::fair(
@@ -318,20 +316,22 @@ fn dropped_pi_wait_preparation_does_not_publish_a_donation_edge() {
             RtPriority::new(99).unwrap(),
         )))
         .unwrap();
-    let lock = PiLockIdentity::new();
+    let lock = PiMutexCore::new();
     let base_policy = owner.effective_policy();
+    let stale_owner = ThreadId::from_parts(u32::MAX, 1);
 
-    let prepared = system
-        .prepare_pi_wait_start(
-            lock.lock_ref().unwrap(),
-            waiter.id(),
-            PiWaitOwner::Owned(owner.id()),
-            waiter.id().as_u64(),
-        )
-        .unwrap();
+    assert_eq!(
+        lock.try_acquire(stale_owner).unwrap(),
+        PiMutexAcquire::Acquired
+    );
+    assert!(matches!(
+        system.pi_mutex_lock_slow(lock.mutex_ref().unwrap(), waiter.id(), waiter.id().as_u64(),),
+        Err(TaskError::InvalidPiWaitState(
+            PiWaitStateError::ExitedParticipant
+        ))
+    ));
     assert_eq!(owner.effective_policy(), base_policy);
-    drop(prepared);
-    assert_eq!(owner.effective_policy(), base_policy);
+    assert!(lock.try_release(stale_owner).unwrap());
 
     let committed = support::commit_pi_wait(&system, &lock, waiter.id(), owner.id()).unwrap();
     assert_eq!(
@@ -350,12 +350,18 @@ fn stale_pi_owner_returns_a_typed_error_instead_of_reporting_a_cycle() {
         .unwrap();
     let stale_owner = ThreadId::from_parts(u32::MAX, 1);
 
-    let lock = PiLockIdentity::new();
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        support::commit_pi_wait(&system, &lock, waiter.id(), stale_owner)
-    }));
-
-    assert!(matches!(result.unwrap(), Err(TaskError::StaleThreadId)));
+    let lock = PiMutexCore::new();
+    assert_eq!(
+        lock.try_acquire(stale_owner).unwrap(),
+        PiMutexAcquire::Acquired
+    );
+    assert!(matches!(
+        system.pi_mutex_lock_slow(lock.mutex_ref().unwrap(), waiter.id(), waiter.id().as_u64(),),
+        Err(TaskError::InvalidPiWaitState(
+            PiWaitStateError::ExitedParticipant
+        ))
+    ));
+    assert!(lock.try_release(stale_owner).unwrap());
 }
 
 #[test]
@@ -367,7 +373,7 @@ fn threads_with_live_pi_edges_cannot_exit_and_leave_dangling_donations() {
     let waiter = system
         .create_thread(ThreadSpec::new(SchedulePolicy::default()))
         .unwrap();
-    let lock = PiLockIdentity::new();
+    let lock = PiMutexCore::new();
     let wait = support::commit_pi_wait(&system, &lock, waiter.id(), owner.id()).unwrap();
 
     assert_eq!(
@@ -386,13 +392,22 @@ fn threads_with_live_pi_edges_cannot_exit_and_leave_dangling_donations() {
     let live_waiter = system
         .create_thread(ThreadSpec::new(SchedulePolicy::default()))
         .unwrap();
-    let stale_lock = PiLockIdentity::new();
+    let stale_lock = PiMutexCore::new();
+    assert_eq!(
+        stale_lock.try_acquire(owner.id()).unwrap(),
+        PiMutexAcquire::Acquired
+    );
     assert!(matches!(
-        support::commit_pi_wait(&system, &stale_lock, live_waiter.id(), owner.id()),
+        system.pi_mutex_lock_slow(
+            stale_lock.mutex_ref().unwrap(),
+            live_waiter.id(),
+            live_waiter.id().as_u64(),
+        ),
         Err(TaskError::InvalidPiWaitState(
             PiWaitStateError::ExitedParticipant
         ))
     ));
+    assert!(stale_lock.try_release(owner.id()).unwrap());
 }
 
 fn online_system() -> (TaskSystem, core::pin::Pin<Box<ax_task::CpuLocal>>) {

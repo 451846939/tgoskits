@@ -9,14 +9,14 @@ pub use ax_plat::irq::{
     IrqContext, IrqDomainId, IrqError, IrqExecution, IrqHandle, IrqId, IrqNumber, IrqOutcome,
     IrqRequest, IrqReturn, IrqScope, IrqSource, IrqStatus, IrqTrigger, LEGACY_IRQ_DOMAIN,
     LOONGARCH_EIOINTC_DOMAIN, LOONGARCH_PCH_PIC_DOMAIN, RISCV_PLIC_DOMAIN, ShareMode, TrapVector,
-    X86_IOAPIC_DOMAIN, X86_LAPIC_DOMAIN, cpu_online, disable_irq, dispatch_irq, enable_irq,
-    free_irq, handle, in_irq_context, init_boot_irqs, irq_status, is_cpu_online, legacy_irq,
-    legacy_irq_raw, prepare_irq_context, request_irq, request_percpu_irq, request_shared_irq,
-    resolve_irq_source, resolve_percpu_irq, run_on_cpu_sync, set_enable, set_run_on_cpu_sync,
-    set_trigger, synchronize_irq, try_legacy_irq,
+    X86_IOAPIC_DOMAIN, X86_LAPIC_DOMAIN, cpu_online, disable_irq, enable_irq, free_irq,
+    in_irq_context, init_boot_irqs, irq_status, is_cpu_online, legacy_irq, legacy_irq_raw,
+    request_irq, request_percpu_irq, request_shared_irq, resolve_irq_source, resolve_percpu_irq,
+    run_on_cpu_sync, set_enable, set_run_on_cpu_sync, set_trigger, synchronize_irq, try_legacy_irq,
 };
 #[cfg(feature = "ipi")]
 pub use ax_plat::irq::{IpiTarget, send_ipi};
+use ax_plat::irq::{handle, prepare_irq_context};
 
 /// Returns the platform IRQ id used for inter-processor interrupts.
 #[cfg(feature = "ipi")]
@@ -39,14 +39,28 @@ pub fn handle_irq(vector: usize) -> bool {
     // forwards the intercepted vector. Retaining this saved state through the
     // preemption-guard release gives both paths the same irqentry boundary and
     // lets a pending reschedule enter through the IRQ-return scheduler baton.
-    let irq_guard = ax_kernel_guard::IrqSave::new();
     prepare_irq_context(TrapVector(vector));
-    let preempt_guard = ax_kernel_guard::NoPreempt::new();
-    let handled = handle(TrapVector(vector)).is_some();
+    with_irq_entry(|| handle(TrapVector(vector)).is_some())
+}
 
-    drop(preempt_guard); // rescheduling may occur with local IRQs still disabled.
+/// Dispatches an IRQ that was acknowledged by an architecture backend.
+///
+/// Hypervisors may consume the physical interrupt token while the guest is
+/// running and dispatch the already-resolved action only after dropping guest
+/// CPU ownership. This entry retains the same IRQ/preemption contract as a
+/// hardware trap without acknowledging the controller a second time.
+pub fn handle_acknowledged_irq(irq: IrqId) -> IrqOutcome {
+    with_irq_entry(|| ax_plat::irq::dispatch_irq(irq))
+}
+
+fn with_irq_entry<R>(dispatch: impl FnOnce() -> R) -> R {
+    let mut irq_guard = ax_kernel_guard::IrqSave::new();
+    let preempt_guard = irq_guard.disable_preempt_for_irq_return();
+    let result = dispatch();
+
+    drop(preempt_guard); // Explicit IRQ-return scheduling keeps local IRQs disabled.
     drop(irq_guard);
-    handled
+    result
 }
 
 /// Tests IRQ-action context while the caller already pins the current CPU.

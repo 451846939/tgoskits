@@ -456,7 +456,7 @@ impl TaskSystem {
         if incoming.id() == previous {
             return Err(TaskError::InvalidConfiguration);
         }
-        let (migration_target, previous_exited) = {
+        let (migration_target, previous_exited, affinity_completed) = {
             let bandwidth = cpu.as_ref().get_ref().deadline_bandwidth();
             let mut sched = handoff.previous.sched().lock();
             let (migration_target, previous_exited) =
@@ -474,8 +474,13 @@ impl TaskSystem {
             if let Some(target) = migration_target {
                 handoff.previous.set_wake_cpu_hint(target);
             }
-            (migration_target, previous_exited)
+            let affinity_completed =
+                Self::complete_affinity_if_satisfied_locked(&handoff.previous, &sched);
+            (migration_target, previous_exited, affinity_completed)
         };
+        if affinity_completed {
+            handoff.previous.notify_affinity_waiters();
+        }
         if let Some(target) = migration_target
             && self
                 .deliver_owner_migration(&handoff.previous, owner, target)

@@ -4,7 +4,7 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use ax_task::{CpuLocal, PiLockIdentity, SchedulePolicy, TaskSystem, TaskSystemConfig, ThreadSpec};
+use ax_task::{CpuLocal, PiMutexCore, SchedulePolicy, TaskSystem, TaskSystemConfig, ThreadSpec};
 
 mod support;
 
@@ -43,7 +43,7 @@ fn pi_registration_release_claim_and_cancel_do_not_allocate() {
     let cancelled = system
         .create_thread(ThreadSpec::new(SchedulePolicy::default()))
         .unwrap();
-    let lock = PiLockIdentity::new();
+    let lock = PiMutexCore::new();
 
     let selected_wait = assert_no_alloc("register selected waiter", || {
         support::commit_pi_wait(&system, &lock, selected.id(), owner.id()).unwrap()
@@ -55,14 +55,12 @@ fn pi_registration_release_claim_and_cancel_do_not_allocate() {
         system.pi_wait_cancel(cancelled_wait).unwrap()
     });
     assert_no_alloc("commit release and claim", || {
-        let release = system
-            .prepare_pi_mutex_release(lock.lock_ref().unwrap(), owner.id())
-            .unwrap();
-        // SAFETY: this scheduler-level test models the ownerless publication.
-        unsafe { release.commit_after_local_release() };
-        let claim = system.prepare_pi_mutex_claim(&selected_wait).unwrap();
-        // SAFETY: this scheduler-level test models claimant publication.
-        unsafe { claim.commit_after_local_claim() };
+        drop(
+            system
+                .pi_mutex_release(lock.mutex_ref().unwrap(), owner.id())
+                .unwrap(),
+        );
+        system.pi_mutex_claim(&selected_wait).unwrap();
     });
     assert!(selected_wait.is_granted());
 }

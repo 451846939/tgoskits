@@ -44,11 +44,12 @@ pub(crate) fn validate_schedule_context(
     if irqs_enabled {
         ax_hal::asm::enable_irqs();
     }
+    let preempt_depth = current_preempt_depth();
     if irqs_enabled
         && !hard_irq
         && state.irq.is_clear()
         && state.preempt.is_clear()
-        && current_preempt_depth() == 0
+        && preempt_depth == 0
     {
         RuntimeStatus::Success
     } else {
@@ -165,8 +166,21 @@ pub(crate) fn finish_initial_context_switch() {
     );
 }
 
-fn exit_lock_preempt(irq_return: bool) {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreemptExitOrigin {
+    Task,
+    IrqReturn,
+}
+
+impl PreemptExitOrigin {
+    const fn is_irq_return(self) -> bool {
+        matches!(self, Self::IrqReturn)
+    }
+}
+
+fn exit_lock_preempt(origin: PreemptExitOrigin) {
     let irqs_were_enabled = ax_hal::asm::irqs_enabled();
+    let irq_return = origin.is_irq_return();
     assert!(
         !irq_return || !irqs_were_enabled,
         "IRQ-return preemption exit requires hardware IRQs disabled"
@@ -182,7 +196,7 @@ fn exit_lock_preempt(irq_return: bool) {
         let must_schedule = preempt_exit_needs_schedule(
             state,
             preempt_depth,
-            irq_return,
+            origin,
             irqs_were_enabled,
             in_hard_irq_pinned,
         );
@@ -208,10 +222,9 @@ fn exit_lock_preempt(irq_return: bool) {
         use ax_task::runtime::RuntimeSchedulerEntry;
 
         if must_schedule {
-            let entry = if irq_return {
-                RuntimeSchedulerEntry::IrqReturn
-            } else {
-                RuntimeSchedulerEntry::PreemptExit
+            let entry = match origin {
+                PreemptExitOrigin::Task => RuntimeSchedulerEntry::PreemptExit,
+                PreemptExitOrigin::IrqReturn => RuntimeSchedulerEntry::IrqReturn,
             };
             // SAFETY: this path retains exactly one lock-preemption depth and
             // keeps raw IRQs disabled while the runtime atomically transforms
@@ -219,6 +232,11 @@ fn exit_lock_preempt(irq_return: bool) {
             if let Err(error) = unsafe { ax_task::schedule_current_cpu_from_preempt_exit(entry) } {
                 panic!("preemption-exit scheduler entry failed: {error}");
             }
+            assert_eq!(
+                ax_hal::asm::irqs_enabled(),
+                !irq_return,
+                "scheduler continuation restored the wrong hardware IRQ state"
+            );
             return;
         }
     }
@@ -257,7 +275,7 @@ pub(crate) fn exit_preempt() {
         ax_hal::percpu::PreemptExit::NestedConsumed
         | ax_hal::percpu::PreemptExit::FinalConsumed => {}
         ax_hal::percpu::PreemptExit::FinalPending => {
-            exit_lock_preempt(!ax_hal::asm::irqs_enabled());
+            exit_lock_preempt(PreemptExitOrigin::Task);
         }
     }
 }
@@ -268,14 +286,14 @@ pub(crate) fn exit_preempt() {
 fn preempt_exit_needs_schedule(
     state: &RuntimeGuardState,
     preempt_depth: u32,
-    irq_return: bool,
+    origin: PreemptExitOrigin,
     irqs_were_enabled: bool,
     in_hard_irq: impl FnOnce() -> bool,
 ) -> bool {
     state.irq.is_clear()
         && preempt_depth == 1
         && matches!(state.preempt.scheduler_baton, SchedulerBatonState::Finished)
-        && (irq_return || irqs_were_enabled)
+        && (origin.is_irq_return() || irqs_were_enabled)
         && !in_hard_irq()
 }
 
@@ -472,20 +490,27 @@ impl ax_kernel_guard::KernelGuardIf for KernelGuardIfImpl {
     }
 
     fn enable_preempt() {
-        let Ok(exit) = ax_hal::percpu::scheduler_prepare_preempt_guard_exit() else {
-            #[cfg(not(feature = "host-test"))]
-            panic!("architecture preemption state is invalid while enabling preemption");
-            #[cfg(feature = "host-test")]
-            return;
-        };
-        match exit {
-            ax_hal::percpu::PreemptExit::NestedConsumed
-            | ax_hal::percpu::PreemptExit::FinalConsumed => return,
-            ax_hal::percpu::PreemptExit::FinalPending => {}
-        }
-        let irq_return = !ax_hal::asm::irqs_enabled();
-        exit_lock_preempt(irq_return);
+        finish_kernel_preempt_guard(PreemptExitOrigin::Task);
     }
+
+    fn enable_preempt_from_irq_return() {
+        finish_kernel_preempt_guard(PreemptExitOrigin::IrqReturn);
+    }
+}
+
+fn finish_kernel_preempt_guard(origin: PreemptExitOrigin) {
+    let Ok(exit) = ax_hal::percpu::scheduler_prepare_preempt_guard_exit() else {
+        #[cfg(not(feature = "host-test"))]
+        panic!("architecture preemption state is invalid while enabling preemption");
+        #[cfg(feature = "host-test")]
+        return;
+    };
+    match exit {
+        ax_hal::percpu::PreemptExit::NestedConsumed
+        | ax_hal::percpu::PreemptExit::FinalConsumed => return,
+        ax_hal::percpu::PreemptExit::FinalPending => {}
+    }
+    exit_lock_preempt(origin);
 }
 
 #[cfg(test)]

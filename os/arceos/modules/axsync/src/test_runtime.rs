@@ -24,8 +24,6 @@ std::thread_local! {
     static TASK_SYSTEM: Cell<usize> = const { Cell::new(0) };
     static CPU_LOCAL: Cell<usize> = const { Cell::new(0) };
     static CPU_REMOTE: Cell<usize> = const { Cell::new(0) };
-    static SCHEDULER_IPIS: Cell<usize> = const { Cell::new(0) };
-    static LAST_SCHEDULER_IPI_CPU: Cell<usize> = const { Cell::new(usize::MAX) };
     static PREEMPT_DEPTH: Cell<usize> = const { Cell::new(0) };
     static SCHEDULE_CONTEXT_SAFE: Cell<bool> = const { Cell::new(true) };
     static IRQ_GUARD_ENTRIES: Cell<usize> = const { Cell::new(0) };
@@ -59,6 +57,10 @@ impl ax_kernel_guard::KernelGuardIf for UnitTestKernelGuard {
                     .expect("test preempt enable without disable"),
             );
         });
+    }
+
+    fn enable_preempt_from_irq_return() {
+        Self::enable_preempt();
     }
 }
 
@@ -158,11 +160,7 @@ impl_task_runtime! {
         fn monotonic_ns() -> u64 { 0 }
         fn timer_resolution_ns() -> u64 { 1 }
         fn publish_task_deadline(_update: TaskDeadlineUpdate) {}
-        fn send_scheduler_ipi(cpu: RuntimeCpuId) -> RuntimeStatus {
-            LAST_SCHEDULER_IPI_CPU.with(|last| last.set(cpu.as_u32() as usize));
-            SCHEDULER_IPIS.with(|count| {
-                count.set(count.get().checked_add(1).expect("test IPI count overflow"));
-            });
+        fn send_scheduler_ipi(_cpu: RuntimeCpuId) -> RuntimeStatus {
             RuntimeStatus::Success
         }
         fn wait_for_interrupt() {}
@@ -280,20 +278,6 @@ pub(crate) fn clear() {
 
 pub(crate) fn set_schedule_context_safe(safe: bool) {
     SCHEDULE_CONTEXT_SAFE.with(|state| state.set(safe));
-}
-
-pub(crate) fn reset_scheduler_ipis() {
-    SCHEDULER_IPIS.with(|count| count.set(0));
-    LAST_SCHEDULER_IPI_CPU.with(|cpu| cpu.set(usize::MAX));
-}
-
-pub(crate) fn scheduler_ipi_count() -> usize {
-    SCHEDULER_IPIS.with(Cell::get)
-}
-
-pub(crate) fn last_scheduler_ipi_cpu() -> Option<usize> {
-    let cpu = LAST_SCHEDULER_IPI_CPU.with(Cell::get);
-    (cpu != usize::MAX).then_some(cpu)
 }
 
 pub(crate) fn preempt_depth() -> usize {

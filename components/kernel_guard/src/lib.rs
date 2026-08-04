@@ -39,6 +39,9 @@
 //!     fn enable_preempt() {
 //!         // Your implementation here
 //!     }
+//!     fn enable_preempt_from_irq_return() {
+//!         // Your IRQ-return implementation here
+//!     }
 //!     fn disable_preempt() {
 //!         // Your implementation here
 //!     }
@@ -64,8 +67,18 @@ mod arch;
 /// Low-level interfaces that must be implemented by the crate user.
 #[ax_crate_interface::def_interface]
 pub trait KernelGuardIf {
-    /// How to enable kernel preemption.
+    /// Enables kernel preemption from ordinary task context.
+    ///
+    /// If local IRQs are disabled, this path must defer scheduling. It must not
+    /// infer an IRQ-return boundary from the live hardware IRQ state.
     fn enable_preempt();
+
+    /// Enables kernel preemption at an explicit IRQ-return boundary.
+    ///
+    /// The implementation may enter the scheduler while local IRQs remain
+    /// disabled, but must return with them still disabled for the architecture
+    /// exception epilogue.
+    fn enable_preempt_from_irq_return();
 
     /// How to disable kernel preemption.
     fn disable_preempt();
@@ -94,6 +107,15 @@ pub struct NoOp;
 
 /// A guard that disables/enables local IRQs around the critical section.
 pub struct IrqSave(usize);
+
+/// A preemption guard whose final release is an explicit IRQ-return boundary.
+///
+/// The mutable borrow ties this guard to a live [`IrqSave`], so the architecture
+/// IRQ state cannot be restored before the preemption exit has completed.
+#[must_use = "dropping the guard completes the IRQ-return preemption exit"]
+pub struct IrqReturnPreemptGuard<'irq> {
+    _irq_guard: core::marker::PhantomData<&'irq mut IrqSave>,
+}
 
 /// A guard that disables/enables kernel preemption around the critical section.
 pub struct NoPreempt;
@@ -200,6 +222,25 @@ mod imp {
         /// Creates a new [`IrqSave`] guard.
         pub fn new() -> Self {
             Self(Self::acquire())
+        }
+
+        /// Disables preemption for work completed by an IRQ-return epilogue.
+        ///
+        /// Unlike [`NoPreempt`], dropping the returned guard explicitly permits
+        /// IRQ-return scheduling while hardware IRQs remain disabled. The
+        /// borrow prevents this [`IrqSave`] from being released first.
+        pub fn disable_preempt_for_irq_return(&mut self) -> IrqReturnPreemptGuard<'_> {
+            NoPreempt::acquire();
+            IrqReturnPreemptGuard {
+                _irq_guard: core::marker::PhantomData,
+            }
+        }
+    }
+
+    impl Drop for IrqReturnPreemptGuard<'_> {
+        fn drop(&mut self) {
+            #[cfg(feature = "preempt")]
+            ax_crate_interface::call_interface!(KernelGuardIf::enable_preempt_from_irq_return);
         }
     }
 

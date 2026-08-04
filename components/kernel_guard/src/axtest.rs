@@ -40,6 +40,11 @@ fn kernel_guard_irq_save_contracts_hold() {
 
     let default_guard = IrqSave::default();
     drop(default_guard);
+
+    let mut irq_guard = IrqSave::new();
+    let preempt_guard = irq_guard.disable_preempt_for_irq_return();
+    drop(preempt_guard);
+    drop(irq_guard);
 }
 
 #[axtest]

@@ -190,6 +190,17 @@ pub(crate) trait ArchOps {
                 unbind_result?;
                 Self::finish_deferred_run_work(vm, vcpu, work)
             }
+            Ok(BoundVcpuExit::DeferHypercall(work)) => {
+                unbind_result?;
+                let return_value = crate::runtime::hvc::finish_deferred_hypercall(vm.clone(), work);
+                vcpu.set_return_value(return_value);
+                Ok(VcpuRunAction {
+                    waits_for_event: false,
+                    stop_reason: None,
+                    resets_vm: false,
+                    exits_vcpu: false,
+                })
+            }
             Ok(BoundVcpuExit::Continue) => unreachable!("continued exits do not leave run loop"),
             Err(err) => {
                 if let Err(unbind_err) = unbind_result {

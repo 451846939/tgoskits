@@ -162,7 +162,7 @@ USB/vsock 控制器协议属于外围驱动；除非它们违反上述调度交�
 | task deadline | `hrtimer`、`sched/deadline.c` | IRQ 只处理 generation-bearing 值记录；CBS 状态机是唯一期限真值 | Deadline 已改为 class-owned 有序 AVL rq，并在节点内增广最早 CBS 事件；pick/dequeue/rekey 为 O(log n)；CBS 记账与物理入队同属目标 rq 事务；CBS 生命周期改为互斥状态，删除 `base_deadline` 镜像 |
 | clockevent/nohz | `clockevents_program_event()`、`clockevents_shutdown()`、`hrtimer_interrupt()`、`tick_nohz_idle_enter()`、`tick_nohz_stop_tick()`、`tick_nohz_idle_exit()` | 每 CPU 单一物理 owner；CPU 生命周期与 firing 带 epoch；早到/陈旧边不得进入 scheduler；idle 无调度事件时停止 tick；无期限用 `Option` | scheduler tick 建模为 `Running/Stopped`；online/offline 推进 CPU epoch；IRQ 只有在当前 arm 已到期时才能取得 move-only firing token，旧 pending edge 只重编程当前 arm；idle IRQ-off 提交时撤销 tick，只保留 task deadline |
 | switch tail | `finish_task_switch()` | 清 outgoing `on_cpu` 后才能回收；已提交的 raw switch 不可重试 | `on_switch_in` 已移到 current publication、runtime tail、handoff consumption 之后的 move-only completion，并在释放 `CpuLocal` borrow 后执行；task placement 仍镜像 switch-tail 暂态，待收敛到 CPU handoff |
-| PI/锁 | `rtmutex`、`spinlock_rt.c` | raw rq/IRQ gate、sleeping PI、task-local pin 四层分离；每把锁拥有有序 waiter tree，owner 只接收各锁 top waiter；deboost/grant 后锁外 wake | `PiLockIdentity` 内嵌 allocation-free AVL waiter tree，线程预备 lock/owner 两套 linkage；owner donor tree 只保存每把已持有锁的 top waiter；ax-sync 局部 metadata 只保存 pinned waiter 生命周期，不再复制 urgency 或扫描选人；release 由 ax-task 返回 selected+wake，claim 只接受绑定该线程、generation 和锁的 `PiWaitToken` |
+| PI/锁 | `rtmutex`、`spinlock_rt.c` | raw rq/IRQ gate、sleeping PI、task-local pin 四层分离；每把锁拥有有序 waiter tree，owner 只接收各锁 top waiter；deboost/grant 后锁外 wake | `PiMutexCore` 唯一拥有 generation-bearing owner word 与 allocation-free AVL waiter tree；线程预备 lock/owner 两套 linkage，owner donor tree 只保存每把已持有锁的 top waiter；ax-sync 不再保存第二份 owner、selected 或 waiter 容器；registration、release、claim 由 ax-task 在同一调度事务内完成，锁外执行 block/wake |
 | 阻塞等待 | `do_lock_file_wait()`、`wait_event_interruptible()`、`locks_delete_block()` | wake 只是重试提示；条件与临时阻塞关系由领域层拥有，返回前必须先注销 | scheduler notification 与 nofault access retry 已类型化分离，fcntl/futex 外层负责重试 |
 | IRQ waiter | `__free_irq()`、`synchronize_irq()` | 撤销后 grace，再释放 | token/drain 类型状态与同地址 ABA 防护已实现 |
 | signal | `recalc_sigpending_tsk()` | scan 后只能确认已观察 generation | 单调 interruption generation 已实现 |
@@ -557,22 +557,24 @@ Linux 在 `dequeue_task_dl()`、`inactive_task_timer()` 与 switch-tail 的
 
 ax-sync 与 ax-task 的 PI registration、release 和 claim 遵循 Linux rtmutex 的事务边界：
 
-1. mutex-local metadata 只在任务上下文由短暂的 `SpinNoPreempt` 门保护；硬中断不访问
-   该状态，也不为这个局部临界区关闭中断；
-2. 这个局部门就是该 mutex 唯一的 slow-path gate，对应 Linux 的 `rtmutex->wait_lock`。
-   固定锁序为 `slow-path gate -> TaskSystemState -> PiLockWaitState`；ax-task 不反向取得
-   ax-sync 的 gate；
-3. registration 在 gate 内先用 owner word 的 waiters bit 排除 fast unlock，再验证 donation
-   graph、插入 pinned local node，并在释放 gate 前提交 per-lock 有序 waiter tree 与 owner
-   donation。其他 contender 不可能拿到仅完成一半的 local/scheduler 状态；
-4. release 在 gate 内选择 cached top，先发布 ownerless owner word，再立即提交 scheduler
-   selected/deboost；claim 同样在 gate 内删除 local node、发布新 owner/grant 并提交 scheduler
-   claim。ownerless 状态一旦对下一个 slow path 可见，selected token 必然已经可见；
-5. 本地无序链只拥有 pinned waiter 的生命周期，不参与 urgency 排序。原先用于跨 gate
-   重试的 `pending_head`、metadata sequence 和 snapshot 校验全部删除，不再维护重复的
-   handoff 真值；
-6. 所有 local、donation graph 与 token publication 完成并释放 gate 后，才通过定向 wake
-   唤醒被选中的 waiter。wake 不得发生在局部门或 scheduler graph lock 内。
+1. `PiMutexCore` 唯一拥有物理 owner word、mutex generation 和按 urgency 排序的 waiter
+   tree；硬中断不访问该状态，task fast path 只在 CPU pin 下操作 owner word；
+2. waiter tree 的 raw ticket gate 对应 Linux `rtmutex->wait_lock`。固定锁序为
+   `TaskSystemState -> PiMutexCore.waiters`；ax-sync 不再拥有一个额外的 slow-path gate，
+   ax-task 也不会在持有 per-lock gate 时反向取得调度图锁；
+3. registration 在一个事务中验证 owner snapshot 和 donation graph，以 waiters bit 排除
+   fast unlock，再把线程内嵌的 lock waiter linkage 插入 per-lock tree，并把该锁 cached top
+   挂入 owner donor tree。失败发生在任何 publication 前，不再向 ax-sync 暴露 prepared
+   transaction 或半提交状态；
+4. release 在同一事务中移除旧 owner 的 top donation、选择 waiter、完成 deboost，再以
+   Release 发布 ownerless owner word。selection 必须先于 ownerless word 可见；新 contender
+   因 waiters bit 不能窃取已经选中的 handoff；
+5. claim 只接受原 registration 生成的 move-only `PiWaitToken`，验证 mutex generation、
+   selected generation 与 current thread 后，删除线程 waiter linkage、发布新 owner/grant，
+   再把剩余 cached top 挂入新 owner donor tree；
+6. ax-sync 只保存 `PiMutexCore` 和 waiter sequence，不保存第二份 owner、selected、本地
+   waiter 链或 pinned waiter 生命周期。block 与定向 wake 都在调度图和 per-lock gate 释放后
+   执行。
 
 这个顺序对应 Linux `rt_mutex` 的 `wait_lock -> task->pi_lock` 分层和 `wake_q` 锁外唤醒语义。
 owner word 是物理持有者的唯一权威，ax-task per-lock tree 是调度顺序与 selected token 的
@@ -580,8 +582,9 @@ owner word 是物理持有者的唯一权威，ax-task per-lock tree 是调度�
 selected token；claim 或新 waiter 恰好跨过该窗口时会把旧快照带进下一次 scheduler
 事务，最终得到 `ownerless handoff has no selected scheduler waiter`。QEMU/GDB 已在
 `test-cargo-jobserver-wait` 的 pthread/pipe 波次确定性定位到这一状态，因此不采用局部重试，
-而是恢复 Linux 的单 gate 事务边界。这个 gate 使用 `SpinNoPreempt` 而非 `SpinNoIrq`，硬中断
-不访问 PI metadata；实际 wake 始终在 gate 外完成。
+而是删除 ax-sync 的第二个 gate，把 owner word、waiter tree、donation graph 和 selection
+纳入 ax-task 的单一事务。per-lock gate 是不关中断的 raw ticket gate，硬中断不访问 PI
+metadata；实际 block/wake 始终在 gate 外完成。
 
 Linux v7.1 的 `rt_mutex_adjust_prio_chain()` 默认允许较深的链并在遍历中提供可抢占点；当前
 ax-task 的 donation graph 仍由一个不可抢占事务保护，因此不能照搬 Linux 的 1024 层默认
@@ -594,14 +597,14 @@ tree 保存全部 waiter，owner 的 donor tree 只保存每把锁的 cached top
 donor。registration、policy update、release 和 claim 均不再按 owner 或 registry 扫描全部
 waiter，ax-sync 的本地链也不参与调度排序。
 
-`prepare_pi_mutex_claim()` 只接受原 registration 的 `PiWaitToken`，不再让上层重复传入
-claimant 或 lock identity。facade 同时验证 current thread 与 token identity，避免把另一
-线程的 local waiter publication 提交到 scheduler。claim preflight 把当前 selected edge
-按“即将 detach”建模；不能在已持有该 lock waiter-tree guard 时沿旧 `blocked_on` 再次进入
-同一 raw gate。该边界对应 Linux 在 owner handoff/fixup 中先确定 waiter/owner 状态，再做
-prio-chain 调整，而不是递归获取同一 `wait_lock`。
+`pi_mutex_claim()` 只接受原 registration 的 `PiWaitToken`，不再让上层重复传入 claimant 或
+lock identity。facade 同时验证 current thread 与 token identity，避免把另一线程的 waiter
+publication 提交到 scheduler。claim preflight 把当前 selected edge 按“即将 detach”建模；
+不能在已持有该 lock waiter-tree guard 时沿旧 `blocked_on` 再次进入同一 raw gate。该边界
+对应 Linux 在 owner handoff/fixup 中先确定 waiter/owner 状态，再做 prio-chain 调整，而不是
+递归获取同一 `wait_lock`。
 
-`PiLockId` 与 waiter registration 均带 generation，锁销毁前必须 quiesce，防止地址复用
+`PiMutexId` 与 waiter registration 均带 generation，锁销毁前必须 quiesce，防止地址复用
 ABA。任务等待通过 park/completion 睡眠，不在禁抢占区做无界 spin。ax-sync host runtime
 的 CPU、guard、TaskSystem 指针和 IPI 观测也必须是测试线程局部状态；进程全局 fake 会让
 并行测试彼此清空 guard depth 或借用过期指针，既制造假失败，也会掩盖真实事务顺序。
@@ -688,7 +691,8 @@ vsock hard/poll 路径只发布固定事件与 credit snapshot，connection mana
 | current 指针校验 | 错位 publication 返回 `Ok(0x1)` | guard 访问前返回 `CurrentThreadMismatch` |
 | remote affinity | completion 在目标 owner 真正 enqueue 前完成 | generation completion 在 destination commit 后发布 |
 | clockevent 丢边 | overdue sleeper 永久挂起 | scheduler safe point 有界恢复 overdue deadline |
-| PI 地址复用 | 新锁可匹配旧 donation edge | `PiLockIdentity` generation 永不复用 |
+| PI 地址复用 | 新锁可匹配旧 donation edge | `PiMutexCore` generation 永不复用 |
+| PI 锁对象膨胀 | waiter linkage、owner 和 handoff 在 ax-sync/ax-task 重复保存，`RawMutex` 为 152 B | linkage 全部归线程、owner/tree 归 `PiMutexCore`，`RawMutex` 收敛为 64 B |
 | PI owner 扫描 | blocked waiter urgency 变化时 prepare/apply 两次扫描 owner 的全部 waiter，两个 waiter 确定访问 4 次 | per-lock AVL 重排一个节点，owner donor tree 只替换 cached top，访问计数为 0 |
 | PI claim 自锁 | 持有 lock waiter-tree guard 后沿 claimant 的旧 `blocked_on` 重进同一 raw gate，ownerless claim 永久停滞 | token-bound claim preflight 把 selected edge 视为待 detach，证明链深度为 1，commit 后再从新 owner 的 remaining top 重算 |
 | IRQ waiter | 第二次 IRQ 可被注册尾清掉 | 单原子状态线性化 Pending/Waiter/Notifying |
@@ -889,6 +893,50 @@ ax-runtime 的边界断言。Linux v7.1 的 `vmx_vcpu_enter_exit()` 则要求
 preemption guard，使待调度状态只能通过 IRQ-return baton 被消费，最后才恢复调用者
 原 IRQ 状态。真实 trap 的保存状态本来就是关闭，VM-exit 的延迟分发则由同一边界规范
 化，Axvisor 不再保留架构专用的补丁或旧兼容入口。
+
+### 2026-08-04 AArch64 vCPU 交接与 console endpoint
+
+Linux v7.1 arm64 KVM 把 guest/VGIC 所有权和可阻塞任务上下文分成两个阶段：
+`kvm_arch_vcpu_put()` 先保存 timer、释放 VGIC CPU interface，`kvm_vcpu_block()` 才允许
+宿主线程进入 `schedule()`；唤醒后由 `kvm_arch_vcpu_load()` 按 timer、VGIC 顺序重新取得
+本 CPU 的 guest 状态。`kvm_psci_vcpu_on()` 也只在目标状态与 reset state 完整发布后执行
+`wake_up()`，不会在仍持有当前 vCPU 的 CPU-local guest ownership 时等待目标启动。
+
+AxVM 原 CPU_ON 路径在 `AxVCpu::with_current_cpu_set()` 保持宿主 CPU pin 和 guest binding
+期间创建目标线程并等待 startup ACK。目标若需要同一个调度边界，当前 vCPU 无法 switch
+tail，最终由 ax-task 正确拒绝在 `preempt_depth=1` 下阻塞。新路径把 HVC 结果类型化为
+`DeferredHyperCall::PsciCpuOn`：先退出 guest、保存状态并执行 `vcpu.unbind()`，再启动目标
+和等待 ACK，最后把 PSCI 返回值写回。这个 deferred token 是一次性所有权，不保留旧的
+“在 HVC handler 内直接阻塞”兼容入口。
+
+GIC maintenance/physical IRQ 已经由硬件入口完成 claim，不能再次进入普通
+`handle_irq(vector)` 重复 ACK。四架构共用入口因此区分 raw vector 和 move-only
+`IrqId`：`handle_acknowledged_irq()` 只复用 IRQ entry、preemption guard 与 IRQ-return
+baton，控制器 claim/ACK/EOI 仍由原 owner 完成。调度工作只能在 guest ownership 释放后
+或统一 IRQ tail 消费。
+
+Axvisor console 同样拆成三类独立生命周期：任务态 `ConsoleState` 管理 attach/running 与
+backend generation；vCPU callback 只向固定容量 `GuestOutputFrame` 队列执行一次有界
+`try_lock` 发布，竞争、队列满或单次超出发布预算时允许丢弃观测性输出；唯一 shell
+consumer 在任务上下文完成 generation 校验、行格式化和物理 UART 写入。vCPU 路径不再
+取得 `std::sync::Mutex`、分配 `Vec` 或调用可能等待 UART 的宿主接口。旧 endpoint 的
+注销只 Release 发布 inactive，已入队帧由 generation 校验丢弃；Arc 负责物理生命周期，
+因此不再在 control mutex 内等待 reader 计数归零。
+
+最低层调度测试还固定了 Linux `finish_task_switch()` 对应边界：policy/affinity owner work
+在 `switch_handoff` 存在时必须保持 pending，只有 `complete_context_switch()` 清除前一线程
+的物理 `on_cpu` 后才能消费。旧测试绕过 production facade 的 switch tail 并期待提前
+drain，属于错误测试模型；新断言先验证 tail 前 `drained=0, pending=true`，再验证 tail 后
+唯一消费，不能以放宽 owner-control guard 的方式让测试通过。
+
+修复前 AArch64 GICv2 timer-stress 在约 4.6--5.1 秒稳定触发
+`UnsafeContext(preempt_depth=1)`；当前 GICv2 正式标志
+`AXVISOR_GICV2_TIMER_STRESS_PASSED`，QEMU 34.21 秒、完整命令 44.22 秒。GICv3 同样通过
+`AXVISOR_GICV3_TIMER_STRESS_PASSED`，QEMU 33.31 秒、完整命令 43.35 秒。相对同机上一
+检查点的 35.26/35.83 秒 QEMU 时间分别下降约 3.0%/7.0%。ax-task 当前为
+285 个单元测试、21 个 loom case、11 个 doctest 全通过，AxVM host 单元测试 218/218。
+这些时间只证明死锁消除和端到端前进性，不是 Linux RT 同 workload 延迟对比，不能据此
+宣称已经达到 Linux RT 性能水平。
 
 同配置完整 guest benchmark 的中位 handoff 从 138,786 ns 降到 111,948 ns，
 改善约 19.3%；这证明分配与共享引用流量确实位于热路径，但仍为 Linux RT 的约

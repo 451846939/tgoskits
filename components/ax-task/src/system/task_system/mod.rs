@@ -40,10 +40,10 @@ pub use outcome::{
     ScheduleDecision, SchedulerOutcome, SwitchInCompletion,
 };
 pub(crate) use park_exit::CurrentExitPermit;
-pub use pi::{PiMutexClaim, PiMutexRelease, PiWaitStart};
+pub use pi::PiMutexLockResult;
 use registry::{
-    CpuRegistration, DeadlineCallbackClaim, DetachedThreadRecord, PiRecomputeProof,
-    PiWaitRegistration, TaskSystemState, ThreadRecord, ThreadSlot,
+    CpuRegistration, DeadlineCallbackClaim, DetachedThreadRecord, PiWaitRegistration,
+    TaskSystemState, ThreadRecord, ThreadSlot,
 };
 use thread_callbacks::ThreadCallbackState;
 
@@ -55,7 +55,7 @@ use crate::system::cpu::WakePreemptionDecision;
 use crate::{
     CpuId, CpuLocal, CpuRemote, CpuRemotePublication, CpuSet, CpuSnapshot, DeadlineAdmission,
     DeadlineBandwidthSnapshot, DeadlineEntity, DetachedQueueEntry, EnqueueReason, FairMode,
-    OwnedThreadSchedulerExit, ParkCommit, ParkPrepare, ParkTicket, PiLockRaw, PiWaitKey,
+    OwnedThreadSchedulerExit, ParkCommit, ParkPrepare, ParkTicket, PiMutexRaw, PiWaitKey,
     PiWaitToken, PiWaitTree, QueuedThread, SchedulePolicy, SchedulingClass, SchedulingEntity,
     SwitchReason, TaskError, TaskSystemConfig, ThreadAffinityChange, ThreadCore, ThreadExtension,
     ThreadExtensionBorrow, ThreadExtensionLease, ThreadExtensionView, ThreadHandle, ThreadId,

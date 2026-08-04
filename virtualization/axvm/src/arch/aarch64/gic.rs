@@ -535,7 +535,7 @@ pub(crate) fn dispatch_acknowledged_host_irq(token: usize) {
             return;
         }
     };
-    let outcome = ax_std::os::arceos::modules::ax_hal::irq::dispatch_irq(irq);
+    let outcome = ax_std::os::arceos::modules::ax_hal::irq::handle_acknowledged_irq(irq);
     if !outcome.handled {
         if outcome.called == 0 {
             warn!("Unhandled acknowledged host IRQ {raw}");

@@ -1103,6 +1103,10 @@ mod tests {
             });
         }
 
+        fn enable_preempt_from_irq_return() {
+            Self::enable_preempt();
+        }
+
         fn disable_preempt() {
             PREEMPT_DEPTH.with(|depth| depth.set(depth.get() + 1));
         }

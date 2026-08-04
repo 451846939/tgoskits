@@ -1,13 +1,12 @@
 use super::*;
 
-/// Prepares a PI donation edge for publication after local waiter insertion.
-pub fn prepare_pi_wait_start<'lock>(
-    lock: PiLockRef<'lock>,
-    owner: PiWaitOwner,
+/// Enters the scheduler-owned PI mutex slow path.
+pub fn pi_mutex_lock_slow<'lock>(
+    lock: PiMutexRef<'lock>,
     sequence: u64,
-) -> Result<PiWaitStart<'static, 'lock>, TaskError> {
+) -> Result<PiMutexLockResult<'lock>, TaskError> {
     let waiter = current_thread_id()?;
-    runtime_task_system()?.prepare_pi_wait_start(lock, waiter, owner, sequence)
+    runtime_task_system()?.pi_mutex_lock_slow(lock, waiter, sequence)
 }
 
 /// Blocks the calling waiter until it is selected to claim or granted.
@@ -52,21 +51,17 @@ pub fn pi_wait_cancel(token: PiWaitToken<'_>) -> Result<(), TaskError> {
     runtime_task_system()?.pi_wait_cancel(token)
 }
 
-/// Prepares the scheduler half of a contended PI mutex release.
-pub fn prepare_pi_mutex_release<'lock>(
-    lock: PiLockRef<'lock>,
-) -> Result<PiMutexRelease<'static, 'lock>, TaskError> {
-    runtime_task_system()?.prepare_pi_mutex_release(lock, current_thread_id()?)
+/// Publishes a contended PI mutex release and returns its wake target.
+pub fn pi_mutex_release(lock: PiMutexRef<'_>) -> Result<ThreadWakeHandle, TaskError> {
+    runtime_task_system()?.pi_mutex_release(lock, current_thread_id()?)
 }
 
-/// Prepares the scheduler half of claiming an ownerless PI mutex.
-pub fn prepare_pi_mutex_claim<'lock>(
-    token: &PiWaitToken<'lock>,
-) -> Result<PiMutexClaim<'static, 'lock>, TaskError> {
+/// Claims the ownerless PI mutex handoff selected for this waiter.
+pub fn pi_mutex_claim(token: &PiWaitToken<'_>) -> Result<(), TaskError> {
     if current_thread_id()? != token.thread_id() {
         return Err(TaskError::InvalidPiState);
     }
-    runtime_task_system()?.prepare_pi_mutex_claim(token)
+    runtime_task_system()?.pi_mutex_claim(token)
 }
 
 /// Publishes a targeted task-context wake after PI metadata handoff.

@@ -57,6 +57,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(axtest)', 'cfg(feature, va
 [target.'cfg(any(not(any(windows, unix)), target_env = "musl"))'.dependencies]
 anyhow.workspace = true
 log = "0.4"
+heapless.workspace = true
 
 # System dependent modules provided by ArceOS.
 ax-std = { workspace = true, default-features = false, features = [

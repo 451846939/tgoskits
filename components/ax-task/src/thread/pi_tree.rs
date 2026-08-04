@@ -1,7 +1,7 @@
 //! Allocation-free ordered PI waiter linkage.
 
 use alloc::boxed::Box;
-use core::{cell::UnsafeCell, cmp::Ordering, fmt};
+use core::{cell::UnsafeCell, cmp::Ordering, fmt, ptr::NonNull};
 
 use crate::{SchedulingUrgency, ThreadId};
 
@@ -150,7 +150,7 @@ impl fmt::Debug for PiWaitNodeStorage {
 #[derive(Debug)]
 pub(crate) struct PiWaitTree {
     root: PiWaitLink,
-    first: Option<PiWaitKey>,
+    first: Option<NonNull<PiWaitNode>>,
     len: usize,
 }
 
@@ -172,7 +172,12 @@ impl PiWaitTree {
     }
 
     pub(crate) fn first(&self) -> Option<PiWaitKey> {
-        self.first
+        self.first.map(|first| {
+            // SAFETY: `first` points into one of the boxes owned by `root`.
+            // AVL rotations move boxes, never their allocations, and removal
+            // refreshes this cache before returning the detached box.
+            unsafe { first.as_ref().key }
+        })
     }
 
     pub(crate) fn contains(&self, key: PiWaitKey) -> bool {
@@ -181,8 +186,11 @@ impl PiWaitTree {
 
     pub(crate) fn insert(&mut self, key: PiWaitKey, mut node: Box<PiWaitNode>) {
         node.reset(key);
+        let node_pointer = NonNull::from(node.as_mut());
         self.root = insert_node(self.root.take(), node);
-        self.first = Some(self.first.map_or(key, |first| first.min(key)));
+        if self.first().is_none_or(|first| key < first) {
+            self.first = Some(node_pointer);
+        }
         self.len = self
             .len
             .checked_add(1)
@@ -194,8 +202,8 @@ impl PiWaitTree {
         self.root = root;
         if removed.is_some() {
             self.len -= 1;
-            if self.first == Some(key) {
-                self.first = find_first(self.root.as_deref()).map(|node| node.key);
+            if self.first() == Some(key) {
+                self.first = find_first(self.root.as_deref()).map(NonNull::from);
             }
         }
         removed
@@ -207,11 +215,16 @@ impl PiWaitTree {
         let (count, _) = validate_node(self.root.as_deref(), &mut previous);
         assert_eq!(count, self.len);
         assert_eq!(
-            self.first,
+            self.first(),
             find_first(self.root.as_deref()).map(|node| node.key)
         );
     }
 }
+
+// SAFETY: cached pointers refer only to heap nodes owned by the same tree.
+// Moving the tree preserves those allocations, and every mutation requires
+// exclusive access through the PI graph transaction.
+unsafe impl Send for PiWaitTree {}
 
 fn link_height(link: &PiWaitLink) -> usize {
     link.as_deref().map_or(0, |node| node.height)

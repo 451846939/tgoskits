@@ -13,7 +13,7 @@
 
 ## Features
 
-- `multitask`: Enable the task scheduler's PI mutex protocol. One per-lock slow-path gate commits the physical owner word, pinned waiter lifetime, donation graph, and handoff selection as a single transaction. Blocking and targeted wake run after the gate is released.
+- `multitask`: Enable the task scheduler's PI mutex protocol. `ax-task`'s per-lock `PiMutexCore` is the single owner of the physical owner word and urgency-ordered waiter tree; waiter linkage lives in the blocked thread. Registration, donation, deboost, and handoff are committed in one scheduler transaction, while blocking and targeted wake run after all metadata gates have been released.
 - `lockdep`: Enable sleeping-lock dependency validation in addition to PI.
 
 ## License

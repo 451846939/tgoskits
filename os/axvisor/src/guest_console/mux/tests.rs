@@ -86,7 +86,7 @@ fn stopped_or_removed_guest_invalidates_its_serial_backend_generation() {
     assert_eq!(backend.read(&mut input), 0);
     assert_eq!(
         mux.core
-            .format_guest_output(4, backend.generation, b"late output"),
+            .format_guest_output(4, backend.endpoint.generation, b"late output"),
         None
     );
 
@@ -103,7 +103,7 @@ fn multiple_running_guests_receive_line_prefixes() {
     mux.set_running([1]);
     assert_eq!(
         mux.core
-            .format_guest_output(1, backend_1.generation, b"boot\n"),
+            .format_guest_output(1, backend_1.endpoint.generation, b"boot\n"),
         Some(b"boot\n".to_vec())
     );
 
@@ -111,18 +111,40 @@ fn multiple_running_guests_receive_line_prefixes() {
     mux.set_running([1, 2]);
     assert_eq!(
         mux.core
-            .format_guest_output(1, backend_1.generation, b"ready\nprompt"),
+            .format_guest_output(1, backend_1.endpoint.generation, b"ready\nprompt"),
         Some(b"[VM 1] ready\n[VM 1] prompt".to_vec())
     );
     assert_eq!(
         mux.core
-            .format_guest_output(2, backend_2.generation, b"other\n"),
+            .format_guest_output(2, backend_2.endpoint.generation, b"other\n"),
         Some(b"\n[VM 2] other\n".to_vec())
     );
     assert_eq!(
         mux.core
-            .format_guest_output(1, backend_1.generation, b"> \n"),
+            .format_guest_output(1, backend_1.endpoint.generation, b"> \n"),
         Some(b"[VM 1] > \n".to_vec())
+    );
+}
+
+#[test]
+fn starting_a_second_guest_publishes_multi_guest_output_mode() {
+    let mux = GuestConsoleMux::new();
+    let backend_1 = mux.core.create_serial_backend(1);
+    mux.core.create_serial_backend(2);
+
+    mux.mark_running(1);
+    assert_eq!(
+        mux.core
+            .format_guest_output(1, backend_1.endpoint.generation, b"boot\n"),
+        Some(b"boot\n".to_vec())
+    );
+
+    mux.mark_running(2);
+    assert_eq!(
+        mux.core
+            .format_guest_output(1, backend_1.endpoint.generation, b"ready\n"),
+        Some(b"[VM 1] ready\n".to_vec()),
+        "the output endpoint must observe the control-plane running-set publication",
     );
 }
 
@@ -140,7 +162,42 @@ fn replacement_backend_invalidates_the_previous_vm_generation() {
     assert_eq!(input, [b'x']);
     assert_eq!(
         mux.core
-            .format_guest_output(8, stale_backend.generation, b"stale"),
+            .format_guest_output(8, stale_backend.endpoint.generation, b"stale"),
         None
     );
+}
+
+#[test]
+fn vcpu_output_is_deferred_to_the_task_context_consumer() {
+    let mux = GuestConsoleMux::new();
+    let backend = mux.core.create_serial_backend(9);
+    mux.mark_running(9);
+
+    backend.write(b"guest output\n");
+
+    let mut output = Vec::new();
+    assert_eq!(
+        mux.core
+            .drain_guest_output_with(OUTPUT_DRAIN_BUDGET, |bytes| output.extend_from_slice(bytes)),
+        1
+    );
+    assert_eq!(output, b"guest output\n");
+}
+
+#[test]
+fn queued_output_from_a_retired_generation_is_discarded() {
+    let mux = GuestConsoleMux::new();
+    let stale = mux.core.create_serial_backend(10);
+    mux.mark_running(10);
+    stale.write(b"stale");
+
+    mux.core.create_serial_backend(10);
+
+    let mut output = Vec::new();
+    assert_eq!(
+        mux.core
+            .drain_guest_output_with(OUTPUT_DRAIN_BUDGET, |bytes| output.extend_from_slice(bytes)),
+        1
+    );
+    assert!(output.is_empty());
 }

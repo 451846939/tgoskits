@@ -6,27 +6,27 @@ use core::{
 };
 
 use ax_task::{
-    CpuId, CpuLocal, CpuRemote, PiLockIdentity, PiWaitOwner, PiWaitToken, TaskError, TaskSystem,
-    ThreadId, impl_trait,
+    CpuId, CpuLocal, CpuRemote, PiMutexAcquire, PiMutexCore, PiMutexLockResult, PiWaitToken,
+    TaskError, TaskSystem, ThreadId, impl_trait,
     runtime::{TaskRuntime, *},
 };
 
 /// Commits a scheduler-only PI wait used by model tests.
 pub fn commit_pi_wait<'lock>(
     system: &TaskSystem,
-    lock: &'lock PiLockIdentity,
+    lock: &'lock PiMutexCore,
     waiter: ThreadId,
     owner: ThreadId,
 ) -> Result<PiWaitToken<'lock>, TaskError> {
-    let registration = system.prepare_pi_wait_start(
-        lock.lock_ref()?,
-        waiter,
-        PiWaitOwner::Owned(owner),
-        waiter.as_u64(),
-    )?;
-    // SAFETY: scheduler model tests have no separate mutex metadata object;
-    // the fixture models its local pinned waiter as published at this point.
-    Ok(unsafe { registration.commit_after_local_registration() })
+    if !lock.is_owned_by(owner) {
+        if lock.try_acquire(owner)? != PiMutexAcquire::Acquired {
+            return Err(TaskError::InvalidPiState);
+        }
+    }
+    match system.pi_mutex_lock_slow(lock.mutex_ref()?, waiter, waiter.as_u64())? {
+        PiMutexLockResult::Waiting(token) => Ok(token),
+        PiMutexLockResult::Acquired => Err(TaskError::InvalidPiState),
+    }
 }
 
 mod virtual_runtime;
@@ -647,7 +647,7 @@ pub fn reset_resource_release_counts() {
 
 pub fn clear_handles() {
     let _pi_helper =
-        |system: &TaskSystem, lock: &PiLockIdentity, waiter: ThreadId, owner: ThreadId| {
+        |system: &TaskSystem, lock: &PiMutexCore, waiter: ThreadId, owner: ThreadId| {
             let _ = commit_pi_wait(system, lock, waiter, owner);
         };
     TASK_SYSTEM.with(|handle| handle.set(0));

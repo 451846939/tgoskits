@@ -239,6 +239,10 @@ impl ax_kernel_guard::KernelGuardIf for NetTestKernelGuard {
         });
         assert_ne!(previous, 0, "test preemption guard depth underflowed");
     }
+
+    fn enable_preempt_from_irq_return() {
+        Self::enable_preempt();
+    }
 }
 
 pub(crate) fn reset_preempt_guards() {

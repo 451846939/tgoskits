@@ -3,7 +3,7 @@
 
 use ax_task::{
     CpuId, CpuSet, DEFAULT_BALANCE_INTERVAL_NS, DeadlineFlags, DeadlinePolicy, FairMode, Nice,
-    PiLockIdentity, RtPriority, SchedulePolicy, SchedulingClass, TaskSystem, TaskSystemConfig,
+    PiMutexCore, RtPriority, SchedulePolicy, SchedulingClass, TaskSystem, TaskSystemConfig,
     ThreadSpec, ThreadState, WakeResult,
 };
 
@@ -146,7 +146,7 @@ fn load_summary_publishes_effective_current_and_top_pushable_keys() {
         owner.id()
     );
     let before = cpu0.try_load_summary().unwrap().epoch();
-    let lock = PiLockIdentity::new();
+    let lock = PiMutexCore::new();
     let wait = support::commit_pi_wait(&system, &lock, donor.id(), owner.id()).unwrap();
     system.drain_policy_updates(cpu0.as_mut(), 1).unwrap();
     system.enqueue(cpu0.as_mut(), pushable.id(), 1).unwrap();

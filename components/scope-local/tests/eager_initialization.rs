@@ -20,6 +20,10 @@ impl ax_kernel_guard::KernelGuardIf for KernelGuardIfImpl {
         PREEMPT_DEPTH.fetch_sub(1, Ordering::AcqRel);
     }
 
+    fn enable_preempt_from_irq_return() {
+        Self::enable_preempt();
+    }
+
     fn disable_preempt() {
         PREEMPT_DEPTH.fetch_add(1, Ordering::AcqRel);
     }

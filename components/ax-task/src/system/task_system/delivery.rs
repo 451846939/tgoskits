@@ -156,15 +156,11 @@ impl TaskSystem {
             return self.publish_owner_affinity_retry(core, physical_owner, target);
         }
 
-        // A switch handoff owns both the old stack and its committed
-        // destination until switch tail clears `on_cpu`. Re-publish the
-        // control request rather than rewriting that destination behind the
-        // already staged handoff.
+        // Owner-control draining is forbidden while a switch handoff exists,
+        // so an outgoing-only `on_cpu` owner here indicates corrupt placement
+        // state rather than work that can be made safe by self-republication.
         if on_cpu == Some(owner) && running_cpu.is_none() {
-            drop(sched);
-            self.publish_owner_affinity_retry(core, owner, target)?;
-            cpu.request_scheduler_work();
-            return Ok(());
+            return Err(TaskError::InvalidConfiguration);
         }
 
         if queued_cpu == Some(owner) {
@@ -245,6 +241,11 @@ impl TaskSystem {
         if sched.deadline.bandwidth_cpu == Some(owner) && target != owner {
             return Err(TaskError::InvalidConfiguration);
         }
+        let completed = Self::complete_affinity_if_satisfied_locked(core, &sched);
+        drop(sched);
+        if completed {
+            core.notify_affinity_waiters();
+        }
         Ok(())
     }
 
@@ -256,6 +257,23 @@ impl TaskSystem {
     ) -> Result<OwnerControlDrain, TaskError> {
         self.ensure_owner_cpu_context(&cpu)?;
         self.ensure_owner_cpu_online(&cpu)?;
+        // Owner-control work is ordered after the architecture switch tail.
+        // Until then `on_cpu` is a lifetime pin for the outgoing stack, not a
+        // runnable-placement owner. Consuming an affinity update in this
+        // window either has to republish itself indefinitely or can lose the
+        // completion when the tail detaches a blocked task. Linux closes the
+        // same interval in `finish_task_switch()` before the rq owner handles
+        // migration work. Keep the original intrusive publication pending and
+        // make the scheduler revisit it after tail instead.
+        if cpu.as_ref().get_ref().switch_handoff().is_some()
+            && cpu.remote().owner_control_inbox().has_pending()
+        {
+            cpu.request_scheduler_work();
+            return Ok(OwnerControlDrain {
+                drained: 0,
+                pending: true,
+            });
+        }
         let (drained, pending) = {
             let remote = Arc::clone(cpu.remote());
             let scratch = cpu.as_mut().drain_state_mut();

@@ -7,4 +7,6 @@ impl ax_kernel_guard::KernelGuardIf for FsTestKernelGuard {
     fn disable_preempt() {}
 
     fn enable_preempt() {}
+
+    fn enable_preempt_from_irq_return() {}
 }

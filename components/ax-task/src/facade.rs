@@ -5,11 +5,11 @@ use core::{marker::PhantomData, mem::align_of, ops::Deref, pin::Pin, ptr};
 
 use crate::{
     CpuId, CpuLocal, CpuLocalOwnerBorrow, CpuRemote, CpuSet, CurrentExitPermit, IrqRegisterResult,
-    IrqWaitCell, IrqWaitRegistration, IrqWaitToken, Nice, ParkCommit, ParkPrepare, PiLockRef,
-    PiMutexClaim, PiMutexRelease, PiWaitOwner, PiWaitStart, PiWaitToken, RtPriority,
-    ScheduleDecision, SchedulePolicy, SchedulerOutcome, TaskError, TaskSystem, ThreadBuilder,
-    ThreadCore, ThreadExtensionLease, ThreadHandle, ThreadId, ThreadRuntimeSnapshot, ThreadState,
-    ThreadWakeHandle, WaitQueue, WakeResult,
+    IrqWaitCell, IrqWaitRegistration, IrqWaitToken, Nice, ParkCommit, ParkPrepare,
+    PiMutexLockResult, PiMutexRef, PiWaitToken, RtPriority, ScheduleDecision, SchedulePolicy,
+    SchedulerOutcome, TaskError, TaskSystem, ThreadBuilder, ThreadCore, ThreadExtensionLease,
+    ThreadHandle, ThreadId, ThreadRuntimeSnapshot, ThreadState, ThreadWakeHandle, WaitQueue,
+    WakeResult,
     executor::CoroutineHeader,
     inbox::PublishResult,
     runtime::{
@@ -35,8 +35,7 @@ pub(crate) use deadline::{
     commit_current_park, prepare_current_park,
 };
 pub use pi::{
-    pi_block_current, pi_wait_cancel, pi_wake, prepare_pi_mutex_claim, prepare_pi_mutex_release,
-    prepare_pi_wait_start,
+    pi_block_current, pi_mutex_claim, pi_mutex_lock_slow, pi_mutex_release, pi_wait_cancel, pi_wake,
 };
 use runtime_cpu::{
     RuntimeCpuPin, RuntimeSchedulerFrameGuard, runtime_current_cpu, validate_schedule_context,

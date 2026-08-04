@@ -3,10 +3,7 @@
 use core::{fmt, marker::PhantomData};
 
 use super::*;
-use crate::{
-    PiLockIdentity, PiLockRef, PiLockWaitState, PiWaitOwner, PiWaitStateError, ThreadWakeHandle,
-    lock::{PreemptTicketGuard, RawTicketGuard},
-};
+use crate::{PiMutexRef, PiMutexWaiters, PiWaitStateError, ThreadWakeHandle};
 
 impl TaskSystemState {
     fn replace_owner_lock_top(
@@ -82,7 +79,8 @@ impl TaskSystemState {
 
     fn insert_lock_waiter(
         &mut self,
-        lock_state: &mut PiLockWaitState,
+        lock_state: &mut PiMutexWaiters,
+        owner: Option<ThreadId>,
         waiter: ThreadId,
         registration: PiWaitRegistration,
     ) -> Result<(), TaskError> {
@@ -100,12 +98,13 @@ impl TaskSystemState {
         };
         lock_state.waiters.insert(registration.key, node);
         self.thread_record_mut(waiter)?.blocked_on = Some(registration);
-        self.publish_lock_top_change(lock_state.owner, old_top, lock_state.waiters.first())
+        self.publish_lock_top_change(owner, old_top, lock_state.waiters.first())
     }
 
     fn remove_lock_waiter(
         &mut self,
-        lock_state: &mut PiLockWaitState,
+        lock_state: &mut PiMutexWaiters,
+        owner: Option<ThreadId>,
         waiter: ThreadId,
     ) -> Result<PiWaitRegistration, TaskError> {
         let registration = self
@@ -117,7 +116,7 @@ impl TaskSystemState {
             .waiters
             .remove(registration.key)
             .ok_or(TaskError::InvalidPiState)?;
-        self.publish_lock_top_change(lock_state.owner, old_top, lock_state.waiters.first())?;
+        self.publish_lock_top_change(owner, old_top, lock_state.waiters.first())?;
         self.thread_record_mut(waiter)?.blocked_on = None;
         let core = Arc::clone(&self.thread_record(waiter)?.core);
         // SAFETY: the node is detached from the lock tree and the blocked_on
@@ -142,11 +141,11 @@ impl TaskSystemState {
                 .scheduling_urgency(sched.policy.effective)
         };
         if urgency == registration.key.urgency {
-            let lock_state = unsafe {
+            let _lock_state = unsafe {
                 // SAFETY: blocked_on is lifetime-bound by the live wait token.
                 registration.lock.lock_state()
             };
-            return Ok(lock_state.owner);
+            return Ok(unsafe { registration.lock.core() }.owner_snapshot().owner());
         }
 
         let mut lock_state = unsafe {
@@ -165,255 +164,49 @@ impl TaskSystemState {
             .as_mut()
             .ok_or(TaskError::InvalidPiState)?
             .key = new_key;
-        self.publish_lock_top_change(lock_state.owner, old_top, lock_state.waiters.first())?;
-        Ok(lock_state.owner)
+        let owner = unsafe { registration.lock.core() }.owner_snapshot().owner();
+        self.publish_lock_top_change(owner, old_top, lock_state.waiters.first())?;
+        Ok(owner)
     }
 }
 
-/// Prepared scheduler transaction for publishing one local PI waiter.
-#[must_use = "a prepared PI waiter must be committed after local publication or dropped"]
-pub struct PiWaitStart<'system, 'lock> {
-    state: PreemptTicketGuard<'system, TaskSystemState>,
-    lock_state: RawTicketGuard<'lock, PiLockWaitState>,
-    fair_slice_ns: u64,
-    lock: PiLockRaw,
-    waiter: ThreadId,
-    waiter_core: Arc<ThreadCore>,
-    initial_owner: Option<Arc<ThreadCore>>,
-    generation: u64,
-    key: PiWaitKey,
-    owner: Option<ThreadId>,
-    initialize_owner: bool,
-    recompute: Option<PiRecomputeProof>,
-    _lock_lifetime: PhantomData<&'lock PiLockIdentity>,
+/// Result of entering the PI mutex slow path.
+#[must_use = "a registered PI waiter must be blocked, claimed, or cancelled"]
+pub enum PiMutexLockResult<'lock> {
+    /// A racing fast unlock let this caller acquire the mutex directly.
+    Acquired,
+    /// The caller is linked in the mutex-owned scheduler waiter tree.
+    Waiting(PiWaitToken<'lock>),
 }
 
-impl fmt::Debug for PiWaitStart<'_, '_> {
+impl fmt::Debug for PiMutexLockResult<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("PiWaitStart")
-            .field("lock", &self.lock.id())
-            .field("waiter", &self.waiter)
-            .field("generation", &self.generation)
-            .field("key", &self.key)
-            .field("owner", &self.owner)
-            .finish_non_exhaustive()
-    }
-}
-
-impl<'lock> PiWaitStart<'_, 'lock> {
-    /// Publishes the prevalidated scheduler registration.
-    ///
-    /// # Safety
-    ///
-    /// The owning mutex must hold its slow-path gate and have inserted the
-    /// matching pinned waiter into its local metadata queue. The gate must stay
-    /// held through this commit, and the waiter must remain present until the
-    /// returned token is cancelled or granted.
-    pub unsafe fn commit_after_local_registration(mut self) -> PiWaitToken<'lock> {
-        if self.initialize_owner {
-            self.lock_state.owner = self.owner;
+        match self {
+            Self::Acquired => formatter.write_str("Acquired"),
+            Self::Waiting(token) => formatter
+                .debug_tuple("Waiting")
+                .field(&token.thread_id())
+                .finish(),
         }
-        self.state
-            .insert_lock_waiter(
-                &mut self.lock_state,
-                self.waiter,
-                PiWaitRegistration {
-                    lock: self.lock,
-                    key: self.key,
-                    generation: self.generation,
-                },
-            )
-            .expect("prepared PI waiter insertion must remain valid");
-        if let Some(recompute) = self.recompute {
-            self.state
-                .apply_pi_recompute_chain(recompute, self.fair_slice_ns);
-        }
-        PiWaitToken {
-            core: self.waiter_core,
-            initial_owner: self.initial_owner,
-            generation: self.generation,
-            lock: self.lock,
-            _lock_lifetime: PhantomData,
-        }
-    }
-}
-
-/// Prepared scheduler half of releasing one contended PI mutex.
-#[must_use = "a prepared PI release must be committed after local publication or dropped"]
-pub struct PiMutexRelease<'system, 'lock> {
-    state: PreemptTicketGuard<'system, TaskSystemState>,
-    lock_state: RawTicketGuard<'lock, PiLockWaitState>,
-    fair_slice_ns: u64,
-    old_owner: ThreadId,
-    selected: ThreadId,
-    selected_generation: u64,
-    wake: ThreadWakeHandle,
-    old_recompute: PiRecomputeProof,
-    _lock_lifetime: PhantomData<&'lock PiLockIdentity>,
-}
-
-impl fmt::Debug for PiMutexRelease<'_, '_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("PiMutexRelease")
-            .field("old_owner", &self.old_owner)
-            .field("selected", &self.selected)
-            .finish_non_exhaustive()
-    }
-}
-
-impl PiMutexRelease<'_, '_> {
-    /// Returns the waiter selected by the scheduler's cached lock top.
-    pub const fn selected(&self) -> ThreadId {
-        self.selected
-    }
-
-    /// Removes this lock's top donation, publishes ownerless selection, and
-    /// returns the targeted wake capability.
-    ///
-    /// # Safety
-    ///
-    /// The mutex must hold its slow-path gate and have published its ownerless
-    /// owner word. The gate must stay held through this scheduler selection.
-    pub unsafe fn commit_after_local_release(mut self) -> ThreadWakeHandle {
-        let top = self.lock_state.waiters.first();
-        self.state
-            .replace_owner_lock_top(self.old_owner, top, None)
-            .expect("prepared PI release top must remain linked");
-        self.lock_state.owner = None;
-        self.lock_state.selected = Some(self.selected);
-        self.state
-            .thread_record(self.selected)
-            .expect("prepared PI selected waiter must remain live")
-            .core
-            .pi_wait_state()
-            .select(self.selected_generation)
-            .expect("prepared PI selection generation must remain current");
-        self.state
-            .apply_pi_recompute_chain(self.old_recompute, self.fair_slice_ns);
-        self.wake
-    }
-}
-
-/// Prepared scheduler half of claiming an ownerless PI mutex.
-#[must_use = "a prepared PI claim must be committed after local ownership publication or dropped"]
-pub struct PiMutexClaim<'system, 'lock> {
-    state: PreemptTicketGuard<'system, TaskSystemState>,
-    lock_state: RawTicketGuard<'lock, PiLockWaitState>,
-    fair_slice_ns: u64,
-    claimant: ThreadId,
-    generation: u64,
-    next_recompute: PiRecomputeProof,
-    _lock_lifetime: PhantomData<&'lock PiLockIdentity>,
-}
-
-impl fmt::Debug for PiMutexClaim<'_, '_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("PiMutexClaim")
-            .field("claimant", &self.claimant)
-            .finish_non_exhaustive()
-    }
-}
-
-impl PiMutexClaim<'_, '_> {
-    /// Attaches the remaining lock top to the claimant and grants ownership.
-    ///
-    /// # Safety
-    ///
-    /// The mutex must hold its slow-path gate, have removed `claimant` from
-    /// local waiter metadata, and have published it as physical owner. The gate
-    /// must stay held through this scheduler claim commit.
-    pub unsafe fn commit_after_local_claim(mut self) {
-        let registration = self
-            .state
-            .remove_lock_waiter(&mut self.lock_state, self.claimant)
-            .expect("prepared PI claimant must remain in the lock waiter tree");
-        debug_assert_eq!(registration.generation, self.generation);
-        self.lock_state.selected = None;
-        if let Some(top) = self.lock_state.waiters.first() {
-            self.lock_state.owner = Some(self.claimant);
-            self.state
-                .replace_owner_lock_top(self.claimant, None, Some(top))
-                .expect("remaining PI lock top must attach to claimant");
-        } else {
-            self.lock_state.owner = None;
-        }
-        let wait_state = self
-            .state
-            .thread_record(self.claimant)
-            .expect("prepared PI claimant must remain live")
-            .core
-            .pi_wait_state();
-        wait_state.clear_selection(self.generation);
-        wait_state
-            .grant(self.generation)
-            .expect("prepared PI claimant generation must remain current");
-        self.state
-            .apply_pi_recompute_chain(self.next_recompute, self.fair_slice_ns);
     }
 }
 
 impl TaskSystem {
-    /// Prepares a lock-local waiter insertion without publishing a graph edge.
-    pub fn prepare_pi_wait_start<'lock>(
+    /// Registers one contender in the mutex-owned PI waiter tree.
+    pub fn pi_mutex_lock_slow<'lock>(
         &self,
-        lock: PiLockRef<'lock>,
+        lock: PiMutexRef<'lock>,
         waiter: ThreadId,
-        owner: PiWaitOwner,
         sequence: u64,
-    ) -> Result<PiWaitStart<'_, 'lock>, TaskError> {
-        let state = self.state.lock();
+    ) -> Result<PiMutexLockResult<'lock>, TaskError> {
+        let mut state = self.state.lock();
         let lock_raw = lock.raw();
-        let lock_state = lock.lock_state();
-        let (owner, initialize_owner) = match owner {
-            PiWaitOwner::Owned(owner) => {
-                if waiter == owner {
-                    return Err(TaskError::InvalidPiWaitState(
-                        PiWaitStateError::WaiterOwnsLock,
-                    ));
-                }
-                if lock_state.waiters.is_empty() {
-                    if lock_state.owner.is_some() || lock_state.selected.is_some() {
-                        return Err(TaskError::InvalidPiWaitState(
-                            PiWaitStateError::StaleSchedulerOwnership,
-                        ));
-                    }
-                    (Some(owner), true)
-                } else if lock_state.owner == Some(owner) && lock_state.selected.is_none() {
-                    (Some(owner), false)
-                } else {
-                    return Err(TaskError::InvalidPiWaitState(
-                        PiWaitStateError::PhysicalOwnerMismatch,
-                    ));
-                }
-            }
-            PiWaitOwner::Ownerless => {
-                if lock_state.owner.is_some()
-                    || lock_state.selected.is_none()
-                    || lock_state.waiters.is_empty()
-                {
-                    return Err(TaskError::InvalidPiWaitState(
-                        PiWaitStateError::OwnerlessSelectionMissing,
-                    ));
-                }
-                (None, false)
-            }
-        };
-        if state.thread_record(waiter)?.sched.lock().lifecycle.state() == ThreadState::Exited
-            || owner.is_some_and(|owner| {
-                state.thread_record(owner).is_ok_and(|record| {
-                    record.sched.lock().lifecycle.state() == ThreadState::Exited
-                })
-            })
-        {
+        let core = lock.core();
+        let mut lock_state = lock.lock_state();
+        if state.thread_record(waiter)?.sched.lock().lifecycle.state() == ThreadState::Exited {
             return Err(TaskError::InvalidPiWaitState(
                 PiWaitStateError::ExitedParticipant,
             ));
-        }
-        if let Some(owner) = owner {
-            state.ensure_pi_acyclic(waiter, owner, self.config.pi_chain_limit())?;
         }
         if state.thread_record(waiter)?.blocked_on.is_some() {
             return Err(TaskError::InvalidPiWaitState(
@@ -430,31 +223,92 @@ impl TaskSystem {
                 .scheduling_urgency(sched.policy.effective)
         };
         let key = PiWaitKey::new(urgency, sequence, waiter);
-        let becomes_top = lock_state.waiters.first().is_none_or(|top| key < top);
-        let recompute = owner
-            .filter(|_| becomes_top)
-            .map(|owner| state.prepare_pi_recompute_chain(owner, self.config.pi_chain_limit()))
-            .transpose()?;
-        let initial_owner = match owner {
-            Some(owner) => Some(Arc::clone(&state.thread_record(owner)?.core)),
-            None => None,
-        };
         let generation = waiter_core.pi_wait_state().begin()?;
-        Ok(PiWaitStart {
-            state,
-            lock_state,
-            fair_slice_ns: self.config.fair_slice_ns(),
-            lock: lock_raw,
-            waiter,
-            waiter_core,
-            initial_owner,
-            generation,
-            key,
-            owner,
-            initialize_owner,
-            recompute,
-            _lock_lifetime: PhantomData,
-        })
+
+        loop {
+            let snapshot = core.owner_snapshot();
+            if snapshot.is_unlocked() {
+                if !lock_state.waiters.is_empty() {
+                    return Err(TaskError::InvalidPiWaitState(
+                        PiWaitStateError::StaleSchedulerOwnership,
+                    ));
+                }
+                if core.try_acquire_snapshot(snapshot, waiter)? {
+                    return Ok(PiMutexLockResult::Acquired);
+                }
+                continue;
+            }
+
+            let owner = snapshot.owner();
+            if owner == Some(waiter) {
+                return Err(TaskError::InvalidPiWaitState(
+                    PiWaitStateError::WaiterOwnsLock,
+                ));
+            }
+            if snapshot.has_waiters() != !lock_state.waiters.is_empty()
+                || snapshot.is_ownerless() && lock_state.waiters.is_empty()
+            {
+                return Err(TaskError::InvalidPiWaitState(
+                    PiWaitStateError::StaleSchedulerOwnership,
+                ));
+            }
+            if owner.is_none() && !snapshot.is_ownerless() {
+                return Err(TaskError::InvalidPiWaitState(
+                    PiWaitStateError::OwnerlessSelectionMissing,
+                ));
+            }
+            if owner.is_some_and(|owner| {
+                state.thread_record(owner).is_err()
+                    || state.thread_record(owner).is_ok_and(|record| {
+                        record.sched.lock().lifecycle.state() == ThreadState::Exited
+                    })
+            }) {
+                return Err(TaskError::InvalidPiWaitState(
+                    PiWaitStateError::ExitedParticipant,
+                ));
+            }
+            if let Some(owner) = owner {
+                state.ensure_pi_acyclic(waiter, owner, self.config.pi_chain_limit())?;
+            }
+            let becomes_top = lock_state.waiters.first().is_none_or(|top| key < top);
+            let recompute = owner
+                .filter(|_| becomes_top)
+                .map(|owner| state.prepare_pi_recompute_chain(owner, self.config.pi_chain_limit()))
+                .transpose()?;
+            let initial_owner = owner
+                .map(|owner| {
+                    state
+                        .thread_record(owner)
+                        .map(|record| Arc::clone(&record.core))
+                })
+                .transpose()?;
+
+            if !core.try_mark_waiters(snapshot) {
+                continue;
+            }
+            state
+                .insert_lock_waiter(
+                    &mut lock_state,
+                    owner,
+                    waiter,
+                    PiWaitRegistration {
+                        lock: lock_raw,
+                        key,
+                        generation,
+                    },
+                )
+                .expect("validated PI waiter insertion must remain infallible");
+            if let Some(recompute) = recompute {
+                state.apply_pi_recompute_chain(recompute, self.config.fair_slice_ns());
+            }
+            return Ok(PiMutexLockResult::Waiting(PiWaitToken {
+                core: waiter_core,
+                initial_owner,
+                generation,
+                lock: lock_raw,
+                _lock_lifetime: PhantomData,
+            }));
+        }
     }
 
     /// Cancels a committed waiter which has not been selected for claim.
@@ -470,22 +324,31 @@ impl TaskSystem {
             return Err(TaskError::InvalidPiState);
         }
         let mut lock_state = unsafe {
-            // SAFETY: token retains the lock-identity borrow for this call.
+            // SAFETY: token retains the mutex-core borrow for this call.
             token.lock.lock_state()
         };
-        if lock_state.selected == Some(waiter) {
+        if token.is_selected() {
             return Err(TaskError::InvalidPiState);
         }
-        let owner = lock_state.owner;
+        let core = unsafe {
+            // SAFETY: token retains the physical mutex-core borrow.
+            token.lock.core()
+        };
+        let snapshot = core.owner_snapshot();
+        let owner = snapshot.owner();
+        if !snapshot.has_waiters() {
+            return Err(TaskError::InvalidPiState);
+        }
         let top_changes = lock_state.waiters.first() == Some(registration.key);
         let recompute = owner
             .filter(|_| top_changes)
             .map(|owner| state.prepare_pi_recompute_chain(owner, self.config.pi_chain_limit()))
             .transpose()?;
-        state.remove_lock_waiter(&mut lock_state, waiter)?;
+        state.remove_lock_waiter(&mut lock_state, owner, waiter)?;
         token.core.pi_wait_state().clear_selection(token.generation);
         if lock_state.waiters.is_empty() {
-            lock_state.owner = None;
+            let owner = owner.ok_or(TaskError::InvalidPiState)?;
+            core.clear_waiters_bit(owner)?;
         }
         if let Some(recompute) = recompute {
             state.apply_pi_recompute_chain(recompute, self.config.fair_slice_ns());
@@ -493,15 +356,17 @@ impl TaskSystem {
         Ok(())
     }
 
-    /// Prepares release using the lock tree's cached top waiter.
-    pub fn prepare_pi_mutex_release<'lock>(
+    /// Publishes an ownerless handoff and returns the selected wake target.
+    pub fn pi_mutex_release(
         &self,
-        lock: PiLockRef<'lock>,
+        lock: PiMutexRef<'_>,
         old_owner: ThreadId,
-    ) -> Result<PiMutexRelease<'_, 'lock>, TaskError> {
-        let state = self.state.lock();
+    ) -> Result<ThreadWakeHandle, TaskError> {
+        let mut state = self.state.lock();
+        let core = lock.core();
         let lock_state = lock.lock_state();
-        if lock_state.owner != Some(old_owner) || lock_state.selected.is_some() {
+        let snapshot = core.owner_snapshot();
+        if snapshot.owner() != Some(old_owner) || !snapshot.has_waiters() {
             return Err(TaskError::InvalidPiState);
         }
         let selected_key = lock_state
@@ -529,33 +394,32 @@ impl TaskSystem {
         let wake = ThreadWakeHandle::from_core(Arc::clone(&state.thread_record(selected)?.core));
         let old_recompute =
             state.prepare_pi_recompute_chain(old_owner, self.config.pi_chain_limit())?;
-        Ok(PiMutexRelease {
-            state,
-            lock_state,
-            fair_slice_ns: self.config.fair_slice_ns(),
-            old_owner,
-            selected,
-            selected_generation: registration.generation,
-            wake,
-            old_recompute,
-            _lock_lifetime: PhantomData,
-        })
+        let top = lock_state.waiters.first();
+        state.replace_owner_lock_top(old_owner, top, None)?;
+        state
+            .thread_record(selected)?
+            .core
+            .pi_wait_state()
+            .select(registration.generation)?;
+        core.publish_ownerless();
+        state.apply_pi_recompute_chain(old_recompute, self.config.fair_slice_ns());
+        Ok(wake)
     }
 
-    /// Prepares the selected waiter to claim an ownerless lock.
-    pub fn prepare_pi_mutex_claim<'lock>(
-        &self,
-        token: &PiWaitToken<'lock>,
-    ) -> Result<PiMutexClaim<'_, 'lock>, TaskError> {
-        let state = self.state.lock();
+    /// Claims an ownerless handoff selected for this waiter.
+    pub fn pi_mutex_claim(&self, token: &PiWaitToken<'_>) -> Result<(), TaskError> {
+        let mut state = self.state.lock();
         let claimant = token.thread_id();
         let lock = token.lock;
-        let lock_state = unsafe {
-            // SAFETY: the borrowed token keeps the physical PI lock identity
-            // live for the returned transaction's complete lifetime.
+        let mut lock_state = unsafe {
+            // SAFETY: the borrowed token keeps the physical mutex core live.
             lock.lock_state()
         };
-        if lock_state.owner.is_some() || lock_state.selected != Some(claimant) {
+        let core = unsafe {
+            // SAFETY: the token lifetime is borrowed from this mutex core.
+            lock.core()
+        };
+        if !core.owner_snapshot().is_ownerless() || !token.is_selected() {
             return Err(TaskError::InvalidPiState);
         }
         let registration = state
@@ -575,14 +439,16 @@ impl TaskSystem {
             return Err(TaskError::InvalidPiState);
         }
         let next_recompute = state.prepare_pi_recompute_after_claim(claimant, registration)?;
-        Ok(PiMutexClaim {
-            state,
-            lock_state,
-            fair_slice_ns: self.config.fair_slice_ns(),
-            claimant,
-            generation: registration.generation,
-            next_recompute,
-            _lock_lifetime: PhantomData,
-        })
+        let registration = state.remove_lock_waiter(&mut lock_state, None, claimant)?;
+        debug_assert_eq!(registration.generation, token.generation);
+        core.publish_owner(claimant, !lock_state.waiters.is_empty());
+        if let Some(top) = lock_state.waiters.first() {
+            state.replace_owner_lock_top(claimant, None, Some(top))?;
+        }
+        let wait_state = &token.core.pi_wait_state();
+        wait_state.clear_selection(token.generation);
+        wait_state.grant(token.generation)?;
+        state.apply_pi_recompute_chain(next_recompute, self.config.fair_slice_ns());
+        Ok(())
     }
 }

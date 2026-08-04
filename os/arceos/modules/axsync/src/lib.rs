@@ -61,8 +61,6 @@ mod lockdep;
 
 #[cfg(feature = "multitask")]
 mod mutex;
-#[cfg(feature = "multitask")]
-mod pi;
 #[cfg(all(test, feature = "multitask", not(target_os = "none")))]
 mod test_runtime;
 
