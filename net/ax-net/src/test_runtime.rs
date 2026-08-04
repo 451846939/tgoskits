@@ -50,6 +50,19 @@ impl_task_runtime! {
             // cached endpoint until InstalledTestRuntime is dropped.
             unsafe { CpuRemoteHandle::from_raw(CPU_REMOTE.load(Ordering::Acquire)) }
         }
+        unsafe fn current_thread_identity() -> ThreadIdentityV1 {
+            let raw = CPU_REMOTE.load(Ordering::Acquire);
+            if raw == 0 {
+                return ThreadIdentityV1::NONE;
+            }
+            // SAFETY: InstalledTestRuntime retains the TaskSystem that owns
+            // this endpoint until the modeled current identity is no longer
+            // observable.
+            let remote = unsafe { &*core::ptr::with_exposed_provenance::<CpuRemote>(raw) };
+            remote.current_thread().map_or(ThreadIdentityV1::NONE, |id| {
+                ThreadIdentityV1::new(id.slot(), id.generation())
+            })
+        }
         unsafe fn cpu_remote_handle(cpu: RuntimeCpuId) -> CpuRemoteHandle {
             let raw = TASK_SYSTEM.load(Ordering::Acquire);
             if raw == 0 {

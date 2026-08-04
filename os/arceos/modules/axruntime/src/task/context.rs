@@ -4,17 +4,17 @@ use core::{
     mem::offset_of,
     pin::Pin,
     ptr::{self, NonNull},
-    sync::atomic::{AtomicU64, Ordering},
 };
 
 use ax_hal::percpu::{
     CpuPin, CurrentContext, CurrentThreadHeader, PreparedThreadSwitch, PreviousThreadBinding,
+    RuntimeThreadCookie,
 };
 use ax_task::{
     TaskError,
     runtime::{
         ContextSwitch, ContextThreadBinding, ExecutionContextHandle, KernelContextRequest,
-        RuntimeHandleResult, RuntimeStatus, StackHandle, UserContextRequest,
+        RuntimeHandleResult, RuntimeStatus, StackHandle, ThreadIdentityV1, UserContextRequest,
     },
 };
 
@@ -85,7 +85,6 @@ struct RuntimeSwitchTail {
 struct RuntimeContext {
     header: CurrentThreadHeader,
     inner: Box<UnsafeCell<ax_hal::context::TaskContext>>,
-    thread_identity: AtomicU64,
     stack: StackHandle,
     switch_tail: UnsafeCell<Option<RuntimeSwitchTail>>,
 }
@@ -100,7 +99,6 @@ impl RuntimeContext {
         Box::into_raw(Box::new(Self {
             header: CurrentThreadHeader::new(identity),
             inner,
-            thread_identity: AtomicU64::new(0),
             stack,
             switch_tail: UnsafeCell::new(None),
         }))
@@ -313,12 +311,18 @@ pub(super) fn bind_runtime_context_thread(binding: ContextThreadBinding) -> Runt
     }
     let thread_identity =
         ((binding.identity.generation as u64) << 32) | binding.identity.slot as u64;
+    let Ok(thread_identity) = usize::try_from(thread_identity) else {
+        return RuntimeStatus::InvalidArgument;
+    };
+    let Some(thread_identity) = RuntimeThreadCookie::new(thread_identity) else {
+        return RuntimeStatus::InvalidArgument;
+    };
     let Ok(context) = runtime_context(binding.context) else {
         return RuntimeStatus::InvalidHandle;
     };
     if context
-        .thread_identity
-        .compare_exchange(0, thread_identity, Ordering::AcqRel, Ordering::Acquire)
+        .header
+        .bind_runtime_thread_cookie(thread_identity)
         .is_err()
     {
         return RuntimeStatus::InvalidArgument;
@@ -328,6 +332,27 @@ pub(super) fn bind_runtime_context_thread(binding: ContextThreadBinding) -> Runt
     // assembly until its first switch-out.
     unsafe { &mut *context.inner.get() }.set_current_header(context.header().as_non_null());
     RuntimeStatus::Success
+}
+
+/// Reads the immutable scheduler identity owned by the current runtime context.
+///
+/// # Safety
+///
+/// The caller must retain migration exclusion until the returned value has
+/// been copied. The architecture current-thread register must retain its live
+/// pinned [`CurrentThreadHeader`] publication for that complete interval.
+pub(super) unsafe fn scheduler_current_thread_identity() -> ThreadIdentityV1 {
+    let header = unsafe { ax_hal::percpu::current_thread_raw() };
+    if header.is_null() {
+        return ThreadIdentityV1::NONE;
+    }
+    // SAFETY: the current-thread register points to a live pinned header.
+    let header = unsafe { &*header };
+    let Some(identity) = header.runtime_thread_cookie() else {
+        return ThreadIdentityV1::NONE;
+    };
+    let identity = identity.get() as u64;
+    ThreadIdentityV1::new(identity as u32, (identity >> 32) as u32)
 }
 
 fn prepare_runtime_thread_switch<'switch>(

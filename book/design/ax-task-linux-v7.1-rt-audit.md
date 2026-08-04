@@ -1495,6 +1495,43 @@ raw clock-pair 从 25.458 变为 27.433 微秒（+7.8%）；八个场景的 raw 
 同一水平，后续必须继续审计 current identity、guard 与 wake/rq transaction，不能把
 clock-normalized 改善表述成已经完成性能对齐。
 
+### 2026-08-05 current identity 的本地执行上下文所有权
+
+旧 `current_thread_id()` 虽然只需要调用线程自己的 generation-bearing identity，仍先取得
+`CpuRemote`，再读取该远程 runqueue publication endpoint 的 `current_thread`。这把 Linux
+本地 `current` 与远程 `rq->curr` 混成同一接口：本 CPU 的 syscall、trace 和任务态资源检查
+都要经过本来只应服务 remote observer 的共享缓存线。
+
+Linux v7.1 的四架构模型在语义上统一为“架构寄存器或 cache-hot per-CPU 槽直接选择当前
+`task_struct`”：x86 的 `get_current()` 读取 `current_task`，AArch64 读取 `sp_el0`，RISC-V
+固定用 `tp`。runqueue 的 `rq->curr` 仍归 scheduler owner，不能反过来充当本地 current
+identity 的事实源。
+
+本轮按该边界做破坏型收敛：
+
+- `TaskRuntime::current_thread_identity()` 明确只允许读取架构 current-thread register 选中的
+  本地执行上下文；`CpuRemote.current_thread` 只保留 remote rq snapshot 语义；
+- `CurrentThreadHeader` 新增一次性 `RuntimeThreadCookie`，在 scheduler generation 进入 runqueue
+  前绑定；零值只表示未绑定的 bootstrap header，第二次绑定返回原 owner；
+- cookie 使用原 header reserved 空间，仍位于同一个 64B current cache line；既有
+  CPU-base、architecture scratch、preempt-state 偏移和四架构汇编 ABI 不变；
+- ax-runtime 不再从 offset-zero header 追到 `RuntimeContext` 的第二缓存线，也不再另存一份
+  `thread_identity`；读取只包含 current pointer 与同缓存线的 immutable cookie；
+- ax-task 的未初始化错误仍只在零 cookie 冷路径查询 `TaskSystem`，正常 current 快路径没有
+  registry、runqueue、IRQ owner 或远程 handle 访问。
+
+确定性红测先要求 cookie 在旧 header 上不存在并稳定编译失败；实现后验证一次绑定成功、
+重复绑定拒绝且 header 仍为 64B。facade 操作计数同时要求一次 `current_thread_id()` 的
+`current_cpu_remote_handle` 读取从 1 降为 0，CPU owner claim 保持 0，迁移 pin 保持 1。
+
+完整 wakeup benchmark 不是这条接口的归因测试：Starry timer/futex 的阻塞主路径使用
+`current_thread_handle()`，不会调用新的 identity hook。诊断运行中 OTHER timer p50 曾从
+218.9 微秒漂移到 248.8 微秒，而 futex case 同时有升有降；该运行已按规则提前停止，不能
+把 QEMU/TCG clockevent 抖动归因给 cookie，也不能用它声称 identity 已达到 Linux RT 性能。
+本检查点的确定性能效证据仅是远程 endpoint 读取 1→0 和跨缓存线追踪 1→0；下一阶段应把
+Starry `current_user_task()` 从 registry-backed `current_thread_handle()` 收敛为生命周期安全的
+本地 current extension capability，才会覆盖 futex、nanosleep 和大多数 syscall 热路径。
+
 ## 模块化结果
 
 - `TaskSystem` orchestration 只负责编排，registry/reap、placement、owner scheduling、deadline、PI、balance、deferred work 分模块；

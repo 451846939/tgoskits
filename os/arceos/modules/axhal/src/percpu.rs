@@ -9,8 +9,8 @@ pub use ax_plat::percpu::{
 };
 pub use cpu_local::{
     CpuAreaRef, CpuLocalError, CpuPin, CurrentContext, CurrentThreadHeader, ExclusiveCpu,
-    PreemptExit, PreparedThreadSwitch, PreviousThreadBinding, ThreadSwitchError,
-    scheduler_clear_preempt_need_resched, scheduler_consume_final_preempt_guard,
+    PreemptExit, PreparedThreadSwitch, PreviousThreadBinding, RuntimeThreadCookie,
+    ThreadSwitchError, scheduler_clear_preempt_need_resched, scheduler_consume_final_preempt_guard,
     scheduler_enter_preempt_guard, scheduler_preempt_guard_depth,
     scheduler_prepare_preempt_guard_exit, scheduler_set_preempt_need_resched, with_cpu_pin,
     with_exclusive_cpu,

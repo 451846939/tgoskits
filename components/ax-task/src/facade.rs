@@ -94,8 +94,9 @@ pub fn current_thread_token() -> Result<CurrentThreadToken, TaskError> {
 /// Returns the calling scheduler thread while the caller retains a CPU pin.
 ///
 /// This is the scheduler-adjacent fast path used by primitives that already
-/// hold migration exclusion. It reads the generation-bearing current identity
-/// from the CPU's remote publication endpoint without recursively entering the
+/// hold migration exclusion. It reads the generation-bearing identity directly
+/// from the runtime context selected by the architecture current-thread
+/// register, without entering either the remote runqueue endpoint or the
 /// IRQ-guarded mutable owner facade.
 ///
 /// # Safety
@@ -105,10 +106,16 @@ pub fn current_thread_token() -> Result<CurrentThreadToken, TaskError> {
 /// Task-context callers normally satisfy this with a preemption guard or an
 /// IRQ-aware metadata lock.
 pub unsafe fn current_thread_id_pinned() -> Result<ThreadId, TaskError> {
-    current_cpu_remote()
-        .ok_or(TaskError::NotInitialized)?
-        .current_thread()
-        .ok_or(TaskError::NoRunnableThread)
+    let identity = unsafe { task_runtime::current_thread_identity() };
+    if !identity.is_bound() {
+        // Preserve the public distinction between a runtime that has not
+        // installed its task system and an initialized bootstrap context that
+        // has not published a scheduler thread. This cold error path does not
+        // add a handle lookup to the bound-current fast path.
+        let _system = runtime_task_system()?;
+        return Err(TaskError::NoRunnableThread);
+    }
+    Ok(ThreadId::from_parts(identity.slot, identity.generation))
 }
 
 /// Tests the current CPU's sticky reschedule request while migration is pinned.

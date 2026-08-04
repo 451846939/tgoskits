@@ -91,6 +91,17 @@ impl_task_runtime! {
             // this cached current-CPU endpoint.
             unsafe { CpuRemoteHandle::from_raw(CPU_REMOTE.with(Cell::get)) }
         }
+        unsafe fn current_thread_identity() -> ThreadIdentityV1 {
+            let raw = CPU_REMOTE.with(Cell::get);
+            if raw == 0 {
+                return ThreadIdentityV1::NONE;
+            }
+            // SAFETY: install/clear retain the TaskSystem owning this endpoint.
+            let remote = unsafe { &*core::ptr::with_exposed_provenance::<CpuRemote>(raw) };
+            remote.current_thread().map_or(ThreadIdentityV1::NONE, |id| {
+                ThreadIdentityV1::new(id.slot(), id.generation())
+            })
+        }
         unsafe fn cpu_remote_handle(cpu: RuntimeCpuId) -> CpuRemoteHandle {
             let raw = TASK_SYSTEM.with(Cell::get);
             if raw == 0 {

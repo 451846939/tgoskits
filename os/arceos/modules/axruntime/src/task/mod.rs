@@ -33,7 +33,8 @@ use ax_task::{
         AddressSpaceReclaimArmOutcome, ContextSwitch, ContextThreadBinding, CpuRemoteHandle,
         CurrentCpuLocalHandle, CurrentCpuOwnerHandles, ExecutionContextHandle, IrqGuardToken,
         KernelContextRequest, RuntimeCpuId, RuntimeHandleResult, RuntimeStatus, StackHandle,
-        StackRequest, TaskRuntime, TaskSystemHandle, TlsHandle, TlsRequest, UserContextRequest,
+        StackRequest, TaskRuntime, TaskSystemHandle, ThreadIdentityV1, TlsHandle, TlsRequest,
+        UserContextRequest,
     },
 };
 
@@ -75,7 +76,7 @@ pub use context::diagnose_current_stack_guard_page_fault;
 use context::{
     bind_bootstrap_runtime_context, bind_runtime_context_thread, create_bootstrap_context,
     create_runtime_context, create_user_runtime_context, destroy_runtime_context,
-    finish_runtime_context_switch_tail, switch_runtime_context,
+    finish_runtime_context_switch_tail, scheduler_current_thread_identity, switch_runtime_context,
 };
 pub use executor::{BlockOnError, block_on, block_on_timeout};
 #[cfg(feature = "tls")]

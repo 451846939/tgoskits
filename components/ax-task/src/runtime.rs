@@ -483,9 +483,20 @@ pub struct ThreadIdentityV1 {
 }
 
 impl ThreadIdentityV1 {
+    /// Sentinel returned before a runtime context is bound to a scheduler thread.
+    pub const NONE: Self = Self {
+        slot: 0,
+        generation: 0,
+    };
+
     /// Creates a runtime identity from its explicit generation-bearing parts.
     pub const fn new(slot: u32, generation: u32) -> Self {
         Self { slot, generation }
+    }
+
+    /// Returns whether this value names a published scheduler generation.
+    pub const fn is_bound(self) -> bool {
+        self.generation != 0
     }
 }
 
@@ -649,6 +660,21 @@ pub trait TaskRuntime {
     /// shutdown. It must not identify a [`crate::CpuLocal`] or any other
     /// allocation.
     unsafe fn current_cpu_remote_handle() -> CpuRemoteHandle;
+
+    /// Returns the scheduler identity bound to the calling execution context.
+    ///
+    /// This is the local equivalent of Linux's direct `current` task pointer.
+    /// Providers must read the task-owned runtime context selected by the
+    /// architecture current-thread register; they must not resolve the local
+    /// identity through a remote runqueue endpoint. [`ThreadIdentityV1::NONE`]
+    /// denotes an unbound bootstrap context.
+    ///
+    /// # Safety
+    ///
+    /// The caller must prevent migration and context switches until the value
+    /// has been copied. A bound result must remain immutable for the complete
+    /// lifetime of that runtime context.
+    unsafe fn current_thread_identity() -> ThreadIdentityV1;
 
     /// Returns the Arc-backed [`crate::CpuRemote`] endpoint for `cpu`.
     ///

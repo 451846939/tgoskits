@@ -59,6 +59,12 @@ impl_task_runtime! {
             unsafe { CpuRemoteHandle::from_raw(raw) }
         }
 
+        unsafe fn current_thread_identity() -> ThreadIdentityV1 {
+            // SAFETY: ax-task retains the migration pin required by the
+            // runtime-context current identity boundary.
+            unsafe { scheduler_current_thread_identity() }
+        }
+
         unsafe fn cpu_remote_handle(cpu: RuntimeCpuId) -> CpuRemoteHandle {
             cpu_remote(cpu).map_or(CpuRemoteHandle::NONE, |cpu| {
                 // SAFETY: TaskSystem owns this Arc-backed CpuRemote endpoint

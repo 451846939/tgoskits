@@ -1553,6 +1553,11 @@ mod tests {
         assert_eq!(current_thread_id().unwrap(), bootstrap.id());
 
         assert_eq!(
+            test_runtime::current_cpu_remote_handle_reads(),
+            0,
+            "local current identity must come from the runtime context, not the remote rq endpoint"
+        );
+        assert_eq!(
             test_runtime::cpu_owner_claims(),
             0,
             "a read-only current identity must not enter the mutable CPU owner gate"

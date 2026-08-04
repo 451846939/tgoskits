@@ -18,6 +18,7 @@ std::thread_local! {
     static TASK_SYSTEM_HANDLE: Cell<usize> = const { Cell::new(0) };
     static CPU_LOCAL_HANDLE: Cell<usize> = const { Cell::new(0) };
     static CURRENT_CPU_REMOTE_HANDLE: Cell<usize> = const { Cell::new(0) };
+    static CURRENT_CPU_REMOTE_HANDLE_READS: Cell<usize> = const { Cell::new(0) };
     static CPU_LOCAL_HANDLE_READS: Cell<usize> = const { Cell::new(0) };
     static CPU_REMOTE_HANDLE_READS: Cell<usize> = const { Cell::new(0) };
     static CPU_OWNER_CLAIMS: Cell<usize> = const { Cell::new(0) };
@@ -132,11 +133,25 @@ impl TaskRuntime for UnitTestRuntime {
         unsafe { CurrentCpuOwnerHandles::new(RuntimeCpuId::new(0), local, remote) }
     }
     unsafe fn current_cpu_remote_handle() -> CpuRemoteHandle {
+        CURRENT_CPU_REMOTE_HANDLE_READS.with(|reads| reads.set(reads.get() + 1));
         CURRENT_CPU_REMOTE_HANDLE.with(|handle| {
             // SAFETY: unit fixtures install only CPU 0's Arc-backed endpoint
             // and retain the owning TaskSystem until this slot is cleared.
             unsafe { CpuRemoteHandle::from_raw(handle.get()) }
         })
+    }
+    unsafe fn current_thread_identity() -> ThreadIdentityV1 {
+        let raw = CURRENT_CPU_REMOTE_HANDLE.with(Cell::get);
+        if raw == 0 {
+            return ThreadIdentityV1::NONE;
+        }
+        // SAFETY: fixtures keep the TaskSystem owning this endpoint alive.
+        let remote = unsafe { &*core::ptr::with_exposed_provenance::<crate::CpuRemote>(raw) };
+        remote
+            .current_thread()
+            .map_or(ThreadIdentityV1::NONE, |id| {
+                ThreadIdentityV1::new(id.slot(), id.generation())
+            })
     }
     unsafe fn cpu_remote_handle(cpu: RuntimeCpuId) -> CpuRemoteHandle {
         CPU_REMOTE_HANDLE_READS.with(|reads| reads.set(reads.get() + 1));
@@ -673,6 +688,7 @@ pub(crate) fn install_task_handles(task_system: usize, cpu_local: usize) {
 
 pub(crate) fn reset_cpu_handle_reads() {
     CPU_LOCAL_HANDLE_READS.with(|reads| reads.set(0));
+    CURRENT_CPU_REMOTE_HANDLE_READS.with(|reads| reads.set(0));
     CPU_REMOTE_HANDLE_READS.with(|reads| reads.set(0));
     CPU_OWNER_CLAIMS.with(|claims| claims.set(0));
 }
@@ -682,6 +698,10 @@ pub(crate) fn cpu_handle_reads() -> (usize, usize) {
         CPU_LOCAL_HANDLE_READS.with(Cell::get),
         CPU_REMOTE_HANDLE_READS.with(Cell::get),
     )
+}
+
+pub(crate) fn current_cpu_remote_handle_reads() -> usize {
+    CURRENT_CPU_REMOTE_HANDLE_READS.with(Cell::get)
 }
 
 pub(crate) fn record_cpu_owner_claim() {
