@@ -20,7 +20,7 @@ use axvmconfig::{AxVMCrateConfig, EmulatedDeviceConfig, EmulatedDeviceType};
 use fdt_edit::{Fdt, Node, NodeId};
 use fdt_raw::RegInfo;
 
-use super::tree::{FdtTree, GuestMemorySpec, prop_string, prop_u32_list};
+use super::tree::{FdtTree, GuestMemorySpec, prop_empty, prop_string, prop_u32_list};
 use crate::{
     AxVMRef, AxVmResult, GuestPhysAddr, VMMemoryRegion, ax_err_type,
     boot::images::load_vm_image_from_memory,
@@ -223,6 +223,34 @@ pub fn patch_guest_fdt_for_runtime(
 }
 
 impl FdtTree {
+    fn next_phandle(&self) -> u32 {
+        const AXIVC_PHANDLE_BASE: u32 = 0xa11c_0000;
+
+        self.inner()
+            .iter_node_ids()
+            .filter_map(|id| self.inner().node(id))
+            .flat_map(|node| {
+                [
+                    node.get_property("phandle").and_then(|prop| prop.get_u32()),
+                    node.get_property("linux,phandle")
+                        .and_then(|prop| prop.get_u32()),
+                ]
+            })
+            .flatten()
+            .filter(|phandle| *phandle >= AXIVC_PHANDLE_BASE)
+            .max()
+            .and_then(|phandle| phandle.checked_add(1))
+            .unwrap_or(AXIVC_PHANDLE_BASE)
+    }
+
+    fn root_cells(&self, property: &str, fallback: u32) -> u32 {
+        self.inner()
+            .node(self.inner().root_id())
+            .and_then(|node| node.get_property(property))
+            .and_then(|prop| prop.get_u32())
+            .unwrap_or(fallback)
+    }
+
     fn add_ivc_channel_nodes(&mut self, devices: &[EmulatedDeviceConfig]) -> AxVmResult {
         for device in devices
             .iter()
@@ -234,6 +262,7 @@ impl FdtTree {
     }
 
     fn add_ivc_channel_node(&mut self, device: &EmulatedDeviceConfig) -> AxVmResult {
+        let reserved_phandle = self.add_ivc_reserved_memory_node(device)?;
         let node_id = self.ensure_path(&format!("/ivc-channel@{:x}", device.base_gpa))?;
         info!(
             "Adding guest IVC channel FDT node /ivc-channel@{:x}",
@@ -242,6 +271,7 @@ impl FdtTree {
         self.set_property(node_id, prop_string("compatible", "axvisor,ivc-channel"))?;
         self.set_property(node_id, prop_string("status", "okay"))?;
         self.set_property(node_id, prop_u32_list("axvisor,ivc-version", &[1]))?;
+        self.set_property(node_id, prop_u32_list("memory-region", &[reserved_phandle]))?;
 
         if let Some(notify_irq) = device
             .cfg_list
@@ -259,6 +289,41 @@ impl FdtTree {
                 Some(device.length as u64),
             )]);
         Ok(())
+    }
+
+    fn add_ivc_reserved_memory_node(&mut self, device: &EmulatedDeviceConfig) -> AxVmResult<u32> {
+        let reserved_id = self.ensure_path("/reserved-memory")?;
+        let address_cells = self.root_cells("#address-cells", 2);
+        let size_cells = self.root_cells("#size-cells", 2);
+        self.set_property(
+            reserved_id,
+            prop_u32_list("#address-cells", &[address_cells]),
+        )?;
+        self.set_property(reserved_id, prop_u32_list("#size-cells", &[size_cells]))?;
+        self.set_property(reserved_id, prop_empty("ranges"))?;
+
+        let node_path = format!("/reserved-memory/axivc-shm@{:x}", device.base_gpa);
+        let node_id = self.ensure_path(&node_path)?;
+        let phandle = self
+            .inner()
+            .node(node_id)
+            .and_then(|node| node.get_property("phandle"))
+            .and_then(|prop| prop.get_u32())
+            .unwrap_or_else(|| self.next_phandle());
+
+        info!("Adding guest IVC reserved-memory FDT node {node_path}");
+        self.set_property(node_id, prop_string("compatible", "shared-dma-pool"))?;
+        self.set_property(node_id, prop_u32_list("phandle", &[phandle]))?;
+        self.set_property(node_id, prop_empty("no-map"))?;
+        self.inner_mut()
+            .view_typed_mut(node_id)
+            .ok_or_else(|| ax_err_type!(InvalidData, "new IVC reserved-memory node is missing"))?
+            .set_regs(&[RegInfo::new(
+                device.base_gpa as u64,
+                Some(device.length as u64),
+            )]);
+
+        Ok(phandle)
     }
 }
 
@@ -444,6 +509,25 @@ mod tests {
             node.get_property("axvisor,notify-irq").unwrap().get_u32(),
             Some(60)
         );
+
+        let shm_id = reparsed
+            .get_by_path_id("/reserved-memory/axivc-shm@bff00000")
+            .unwrap();
+        let shm_node = reparsed.node(shm_id).unwrap();
+        let shm_typed_node = reparsed.view_typed(shm_id).unwrap();
+        let shm_phandle = shm_node.get_property("phandle").unwrap().get_u32();
+
+        assert_eq!(
+            shm_node.get_property("compatible").unwrap().as_str(),
+            Some("shared-dma-pool")
+        );
+        assert!(shm_node.get_property("no-map").is_some());
+        assert_eq!(shm_typed_node.regs()[0].address, 0xbff0_0000);
+        assert_eq!(shm_typed_node.regs()[0].size, Some(0x1_0000));
+        assert_eq!(
+            node.get_property("memory-region").unwrap().get_u32(),
+            shm_phandle
+        );
     }
 
     #[test]
@@ -494,5 +578,11 @@ mod tests {
             node.get_property("compatible").unwrap().as_str(),
             Some("axvisor,ivc-channel")
         );
+        assert!(
+            reparsed
+                .get_by_path_id("/reserved-memory/axivc-shm@bff00000")
+                .is_some()
+        );
+        assert!(node.get_property("memory-region").is_some());
     }
 }

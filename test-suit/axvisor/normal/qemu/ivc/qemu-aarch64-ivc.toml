@@ -21,8 +21,10 @@ fail_regex = [
     "(?i)unhandled page fault",
     "(?i)page fault",
     "ivc publish failed",
+    "zephyr ivc perf failed",
     "ivc perf test failed",
     "IVC perf checksum mismatch",
+    "IVC perf data mismatch",
     "(?m)^linux ivc demo failed\\s*$",
 ]
 # Concurrent console streams may prepend ANSI SGR resets to a completion line.

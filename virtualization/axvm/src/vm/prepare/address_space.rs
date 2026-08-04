@@ -4,6 +4,7 @@ use alloc::vec::Vec;
 
 use axdevice::DeviceRuntime;
 use axdevice_base::Resource;
+use axvmconfig::EmulatedDeviceType;
 
 use super::super::{AxVM, AxVMResources, VM_ASPACE_BASE, VM_ASPACE_SIZE};
 use crate::{
@@ -78,6 +79,17 @@ pub(crate) fn guest_owned_regions(resources: &AxVMResources) -> Vec<GuestOwnedRe
                 GuestOwnedRegion::new(range.base_gpa, range.length, VmRegionKind::Reserved)
             }),
     );
+    regions.extend(resources.config.emu_devices().iter().filter_map(|device| {
+        if device.emu_type == EmulatedDeviceType::IVCChannel && device.length > 0 {
+            Some(GuestOwnedRegion::new(
+                device.base_gpa,
+                device.length,
+                VmRegionKind::Reserved,
+            ))
+        } else {
+            None
+        }
+    }));
 
     regions
 }

@@ -16,7 +16,7 @@
 #include <zephyr/sys/util.h>
 
 #define AXIVC_CHANNEL_KEY 0x49564301ULL
-#define AXIVC_CHANNEL_SIZE 0x1000000ULL
+#define AXIVC_CHANNEL_SIZE 0x2000000ULL
 #define AXIVC_PUBLISHER_VM_ID 1ULL
 #define AXIVC_SUBSCRIBER_VM_ID 2ULL
 
@@ -36,6 +36,10 @@
 #define AXIVC_PERF_STATE_READY 1U
 #define AXIVC_PERF_STATE_DONE 2U
 #define AXIVC_PERF_STATE_COMPLETE 3U
+#define AXIVC_PERF_PAYLOAD_MAX (10U * 1024U * 1024U)
+#define AXIVC_PERF_DATA_OFFSET 0x10000U
+#define AXIVC_PERF_READ_MEM_OFFSET AXIVC_PERF_DATA_OFFSET
+#define AXIVC_PERF_WRITE_MEM_OFFSET (AXIVC_PERF_READ_MEM_OFFSET + AXIVC_PERF_PAYLOAD_MAX)
 
 #define HIVC_PUBLISH_CHANNEL 3U
 #define HIVC_NOTIFY 7U
@@ -76,8 +80,8 @@ struct axivc_perf_control {
 	uint32_t iteration;
 	uint32_t reserved0;
 	uint64_t bytes;
-	uint64_t checksum;
-	uint64_t write_ns;
+	uint64_t zephyr_copy_ns;
+	uint64_t reserved1;
 } __aligned(64);
 
 struct axivc_region {
@@ -138,7 +142,7 @@ static void *map_shared_region(uint64_t gpa, uint64_t size)
 	uint8_t *mapped = NULL;
 
 	k_mem_map_phys_bare(&mapped, (uintptr_t)gpa, (size_t)size,
-			    K_MEM_DIRECT_MAP | K_MEM_ARM_NORMAL_NC | K_MEM_PERM_RW);
+			    K_MEM_DIRECT_MAP | K_MEM_CACHE_WB | K_MEM_PERM_RW);
 	return mapped;
 }
 
@@ -195,25 +199,6 @@ static void notify_linux(void)
 		       AXIVC_SUBSCRIBER_VM_ID, 0, 0, 0);
 }
 
-static uint8_t prng_next(uint32_t *state)
-{
-	*state = (*state * 1664525U) + 1013904223U;
-	return (uint8_t)(*state >> 24);
-}
-
-static uint64_t fill_random(uint8_t *buf, size_t len, uint32_t seed)
-{
-	uint64_t checksum = 0;
-	uint32_t state = seed;
-
-	for (size_t i = 0; i < len; i++) {
-		uint8_t value = prng_next(&state);
-		buf[i] = value;
-		checksum += value;
-	}
-	return checksum;
-}
-
 static void wait_for_state(struct axivc_perf_control *perf, uint32_t state)
 {
 	while (__atomic_load_n(&perf->state, __ATOMIC_ACQUIRE) != state) {
@@ -227,8 +212,8 @@ int main(void)
 	uint64_t shm_size = AXIVC_CHANNEL_SIZE;
 	struct axivc_region *region;
 	struct axivc_perf_control *perf;
-	uint8_t *payload;
-	size_t payload_capacity;
+	uint8_t *read_mem;
+	uint8_t *write_mem;
 	uint64_t ret;
 
 	printk("zephyr ivc perf publisher start\n");
@@ -257,59 +242,67 @@ int main(void)
 	region_init(region);
 
 	perf = &region->perf;
-	payload = (uint8_t *)region + ROUND_UP(sizeof(struct axivc_region), 64);
-	payload_capacity = (uint8_t *)region + shm_size - payload;
+	read_mem = (uint8_t *)region + AXIVC_PERF_READ_MEM_OFFSET;
+	write_mem = (uint8_t *)region + AXIVC_PERF_WRITE_MEM_OFFSET;
 
-	printk("zephyr ivc perf shared base=0x%llx size=%llu payload=%zu\n",
+	if (AXIVC_PERF_WRITE_MEM_OFFSET + AXIVC_PERF_PAYLOAD_MAX > shm_size) {
+		printk("zephyr ivc perf failed: shared memory too small size=%llu\n",
+		       (unsigned long long)shm_size);
+		return 1;
+	}
+
+	printk("zephyr ivc perf shared base=0x%llx size=%llu read_mem=0x%x write_mem=0x%x\n",
 	       (unsigned long long)shm_base, (unsigned long long)shm_size,
-	       payload_capacity);
+	       AXIVC_PERF_READ_MEM_OFFSET, AXIVC_PERF_WRITE_MEM_OFFSET);
 
 	for (uint32_t test = 0; test < AXIVC_PERF_TEST_COUNT; test++) {
-		uint64_t total_ns = 0;
+		uint64_t copy_total_ns = 0;
 		size_t bytes = perf_sizes[test];
 
-		if (bytes > payload_capacity) {
-			printk("zephyr ivc perf failed size=%zu capacity=%zu\n",
-			       bytes, payload_capacity);
+		if (bytes > AXIVC_PERF_PAYLOAD_MAX) {
+			printk("zephyr ivc perf failed size=%zu max=%u\n", bytes,
+			       AXIVC_PERF_PAYLOAD_MAX);
 			return 1;
 		}
 
 		for (uint32_t iter = 0; iter < AXIVC_PERF_ITERATIONS; iter++) {
-			uint64_t checksum;
 			uint64_t start_ns;
 			uint64_t end_ns;
-			uint32_t seed = 0x49564300U ^ (test << 16) ^ iter;
+			uint64_t req_bytes;
+			uint32_t req_test;
+			uint32_t req_iter;
 
-			wait_for_state(perf, AXIVC_PERF_STATE_IDLE);
+			wait_for_state(perf, AXIVC_PERF_STATE_READY);
+			req_test = __atomic_load_n(&perf->test_index,
+						   __ATOMIC_ACQUIRE);
+			req_iter = __atomic_load_n(&perf->iteration,
+						   __ATOMIC_ACQUIRE);
+			req_bytes = __atomic_load_n(&perf->bytes, __ATOMIC_ACQUIRE);
+			if (req_test != test || req_iter != iter || req_bytes != bytes) {
+				printk("zephyr ivc perf failed descriptor test=%u iter=%u bytes=%llu\n",
+				       req_test, req_iter,
+				       (unsigned long long)req_bytes);
+				return 1;
+			}
+
 			start_ns = k_cycle_get_64() * 1000000000ULL /
 				   sys_clock_hw_cycles_per_sec();
-			checksum = fill_random(payload, bytes, seed);
+			memcpy(write_mem, read_mem, bytes);
 			end_ns = k_cycle_get_64() * 1000000000ULL /
 				 sys_clock_hw_cycles_per_sec();
-			total_ns += end_ns - start_ns;
-
-			__atomic_store_n(&perf->test_index, test,
+			copy_total_ns += end_ns - start_ns;
+			__atomic_store_n(&perf->zephyr_copy_ns, end_ns - start_ns,
 					 __ATOMIC_RELAXED);
-			__atomic_store_n(&perf->iteration, iter,
-					 __ATOMIC_RELAXED);
-			__atomic_store_n(&perf->bytes, bytes, __ATOMIC_RELAXED);
-			__atomic_store_n(&perf->checksum, checksum,
-					 __ATOMIC_RELAXED);
-			__atomic_store_n(&perf->write_ns, end_ns - start_ns,
-					 __ATOMIC_RELAXED);
-			__atomic_store_n(&perf->state, AXIVC_PERF_STATE_READY,
+			__atomic_store_n(&perf->state, AXIVC_PERF_STATE_DONE,
 					 __ATOMIC_RELEASE);
 			notify_linux();
-			wait_for_state(perf, AXIVC_PERF_STATE_DONE);
-			__atomic_store_n(&perf->state, AXIVC_PERF_STATE_IDLE,
-					 __ATOMIC_RELEASE);
 		}
 
-		printk("zephyr ivc write size=%zu iterations=%u avg=%llu B/s\n",
+		printk("zephyr ivc copy size=%zu iterations=%u avg=%llu B/s\n",
 		       bytes, AXIVC_PERF_ITERATIONS,
 		       (unsigned long long)((uint64_t)bytes *
 					    AXIVC_PERF_ITERATIONS *
-					    1000000000ULL / total_ns));
+					    1000000000ULL / copy_total_ns));
 	}
 
 	wait_for_state(perf, AXIVC_PERF_STATE_IDLE);

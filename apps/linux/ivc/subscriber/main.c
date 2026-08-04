@@ -11,7 +11,7 @@
 #include <unistd.h>
 
 #define AXIVC_PERF_SHM_BASE 0xbff00000UL
-#define AXIVC_PERF_SHM_SIZE 0x1000000UL
+#define AXIVC_PERF_SHM_SIZE 0x2000000UL
 #define AXIVC_PERF_MAGIC 0x49565046U
 #define AXIVC_PERF_VERSION 1U
 #define AXIVC_PERF_ITERATIONS 100U
@@ -20,6 +20,10 @@
 #define AXIVC_PERF_STATE_READY 1U
 #define AXIVC_PERF_STATE_DONE 2U
 #define AXIVC_PERF_STATE_COMPLETE 3U
+#define AXIVC_PERF_PAYLOAD_MAX (10U * 1024U * 1024U)
+#define AXIVC_PERF_DATA_OFFSET 0x10000U
+#define AXIVC_PERF_READ_MEM_OFFSET AXIVC_PERF_DATA_OFFSET
+#define AXIVC_PERF_WRITE_MEM_OFFSET (AXIVC_PERF_READ_MEM_OFFSET + AXIVC_PERF_PAYLOAD_MAX)
 
 struct axivc_region_header {
     uint32_t magic;
@@ -57,8 +61,8 @@ struct axivc_perf_control {
     uint32_t iteration;
     uint32_t reserved0;
     uint64_t bytes;
-    uint64_t checksum;
-    uint64_t write_ns;
+    uint64_t zephyr_copy_ns;
+    uint64_t reserved1;
 } __attribute__((aligned(64)));
 
 struct axivc_region {
@@ -86,20 +90,26 @@ static const char *perf_size_labels[AXIVC_PERF_TEST_COUNT] = {
 
 char message[1024];
 
+static uint8_t prng_next(uint32_t *state)
+{
+    *state = (*state * 1664525U) + 1013904223U;
+    return (uint8_t)(*state >> 24);
+}
+
+static void fill_random(uint8_t *buf, size_t len, uint32_t seed)
+{
+    uint32_t state = seed;
+
+    for (size_t i = 0; i < len; i++) {
+        buf[i] = prng_next(&state);
+    }
+}
+
 static uint64_t now_ns(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
-}
-
-static uint64_t checksum_payload(volatile uint8_t *payload, size_t bytes)
-{
-    uint64_t checksum = 0;
-    for (size_t i = 0; i < bytes; i++) {
-        checksum += payload[i];
-    }
-    return checksum;
 }
 
 static uint32_t load_state(struct axivc_perf_control *perf)
@@ -121,14 +131,16 @@ static double throughput_gbps(uint64_t bytes, uint64_t iterations, uint64_t ns)
 }
 
 static void print_perf_summary(const uint64_t read_ns[AXIVC_PERF_TEST_COUNT],
-                               const uint64_t write_ns[AXIVC_PERF_TEST_COUNT])
+                               const uint64_t write_ns[AXIVC_PERF_TEST_COUNT],
+                               const uint64_t zephyr_copy_ns[AXIVC_PERF_TEST_COUNT])
 {
     printf("ivc perf summary iterations=%u unit=Gbps\n", AXIVC_PERF_ITERATIONS);
     for (uint32_t test = 0; test < AXIVC_PERF_TEST_COUNT; test++) {
-        printf("ivc perf summary size=%s read=%.3f write=%.3f\n",
+        printf("ivc perf summary size=%s read=%.3f write=%.3f zephyr_copy=%.3f\n",
                perf_size_labels[test],
                throughput_gbps(perf_sizes[test], AXIVC_PERF_ITERATIONS, read_ns[test]),
-               throughput_gbps(perf_sizes[test], AXIVC_PERF_ITERATIONS, write_ns[test]));
+               throughput_gbps(perf_sizes[test], AXIVC_PERF_ITERATIONS, write_ns[test]),
+               throughput_gbps(perf_sizes[test], AXIVC_PERF_ITERATIONS, zephyr_copy_ns[test]));
     }
 }
 
@@ -155,9 +167,13 @@ static int run_perf_subscriber(uint64_t target_publisher_id, uint64_t channel_ke
     ivc_subscriber_p subscriber = NULL;
     struct axivc_region *region;
     struct axivc_perf_control *perf;
-    volatile uint8_t *payload;
+    uint8_t *read_mem;
+    uint8_t *write_mem;
+    uint8_t *source = NULL;
+    uint8_t *sink = NULL;
     uint64_t read_ns[AXIVC_PERF_TEST_COUNT] = {0};
     uint64_t write_ns[AXIVC_PERF_TEST_COUNT] = {0};
+    uint64_t zephyr_copy_ns[AXIVC_PERF_TEST_COUNT] = {0};
 
     manager = ivc_open_manager();
     if (!manager) {
@@ -186,68 +202,100 @@ static int run_perf_subscriber(uint64_t target_publisher_id, uint64_t channel_ke
         ret = 4;
         goto out_close_mem;
     }
+    printf("linux ivc mmap source=devmem\n");
 
     region = (struct axivc_region *)mapping;
     perf = &region->perf;
-    payload = (volatile uint8_t *)mapping + ((sizeof(struct axivc_region) + 63U) & ~63U);
+    read_mem = (uint8_t *)mapping + AXIVC_PERF_READ_MEM_OFFSET;
+    write_mem = (uint8_t *)mapping + AXIVC_PERF_WRITE_MEM_OFFSET;
 
-    if (wait_for_perf_magic(perf) < 0) {
+    if (AXIVC_PERF_WRITE_MEM_OFFSET + AXIVC_PERF_PAYLOAD_MAX > AXIVC_PERF_SHM_SIZE) {
+        fprintf(stderr, "IVC perf shared memory layout exceeds channel size\n");
         ret = 5;
         goto out_unmap;
     }
 
-    while (1) {
-        uint32_t state = load_state(perf);
-        if (state == AXIVC_PERF_STATE_COMPLETE) {
-            break;
-        }
-        if (state != AXIVC_PERF_STATE_READY) {
-            usleep(50);
-            continue;
+    source = malloc(AXIVC_PERF_PAYLOAD_MAX);
+    sink = malloc(AXIVC_PERF_PAYLOAD_MAX);
+    if (!source || !sink) {
+        fprintf(stderr, "Failed to allocate local IVC perf buffers\n");
+        ret = 6;
+        goto out_free_buffers;
+    }
+
+    if (wait_for_perf_magic(perf) < 0) {
+        ret = 7;
+        goto out_free_buffers;
+    }
+
+    for (uint32_t test = 0; test < AXIVC_PERF_TEST_COUNT && ret == 0; test++) {
+        size_t bytes = perf_sizes[test];
+
+        for (uint32_t iter = 0; iter < AXIVC_PERF_ITERATIONS; iter++) {
+            uint64_t start;
+            uint64_t end;
+
+            fill_random(source, bytes, 0x49564300U ^ (test << 16) ^ iter);
+
+            start = now_ns();
+            memcpy(read_mem, source, bytes);
+            end = now_ns();
+            write_ns[test] += end - start;
+
+            __atomic_store_n(&perf->test_index, test, __ATOMIC_RELAXED);
+            __atomic_store_n(&perf->iteration, iter, __ATOMIC_RELAXED);
+            __atomic_store_n(&perf->bytes, bytes, __ATOMIC_RELAXED);
+            store_state(perf, AXIVC_PERF_STATE_READY);
+
+            while (load_state(perf) != AXIVC_PERF_STATE_DONE) {
+                usleep(50);
+            }
+            zephyr_copy_ns[test] += __atomic_load_n(&perf->zephyr_copy_ns,
+                                                    __ATOMIC_ACQUIRE);
+
+            start = now_ns();
+            memcpy(sink, write_mem, bytes);
+            end = now_ns();
+            read_ns[test] += end - start;
+
+            if (memcmp(source, sink, bytes) != 0) {
+                fprintf(stderr,
+                        "IVC perf data mismatch test=%u iter=%u bytes=%zu\n",
+                        test, iter, bytes);
+                ret = 8;
+                break;
+            }
+
+            store_state(perf, AXIVC_PERF_STATE_IDLE);
         }
 
-        uint32_t test = __atomic_load_n(&perf->test_index, __ATOMIC_ACQUIRE);
-        uint32_t iter = __atomic_load_n(&perf->iteration, __ATOMIC_ACQUIRE);
-        uint64_t bytes = __atomic_load_n(&perf->bytes, __ATOMIC_ACQUIRE);
-        uint64_t expected = __atomic_load_n(&perf->checksum, __ATOMIC_ACQUIRE);
-        uint64_t write_iter_ns = __atomic_load_n(&perf->write_ns, __ATOMIC_ACQUIRE);
-        uint64_t start = now_ns();
-        uint64_t actual = checksum_payload(payload, bytes);
-        uint64_t end = now_ns();
-
-        if (test >= AXIVC_PERF_TEST_COUNT || bytes != perf_sizes[test] ||
-            iter >= AXIVC_PERF_ITERATIONS) {
-            fprintf(stderr, "Invalid IVC perf descriptor test=%u iter=%u bytes=%" PRIu64 "\n",
-                    test, iter, bytes);
-            ret = 6;
-            break;
-        }
-        if (actual != expected) {
-            fprintf(stderr,
-                    "IVC perf checksum mismatch test=%u iter=%u bytes=%" PRIu64
-                    " expected=%" PRIu64 " actual=%" PRIu64 "\n",
-                    test, iter, bytes, expected, actual);
-            ret = 7;
-            break;
-        }
-
-        read_ns[test] += end - start;
-        write_ns[test] += write_iter_ns;
-        if (iter + 1 == AXIVC_PERF_ITERATIONS) {
-            printf("linux ivc read size=%" PRIu64 " iterations=%u avg=%.3f Gbps\n",
+        if (ret == 0) {
+            printf("linux ivc write size=%zu iterations=%u avg=%.3f Gbps\n",
+                   bytes, AXIVC_PERF_ITERATIONS,
+                   throughput_gbps(bytes, AXIVC_PERF_ITERATIONS, write_ns[test]));
+            printf("linux ivc read size=%zu iterations=%u avg=%.3f Gbps\n",
                    bytes, AXIVC_PERF_ITERATIONS,
                    throughput_gbps(bytes, AXIVC_PERF_ITERATIONS, read_ns[test]));
         }
-        store_state(perf, AXIVC_PERF_STATE_DONE);
     }
 
     if (ret == 0) {
-        print_perf_summary(read_ns, write_ns);
+        while (load_state(perf) != AXIVC_PERF_STATE_COMPLETE) {
+            if (load_state(perf) == AXIVC_PERF_STATE_IDLE) {
+                usleep(50);
+            } else {
+                usleep(50);
+            }
+        }
+        print_perf_summary(read_ns, write_ns, zephyr_copy_ns);
         printf("ivc perf test pass\n");
     } else {
         printf("ivc perf test failed\n");
     }
 
+out_free_buffers:
+    free(sink);
+    free(source);
 out_unmap:
     if (mapping != MAP_FAILED) {
         munmap(mapping, AXIVC_PERF_SHM_SIZE);
