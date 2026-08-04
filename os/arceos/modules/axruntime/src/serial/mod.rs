@@ -351,6 +351,30 @@ impl SerialTxSender {
         self.shared.started().then_some(()).ok_or(AxError::BadState)
     }
 
+    /// Writes every text byte, sleeping when the bounded TX ring is full.
+    ///
+    /// This task-context operation expands line feeds to CRLF. Hard-IRQ,
+    /// logging, and panic paths must use their dedicated non-blocking
+    /// endpoints instead.
+    pub fn write_text_all(&self, bytes: &[u8]) -> AxResult<usize> {
+        let mut written = 0;
+        while written < bytes.len() {
+            if !self.shared.started() {
+                return Err(AxError::BadState);
+            }
+            let accepted = self
+                .shared
+                .ingress
+                .try_write_text(&bytes[written..], || self.shared.bridge.notify());
+            if accepted == 0 {
+                self.wait_writable()?;
+            } else {
+                written += accepted;
+            }
+        }
+        Ok(written)
+    }
+
     pub fn wait_idle(&self) -> AxResult {
         if !self.shared.started() {
             return Err(AxError::BadState);
@@ -397,6 +421,12 @@ fn notify_drained_space(count: usize, notify_space: impl FnOnce()) {
 
 pub fn runtimes() -> &'static [SerialRuntimeHandle] {
     SERIAL_RUNTIMES.get().map_or(&[], Box::as_ref)
+}
+
+/// Returns the task-context TX capability of the selected runtime console.
+pub fn active_console_tx() -> Option<SerialTxSender> {
+    let index = ACTIVE_CONSOLE.load(Ordering::Acquire);
+    runtimes().get(index).map(SerialRuntimeHandle::tx_sender)
 }
 
 pub(crate) fn init(primary_cpu: usize) {
@@ -594,7 +624,7 @@ pub(crate) fn route_console_bytes(bytes: &[u8]) -> Option<usize> {
     let accepted = runtime
         .shared
         .ingress
-        .try_write_log(bytes, || runtime.shared.bridge.notify());
+        .try_write_text(bytes, || runtime.shared.bridge.notify());
     runtime.shared.stats.add_log_dropped(bytes.len() - accepted);
     Some(accepted)
 }

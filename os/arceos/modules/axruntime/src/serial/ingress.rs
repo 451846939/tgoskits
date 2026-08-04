@@ -212,7 +212,7 @@ impl TxIngress {
         accepted
     }
 
-    pub(super) fn try_write_log(&self, bytes: &[u8], notify: impl FnOnce()) -> usize {
+    pub(super) fn try_write_text(&self, bytes: &[u8], notify: impl FnOnce()) -> usize {
         if bytes.is_empty() || !self.accepting.load(Ordering::Acquire) {
             return 0;
         }
@@ -386,10 +386,10 @@ mod tests {
     }
 
     #[test]
-    fn text_log_submission_expands_line_feeds_to_crlf() {
+    fn text_submission_expands_line_feeds_to_crlf() {
         let ingress = started_ingress();
 
-        assert_eq!(ingress.try_write_log(b"first\nsecond\n", || {}), 13);
+        assert_eq!(ingress.try_write_text(b"first\nsecond\n", || {}), 13);
 
         let mut output = Vec::new();
         while let Some(frame) = ingress.pop() {
@@ -404,7 +404,7 @@ mod tests {
         let mut input = Vec::from([b'x'; TX_FRAME_BYTES - 1]);
         input.push(b'\n');
 
-        assert_eq!(ingress.try_write_log(&input, || {}), input.len());
+        assert_eq!(ingress.try_write_text(&input, || {}), input.len());
         assert_eq!(ingress.pop().unwrap().bytes(), &[b'x'; TX_FRAME_BYTES - 1]);
         assert_eq!(ingress.pop().unwrap().bytes(), b"\r\n");
         assert!(ingress.pop().is_none());

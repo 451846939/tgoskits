@@ -31,8 +31,8 @@ mod stdio {
 
     pub fn ax_console_write_bytes(buf: &[u8]) -> crate::AxResult<usize> {
         #[cfg(feature = "serial")]
-        if let Some(result) = ax_runtime::serial::write_active_console_text(buf) {
-            return result;
+        if let Some(tx) = ax_runtime::serial::active_console_tx() {
+            return tx.write_text_all(buf);
         }
         ax_hal::console::write_text_bytes(buf);
         Ok(buf.len())
