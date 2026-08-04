@@ -1024,6 +1024,35 @@ p50 从 124.292 微秒变为 122.433 微秒，FIFO 同 CPU p50 从 132.665 微�
 引入明显回退，不能单独证明稳定加速；绝对延迟仍高于同宿主 Linux PREEMPT_RT，后续继续
 审计每次切换的 balance、clockevent 重编程和远程唤醒放大。
 
+### 2026-08-04 rq balance 触发与 move-only 迁移选择
+
+Linux v7.1 的 `__schedule()` 不把 SMP balance 作为每次 context switch 的固定尾部：普通
+切换只完成本 rq 的 pick/commit，周期 balance 由 scheduler tick 和调度类条件触发，idle
+进入时才执行 idle balance；`resched_curr()` 只发布本地 flag 或必要的远程 IPI。TGOSKits
+原 `finish_owner_selection()` 则无条件进入 `balance_after_schedule()`，即使没有 idle pull、
+RT/Deadline overload 或 Fair 周期期限也执行一遍通用 balance 分派。
+
+新模型先从 owner 已发布的 coherent rq summary 判断是否存在三类显式工作：idle pull、
+RT/Deadline push、Fair periodic balance。普通切换直接跳过 SMP balance；到期 Fair deadline
+仍由 task clockevent 唤醒 scheduler safe point，因此不依赖后续偶然 IRQ。确定性红测中，
+单 CPU 普通 owner selection 的 balance pass 从 1 降为 0。
+
+迁移选择改为 move-only `OwnerBalanceSelection`：同一 source-rq 扫描同时选定一个候选和
+它的最佳 destination，commit 只能消费该选择一次。旧 Fair 路径会为 3 个低负载目标各
+扫描一次 source rq，随后 transfer 再扫描一次；分步收敛的红测先固定了 2 次变 1 次，
+四 CPU 红测进一步固定 3 次变 1 次。RT/Deadline push 同样复用一次候选选择，不再按每个
+目标重复扫描。commit 在真正 detach 前重新核对 target online/scheduler-ready、affinity、
+sleep timer、Deadline root-domain coverage 和 placement；并发 affinity 更新的红测在旧
+路径错误迁移到已禁止 CPU，新路径返回 retry 且保留 source rq 所有权。
+
+同一 x86 Q35/TCG wakeup-latency 完整组再次通过。相对前一检查点，8 个场景的 p50 中
+5 个下降、3 个上升：OTHER 同 CPU/跨 CPU thread/跨 CPU process 分别为
+120.047/111.541/115.152 微秒，absolute timer 为 163.929 微秒；FIFO 同 CPU/跨 CPU
+thread/跨 CPU process 分别为 119.200/114.416/124.039 微秒，absolute timer 为
+160.585 微秒。guest clock-pair 最小成本同时从 26.205 上升到 27.326 微秒，且 FIFO
+仍出现约 50 毫秒离群点，因此这轮只判定无系统性回退；balance 改造的主要证据是上述
+确定性调用次数和竞态不变量，不把混合的单轮 TCG 分布声明为稳定性能提升。
+
 ## 模块化结果
 
 - `TaskSystem` orchestration 只负责编排，registry/reap、placement、owner scheduling、deadline、PI、balance、deferred work 分模块；

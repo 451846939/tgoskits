@@ -122,7 +122,6 @@ impl TaskSystem {
         &self,
         mut cpu: Pin<&mut CpuLocal>,
     ) -> Result<Option<ThreadId>, TaskError> {
-        let source = cpu.owner();
         let Some(source_summary) = cpu.try_load_summary() else {
             return Ok(None);
         };
@@ -134,45 +133,16 @@ impl TaskSystem {
         {
             return Ok(None);
         }
-        let target = self
-            .cpu_remotes
-            .iter()
-            .enumerate()
-            .filter(|(index, remote)| {
-                remote.accepts_placement() && CpuId::new(*index as u32) != source
-            })
-            .filter_map(|(index, remote)| {
-                let target = CpuId::new(index as u32);
-                let target_summary = remote.try_load_summary()?;
-                if target_summary.runnable_count() >= source_summary.runnable_count() {
-                    return None;
-                }
-                let candidate = self.select_owner_balance_candidate(
-                    cpu.as_ref().get_ref(),
-                    Some(target),
-                    0,
-                    BalanceReason::RtDeadlinePush,
-                )?;
-                let key = candidate.balance_key();
-                if target_summary
-                    .current_key()
-                    .is_some_and(|current| current <= key && current.class_rank() != 3)
-                {
-                    return None;
-                }
-                Some((key, target_summary.runnable_count(), target))
-            })
-            .min_by_key(|(key, load, target)| (*key, *load, target.as_u32()))
-            .map(|(_, _, target)| target);
-        let Some(target) = target else {
+        let now_ns = task_runtime::monotonic_ns();
+        let Some(selection) = self.select_rt_deadline_balance_transfer(
+            cpu.as_ref().get_ref(),
+            source_summary.runnable_count(),
+            now_ns,
+        ) else {
             return Ok(None);
         };
-        let outcome = self.transfer_owner_balance_candidate(
-            cpu.as_mut(),
-            target,
-            task_runtime::monotonic_ns(),
-            BalanceReason::RtDeadlinePush,
-        )?;
+        let target = selection.target();
+        let outcome = self.commit_owner_balance_transfer(cpu.as_mut(), selection)?;
         if outcome == BalanceTransferOutcome::Retry
             && let Some(target_remote) = self.cpu_remote(target)
         {

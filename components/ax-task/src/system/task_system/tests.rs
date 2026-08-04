@@ -1309,13 +1309,53 @@ fn successful_fair_balance_resets_the_minimum_interval() {
     system.enqueue(cpu0.as_mut(), movable.id(), 0).unwrap();
 
     crate::test_runtime::set_monotonic_ns(INTERVAL_NS);
+    balance::reset_balance_candidate_visits();
     assert_eq!(
         system.balance_fair(cpu0.as_mut(), INTERVAL_NS),
         Ok(Some(movable.id()))
     );
+    assert_eq!(
+        balance::balance_candidate_visits(),
+        1,
+        "a periodic balance transaction must select its source candidate only once"
+    );
     assert!(
         cpu0.fair_balance_due(INTERVAL_NS.saturating_mul(2)),
         "successful migration must restore the configured minimum interval"
+    );
+}
+
+#[test]
+fn fair_balance_selects_one_candidate_across_multiple_destinations() {
+    const INTERVAL_NS: u64 = 1_000;
+
+    let system =
+        TaskSystem::new(TaskSystemConfig::new(4).with_balance_interval_ns(INTERVAL_NS)).unwrap();
+    let mut cpus = (0..4)
+        .map(|index| system.create_cpu_local(CpuId::new(index)).unwrap())
+        .collect::<Vec<_>>();
+    for cpu in &mut cpus {
+        system
+            .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
+            .unwrap();
+        system.bring_cpu_online_at(cpu.as_mut(), 0).unwrap();
+    }
+    let movable = system
+        .create_thread(ThreadSpec::new(SchedulePolicy::default()))
+        .unwrap();
+    system.make_ready(movable.id()).unwrap();
+    system.enqueue(cpus[0].as_mut(), movable.id(), 0).unwrap();
+
+    crate::test_runtime::set_monotonic_ns(INTERVAL_NS);
+    balance::reset_balance_candidate_visits();
+    assert_eq!(
+        system.balance_fair(cpus[0].as_mut(), INTERVAL_NS),
+        Ok(Some(movable.id()))
+    );
+    assert_eq!(
+        balance::balance_candidate_visits(),
+        1,
+        "one source-rq candidate transaction must choose among every eligible destination"
     );
 }
 
@@ -3634,6 +3674,31 @@ fn one_owner_selection_publishes_one_load_summary() {
         balance::load_summary_publications(),
         1,
         "the already-published owner snapshot must serve the post-selection balance tail"
+    );
+}
+
+#[test]
+fn ordinary_owner_selection_does_not_enter_balance_without_pending_work() {
+    let system = TaskSystem::new(TaskSystemConfig::new(1)).unwrap();
+    let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
+    system.bring_cpu_online_at(cpu.as_mut(), 0).unwrap();
+    let thread = system
+        .create_thread(ThreadSpec::new(SchedulePolicy::default()))
+        .unwrap();
+    system.make_ready(thread.id()).unwrap();
+    system.enqueue(cpu.as_mut(), thread.id(), 0).unwrap();
+
+    balance::reset_owner_balance_passes();
+    assert_eq!(
+        system.schedule(cpu.as_mut(), 0).unwrap().next(),
+        thread.id()
+    );
+
+    assert_eq!(
+        balance::owner_balance_passes(),
+        0,
+        "a normal owner selection must not enter SMP balancing without idle-pull, RT/DL overload, \
+         or periodic Fair work"
     );
 }
 

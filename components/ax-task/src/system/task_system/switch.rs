@@ -46,9 +46,10 @@ impl TaskSystem {
         // before this tail. Reporting a recoverable error would let block or
         // yield callers attempt to resume an outgoing thread that is no longer
         // current, so runtime failures beyond this boundary are fatal.
-        if self
-            .balance_after_schedule(cpu.as_mut(), decision.next(), now_ns)
-            .is_err()
+        if self.owner_balance_work_pending(cpu.as_ref().get_ref(), decision.next(), now_ns)
+            && self
+                .service_owner_balance(cpu.as_mut(), decision.next(), now_ns)
+                .is_err()
         {
             task_runtime::fatal_invariant(0x5343_0001, decision.next().as_u64() as usize);
         }
