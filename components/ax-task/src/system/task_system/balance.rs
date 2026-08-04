@@ -80,6 +80,11 @@ fn fail_next_balance_transfer_publication_reservation() {
 }
 
 impl TaskSystem {
+    /// Returns the fixed CPU topology width accepted by affinity masks.
+    pub const fn cpu_topology_len(&self) -> usize {
+        self.config.cpu_count()
+    }
+
     /// Captures stable state for deterministic scheduler comparisons.
     pub fn snapshot(&self, cpu: Pin<&CpuLocal>) -> Result<CpuSnapshot, TaskError> {
         self.ensure_owner_cpu_context(&cpu)?;

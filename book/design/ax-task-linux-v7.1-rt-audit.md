@@ -1053,6 +1053,40 @@ thread/跨 CPU process 分别为 119.200/114.416/124.039 微秒，absolute timer
 仍出现约 50 毫秒离群点，因此这轮只判定无系统性回退；balance 改造的主要证据是上述
 确定性调用次数和竞态不变量，不把混合的单轮 TCG 分布声明为稳定性能提升。
 
+### 2026-08-04 当前线程 affinity 与 Fair 单实体快路径
+
+Linux v7.1 的 `yield_task_fair()` 在 `rq->nr_running == 1` 时可以直接返回，但 affinity
+更新并不依赖后续 yield 推进：`__set_cpus_allowed_ptr_locked()` 总是进入
+`affine_move_task()`；运行中任务由 `migration_cpu_stop` 强制离开旧 CPU，已排队任务则在
+rq 锁内直接迁移。`migration_pending`、`on_rq` 和目标 CPU 的重校验共同保证 Fair 的单实体
+快路径不会让任务永久留在 affinity 已排除的 CPU。
+
+TGOSKits 没有独立 stopper 线程，当前任务的同步 affinity 接口在持有 scheduler baton 时
+发布 `migration_target`，随后通过一次 owner schedule-out 完成迁移。因此 Fair 单实体快
+路径不能只判断本地 rq 为空；它还必须确认 placement 仍是本 CPU 的 `Running + on_cpu`、
+affinity 仍包含 owner，且没有待提交的 migration。该条件收敛为
+`ThreadPlacementState::can_continue_running_on()`，所有条件满足时才允许 self-dispatch；否则
+进入统一 schedule-out/switch-tail 事务，迁移切换记录为 `SwitchReason::Migrated`。
+
+确定性红测复现了 CI 的最小状态：两 CPU、当前 CPU 上只有一个 Fair 线程，把 affinity
+收窄到另一 CPU 后调用 `yield_current()`。旧实现返回 self-to-self `Yield`，新实现选择本地
+idle 并提交 `Migrated` handoff。对应 RISC-V 四 CPU QEMU `memtest` 已通过，包含 parallel
+allocation worker 逐 CPU pin、迁移和 cross-CPU free，正式结果为 `1/1 case(s) passed`。
+
+独立 `task-affinity` 压力项还暴露出第二个结构问题：`ax_set_current_affinity()` 先通过
+`thread_affinity()` 复制整个 mask，只为取得 topology width；核心更新随后又通过全局
+`TaskSystemState` registry 查回当前线程。八个 worker 并行 pin 时，GDB 观察到四个 vCPU
+同时排在同一 registry ticket lock 上，调度无关的全局身份表成为当前 rq placement 的串行
+瓶颈。Linux 的当前任务 affinity 事务由 task metadata 与 owner rq 串行，不经过全局 PID/
+task registry。
+
+新路径公开只读、固定的 `cpu_topology_len()`，上层不再查询当前线程 mask；
+`set_current_affinity()` 直接使用 scheduler baton 已经稳定持有的 `CpuLocal::current_core`，
+只锁 root-domain 和该线程的 scheduler state，并通过 CPU remote snapshot 选择目标。topology
+width 不使用 online count，避免 hotplug 后改变 affinity mask ABI。RISC-V 四 CPU
+`task-affinity` 从修复前超过 30 秒仍无结束标志，收敛为 guest 内 44 毫秒完成，runner 正式
+结果为 `1/1 case(s) passed`。
+
 ## 模块化结果
 
 - `TaskSystem` orchestration 只负责编排，registry/reap、placement、owner scheduling、deadline、PI、balance、deferred work 分模块；

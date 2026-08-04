@@ -404,12 +404,15 @@ impl TaskSystem {
     ) -> Result<bool, TaskError> {
         self.ensure_owner_cpu_context(&cpu)?;
         validate_affinity(&affinity, self.config.cpu_count())?;
-        let state = self.state.lock();
+        self.ensure_owner_cpu_online(&cpu)?;
         let root_domain = self.root_domain.lock();
-        state.ensure_cpu_online(&cpu)?;
         let current = cpu.current().ok_or(TaskError::NoRunnableThread)?;
-        let record = state.thread_record(current)?;
-        let mut sched = record.sched.lock();
+        let core = cpu
+            .current_core()
+            .filter(|core| core.id() == current)
+            .cloned()
+            .ok_or(TaskError::InvalidConfiguration)?;
+        let mut sched = core.sched().lock();
         if sched.placement.running_cpu() != Some(cpu.owner())
             || sched.placement.on_cpu() != Some(cpu.owner())
         {
@@ -420,12 +423,12 @@ impl TaskSystem {
         if is_deadline && !affinity.covers(&root_domain.online) {
             return Err(TaskError::DeadlineAffinity);
         }
-        let timer_cpu = record.core.sleep_timer_cpu();
+        let timer_cpu = core.sleep_timer_cpu();
         if timer_cpu.is_some_and(|timer_cpu| !affinity.contains(timer_cpu)) {
             return Err(TaskError::ActiveTimerAffinity);
         }
         let target = timer_cpu
-            .or_else(|| state.select_allowed_cpu(&affinity))
+            .or_else(|| self.select_allowed_active_cpu(&affinity, None))
             .ok_or(TaskError::InvalidConfiguration)?;
         let owner = cpu.owner();
         let must_migrate = !affinity.contains(owner);
@@ -439,14 +442,10 @@ impl TaskSystem {
         sched
             .placement
             .set_migration_target(must_migrate.then_some(target))?;
-        record
-            .core
-            .set_wake_cpu_hint(if must_migrate { target } else { owner });
-        let completed = Self::complete_affinity_if_satisfied_locked(&record.core, &sched);
-        let core = Arc::clone(&record.core);
+        core.set_wake_cpu_hint(if must_migrate { target } else { owner });
+        let completed = Self::complete_affinity_if_satisfied_locked(&core, &sched);
         drop(sched);
         drop(root_domain);
-        drop(state);
         if completed {
             core.notify_affinity_waiters();
         }

@@ -3406,6 +3406,15 @@ fn owner_current_affinity_change_does_not_publish_a_self_request() {
         Some(CpuId::new(0)),
         "a post-publication scheduler fence must rendezvous with the physical owner"
     );
+
+    let decision = system.yield_current(cpu0.as_mut(), 1).unwrap();
+    assert_eq!(decision.previous(), Some(running.id()));
+    assert_ne!(
+        decision.next(),
+        running.id(),
+        "the only runnable Fair owner must not self-dispatch after its affinity excludes this CPU"
+    );
+    assert_eq!(decision.switch_reason(), SwitchReason::Migrated);
 }
 
 #[test]

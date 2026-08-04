@@ -433,9 +433,11 @@ impl TaskSystem {
         let previous = cpu.current();
         let previous_core = cpu.current_core().cloned();
         if let Some(core) = previous_core.as_ref() {
+            let owner = cpu.owner();
             let continuing_dispatch = {
                 let sched = core.sched().lock();
                 (matches!(sched.policy.effective_entity, SchedulingEntity::Fair(_))
+                    && sched.placement.can_continue_running_on(owner)
                     && cpu.lock_run_queue().len() == 0)
                     .then(|| Self::owner_dispatch(core, &sched, now_ns))
                     .transpose()?
@@ -498,8 +500,12 @@ impl TaskSystem {
             next_core.id(),
             migration_target,
         )?;
-        let decision =
-            Self::owner_switch_plan(previous_core.as_ref(), &next_core, SwitchReason::Yield);
+        let reason = if migration_target.is_some() {
+            SwitchReason::Migrated
+        } else {
+            SwitchReason::Yield
+        };
+        let decision = Self::owner_switch_plan(previous_core.as_ref(), &next_core, reason);
         Ok(self.finish_owner_selection(cpu, decision, now_ns))
     }
 }

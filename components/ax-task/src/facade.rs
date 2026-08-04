@@ -213,6 +213,11 @@ pub fn cpu_busy_runtime_ns(cpu: CpuId) -> Result<u64, TaskError> {
     runtime_task_system()?.cpu_busy_runtime_ns(cpu)
 }
 
+/// Returns the fixed topology width accepted by scheduler affinity masks.
+pub fn cpu_topology_len() -> Result<usize, TaskError> {
+    Ok(runtime_task_system()?.cpu_topology_len())
+}
+
 /// Updates a thread scheduling policy through its owner CPU.
 ///
 /// # Errors

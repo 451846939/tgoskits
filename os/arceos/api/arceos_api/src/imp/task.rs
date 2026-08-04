@@ -122,15 +122,10 @@ cfg_task! {
 
     #[track_caller]
     pub fn ax_set_current_affinity(cpumask: AxCpuMask) -> crate::AxResult {
-        let thread = task_result(
-            ax_runtime::task::current_thread_id(),
-            "read current task identity",
-        )?;
         let topology_len = task_result(
-            ax_runtime::task::thread_affinity(thread),
-            "read task affinity topology",
-        )?
-        .topology_len();
+            ax_runtime::task::cpu_topology_len(),
+            "read task CPU topology",
+        )?;
         let affinity = cpu_set_from_mask(cpumask, topology_len)?;
         task_result(
             ax_runtime::task::set_current_thread_affinity(affinity),

@@ -37,6 +37,15 @@ impl ThreadPlacementState {
         self.physical.migration_target()
     }
 
+    /// Returns whether the current physical owner may keep executing without
+    /// first committing a placement transition.
+    pub(in crate::system) fn can_continue_running_on(&self, cpu: CpuId) -> bool {
+        self.physical.running_cpu() == Some(cpu)
+            && self.on_cpu == Some(cpu)
+            && self.physical.migration_target().is_none()
+            && self.affinity.contains(cpu)
+    }
+
     pub(in crate::system) fn assigned_cpu(&self) -> Option<CpuId> {
         self.physical
             .running_cpu()
