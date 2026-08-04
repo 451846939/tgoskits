@@ -798,11 +798,13 @@ mod tests {
         system.complete_context_switch(cpu.as_mut()).unwrap();
 
         let _runtime_handles = InstalledTaskHandles::new(system.as_ref(), cpu.as_mut());
+        test_runtime::reset_scheduler_frame_state();
         test_runtime::configure_irq_exit_schedule_reentry(1);
         assert!(matches!(
             schedule_current_cpu().unwrap(),
             SchedulerOutcome::Quiescent
         ));
+        test_runtime::configure_irq_exit_schedule_reentry(0);
 
         assert_eq!(
             REENTRANT_EXIT_CALLBACKS.load(Ordering::Acquire),
@@ -816,6 +818,11 @@ mod tests {
             REENTRANT_EXIT_CALLBACKS_IN_IRQ_EXIT.load(Ordering::Acquire),
             0,
             "nested scheduler completion must not recursively run task work on the active stack"
+        );
+        assert_eq!(
+            test_runtime::scheduler_frame_state().1,
+            1,
+            "IRQ guard exit under preemption exclusion must not create a nested scheduler frame"
         );
     }
 
@@ -1297,6 +1304,98 @@ mod tests {
         );
         drop(current);
         assert_eq!(test_runtime::active_irq_guards(), 0);
+    }
+
+    #[test]
+    fn beginning_a_park_uses_one_owner_transaction() {
+        let system = Box::pin(TaskSystem::new(crate::TaskSystemConfig::new(1)).unwrap());
+        let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
+        system
+            .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
+            .unwrap();
+        system.bring_cpu_online(cpu.as_mut()).unwrap();
+        let _runtime_handles = InstalledTaskHandles::new(system.as_ref(), cpu.as_mut());
+        test_runtime::reset_cpu_handle_reads();
+
+        let CurrentParkStart::Prepared(park) = begin_current_park().unwrap() else {
+            panic!("a fresh current thread must prepare its first park")
+        };
+
+        let owner_claims = test_runtime::cpu_owner_claims();
+        park.cancel().unwrap();
+        assert_eq!(
+            owner_claims,
+            1,
+            "current identity capture and Parking publication must share one owner transaction"
+        );
+    }
+
+    #[test]
+    fn park_deadline_arm_uses_one_owner_transaction() {
+        let system = Box::pin(TaskSystem::new(crate::TaskSystemConfig::new(1)).unwrap());
+        let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
+        system
+            .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
+            .unwrap();
+        system.bring_cpu_online(cpu.as_mut()).unwrap();
+        let _runtime_handles = InstalledTaskHandles::new(system.as_ref(), cpu.as_mut());
+        let CurrentParkStart::Prepared(mut park) = begin_current_park().unwrap() else {
+            panic!("a fresh current thread must prepare its first park")
+        };
+        test_runtime::reset_cpu_handle_reads();
+
+        park.arm_deadline(10).unwrap();
+
+        let owner_claims = test_runtime::cpu_owner_claims();
+        park.cancel().unwrap();
+        assert_eq!(
+            owner_claims,
+            1,
+            "deadline owner validation and heap insertion must share one owner transaction"
+        );
+    }
+
+    #[test]
+    fn pi_wait_preparation_uses_one_owner_transaction() {
+        use super::pi::{PiParkAttempt, prepare_pi_park_attempt};
+        use crate::{PiMutexAcquire, PiMutexCore};
+
+        let system = Box::pin(TaskSystem::new(crate::TaskSystemConfig::new(1)).unwrap());
+        let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
+        let running = system
+            .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
+            .unwrap();
+        let owner = system
+            .create_thread(ThreadSpec::new(SchedulePolicy::default()))
+            .unwrap();
+        system.bring_cpu_online(cpu.as_mut()).unwrap();
+        let _runtime_handles = InstalledTaskHandles::new(system.as_ref(), cpu.as_mut());
+        let lock = PiMutexCore::new();
+        assert_eq!(
+            lock.try_acquire(owner.id()).unwrap(),
+            PiMutexAcquire::Acquired
+        );
+        let PiMutexLockResult::Waiting(token) = system
+            .pi_mutex_lock_slow(lock.mutex_ref().unwrap(), running.id(), running.id().as_u64())
+            .unwrap()
+        else {
+            panic!("the current thread must enter the PI wait slow path")
+        };
+        test_runtime::reset_cpu_handle_reads();
+
+        let PiParkAttempt::Prepared(mut ticket) = prepare_pi_park_attempt(&system, &token).unwrap()
+        else {
+            panic!("an unselected PI waiter must prepare one park transaction")
+        };
+
+        let owner_claims = test_runtime::cpu_owner_claims();
+        cancel_current_park(&mut ticket).unwrap();
+        system.pi_wait_cancel(token).unwrap();
+        assert_eq!(
+            owner_claims,
+            1,
+            "PI current validation, policy drain, and park publication must share one owner transaction"
+        );
     }
 
     #[test]

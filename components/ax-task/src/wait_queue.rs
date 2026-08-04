@@ -7,11 +7,8 @@ use core::{
 };
 
 use crate::{
-    ParkPrepare, TaskError, ThreadHandle, ThreadId, ThreadWakeHandle,
-    facade::{
-        acquire_blocking_permit, arm_current_park_deadline, cancel_current_park,
-        cancel_current_park_deadline, commit_current_park, prepare_current_park,
-    },
+    CurrentParkStart, TaskError, ThreadId, ThreadWakeHandle,
+    facade::{acquire_blocking_permit, begin_current_park_with_permit},
     lock::PreemptTicketLock,
     runtime::task_runtime,
 };
@@ -194,7 +191,8 @@ impl WaitQueue {
         deadline_ns: Option<u64>,
         condition: Option<&dyn Fn() -> bool>,
     ) -> Result<WaitOutcome, TaskError> {
-        let thread = crate::current_thread_handle()?;
+        // Validate sleepability before taking the queue's non-sleeping
+        // publication lock. This permit cannot escape the park attempt.
         let permit = acquire_blocking_permit()?;
         let observed_generation = if let Some(condition) = condition {
             let generation = self.notification_generation.load(Ordering::Acquire);
@@ -205,50 +203,35 @@ impl WaitQueue {
         } else {
             None
         };
-        let mut ticket = {
+        let park = {
             let mut waiters = self.waiters.lock();
             if observed_generation.is_some_and(|generation| {
                 self.notification_generation.load(Ordering::Acquire) != generation
             }) {
                 return Ok(WaitOutcome::OtherWake);
             }
-            waiters.push_back(Waiter::new(&thread));
-            let mut ticket = match prepare_current_park(&permit) {
-                Err(error) => {
-                    remove_waiter(&mut waiters, thread.id());
-                    return Err(error);
-                }
-                Ok(ParkPrepare::Notified) => {
-                    remove_waiter(&mut waiters, thread.id());
-                    return Ok(WaitOutcome::OtherWake);
-                }
-                Ok(ParkPrepare::Prepared(park)) => park,
+            let mut park = match begin_current_park_with_permit(&permit)? {
+                CurrentParkStart::Notified => return Ok(WaitOutcome::OtherWake),
+                CurrentParkStart::Prepared(park) => park,
             };
+            let thread = park.thread_id();
+            waiters.push_back(Waiter::new(thread, park.wake_handle()));
             if let Some(deadline_ns) = deadline_ns
-                && let Err(error) = arm_current_park_deadline(&thread, &mut ticket, deadline_ns)
+                && let Err(error) = park.arm_deadline(deadline_ns)
             {
-                remove_waiter(&mut waiters, thread.id());
-                cancel_current_park(&mut ticket)?;
+                remove_waiter(&mut waiters, thread);
+                park.cancel()?;
                 return Err(error);
             }
-            ticket
+            park
         };
+        let thread = park.thread_id();
 
-        if let Err(error) = commit_current_park(&mut ticket) {
-            let deadline_result = cancel_current_park_deadline(&thread, &mut ticket);
-            remove_waiter(&mut self.waiters.lock(), thread.id());
-            if cancel_current_park(&mut ticket).is_err() {
-                // A fallible blocking API may return only after restoring the
-                // caller to Running. Failure here means commit crossed its
-                // mutation boundary before reporting an error.
-                task_runtime::fatal_invariant(0x5041_0001, thread.id().as_u64() as usize);
-            }
-            let _cancelled = deadline_result?;
+        if let Err(error) = park.commit() {
+            remove_waiter(&mut self.waiters.lock(), thread);
             return Err(error);
         }
-        let deadline_result = cancel_current_park_deadline(&thread, &mut ticket);
-        let removed = remove_waiter(&mut self.waiters.lock(), thread.id());
-        let _cancelled = deadline_result?;
+        let removed = remove_waiter(&mut self.waiters.lock(), thread);
         Ok(if removed {
             WaitOutcome::OtherWake
         } else {
@@ -283,11 +266,8 @@ struct Waiter {
 }
 
 impl Waiter {
-    fn new(thread: &ThreadHandle) -> Self {
-        Self {
-            thread: thread.id(),
-            wake: thread.wake_handle(),
-        }
+    fn new(thread: ThreadId, wake: ThreadWakeHandle) -> Self {
+        Self { thread, wake }
     }
 }
 
@@ -326,8 +306,59 @@ fn sleep_until_ns(deadline_ns: u64) {
 
 #[cfg(test)]
 mod tests {
+    use alloc::boxed::Box;
+
     use super::*;
-    use crate::{SchedulePolicy, TaskSystem, TaskSystemConfig, ThreadSpec};
+    use crate::{CpuId, SchedulePolicy, TaskSystem, TaskSystemConfig, ThreadSpec, WakeResult};
+
+    struct InstalledTaskHandles;
+
+    impl InstalledTaskHandles {
+        fn new(
+            system: core::pin::Pin<&TaskSystem>,
+            cpu: core::pin::Pin<&mut crate::CpuLocal>,
+        ) -> Self {
+            crate::test_runtime::install_task_handles(
+                (system.get_ref() as *const TaskSystem).expose_provenance(),
+                // SAFETY: the fixture publishes this pointer only while the
+                // pinned CPU object and owning task system remain alive.
+                (unsafe { core::pin::Pin::get_unchecked_mut(cpu) } as *mut crate::CpuLocal)
+                    .expose_provenance(),
+            );
+            Self
+        }
+    }
+
+    impl Drop for InstalledTaskHandles {
+        fn drop(&mut self) {
+            crate::test_runtime::clear_task_handles();
+        }
+    }
+
+    #[test]
+    fn waiter_publication_uses_one_scheduler_owner_transaction() {
+        let system = Box::pin(TaskSystem::new(TaskSystemConfig::new(1)).unwrap());
+        let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
+        let running = system
+            .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
+            .unwrap();
+        system.bring_cpu_online(cpu.as_mut()).unwrap();
+        let _runtime_handles = InstalledTaskHandles::new(system.as_ref(), cpu.as_mut());
+        assert_eq!(running.wake_handle().wake_from_task(), WakeResult::Notified);
+        crate::test_runtime::reset_cpu_handle_reads();
+
+        assert_eq!(
+            WaitQueue::new().wait_once(None).unwrap(),
+            WaitOutcome::OtherWake
+        );
+
+        assert_eq!(
+            crate::test_runtime::cpu_owner_claims(),
+            1,
+            "current identity capture and waiter park publication must be one scheduler \
+             transaction"
+        );
+    }
 
     #[test]
     fn elapsed_conditional_deadline_checks_predicate_outside_the_waiter_lock() {
@@ -358,7 +389,10 @@ mod tests {
             .create_thread(ThreadSpec::new(SchedulePolicy::default()))
             .unwrap();
         let queue = WaitQueue::new();
-        queue.waiters.lock().push_back(Waiter::new(&thread));
+        queue
+            .waiters
+            .lock()
+            .push_back(Waiter::new(thread.id(), thread.wake_handle()));
 
         assert!(queue.notify_one());
         assert!(!remove_waiter(&mut queue.waiters.lock(), thread.id()));
@@ -371,7 +405,10 @@ mod tests {
             .create_thread(ThreadSpec::new(SchedulePolicy::default()))
             .unwrap();
         let queue = WaitQueue::new();
-        queue.waiters.lock().push_back(Waiter::new(&thread));
+        queue
+            .waiters
+            .lock()
+            .push_back(Waiter::new(thread.id(), thread.wake_handle()));
 
         assert!(remove_waiter(&mut queue.waiters.lock(), thread.id()));
         assert!(!queue.notify_one());

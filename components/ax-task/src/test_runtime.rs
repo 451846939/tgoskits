@@ -202,6 +202,7 @@ impl TaskRuntime for UnitTestRuntime {
             tokens.swap_remove(index);
         });
         let may_reenter = ACTIVE_IRQ_TOKENS.with(|tokens| tokens.borrow().is_empty())
+            && ACTIVE_PREEMPT_TOKENS.with(|tokens| tokens.borrow().is_empty())
             && SCHEDULER_FRAME_DEPTH.with(|depth| depth.get() == 0)
             && !IRQ_EXIT_SCHEDULE_ACTIVE.with(Cell::get)
             && IRQ_EXIT_SCHEDULE_REMAINING.with(|remaining| {
@@ -305,10 +306,12 @@ impl TaskRuntime for UnitTestRuntime {
     }
     fn validate_schedule_context(_origin: RuntimeScheduleOrigin) -> RuntimeStatus {
         let irq_clear = ACTIVE_IRQ_TOKENS.with(|tokens| tokens.borrow().is_empty());
+        let preempt_clear = ACTIVE_PREEMPT_TOKENS.with(|tokens| tokens.borrow().is_empty());
         let scheduler_clear = SCHEDULER_FRAME_DEPTH.with(|depth| depth.get() == 0);
         if SCHEDULE_CONTEXT_SAFE.with(Cell::get)
             && !IN_HARD_IRQ.with(Cell::get)
             && irq_clear
+            && preempt_clear
             && scheduler_clear
         {
             RuntimeStatus::Success

@@ -1,5 +1,11 @@
 use super::*;
 
+pub(super) enum PiParkAttempt {
+    Complete,
+    Retry,
+    Prepared(crate::ParkTicket),
+}
+
 /// Enters the scheduler-owned PI mutex slow path.
 pub fn pi_mutex_lock_slow<'lock>(
     lock: PiMutexRef<'lock>,
@@ -15,25 +21,11 @@ pub fn pi_block_current(token: &PiWaitToken<'_>) -> Result<(), TaskError> {
         return Ok(());
     }
     let system = runtime_task_system()?;
-    if runtime_current_cpu()?.current() != Some(token.thread_id()) {
-        return Err(TaskError::InvalidPiState);
-    }
     loop {
-        {
-            let mut irq = RuntimeIrqGuard::enter();
-            let now_ns = task_runtime::monotonic_ns();
-            let mut cpu = runtime_current_cpu_mut(&mut irq)?;
-            system.drain_policy_updates(cpu.as_mut(), now_ns)?;
-        }
-        if token.is_selected() || token.is_granted() {
-            return Ok(());
-        }
-        let mut ticket = {
-            let permit = acquire_blocking_permit()?;
-            match prepare_current_park(&permit)? {
-                ParkPrepare::Notified => continue,
-                ParkPrepare::Prepared(ticket) => ticket,
-            }
+        let mut ticket = match prepare_pi_park_attempt(system, token)? {
+            PiParkAttempt::Complete => return Ok(()),
+            PiParkAttempt::Retry => continue,
+            PiParkAttempt::Prepared(ticket) => ticket,
         };
         if token.is_selected() || token.is_granted() {
             cancel_current_park(&mut ticket)?;
@@ -43,6 +35,27 @@ pub fn pi_block_current(token: &PiWaitToken<'_>) -> Result<(), TaskError> {
         if token.is_selected() || token.is_granted() {
             return Ok(());
         }
+    }
+}
+
+pub(super) fn prepare_pi_park_attempt(
+    system: &TaskSystem,
+    token: &PiWaitToken<'_>,
+) -> Result<PiParkAttempt, TaskError> {
+    let _permit = acquire_blocking_permit()?;
+    let mut irq = RuntimeIrqGuard::enter();
+    let now_ns = task_runtime::monotonic_ns();
+    let mut cpu = runtime_current_cpu_mut(&mut irq)?;
+    if cpu.current() != Some(token.thread_id()) {
+        return Err(TaskError::InvalidPiState);
+    }
+    system.drain_policy_updates(cpu.as_mut(), now_ns)?;
+    if token.is_selected() || token.is_granted() {
+        return Ok(PiParkAttempt::Complete);
+    }
+    match system.prepare_park(cpu.as_mut())? {
+        ParkPrepare::Notified => Ok(PiParkAttempt::Retry),
+        ParkPrepare::Prepared(ticket) => Ok(PiParkAttempt::Prepared(ticket)),
     }
 }
 

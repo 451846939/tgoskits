@@ -30,9 +30,10 @@ pub use deadline::{
     begin_current_park, on_clock_event, on_clock_event_with_scheduler_tick,
     take_current_expired_task_deadlines,
 };
+#[cfg(test)]
+use deadline::{arm_current_park_deadline, cancel_current_park_deadline, prepare_current_park};
 pub(crate) use deadline::{
-    arm_current_park_deadline, cancel_current_park, cancel_current_park_deadline,
-    commit_current_park, prepare_current_park,
+    begin_current_park_with_permit, cancel_current_park, commit_current_park,
 };
 pub use pi::{
     pi_block_current, pi_mutex_claim, pi_mutex_lock_slow, pi_mutex_release, pi_wait_cancel, pi_wake,

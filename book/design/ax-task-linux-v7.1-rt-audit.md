@@ -1198,6 +1198,51 @@ notification handoff callback 也观察到 waiter lock 被占用；前者作为�
 x86_64 四 CPU QEMU
 `task-wait-queue-remote-wake` 正式通过，guest 13 毫秒，runner `1/1 case(s) passed`。
 
+### 2026-08-04 Park、deadline 与 PI 单 owner 事务
+
+Linux v7.1 的 `__schedule()`、`try_to_wake_up()` 和 rtmutex 慢路径都以当前 task 状态与
+目标 rq/PI 元数据的单次受控事务为边界。调用方不会先复制一份 current task，再释放保护，
+随后为同一次入睡准备反复取得当前 rq。旧 facade 却把 current identity、`Parking`
+publication、deadline owner 校验和 PI policy drain 分成多个 `runtime_current_cpu()` 调用；
+每次调用都会重新关闭 IRQ、读取 CPU-local handles 并 claim `CpuLocal` owner gate。
+
+新的 `begin_current_park()` 在一次 IRQ-off owner borrow 内同时复制 generation-bearing
+`ThreadHandle` 并执行 `prepare_park()`。`PreparedCurrentPark` 对上层只额外暴露受限的
+`ThreadWakeHandle`；`WaitQueue` 在自己的 waiter lock 内取得该 move-only transaction，
+发布 wake capability 后在锁外 commit，不再先保存完整 scheduler handle 再走旧的
+`prepare_current_park()` 旁路。sleepability 必须在取得 waiter 的非睡眠 preempt lock 前
+验证；不可逃逸的 blocking permit 只授权紧随其后的这次 park publication。测试 runtime
+现在与 production 一样检查普通 preempt depth，避免 host 测试把生产 runtime 会拒绝的
+锁内验证误判为安全。deadline arm/cancel 同样在一个 owner borrow 内完成 current 校验、
+CPU ownership 校验、heap mutation 与下一物理 deadline 计算。
+
+PI 慢路径把 current waiter 校验、owner policy update drain 和 `Parking` publication 合并为
+一次 owner transaction；token 已经 selected/granted 时仍在释放 owner gate 后返回，实际
+block/wake 继续位于 PI metadata 和 rq 锁之外。旧测试专用 park helper 不再进入 production
+接口，不保留双轨兼容用法。
+
+最低层计数红测直接统计 `CpuLocal` owner claim：
+
+| 路径 | 修复前 | 修复后 |
+| --- | ---: | ---: |
+| `begin_current_park()` identity + Parking publication | 2 | 1 |
+| WaitQueue waiter publication | 2 | 1 |
+| park deadline owner validation + arm | 2 | 1 |
+| PI current validation + policy drain + park publication | 3 | 1 |
+
+这些测试约束的是所有调用者共享的事务边界，不以某次 TCG 延迟波动替代正确性证据。端到端
+性能使用同一 Q35/TCG wakeup-latency workload 复测。第一次运行的 guest clock-pair 最小
+成本从基线 26.753 微秒上升到 35.131 微秒，8 项原始 p50 有升有降，不能归因给代码；立即
+复跑时 clock-pair 为 25.437 微秒，QEMU 时间从基线 78.23 秒降到 76.75 秒，8 项 p50 全部
+下降：OTHER 同 CPU、跨 CPU thread、跨 CPU process、timer 分别下降 4.2%、2.5%、3.4%、
+6.0%，FIFO 对应四项分别下降 4.5%、7.0%、4.4%、5.8%。其中 same-CPU OTHER 从
+123.143 降到 117.913 微秒，OTHER timer 从 227.770 降到 214.212 微秒。
+
+两次都打印正式 `WAKEUP_LATENCY_PASSED`，第二次同基线的 clock-pair 更可比；但单宿主 TCG
+复跑只能证明当前检查点没有性能回退并与 owner-claim 降低方向一致。绝对延迟仍为 Linux
+PREEMPT_RT 的数倍，后续必须继续审计 current handle、switch tail 和 clockevent 固定成本，
+不得把这组相对改善描述为已经达到 Linux RT 水平。
+
 ## 模块化结果
 
 - `TaskSystem` orchestration 只负责编排，registry/reap、placement、owner scheduling、deadline、PI、balance、deferred work 分模块；
