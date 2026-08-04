@@ -146,8 +146,8 @@ fn load_summary_publishes_effective_current_and_top_pushable_keys() {
         owner.id()
     );
     let before = cpu0.try_load_summary().unwrap().epoch();
-    let lock = PiLockIdentity::new().id().unwrap();
-    let _wait = support::commit_pi_wait(&system, lock, donor.id(), owner.id()).unwrap();
+    let lock = PiLockIdentity::new();
+    let wait = support::commit_pi_wait(&system, &lock, donor.id(), owner.id()).unwrap();
     system.drain_policy_updates(cpu0.as_mut(), 1).unwrap();
     system.enqueue(cpu0.as_mut(), pushable.id(), 1).unwrap();
 
@@ -159,6 +159,7 @@ fn load_summary_publishes_effective_current_and_top_pushable_keys() {
     assert_eq!(summary.pushable_class(), Some(SchedulingClass::Realtime));
     assert_eq!(summary.pushable_key().unwrap().primary(), 19);
     assert!(summary.is_overloaded());
+    system.pi_wait_cancel(wait).unwrap();
 }
 
 #[test]

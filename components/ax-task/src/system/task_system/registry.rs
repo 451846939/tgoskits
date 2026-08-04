@@ -85,14 +85,6 @@ impl PiRecomputeProof {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(super) struct PiWaiterCursor {
-    owner: ThreadId,
-    previous: Option<ThreadId>,
-    next: Option<ThreadId>,
-    remaining: usize,
-}
-
 impl TaskSystemState {
     pub(super) fn claim_pending_deadline_overrun(
         &mut self,
@@ -195,40 +187,6 @@ impl TaskSystemState {
             return Err(TaskError::StaleThreadId);
         }
         slot.record.as_mut().ok_or(TaskError::StaleThreadId)
-    }
-
-    pub(super) fn pi_waiter_cursor(&self, owner: ThreadId) -> Result<PiWaiterCursor, TaskError> {
-        Ok(PiWaiterCursor {
-            owner,
-            previous: None,
-            next: self.thread_record(owner)?.pi_waiter_head,
-            remaining: self.slots.len(),
-        })
-    }
-
-    pub(super) fn next_pi_waiter(
-        &self,
-        cursor: &mut PiWaiterCursor,
-    ) -> Result<Option<(ThreadId, PiWaitRegistration)>, TaskError> {
-        let Some(waiter) = cursor.next else {
-            return Ok(None);
-        };
-        if cursor.remaining == 0 {
-            return Err(TaskError::PiCycle);
-        }
-        #[cfg(test)]
-        PI_DONOR_RECORD_VISITS.set(PI_DONOR_RECORD_VISITS.get().saturating_add(1));
-        let registration = self
-            .thread_record(waiter)?
-            .blocked_on
-            .ok_or(TaskError::InvalidPiState)?;
-        if registration.owner != Some(cursor.owner) || registration.owner_prev != cursor.previous {
-            return Err(TaskError::InvalidPiState);
-        }
-        cursor.previous = Some(waiter);
-        cursor.next = registration.owner_next;
-        cursor.remaining -= 1;
-        Ok(Some((waiter, registration)))
     }
 
     pub(super) fn cpu_registration(&self, cpu: CpuId) -> Result<&CpuRegistration, TaskError> {
@@ -496,7 +454,15 @@ impl TaskSystemState {
             let Some(registration) = self.thread_record(owner)?.blocked_on else {
                 return Ok(());
             };
-            let Some(next_owner) = registration.owner else {
+            let lock_state = unsafe {
+                // SAFETY: a live blocked_on registration is lifetime-bound by
+                // its wait token and keeps the physical lock identity stable.
+                registration.lock.lock_state()
+            };
+            if !lock_state.waiters.contains(registration.key) {
+                return Err(TaskError::InvalidPiState);
+            }
+            let Some(next_owner) = lock_state.owner else {
                 return Ok(());
             };
             if depth == chain_limit {
@@ -661,26 +627,34 @@ impl TaskSystemState {
         let mut current = start;
         for depth in 1..=chain_limit {
             let record = self.thread_record(current)?;
-            let (blocked_on, dispatch_generation) = {
+            let (blocked_on, dispatch_generation, donating_locks) = {
                 let sched = record.sched.lock();
-                (record.blocked_on, sched.policy.dispatch_generation)
+                (
+                    record.blocked_on,
+                    sched.policy.dispatch_generation,
+                    sched.pi.donating_locks,
+                )
             };
             if dispatch_generation == u64::MAX {
                 return Err(TaskError::InvalidConfiguration);
             }
-            let mut waiter_count = 0;
-            let mut cursor = self.pi_waiter_cursor(current)?;
-            while let Some((waiter, _)) = self.next_pi_waiter(&mut cursor)? {
-                self.validate_pi_donor(waiter)?;
-                waiter_count += 1;
-            }
-            if waiter_count != self.thread_record(current)?.sched.lock().pi.blocked_waiters {
+            if record.pi_donors.len() != donating_locks {
                 return Err(TaskError::InvalidPiState);
+            }
+            if let Some(top) = record.pi_donors.first() {
+                self.validate_pi_donor(top.thread)?;
             }
             let Some(registration) = blocked_on else {
                 return Ok(PiRecomputeProof { start, depth });
             };
-            let Some(owner) = registration.owner else {
+            let lock_state = unsafe {
+                // SAFETY: blocked_on retains the lock-identity lifetime.
+                registration.lock.lock_state()
+            };
+            if !lock_state.waiters.contains(registration.key) {
+                return Err(TaskError::InvalidPiState);
+            }
+            let Some(owner) = lock_state.owner else {
                 return Ok(PiRecomputeProof { start, depth });
             };
             if depth == chain_limit {
@@ -691,6 +665,40 @@ impl TaskSystemState {
         Err(TaskError::PiChainLimit { limit: chain_limit })
     }
 
+    /// Prevalidates the claimant after its selected wait edge is detached.
+    ///
+    /// The caller still holds the physical lock's waiter-tree guard, so the
+    /// committed graph continues to contain `claimant.blocked_on` until local
+    /// ownership is published. Re-entering that lock while walking the old
+    /// edge would self-deadlock. The prepared claim semantically removes this
+    /// one edge, making the claimant the terminal owner of a one-node chain.
+    pub(super) fn prepare_pi_recompute_after_claim(
+        &self,
+        claimant: ThreadId,
+        expected: PiWaitRegistration,
+    ) -> Result<PiRecomputeProof, TaskError> {
+        let record = self.thread_record(claimant)?;
+        let sched = record.sched.lock();
+        if record.blocked_on != Some(expected)
+            || sched.policy.dispatch_generation == u64::MAX
+            || record.pi_donors.len() != sched.pi.donating_locks
+        {
+            return Err(if sched.policy.dispatch_generation == u64::MAX {
+                TaskError::InvalidConfiguration
+            } else {
+                TaskError::InvalidPiState
+            });
+        }
+        drop(sched);
+        if let Some(top) = record.pi_donors.first() {
+            self.validate_pi_donor(top.thread)?;
+        }
+        Ok(PiRecomputeProof {
+            start: claimant,
+            depth: 1,
+        })
+    }
+
     pub(super) fn apply_pi_recompute_chain(&mut self, proof: PiRecomputeProof, fair_slice_ns: u64) {
         let mut current = proof.start();
         for depth in 1..=proof.depth() {
@@ -698,12 +706,11 @@ impl TaskSystemState {
                 current_core,
                 base,
                 base_entity,
-                blocked_on,
                 previous_policy,
                 previous_entity,
                 previous_pi_donor,
                 previous_deadline_donor,
-                blocked_pi_waiters,
+                donating_locks,
                 previous_pi_critical_rescue,
                 previous_dispatch_generation,
             ) = {
@@ -721,12 +728,11 @@ impl TaskSystemState {
                     Arc::clone(&record.core),
                     sched.policy.applied,
                     base_entity,
-                    record.blocked_on,
                     sched.policy.effective,
                     sched.policy.effective_entity,
                     sched.pi.donor,
                     sched.pi.deadline_donor,
-                    sched.pi.blocked_waiters,
+                    sched.pi.donating_locks,
                     sched.pi.critical_rescue,
                     sched.policy.dispatch_generation,
                 )
@@ -736,13 +742,13 @@ impl TaskSystemState {
             let mut effective_urgency = base_entity.scheduling_urgency(base);
             let mut pi_donor = None;
             let mut deadline_donor = None;
-            let mut cursor = self
-                .pi_waiter_cursor(current)
-                .expect("prepared PI owner must retain its waiter list");
-            while let Some((waiter, _)) = self
-                .next_pi_waiter(&mut cursor)
-                .expect("prepared PI waiter list must remain linked")
+            if let Some(top) = self
+                .thread_record(current)
+                .expect("prepared PI owner must remain live")
+                .pi_donors
+                .first()
             {
+                let waiter = top.thread;
                 let donor_record = self
                     .thread_record(waiter)
                     .expect("prepared PI waiter must retain its thread record");
@@ -790,7 +796,7 @@ impl TaskSystemState {
                         .core,
                 )
             });
-            let should_rescue = blocked_pi_waiters != 0
+            let should_rescue = donating_locks != 0
                 && effective_entity
                     .deadline()
                     .is_some_and(|deadline| deadline.remaining_runtime_ns() == 0);
@@ -837,10 +843,10 @@ impl TaskSystemState {
                 current_core.publish_effective_schedule(policy, entity);
                 self.request_owner_reschedule(current);
             }
-            let Some(registration) = blocked_on else {
-                return;
-            };
-            let Some(owner) = registration.owner else {
+            let owner = self
+                .refresh_blocked_waiter_key(current)
+                .expect("prepared PI waiter key refresh must remain valid");
+            let Some(owner) = owner else {
                 return;
             };
             assert!(
@@ -880,7 +886,7 @@ pub(super) struct ThreadRecord {
     pub(super) resources: ThreadResources,
     pub(super) extension: Option<ThreadExtension>,
     pub(super) blocked_on: Option<PiWaitRegistration>,
-    pub(super) pi_waiter_head: Option<ThreadId>,
+    pub(super) pi_donors: PiWaitTree,
     pub(super) callbacks: ThreadCallbackState,
 }
 
@@ -910,20 +916,15 @@ impl DetachedThreadRecord {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct PiWaitRegistration {
-    pub(super) lock: PiLockId,
-    /// Current donation owner. `None` denotes an ownerless rtmutex claim
-    /// window; `owner_prev`/`owner_next` then form the pending lock chain
-    /// anchored by the mutex-local selected waiter.
-    pub(super) owner: Option<ThreadId>,
+    pub(super) lock: PiLockRaw,
+    pub(super) key: PiWaitKey,
     pub(super) generation: u64,
-    pub(super) owner_prev: Option<ThreadId>,
-    pub(super) owner_next: Option<ThreadId>,
 }
 
 impl ThreadRecord {
     pub(super) fn has_live_pi_edges(&self) -> bool {
         self.blocked_on.is_some()
-            || self.pi_waiter_head.is_some()
-            || self.sched.lock().pi.blocked_waiters != 0
+            || !self.pi_donors.is_empty()
+            || self.sched.lock().pi.donating_locks != 0
     }
 }

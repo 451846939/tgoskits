@@ -43,26 +43,24 @@ fn pi_registration_release_claim_and_cancel_do_not_allocate() {
     let cancelled = system
         .create_thread(ThreadSpec::new(SchedulePolicy::default()))
         .unwrap();
-    let lock = PiLockIdentity::new().id().unwrap();
+    let lock = PiLockIdentity::new();
 
     let selected_wait = assert_no_alloc("register selected waiter", || {
-        support::commit_pi_wait(&system, lock, selected.id(), owner.id()).unwrap()
+        support::commit_pi_wait(&system, &lock, selected.id(), owner.id()).unwrap()
     });
     let cancelled_wait = assert_no_alloc("register cancelled waiter", || {
-        support::commit_pi_wait(&system, lock, cancelled.id(), owner.id()).unwrap()
+        support::commit_pi_wait(&system, &lock, cancelled.id(), owner.id()).unwrap()
     });
     assert_no_alloc("cancel waiter", || {
         system.pi_wait_cancel(cancelled_wait).unwrap()
     });
     assert_no_alloc("commit release and claim", || {
         let release = system
-            .prepare_pi_mutex_release(lock, owner.id(), selected.id())
+            .prepare_pi_mutex_release(lock.lock_ref().unwrap(), owner.id())
             .unwrap();
         // SAFETY: this scheduler-level test models the ownerless publication.
         unsafe { release.commit_after_local_release() };
-        let claim = system
-            .prepare_pi_mutex_claim(lock, selected.id(), selected.id())
-            .unwrap();
+        let claim = system.prepare_pi_mutex_claim(&selected_wait).unwrap();
         // SAFETY: this scheduler-level test models claimant publication.
         unsafe { claim.commit_after_local_claim() };
     });

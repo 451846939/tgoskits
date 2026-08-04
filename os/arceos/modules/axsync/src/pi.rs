@@ -8,20 +8,18 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use ax_task::{SchedulingUrgency, ThreadHandle, ThreadId, ThreadWakeHandle};
+use ax_task::ThreadId;
 
 /// A pinned waiter embedded in the blocked `RawMutex::lock` call frame.
 pub(crate) struct WaiterNode {
     thread_id: ThreadId,
-    urgency: SchedulingUrgency,
-    sequence: u64,
     granted: AtomicBool,
-    thread: Option<ThreadHandle>,
+    prev: UnsafeCell<Option<NonNull<WaiterNode>>>,
     next: UnsafeCell<Option<NonNull<WaiterNode>>>,
     _pinned: PhantomPinned,
 }
 
-/// Intrusive waiter list sorted from most to least urgent.
+/// Unordered intrusive waiter ownership list.
 #[derive(Debug)]
 pub(crate) struct WaiterQueue {
     head: Option<NonNull<WaiterNode>>,
@@ -33,18 +31,11 @@ pub(crate) struct WaiterPointer(NonNull<WaiterNode>);
 
 impl WaiterNode {
     /// Creates an unlinked waiter owned by the current lock call frame.
-    pub(crate) const fn new(
-        thread_id: ThreadId,
-        urgency: SchedulingUrgency,
-        sequence: u64,
-        thread: ThreadHandle,
-    ) -> Self {
+    pub(crate) const fn new(thread_id: ThreadId) -> Self {
         Self {
             thread_id,
-            urgency,
-            sequence,
             granted: AtomicBool::new(false),
-            thread: Some(thread),
+            prev: UnsafeCell::new(None),
             next: UnsafeCell::new(None),
             _pinned: PhantomPinned,
         }
@@ -60,34 +51,9 @@ impl WaiterNode {
         self.thread_id
     }
 
-    /// Returns this waiter's current urgency without its FIFO tie-break.
-    pub(crate) fn effective_urgency(&self) -> SchedulingUrgency {
-        self.thread
-            .as_ref()
-            .map(ThreadHandle::effective_scheduling_urgency)
-            .unwrap_or(self.urgency)
-    }
-
     #[cfg(test)]
-    fn new_for_test(
-        thread_id: ThreadId,
-        urgency: SchedulingUrgency,
-        sequence: u64,
-    ) -> Pin<alloc::boxed::Box<Self>> {
-        alloc::boxed::Box::pin(Self {
-            thread_id,
-            urgency,
-            sequence,
-            granted: AtomicBool::new(false),
-            thread: None,
-            next: UnsafeCell::new(None),
-            _pinned: PhantomPinned,
-        })
-    }
-
-    #[inline(always)]
-    fn ordering_key(&self) -> (SchedulingUrgency, u64) {
-        (self.urgency, self.sequence)
+    fn new_for_test(thread_id: ThreadId) -> Pin<alloc::boxed::Box<Self>> {
+        alloc::boxed::Box::pin(Self::new(thread_id))
     }
 
     /// Publishes ownership before the selected waiter is woken.
@@ -114,6 +80,16 @@ impl WaiterNode {
         // SAFETY: required by this method's contract.
         unsafe { *self.next.get() = next };
     }
+
+    unsafe fn prev(&self) -> Option<NonNull<Self>> {
+        // SAFETY: required by this method's contract.
+        unsafe { *self.prev.get() }
+    }
+
+    unsafe fn set_prev(&self, prev: Option<NonNull<Self>>) {
+        // SAFETY: required by this method's contract.
+        unsafe { *self.prev.get() = prev };
+    }
 }
 
 impl WaiterQueue {
@@ -122,7 +98,7 @@ impl WaiterQueue {
         Self { head: None, len: 0 }
     }
 
-    /// Inserts one pinned waiter according to effective scheduler urgency.
+    /// Inserts one pinned waiter without performing scheduler selection.
     ///
     /// # Safety
     ///
@@ -130,29 +106,16 @@ impl WaiterQueue {
     /// queue. The caller must hold the mutex metadata lock.
     pub(crate) unsafe fn insert(&mut self, waiter: Pin<&WaiterNode>) {
         let waiter_ptr = NonNull::from(waiter.get_ref());
-        let mut previous: Option<NonNull<WaiterNode>> = None;
-        let mut current = self.head;
-
-        while let Some(current_ptr) = current {
-            // SAFETY: every queued pointer satisfies `insert`'s lifetime
-            // contract, and the metadata lock prevents list mutation races.
-            let current_ref = unsafe { current_ptr.as_ref() };
-            if waiter.ordering_key() < current_ref.ordering_key() {
-                break;
-            }
-            previous = current;
-            // SAFETY: the metadata lock is held.
-            current = unsafe { current_ref.next() };
-        }
-
         // SAFETY: the metadata lock is held and waiter is not linked yet.
-        unsafe { waiter.set_next(current) };
-        if let Some(previous_ptr) = previous {
-            // SAFETY: previous is a live queued node and metadata is locked.
-            unsafe { previous_ptr.as_ref().set_next(Some(waiter_ptr)) };
-        } else {
-            self.head = Some(waiter_ptr);
+        unsafe {
+            waiter.set_prev(None);
+            waiter.set_next(self.head);
         }
+        if let Some(head) = self.head {
+            // SAFETY: the old head remains pinned under the metadata lock.
+            unsafe { head.as_ref().set_prev(Some(waiter_ptr)) };
+        }
+        self.head = Some(waiter_ptr);
         self.len += 1;
     }
 
@@ -166,44 +129,52 @@ impl WaiterQueue {
         let head_ref = unsafe { head.as_ref() };
         // SAFETY: the metadata lock is held.
         self.head = unsafe { head_ref.next() };
+        if let Some(next) = self.head {
+            // SAFETY: the new head remains linked under the metadata lock.
+            unsafe { next.as_ref().set_prev(None) };
+        }
         // SAFETY: the removed node is no longer part of this list.
-        unsafe { head_ref.set_next(None) };
+        unsafe {
+            head_ref.set_prev(None);
+            head_ref.set_next(None);
+        }
         self.len -= 1;
         Some(WaiterPointer(head))
-    }
-
-    /// Returns the current head while the caller holds the metadata lock.
-    pub(crate) fn head(&self) -> Option<WaiterPointer> {
-        self.head.map(WaiterPointer)
     }
 
     /// Removes a previously selected waiter.
     ///
     /// The caller must hold the metadata lock across selection and removal.
     pub(crate) fn remove(&mut self, selected: &WaiterPointer) -> Option<WaiterPointer> {
-        let mut previous: Option<NonNull<WaiterNode>> = None;
-        let mut current = self.head;
-        while let Some(current_ptr) = current {
-            // SAFETY: metadata is locked and all queued nodes stay pinned.
-            let current_ref = unsafe { current_ptr.as_ref() };
-            // SAFETY: the metadata lock is held.
-            let next = unsafe { current_ref.next() };
-            if current_ptr == selected.0 {
-                if let Some(previous_ptr) = previous {
-                    // SAFETY: previous is a live queued node under metadata lock.
-                    unsafe { previous_ptr.as_ref().set_next(next) };
-                } else {
-                    self.head = next;
-                }
-                // SAFETY: selected is no longer part of this list.
-                unsafe { current_ref.set_next(None) };
-                self.len -= 1;
-                return Some(WaiterPointer(current_ptr));
-            }
-            previous = current;
-            current = next;
+        let selected_ref = unsafe {
+            // SAFETY: callers may only construct a pointer from the pinned
+            // waiter owned by this metadata transaction.
+            selected.0.as_ref()
+        };
+        let (previous, next) = unsafe {
+            // SAFETY: the metadata lock serializes both intrusive links.
+            (selected_ref.prev(), selected_ref.next())
+        };
+        if previous.is_none() && self.head != Some(selected.0) {
+            return None;
         }
-        None
+        if let Some(previous) = previous {
+            // SAFETY: previous is a live linked waiter under metadata lock.
+            unsafe { previous.as_ref().set_next(next) };
+        } else {
+            self.head = next;
+        }
+        if let Some(next) = next {
+            // SAFETY: next is a live linked waiter under metadata lock.
+            unsafe { next.as_ref().set_prev(previous) };
+        }
+        // SAFETY: selected is now detached from both neighbors.
+        unsafe {
+            selected_ref.set_prev(None);
+            selected_ref.set_next(None);
+        }
+        self.len -= 1;
+        Some(WaiterPointer(selected.0))
     }
 
     /// Returns whether the queue contains no waiters.
@@ -222,6 +193,7 @@ impl WaiterPointer {
     /// # Safety
     ///
     /// The waiter must still be pinned in its lock call frame.
+    #[cfg(test)]
     pub(crate) unsafe fn thread_id(&self) -> ThreadId {
         // SAFETY: forwarded caller contract keeps the waiter alive.
         unsafe { self.node() }.thread_id
@@ -237,46 +209,6 @@ impl WaiterPointer {
         unsafe { self.node() }.grant();
     }
 
-    /// Clones the direct targeted-wake handle in task context.
-    ///
-    /// # Safety
-    ///
-    /// The waiter must still be pinned in its lock call frame.
-    pub(crate) unsafe fn wake_handle(&self) -> Option<ThreadWakeHandle> {
-        // SAFETY: forwarded caller contract keeps the waiter alive.
-        unsafe { self.node() }
-            .thread
-            .as_ref()
-            .map(ThreadHandle::wake_handle)
-    }
-
-    /// Returns this waiter's latest effective ordering key.
-    ///
-    /// # Safety
-    ///
-    /// The waiter must remain pinned, and the metadata lock must exclude
-    /// enqueue/removal while the key is sampled.
-    pub(crate) unsafe fn effective_ordering_key(&self) -> (SchedulingUrgency, u64) {
-        // SAFETY: forwarded caller contract keeps the waiter alive.
-        let node = unsafe { self.node() };
-        let urgency = node
-            .thread
-            .as_ref()
-            .map(ThreadHandle::effective_scheduling_urgency)
-            .unwrap_or(node.urgency);
-        (urgency, node.sequence)
-    }
-
-    /// Advances through the metadata-locked intrusive list.
-    ///
-    /// # Safety
-    ///
-    /// The metadata lock must be held and every node must remain pinned.
-    pub(crate) unsafe fn next(&self) -> Option<Self> {
-        // SAFETY: forwarded caller contract keeps the waiter and list stable.
-        unsafe { self.node().next() }.map(Self)
-    }
-
     unsafe fn node(&self) -> &WaiterNode {
         // SAFETY: required by this method's caller contract.
         unsafe { self.0.as_ref() }
@@ -287,37 +219,42 @@ impl WaiterPointer {
 // metadata lock is held. Nodes remain pinned until they are removed and granted.
 unsafe impl Send for WaiterQueue {}
 
-// SAFETY: `granted` is atomic; `next` is touched only under the metadata lock;
-// all other fields are immutable while the waiter is published.
+// SAFETY: `granted` is atomic; intrusive links are touched only under metadata;
+// the generation-bearing thread identity is immutable while published.
 unsafe impl Sync for WaiterNode {}
 
 #[cfg(test)]
 mod tests {
     use ax_task::{
-        CpuId, FairMode, Nice, PiLockId, PiLockIdentity, PiWaitToken, RtPriority, SchedulePolicy,
-        SchedulingUrgency, TaskError, TaskSystem, TaskSystemConfig, ThreadHandle, ThreadId,
+        CpuId, FairMode, Nice, PiLockIdentity, PiWaitOwner, PiWaitToken, RtPriority,
+        SchedulePolicy, TaskError, TaskSystem, TaskSystemConfig, ThreadHandle, ThreadId,
         ThreadSpec,
     };
 
     use super::*;
 
-    fn commit_pi_wait(
+    fn commit_pi_wait<'lock>(
         system: &TaskSystem,
-        lock: PiLockId,
+        lock: &'lock PiLockIdentity,
         waiter: ThreadId,
         owner: ThreadId,
-    ) -> Result<PiWaitToken, TaskError> {
-        let registration = system.prepare_pi_wait_start(lock, waiter, owner)?;
+    ) -> Result<PiWaitToken<'lock>, TaskError> {
+        let registration = system.prepare_pi_wait_start(
+            lock.lock_ref()?,
+            waiter,
+            PiWaitOwner::Owned(owner),
+            waiter.as_u64(),
+        )?;
         // SAFETY: scheduler-only tests model the local pinned waiter publication.
         Ok(unsafe { registration.commit_after_local_registration() })
     }
 
     #[test]
-    fn pops_waiters_in_effective_urgency_order() {
+    fn local_waiter_ownership_list_does_not_duplicate_scheduler_order() {
         let mut queue = WaiterQueue::new();
-        let fair = WaiterNode::new_for_test(thread(1), key(2, 100), 0);
-        let rt = WaiterNode::new_for_test(thread(2), key(1, 80), 1);
-        let deadline = WaiterNode::new_for_test(thread(3), key(0, 50), 2);
+        let fair = WaiterNode::new_for_test(thread(1));
+        let rt = WaiterNode::new_for_test(thread(2));
+        let deadline = WaiterNode::new_for_test(thread(3));
 
         unsafe {
             queue.insert(fair.as_ref());
@@ -333,28 +270,31 @@ mod tests {
     }
 
     #[test]
-    fn preserves_fifo_order_for_equal_urgency() {
+    fn removes_a_known_local_waiter_without_scanning_for_scheduler_order() {
         let mut queue = WaiterQueue::new();
-        // Scheduler keys currently carry a thread-identity tie break. PI mutex
-        // FIFO ordering must use the local arrival sequence instead: a later
-        // waiter with a numerically smaller ThreadId is not allowed to pass.
-        let first = WaiterNode::new_for_test(thread(9), SchedulingUrgency::new(1, 50), 1);
-        let second = WaiterNode::new_for_test(thread(1), SchedulingUrgency::new(1, 50), 2);
+        let first = WaiterNode::new_for_test(thread(1));
+        let middle = WaiterNode::new_for_test(thread(2));
+        let last = WaiterNode::new_for_test(thread(3));
 
         unsafe {
             queue.insert(first.as_ref());
-            queue.insert(second.as_ref());
+            queue.insert(middle.as_ref());
+            queue.insert(last.as_ref());
         }
+        let removed = queue
+            .remove(&WaiterPointer::from_pin(middle.as_ref()))
+            .unwrap();
 
         unsafe {
-            assert_eq!(queue.pop_front().unwrap().thread_id(), thread(9));
+            assert_eq!(removed.thread_id(), thread(2));
+            assert_eq!(queue.pop_front().unwrap().thread_id(), thread(3));
             assert_eq!(queue.pop_front().unwrap().thread_id(), thread(1));
         }
     }
 
     #[test]
     fn grant_is_visible_before_targeted_wake() {
-        let waiter = WaiterNode::new_for_test(thread(1), key(2, 0), 0);
+        let waiter = WaiterNode::new_for_test(thread(1));
 
         assert!(!waiter.is_granted());
         waiter.grant();
@@ -367,19 +307,19 @@ mod tests {
         let owner = create_thread(&system, fair_policy());
         let low_donor = create_thread(&system, fifo_policy(20));
         let high_donor = create_thread(&system, fifo_policy(80));
-        let low_lock = PiLockIdentity::new().id().unwrap();
-        let high_lock = PiLockIdentity::new().id().unwrap();
+        let low_lock = PiLockIdentity::new();
+        let high_lock = PiLockIdentity::new();
 
-        let low_wait = commit_pi_wait(&system, low_lock, low_donor.id(), owner.id()).unwrap();
+        let low_wait = commit_pi_wait(&system, &low_lock, low_donor.id(), owner.id()).unwrap();
         assert_effective(&owner, fifo_policy(20));
-        let high_wait = commit_pi_wait(&system, high_lock, high_donor.id(), owner.id()).unwrap();
+        let high_wait = commit_pi_wait(&system, &high_lock, high_donor.id(), owner.id()).unwrap();
         assert_effective(&owner, fifo_policy(80));
 
-        commit_test_transfer(&system, high_lock, owner.id(), high_donor.id());
+        commit_test_transfer(&system, &high_lock, owner.id(), &high_wait);
         assert!(high_wait.is_granted());
         assert_effective(&owner, fifo_policy(20));
 
-        commit_test_transfer(&system, low_lock, owner.id(), low_donor.id());
+        commit_test_transfer(&system, &low_lock, owner.id(), &low_wait);
         assert!(low_wait.is_granted());
         assert_effective(&owner, fair_policy());
     }
@@ -390,14 +330,14 @@ mod tests {
         let first_owner = create_thread(&system, fair_policy());
         let second_owner = create_thread(&system, fifo_policy(30));
         let final_donor = create_thread(&system, fifo_policy(90));
-        let first_lock = PiLockIdentity::new().id().unwrap();
-        let second_lock = PiLockIdentity::new().id().unwrap();
+        let first_lock = PiLockIdentity::new();
+        let second_lock = PiLockIdentity::new();
 
         let middle_wait =
-            commit_pi_wait(&system, first_lock, second_owner.id(), first_owner.id()).unwrap();
+            commit_pi_wait(&system, &first_lock, second_owner.id(), first_owner.id()).unwrap();
         assert_effective(&first_owner, fifo_policy(30));
         let final_wait =
-            commit_pi_wait(&system, second_lock, final_donor.id(), second_owner.id()).unwrap();
+            commit_pi_wait(&system, &second_lock, final_donor.id(), second_owner.id()).unwrap();
         assert_effective(&second_owner, fifo_policy(90));
         assert_effective(&first_owner, fifo_policy(90));
 
@@ -417,10 +357,10 @@ mod tests {
         system.make_ready(owner.id()).unwrap();
         system.enqueue(remote_cpu.as_mut(), owner.id(), 0).unwrap();
         let donor = create_thread(&system, fifo_policy(70));
-        let lock = PiLockIdentity::new().id().unwrap();
+        let lock = PiLockIdentity::new();
         crate::test_runtime::reset_scheduler_ipis();
 
-        let _wait = commit_pi_wait(&system, lock, donor.id(), owner.id()).unwrap();
+        let wait = commit_pi_wait(&system, &lock, donor.id(), owner.id()).unwrap();
 
         assert_effective(&owner, fifo_policy(70));
         assert_eq!(crate::test_runtime::scheduler_ipi_count(), 1);
@@ -428,6 +368,7 @@ mod tests {
         let drained = system.drain_policy_updates(remote_cpu.as_mut(), 0).unwrap();
         assert_eq!(drained.drained(), 1);
         assert!(!drained.pending());
+        system.pi_wait_cancel(wait).unwrap();
     }
 
     #[test]
@@ -435,12 +376,12 @@ mod tests {
         let system = task_system(1);
         let first = create_thread(&system, fair_policy());
         let second = create_thread(&system, fair_policy());
-        let first_lock = PiLockIdentity::new().id().unwrap();
-        let second_lock = PiLockIdentity::new().id().unwrap();
-        let first_wait = commit_pi_wait(&system, first_lock, second.id(), first.id()).unwrap();
+        let first_lock = PiLockIdentity::new();
+        let second_lock = PiLockIdentity::new();
+        let first_wait = commit_pi_wait(&system, &first_lock, second.id(), first.id()).unwrap();
 
         assert!(matches!(
-            commit_pi_wait(&system, second_lock, first.id(), second.id()),
+            commit_pi_wait(&system, &second_lock, first.id(), second.id()),
             Err(TaskError::PiCycle)
         ));
         system.pi_wait_cancel(first_wait).unwrap();
@@ -450,28 +391,22 @@ mod tests {
         ThreadId::from_parts(slot, 1)
     }
 
-    fn key(class_rank: u8, primary: u64) -> SchedulingUrgency {
-        SchedulingUrgency::new(class_rank, primary)
-    }
-
     fn task_system(cpu_count: usize) -> TaskSystem {
         TaskSystem::new(TaskSystemConfig::new(cpu_count)).unwrap()
     }
 
     fn commit_test_transfer(
         system: &TaskSystem,
-        lock: ax_task::PiLockId,
+        lock: &PiLockIdentity,
         old_owner: ThreadId,
-        next_owner: ThreadId,
+        wait: &PiWaitToken<'_>,
     ) {
         let release = system
-            .prepare_pi_mutex_release(lock, old_owner, next_owner)
+            .prepare_pi_mutex_release(lock.lock_ref().unwrap(), old_owner)
             .unwrap();
         // SAFETY: these scheduler-only tests model ownerless publication.
-        unsafe { release.commit_after_local_release() };
-        let claim = system
-            .prepare_pi_mutex_claim(lock, next_owner, next_owner)
-            .unwrap();
+        drop(unsafe { release.commit_after_local_release() });
+        let claim = system.prepare_pi_mutex_claim(wait).unwrap();
         // SAFETY: these scheduler-only tests model claimant publication.
         unsafe { claim.commit_after_local_claim() };
     }

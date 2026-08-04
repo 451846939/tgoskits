@@ -1,30 +1,22 @@
 use super::*;
 
 /// Prepares a PI donation edge for publication after local waiter insertion.
-pub fn prepare_pi_wait_start(
-    lock: PiLockId,
-    owner: ThreadId,
-) -> Result<PiWaitStart<'static>, TaskError> {
+pub fn prepare_pi_wait_start<'lock>(
+    lock: PiLockRef<'lock>,
+    owner: PiWaitOwner,
+    sequence: u64,
+) -> Result<PiWaitStart<'static, 'lock>, TaskError> {
     let waiter = current_thread_id()?;
-    runtime_task_system()?.prepare_pi_wait_start(lock, waiter, owner)
-}
-
-/// Prepares a waiter in an ownerless mutex claim window.
-pub fn prepare_pi_wait_start_pending(
-    lock: PiLockId,
-    pending_head: ThreadId,
-) -> Result<PiWaitStart<'static>, TaskError> {
-    let waiter = current_thread_id()?;
-    runtime_task_system()?.prepare_pi_wait_start_pending(lock, waiter, pending_head)
+    runtime_task_system()?.prepare_pi_wait_start(lock, waiter, owner, sequence)
 }
 
 /// Blocks the calling waiter until it is selected to claim or granted.
-pub fn pi_block_current(token: &PiWaitToken) -> Result<(), TaskError> {
+pub fn pi_block_current(token: &PiWaitToken<'_>) -> Result<(), TaskError> {
     if token.is_selected() || token.is_granted() {
         return Ok(());
     }
     let system = runtime_task_system()?;
-    if runtime_current_cpu()?.current() != Some(token.waiter()) {
+    if runtime_current_cpu()?.current() != Some(token.thread_id()) {
         return Err(TaskError::InvalidPiState);
     }
     loop {
@@ -56,26 +48,25 @@ pub fn pi_block_current(token: &PiWaitToken) -> Result<(), TaskError> {
 }
 
 /// Cancels a PI wait token after a handoff-before-block race.
-pub fn pi_wait_cancel(token: PiWaitToken) -> Result<(), TaskError> {
+pub fn pi_wait_cancel(token: PiWaitToken<'_>) -> Result<(), TaskError> {
     runtime_task_system()?.pi_wait_cancel(token)
 }
 
 /// Prepares the scheduler half of a contended PI mutex release.
-pub fn prepare_pi_mutex_release(
-    lock: PiLockId,
-    old_owner: ThreadId,
-    selected: ThreadId,
-) -> Result<PiMutexRelease<'static>, TaskError> {
-    runtime_task_system()?.prepare_pi_mutex_release(lock, old_owner, selected)
+pub fn prepare_pi_mutex_release<'lock>(
+    lock: PiLockRef<'lock>,
+) -> Result<PiMutexRelease<'static, 'lock>, TaskError> {
+    runtime_task_system()?.prepare_pi_mutex_release(lock, current_thread_id()?)
 }
 
 /// Prepares the scheduler half of claiming an ownerless PI mutex.
-pub fn prepare_pi_mutex_claim(
-    lock: PiLockId,
-    pending_head: ThreadId,
-    claimant: ThreadId,
-) -> Result<PiMutexClaim<'static>, TaskError> {
-    runtime_task_system()?.prepare_pi_mutex_claim(lock, pending_head, claimant)
+pub fn prepare_pi_mutex_claim<'lock>(
+    token: &PiWaitToken<'lock>,
+) -> Result<PiMutexClaim<'static, 'lock>, TaskError> {
+    if current_thread_id()? != token.thread_id() {
+        return Err(TaskError::InvalidPiState);
+    }
+    runtime_task_system()?.prepare_pi_mutex_claim(token)
 }
 
 /// Publishes a targeted task-context wake after PI metadata handoff.

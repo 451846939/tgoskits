@@ -2,15 +2,20 @@ use alloc::{boxed::Box, vec::Vec};
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use super::*;
-use crate::{FairEntity, PiLockIdentity};
+use crate::{FairEntity, PiLockIdentity, PiWaitOwner};
 
-fn commit_pi_wait(
+fn commit_pi_wait<'lock>(
     system: &TaskSystem,
-    lock: PiLockId,
+    lock: &'lock PiLockIdentity,
     waiter: ThreadId,
     owner: ThreadId,
-) -> Result<PiWaitToken, TaskError> {
-    let registration = system.prepare_pi_wait_start(lock, waiter, owner)?;
+) -> Result<PiWaitToken<'lock>, TaskError> {
+    let registration = system.prepare_pi_wait_start(
+        lock.lock_ref()?,
+        waiter,
+        PiWaitOwner::Owned(owner),
+        waiter.as_u64(),
+    )?;
     // SAFETY: scheduler unit tests model the local pinned waiter publication.
     Ok(unsafe { registration.commit_after_local_registration() })
 }
@@ -3698,9 +3703,9 @@ fn queued_pi_owner_is_requeued_only_by_its_owner_cpu() {
         system.make_ready(thread.id()).unwrap();
         system.enqueue(cpu.as_mut(), thread.id(), 0).unwrap();
     }
-    let lock = PiLockIdentity::new().id().unwrap();
+    let lock = PiLockIdentity::new();
 
-    let _wait = commit_pi_wait(&system, lock, waiter.id(), owner.id()).unwrap();
+    let wait = commit_pi_wait(&system, &lock, waiter.id(), owner.id()).unwrap();
 
     assert!(matches!(
         owner.effective_policy(),
@@ -3710,6 +3715,7 @@ fn queued_pi_owner_is_requeued_only_by_its_owner_cpu() {
     let drain = system.drain_policy_updates(cpu.as_mut(), 1).unwrap();
     assert_eq!(drain.drained(), 1);
     assert_eq!(system.schedule(cpu.as_mut(), 1).unwrap().next(), owner.id());
+    system.pi_wait_cancel(wait).unwrap();
 }
 
 #[test]
@@ -3742,13 +3748,8 @@ fn deadline_pi_boost_overrides_constrained_wake_throttling() {
     system.make_ready(donor.id()).unwrap();
     system.enqueue(cpu.as_mut(), donor.id(), 0).unwrap();
     system.dequeue(cpu.as_mut(), donor.id()).unwrap();
-    let _wait = commit_pi_wait(
-        &system,
-        PiLockIdentity::new().id().unwrap(),
-        donor.id(),
-        owner.id(),
-    )
-    .unwrap();
+    let lock = PiLockIdentity::new();
+    let wait = commit_pi_wait(&system, &lock, donor.id(), owner.id()).unwrap();
 
     assert_eq!(owner.wake_handle().wake(), crate::WakeResult::Notified);
 
@@ -3758,6 +3759,7 @@ fn deadline_pi_boost_overrides_constrained_wake_throttling() {
         "Linux Deadline PI boost must override constrained wake throttling"
     );
     assert_eq!(system.schedule(cpu.as_mut(), 9).unwrap().next(), owner.id());
+    system.pi_wait_cancel(wait).unwrap();
 }
 
 #[test]
@@ -3774,13 +3776,8 @@ fn effective_rt_entity_never_replaces_the_base_rr_accounting() {
         .unwrap();
     system.make_ready(owner.id()).unwrap();
     system.enqueue(cpu.as_mut(), owner.id(), 0).unwrap();
-    let _wait = commit_pi_wait(
-        &system,
-        PiLockIdentity::new().id().unwrap(),
-        donor.id(),
-        owner.id(),
-    )
-    .unwrap();
+    let lock = PiLockIdentity::new();
+    let wait = commit_pi_wait(&system, &lock, donor.id(), owner.id()).unwrap();
     system.drain_policy_updates(cpu.as_mut(), 0).unwrap();
 
     let state = system.state.lock();
@@ -3800,6 +3797,9 @@ fn effective_rt_entity_never_replaces_the_base_rr_accounting() {
             .matches_policy(sched.policy.effective),
         "effective policy and entity must be published as one coherent snapshot"
     );
+    drop(sched);
+    drop(state);
+    system.pi_wait_cancel(wait).unwrap();
 }
 
 #[test]
@@ -3822,10 +3822,12 @@ fn chained_and_multi_lock_donations_are_withdrawn_independently() {
             RtPriority::new(99).unwrap(),
         )))
         .unwrap();
-    let first_lock = PiLockIdentity::new().id().unwrap();
-    let second_lock = PiLockIdentity::new().id().unwrap();
-    let chained = commit_pi_wait(&system, first_lock, second_owner.id(), first_owner.id()).unwrap();
-    let urgent_wait = commit_pi_wait(&system, second_lock, urgent.id(), second_owner.id()).unwrap();
+    let first_lock = PiLockIdentity::new();
+    let second_lock = PiLockIdentity::new();
+    let chained =
+        commit_pi_wait(&system, &first_lock, second_owner.id(), first_owner.id()).unwrap();
+    let urgent_wait =
+        commit_pi_wait(&system, &second_lock, urgent.id(), second_owner.id()).unwrap();
     assert!(matches!(
         first_owner.effective_policy(),
         SchedulePolicy::Fifo { priority } if priority.get() == 99
@@ -3859,20 +3861,16 @@ fn pi_registration_does_not_scan_unrelated_registry_slots() {
         .unwrap();
     registry::reset_pi_donor_record_visits();
 
-    let _token = commit_pi_wait(
-        &system,
-        PiLockIdentity::new().id().unwrap(),
-        waiter.id(),
-        owner.id(),
-    )
-    .unwrap();
+    let lock = PiLockIdentity::new();
+    let token = commit_pi_wait(&system, &lock, waiter.id(), owner.id()).unwrap();
 
     assert_eq!(
         registry::pi_donor_record_visits(),
-        1,
-        "PI work must visit only the registered donor, not unrelated records"
+        0,
+        "per-lock cached top publication must not scan registry records"
     );
     drop(unrelated);
+    system.pi_wait_cancel(token).unwrap();
 }
 
 #[test]
@@ -3887,11 +3885,11 @@ fn equal_urgency_pi_registration_does_not_rescan_owner_donors() {
     let second = system
         .create_thread(ThreadSpec::new(SchedulePolicy::default()))
         .unwrap();
-    let lock = PiLockIdentity::new().id().unwrap();
-    let first_wait = commit_pi_wait(&system, lock, first.id(), owner.id()).unwrap();
+    let lock = PiLockIdentity::new();
+    let first_wait = commit_pi_wait(&system, &lock, first.id(), owner.id()).unwrap();
     registry::reset_pi_donor_record_visits();
 
-    let second_wait = commit_pi_wait(&system, lock, second.id(), owner.id()).unwrap();
+    let second_wait = commit_pi_wait(&system, &lock, second.id(), owner.id()).unwrap();
 
     assert_eq!(
         registry::pi_donor_record_visits(),
@@ -3899,6 +3897,67 @@ fn equal_urgency_pi_registration_does_not_rescan_owner_donors() {
         "an equal-urgency waiter cannot change the owner or its upstream donation chain"
     );
     assert_eq!(owner.effective_policy(), owner.policy());
+    system.pi_wait_cancel(second_wait).unwrap();
+    system.pi_wait_cancel(first_wait).unwrap();
+}
+
+#[test]
+fn blocked_waiter_policy_change_updates_the_cached_lock_top_without_owner_scan() {
+    let system = TaskSystem::new(TaskSystemConfig::new(1)).unwrap();
+    let owner = system
+        .create_thread(ThreadSpec::new(SchedulePolicy::fair(
+            Nice::new(19).unwrap(),
+            FairMode::Normal,
+        )))
+        .unwrap();
+    let first = system
+        .create_thread(ThreadSpec::new(SchedulePolicy::fifo(
+            RtPriority::new(80).unwrap(),
+        )))
+        .unwrap();
+    let second = system
+        .create_thread(ThreadSpec::new(SchedulePolicy::fifo(
+            RtPriority::new(90).unwrap(),
+        )))
+        .unwrap();
+    let lock = PiLockIdentity::new();
+    let first_wait = commit_pi_wait(&system, &lock, first.id(), owner.id()).unwrap();
+    let second_wait = commit_pi_wait(&system, &lock, second.id(), owner.id()).unwrap();
+    assert_eq!(
+        system
+            .state
+            .lock()
+            .thread_record(owner.id())
+            .unwrap()
+            .sched
+            .lock()
+            .pi
+            .donor,
+        Some(second.id())
+    );
+
+    registry::reset_pi_donor_record_visits();
+    system
+        .set_thread_policy(
+            second.id(),
+            SchedulePolicy::fifo(RtPriority::new(70).unwrap()),
+        )
+        .unwrap();
+    let state = system.state.lock();
+    let owner_sched = state.thread_record(owner.id()).unwrap().sched.lock();
+    assert_eq!(owner_sched.pi.donor, Some(first.id()));
+    assert_eq!(
+        owner_sched.policy.effective,
+        SchedulePolicy::fifo(RtPriority::new(80).unwrap())
+    );
+    drop(owner_sched);
+    drop(state);
+    assert_eq!(
+        registry::pi_donor_record_visits(),
+        0,
+        "a blocked waiter key update must not scan every waiter twice"
+    );
+
     system.pi_wait_cancel(second_wait).unwrap();
     system.pi_wait_cancel(first_wait).unwrap();
 }
@@ -3925,12 +3984,8 @@ fn failed_pi_registration_does_not_publish_a_partial_edge() {
             .dispatch_generation = u64::MAX;
     }
 
-    let result = commit_pi_wait(
-        &system,
-        PiLockIdentity::new().id().unwrap(),
-        waiter.id(),
-        owner.id(),
-    );
+    let lock = PiLockIdentity::new();
+    let result = commit_pi_wait(&system, &lock, waiter.id(), owner.id());
 
     assert_eq!(result.unwrap_err(), TaskError::InvalidConfiguration);
     let state = system.state.lock();
@@ -3942,7 +3997,7 @@ fn failed_pi_registration_does_not_publish_a_partial_edge() {
             .sched
             .lock()
             .pi
-            .blocked_waiters,
+            .donating_locks,
         0
     );
 }
@@ -3958,8 +4013,8 @@ fn failed_pi_release_preserves_the_unselected_wait_transaction() {
             RtPriority::new(90).unwrap(),
         )))
         .unwrap();
-    let lock = PiLockIdentity::new().id().unwrap();
-    let token = commit_pi_wait(&system, lock, waiter.id(), owner.id()).unwrap();
+    let lock = PiLockIdentity::new();
+    let token = commit_pi_wait(&system, &lock, waiter.id(), owner.id()).unwrap();
     {
         let state = system.state.lock();
         state
@@ -3973,7 +4028,7 @@ fn failed_pi_release_preserves_the_unselected_wait_transaction() {
 
     assert_eq!(
         system
-            .prepare_pi_mutex_release(lock, owner.id(), waiter.id())
+            .prepare_pi_mutex_release(lock.lock_ref().unwrap(), owner.id())
             .unwrap_err(),
         TaskError::InvalidConfiguration
     );
@@ -3982,11 +4037,13 @@ fn failed_pi_release_preserves_the_unselected_wait_transaction() {
     assert_eq!(
         state.thread_record(waiter.id()).unwrap().blocked_on,
         Some(PiWaitRegistration {
-            lock,
-            owner: Some(owner.id()),
+            lock: lock.lock_ref().unwrap().raw(),
+            key: PiWaitKey::new(
+                waiter.effective_scheduling_urgency(),
+                waiter.id().as_u64(),
+                waiter.id()
+            ),
             generation: token.generation,
-            owner_prev: None,
-            owner_next: None,
         })
     );
     assert_eq!(
@@ -3996,9 +4053,21 @@ fn failed_pi_release_preserves_the_unselected_wait_transaction() {
             .sched
             .lock()
             .pi
-            .blocked_waiters,
+            .donating_locks,
         1
     );
+    drop(state);
+    {
+        let state = system.state.lock();
+        state
+            .thread_record(owner.id())
+            .unwrap()
+            .sched
+            .lock()
+            .policy
+            .dispatch_generation = 0;
+    }
+    system.pi_wait_cancel(token).unwrap();
 }
 
 #[test]
@@ -4012,11 +4081,11 @@ fn dropped_pi_release_preparation_leaves_the_wait_transaction_intact() {
             RtPriority::new(90).unwrap(),
         )))
         .unwrap();
-    let lock = PiLockIdentity::new().id().unwrap();
-    let token = commit_pi_wait(&system, lock, waiter.id(), owner.id()).unwrap();
+    let lock = PiLockIdentity::new();
+    let token = commit_pi_wait(&system, &lock, waiter.id(), owner.id()).unwrap();
 
     let release = system
-        .prepare_pi_mutex_release(lock, owner.id(), waiter.id())
+        .prepare_pi_mutex_release(lock.lock_ref().unwrap(), owner.id())
         .unwrap();
     drop(release);
 
@@ -4025,11 +4094,13 @@ fn dropped_pi_release_preparation_leaves_the_wait_transaction_intact() {
     assert_eq!(
         state.thread_record(waiter.id()).unwrap().blocked_on,
         Some(PiWaitRegistration {
-            lock,
-            owner: Some(owner.id()),
+            lock: lock.lock_ref().unwrap().raw(),
+            key: PiWaitKey::new(
+                waiter.effective_scheduling_urgency(),
+                waiter.id().as_u64(),
+                waiter.id()
+            ),
             generation: token.generation,
-            owner_prev: None,
-            owner_next: None,
         })
     );
     assert_eq!(
@@ -4039,9 +4110,11 @@ fn dropped_pi_release_preparation_leaves_the_wait_transaction_intact() {
             .sched
             .lock()
             .pi
-            .blocked_waiters,
+            .donating_locks,
         1
     );
+    drop(state);
+    system.pi_wait_cancel(token).unwrap();
 }
 
 #[test]
@@ -4060,13 +4133,13 @@ fn deadline_donor_budget_is_debited_and_overrun_callback_is_deferred() {
     let donor = system
         .create_thread(ThreadSpec::new(deadline).with_extension(extension))
         .unwrap();
-    let lock = PiLockIdentity::new().id().unwrap();
+    let lock = PiLockIdentity::new();
     for thread in [&owner, &donor] {
         system.make_ready(thread.id()).unwrap();
         system.enqueue(cpu.as_mut(), thread.id(), 0).unwrap();
     }
     assert_eq!(system.schedule(cpu.as_mut(), 0).unwrap().next(), donor.id());
-    let _wait = commit_pi_wait(&system, lock, donor.id(), owner.id()).unwrap();
+    let wait = commit_pi_wait(&system, &lock, donor.id(), owner.id()).unwrap();
     system.drain_policy_updates(cpu.as_mut(), 0).unwrap();
     assert_eq!(
         system.block_current(cpu.as_mut(), 0).unwrap().next(),
@@ -4091,6 +4164,7 @@ fn deadline_donor_budget_is_debited_and_overrun_callback_is_deferred() {
     system.drain_policy_updates(cpu.as_mut(), 10).unwrap();
     assert_eq!(system.dispatch_deadline_overruns(1), Ok(1));
     assert_eq!(DEADLINE_OVERRUN_CALLBACKS.load(Ordering::Relaxed), 1);
+    system.pi_wait_cancel(wait).unwrap();
 }
 
 #[test]
@@ -4127,13 +4201,8 @@ fn remote_pi_owner_exclusively_borrows_the_donor_cbs_entity() {
         owner.id()
     );
 
-    let _wait = commit_pi_wait(
-        &system,
-        PiLockIdentity::new().id().unwrap(),
-        donor.id(),
-        owner.id(),
-    )
-    .unwrap();
+    let lock = PiLockIdentity::new();
+    let wait = commit_pi_wait(&system, &lock, donor.id(), owner.id()).unwrap();
     assert_ne!(
         system.block_current(cpu0.as_mut(), 0).unwrap().next(),
         donor.id()
@@ -4204,6 +4273,7 @@ fn remote_pi_owner_exclusively_borrows_the_donor_cbs_entity() {
     system.drain_policy_updates(cpu0.as_mut(), 20).unwrap();
     system.service_deadline_timers(cpu0.as_mut(), 20).unwrap();
     assert_eq!(system.deadline_runtime(donor.id()).unwrap().misses(), 1);
+    system.pi_wait_cancel(wait).unwrap();
 }
 
 #[test]

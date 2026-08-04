@@ -74,7 +74,7 @@ impl TaskSystem {
             resources,
             extension,
             blocked_on: None,
-            pi_waiter_head: None,
+            pi_donors: PiWaitTree::new(),
             callbacks: ThreadCallbackState::new(),
         };
         let context = record.resources.context();

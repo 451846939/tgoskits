@@ -125,7 +125,7 @@ impl ThreadSchedState {
     }
 
     pub(super) fn is_pi_boosted_rt_owner(&self) -> bool {
-        self.pi.blocked_waiters != 0
+        self.pi.donating_locks != 0
             && self.is_pi_boosted()
             && matches!(
                 self.policy.effective,

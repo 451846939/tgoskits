@@ -11,10 +11,10 @@ mod wake_batch;
 pub use wake_batch::ThreadWakeBatch;
 
 use crate::{
-    CpuId, DeadlineFlags, DeadlinePolicy, FairMode, Nice, PiWaitState, RtPriority,
-    RunQueueNodeStorage, SchedulePolicy, SchedulerTickWork, SchedulerTickWorkClaim, SchedulingKey,
-    SchedulingUrgency, TaskError, ThreadAffinityCompletion, ThreadExtensionView, ThreadId,
-    ThreadSchedCell, ThreadState,
+    CpuId, DeadlineFlags, DeadlinePolicy, FairMode, Nice, PiWaitNodeStorage, PiWaitState,
+    RtPriority, RunQueueNodeStorage, SchedulePolicy, SchedulerTickWork, SchedulerTickWorkClaim,
+    SchedulingKey, SchedulingUrgency, TaskError, ThreadAffinityCompletion, ThreadExtensionView,
+    ThreadId, ThreadSchedCell, ThreadState,
     inbox::{InboxKind, InboxNode},
     runtime::{PreemptGuardToken, task_runtime},
     task_work::TaskWorkDoorbell,
@@ -209,7 +209,7 @@ impl Clone for ThreadWakeHandle {
 }
 
 impl ThreadWakeHandle {
-    fn from_core(core: Arc<ThreadCore>) -> Self {
+    pub(crate) fn from_core(core: Arc<ThreadCore>) -> Self {
         let reap_signal = Arc::clone(&core.reap_signal);
         reap_signal.acquire_external_lease();
         Self {
@@ -394,6 +394,7 @@ pub(crate) struct ThreadCore {
     id: ThreadId,
     sched: Arc<ThreadSchedCell>,
     runqueue_nodes: RunQueueNodeStorage,
+    pi_wait_nodes: PiWaitNodeStorage,
     // Immutable after publication. Every handle retaining this copy also pins
     // the registry-owned extension destructor through the reaper Arc contract.
     extension: Option<ThreadExtensionView>,
@@ -448,6 +449,7 @@ impl ThreadCore {
             id,
             sched,
             runqueue_nodes: RunQueueNodeStorage::new(),
+            pi_wait_nodes: PiWaitNodeStorage::new(),
             extension,
             scheduler_tick_work,
             scheduler_tick_work_generation: AtomicU64::new(0),
@@ -488,6 +490,10 @@ impl ThreadCore {
 
     pub(crate) const fn runqueue_nodes(&self) -> &RunQueueNodeStorage {
         &self.runqueue_nodes
+    }
+
+    pub(crate) const fn pi_wait_nodes(&self) -> &PiWaitNodeStorage {
+        &self.pi_wait_nodes
     }
 
     pub(crate) fn begin_runtime_accounting(&self, now_ns: u64) {

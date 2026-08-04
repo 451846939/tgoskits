@@ -533,7 +533,7 @@ impl TaskSystem {
                         donor_sched.pi.deadline_cbs_generation = generation;
                         donor_sched.pi.deadline_cbs_borrower = Some(core.id());
                         pi_critical_rescue =
-                            sched.pi.blocked_waiters != 0 && deadline.remaining_runtime_ns() == 0;
+                            sched.pi.donating_locks != 0 && deadline.remaining_runtime_ns() == 0;
                         Some(generation)
                     } else {
                         // A running/queued donor still owns its local dispatch
@@ -554,7 +554,7 @@ impl TaskSystem {
                 policy: dispatch_policy,
                 entity: dispatch_entity,
                 deadline_donor: sched.pi.deadline_donor,
-                blocks_pi_waiter: sched.pi.blocked_waiters != 0,
+                blocks_pi_waiter: sched.pi.donating_locks != 0,
                 rt_quota_exempt: sched.is_pi_boosted_rt_owner(),
                 pi_critical_rescue,
                 policy_generation: sched.policy.dispatch_generation,

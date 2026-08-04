@@ -26,8 +26,8 @@ impl TaskSystem {
                 return Err(TaskError::ThreadBusy);
             }
             if record.blocked_on.is_some()
-                || record.pi_waiter_head.is_some()
-                || sched.pi.blocked_waiters != 0
+                || !record.pi_donors.is_empty()
+                || sched.pi.donating_locks != 0
             {
                 return Err(TaskError::InvalidPiState);
             }
