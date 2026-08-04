@@ -131,19 +131,37 @@ fn public_api_exposes_user_registers_but_not_the_internal_trap_layout() {
 }
 
 #[test]
-fn x86_user_tls_changes_are_confined_to_the_assembly_entry_window() {
+fn x86_linux_current_keeps_user_tls_live_until_the_next_user_return() {
     let user = read_source("x86_64/uspace.rs");
     let run = function_body(&user, "pub fn run");
     assert!(!run.contains("write_user_thread_pointer"));
     assert!(!run.contains("write_thread_pointer"));
     assert!(!run.contains("KernelGsBase::write"));
     assert!(!run.contains("KernelGsBase::read"));
+    assert!(user.contains("kernel_stack_pointer: u64"));
+    assert!(!user.contains("kernel_fs_base"));
 
     let entry = read_source("x86_64/trap.S");
-    assert!(entry.contains("IA32_FS_BASE"));
-    assert!(entry.contains("IA32_KERNEL_GS_BASE"));
-    assert!(entry.contains("user_fs_base_offset"));
-    assert!(entry.contains("kernel_fs_base_offset"));
+    let kernel_return = entry
+        .split_once(".Lexit_user:")
+        .expect("x86 user trap return section must exist")
+        .1
+        .split_once(".global enter_user")
+        .expect("x86 enter_user boundary must exist")
+        .0;
+    assert!(kernel_return.contains("kernel_stack_pointer_offset"));
+    assert!(!kernel_return.contains("rdmsr"));
+    assert!(!kernel_return.contains("wrmsr"));
+
+    let user_return = entry
+        .split_once("enter_user:")
+        .expect("x86 enter_user section must exist")
+        .1;
+    assert_eq!(user_return.matches("wrmsr").count(), 2);
+    assert!(!user_return.contains("rdmsr"));
+    assert!(user_return.contains("user_fs_base_offset"));
+    assert!(user_return.contains("user_gs_base_offset"));
+    assert!(user_return.contains("kernel_stack_pointer_offset"));
 }
 
 #[cfg(all(target_arch = "x86_64", feature = "uspace"))]

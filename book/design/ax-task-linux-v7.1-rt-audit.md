@@ -1407,6 +1407,54 @@ scheduler，且取时基线同步变慢，因此这些单轮变化只证明修�
 调度性能回退或改善声明。可信的绝对结果确认当前仍未达到 Linux RT 同一水平，最大固定
 差距位于同 CPU futex/FIFO 路径，下一阶段优先剖析该调用链。
 
+### 2026-08-05 x86 LinuxCurrent 用户 TLS 所有权
+
+精确 case marker 的 qperf 运行使用 `qemu/system` staging、2 vCPU 和 leaf callchain，
+FIFO 同 CPU futex 的 25.90 秒 workload 内取得 2,557 个样本并正式返回 `result: ok`。
+窗口内没有 remote IPI 放大；最高占比落在 current identity、owner pick、runqueue enqueue、
+IRQ/preempt guard 和时间换算。第一次用默认单 CPU rootfs 与 FP callchain 的运行在进入 shell
+前由 QEMU plugin SIGSEGV，报告明确为 `incomplete`，其中固件地址样本不进入任何性能结论。
+
+沿 syscall 汇编继续审计后发现更基础的寄存器 owner 错配。Starry final image 明确使用
+LinuxCurrent，`ax-cpu` 也禁止 `uspace + tls`；内核不拥有 FS 寄存器。但旧 x86 用户陷入仍在
+每次 syscall/用户异常入口执行 3 次 `RDMSR` 和 1 次 `WRMSR`，返回用户前再执行 2 次
+`WRMSR`，其中一读一写只为保存并恢复不存在的 kernel FS。与此同时，`UserContext.fs_base`
+在用户执行期间还被临时复用为 kernel continuation stack，迫使入口重新读取用户 FS。
+
+Linux v7.1 `entry_SYSCALL_64`（`arch/x86/entry/entry_64.S:87-121`）不在普通 syscall
+入口读写 FS/GS MSR。非 FSGSBASE 的上下文切换路径在
+`arch/x86/kernel/process_64.c:231-292` 对 selector 0 的常见 64 位线程直接信任已保存 base，
+明确以避免热路径 `RDMSR`；真正的 FS/GS owner 切换收敛在 `__switch_to()` 的
+`save_fsgs()`（同文件 `610-632`）。
+
+当前 x86 LinuxCurrent 路径据此完成以下破坏型收敛：
+
+- `UserContext.fs_base/gs_base` 是禁用 `CR4.FSGSBASE` 时唯一的用户 TLS 软件镜像；
+- 独立的 `kernel_stack_pointer` 保存用户执行期间的 kernel continuation，不再复用 FS 字段；
+- 用户陷入后的 Rust 内核保持用户 FS live，只通过 `SWAPGS` 恢复 CPU area；入口不再执行
+  任何 TLS `RDMSR/WRMSR`；
+- 返回 ring 3 前仍按 `UserContext` 写一次 FS 与 inactive GS，保证迁移、阻塞、clone、ptrace
+  和 `arch_prctl` 后的值正确。后续只有在建立 generation-bearing per-CPU user-TLS binding
+  后，才可继续把这两次写收敛到真实 owner/值变化，不能无条件省略。
+
+确定性红测直接约束汇编边界：旧实现缺少独立 continuation 字段，trap-to-Rust 段含 3 次
+`RDMSR` 与 1 次 `WRMSR`，测试稳定失败；新实现该段读写 MSR 均为 0，user-return 段恰好
+2 次 `WRMSR`。行为验证中，`ARCH_SET/GET_FS/GS` 7/7、clone/pthread/`CLONE_SETTLS`
+21/21、futex wake-op SMP 80,000 次和 AVX context switch 均命中正式 grouped pass 标志。
+
+同一 raw-syscall x86 Q35/TCG 完整复跑结果如下：
+
+- clock-pair `28.407 -> 25.458` 微秒（-10.4%），QEMU `81.39 -> 78.11` 秒（-4.0%）；
+- OTHER 同核/跨核线程/跨核进程 futex p50 分别下降 4.9%/6.5%/6.8%；
+- FIFO 同核/跨核线程/跨核进程 futex p50 分别下降 5.3%/4.7%/7.1%；
+- OTHER/FIFO timer p50 反而上升 12.0%/22.4%。该改动不触及 clockevent/deadline，timer
+  的相反变化保留为独立抖动或后续 finding，不用 futex 改善掩盖，也不归因给 TLS 修改。
+
+修正后的 Starry/Linux RT p50 倍数为：OTHER 同核 8.17x、跨核线程 4.44x、跨核进程
+4.04x、timer 2.38x；FIFO 同核 10.24x、跨核线程 5.22x、跨核进程 4.83x、timer 1.76x。
+固定 syscall 成本下降后仍未达到同一水平，下一阶段继续处理剩余 user-return MSR owner
+publication，以及 qperf 已显示的 current identity、owner pick 和 guard 固定成本。
+
 ## 模块化结果
 
 - `TaskSystem` orchestration 只负责编排，registry/reap、placement、owner scheduling、deadline、PI、balance、deferred work 分模块；
