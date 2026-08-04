@@ -13,6 +13,7 @@ use super::{
         arceos_ivc_guest_requests, arceos_x86_64_guest_request, axvisor_case_asset_config,
         build_group_needs_arceos_x86_64_guest, case_needs_arceos_x86_64_guest,
         inject_arceos_ivc_guest_images, inject_arceos_x86_64_guest_image, inject_linux_ivc_assets,
+        inject_zephyr_ivc_guest_images,
     },
     discover_qemu_cases,
     discovery::{
@@ -323,6 +324,18 @@ impl Axvisor {
         .with_context(|| {
             format!(
                 "failed to prepare Linux IVC assets for Axvisor qemu case `{}`",
+                case.case.case.name
+            )
+        })?;
+        inject_zephyr_ivc_guest_images(
+            self.app.workspace_root(),
+            request,
+            case,
+            &mut prepared_assets,
+        )
+        .with_context(|| {
+            format!(
+                "failed to prepare Zephyr IVC guest image for Axvisor qemu case `{}`",
                 case.case.case.name
             )
         })?;

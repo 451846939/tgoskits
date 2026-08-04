@@ -17,6 +17,7 @@ const ARCEOS_QEMU_GUEST_KERNEL_PATH: &str = "/guest/arceos/ax-helloworld-x86_64.
 const ARCEOS_IVC_GUEST_PACKAGES: &[&str] = &["arceos-ivc-publisher", "arceos-ivc-subscriber"];
 const AXVISOR_IVC_LINUX_PUBLISHER_GUEST_PATH: &str = "/root/ivc-publish";
 const AXVISOR_IVC_LINUX_SUBSCRIBER_GUEST_PATH: &str = "/root/ivc-subscribe";
+const AXVISOR_IVC_ZEPHYR_PUBLISHER_GUEST_PATH: &str = "/guest/zephyr/zephyr-ivc-publisher.bin";
 
 #[derive(Clone, Copy)]
 struct ArceosIvcGuestProfile {
@@ -188,6 +189,32 @@ pub(super) fn inject_linux_ivc_assets(
     result
 }
 
+pub(super) fn inject_zephyr_ivc_guest_images(
+    workspace_root: &Path,
+    request: &ResolvedAxvisorRequest,
+    case: &PreparedAxvisorQemuCase,
+    prepared_assets: &mut test_case::PreparedCaseAssets,
+) -> anyhow::Result<()> {
+    if !case_needs_zephyr_ivc_assets(request, case) {
+        return Ok(());
+    }
+
+    let image = build_zephyr_ivc_publisher(workspace_root)?;
+    ensure_file_exists(&image, "Zephyr IVC publisher image")?;
+
+    let (overlay_dir, temporary_overlay_run_dir) =
+        direct_overlay_dir(workspace_root, request, case)?;
+    copy_guest_overlay_file(
+        &image,
+        &overlay_dir,
+        AXVISOR_IVC_ZEPHYR_PUBLISHER_GUEST_PATH,
+        "Zephyr IVC publisher image",
+    )?;
+    let result = crate::rootfs::inject::inject_overlay(&prepared_assets.rootfs_path, &overlay_dir);
+    test_case::remove_case_run_dir(temporary_overlay_run_dir.as_deref());
+    result
+}
+
 fn direct_overlay_dir(
     workspace_root: &Path,
     request: &ResolvedAxvisorRequest,
@@ -251,6 +278,18 @@ fn case_needs_linux_ivc_assets(
         })
 }
 
+fn case_needs_zephyr_ivc_assets(
+    request: &ResolvedAxvisorRequest,
+    case: &PreparedAxvisorQemuCase,
+) -> bool {
+    case.case.case.name.contains("ivc")
+        && request.vmconfigs.iter().any(|path| {
+            path.file_stem()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains("zephyr-ivc"))
+        })
+}
+
 fn build_linux_ivc_assets(workspace_root: &Path, arch: &str) -> anyhow::Result<PathBuf> {
     let source_dir = workspace_root.join("apps/linux/ivc");
     let build_script = source_dir.join("build.sh");
@@ -270,6 +309,26 @@ fn build_linux_ivc_assets(workspace_root: &Path, arch: &str) -> anyhow::Result<P
         anyhow::bail!("Linux IVC asset build failed with status {status}");
     }
     Ok(out_dir)
+}
+
+fn build_zephyr_ivc_publisher(workspace_root: &Path) -> anyhow::Result<PathBuf> {
+    let source_dir = workspace_root.join("apps/zephyr/ivc_publisher");
+    let build_script = source_dir.join("build.sh");
+    ensure_file_exists(&build_script, "Zephyr IVC build script")?;
+
+    let out_dir = workspace_root.join("tmp/axbuild/zephyr/ivc_publisher/out");
+    let mut command = Command::new(&build_script);
+    command
+        .current_dir(&source_dir)
+        .env("AXVISOR_ZEPHYR_IVC_OUT_DIR", &out_dir);
+
+    let status = command
+        .status()
+        .with_context(|| format!("failed to run {}", build_script.display()))?;
+    if !status.success() {
+        anyhow::bail!("Zephyr IVC publisher build failed with status {status}");
+    }
+    Ok(out_dir.join("zephyr-ivc-publisher.bin"))
 }
 
 pub(super) fn build_group_needs_arceos_x86_64_guest(request: &ResolvedAxvisorRequest) -> bool {
