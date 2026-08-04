@@ -1945,8 +1945,8 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
                     RwFile::new(move |req| match req {
                         SimpleFileOperation::Read => {
                             let nodename = {
-                                let task = current();
-                                let nsproxy = task.as_thread().proc_data.nsproxy.lock();
+                                let task = current_user_task();
+                                let nsproxy = task.as_thread().proc_data.namespace_snapshot();
                                 let uts_namespace = nsproxy.uts_ns.lock();
                                 uts_namespace.nodename
                             };
@@ -1974,7 +1974,7 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
                                 return Err(VfsError::InvalidInput);
                             }
 
-                            if current().as_thread().cred().euid != 0 {
+                            if current_user_task().as_thread().cred().euid != 0 {
                                 return Err(VfsError::OperationNotPermitted);
                             }
 
@@ -1982,9 +1982,9 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
                             for (slot, byte) in nodename.iter_mut().zip(hostname) {
                                 *slot = *byte as _;
                             }
-                            let task = current();
-                            let nsproxy = task.as_thread().proc_data.nsproxy.lock();
-                            nsproxy.uts_ns.lock().nodename = nodename;
+                            let task = current_user_task();
+                            let update = task.as_thread().proc_data.namespace_update();
+                            update.snapshot().uts_ns.lock().nodename = nodename;
                             Ok(None)
                         }
                     }),
