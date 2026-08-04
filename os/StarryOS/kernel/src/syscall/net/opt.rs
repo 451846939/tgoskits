@@ -379,7 +379,12 @@ pub fn sys_getsockopt(
         use linux_raw_sys::net::{SO_REUSEADDR, SOL_SOCKET};
 
         if (level, optname) == (SOL_SOCKET, SO_REUSEADDR) {
-            *get::<i32>(optval, optlen)? = i32::from(socket.reuse_address());
+            write_fixed(
+                optval,
+                optlen_ptr,
+                optlen,
+                i32::from(socket.reuse_address()),
+            )?;
             return Ok(0);
         }
     }
