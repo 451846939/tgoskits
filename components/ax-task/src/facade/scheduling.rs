@@ -53,24 +53,54 @@ fn schedule_current_cpu_with_entry(
     let mut scheduler_frame =
         RuntimeSchedulerFrameGuard::enter(RuntimeScheduleOrigin::Preempt, entry)?;
     let system = runtime_task_system()?;
-    let now_ns = service_scheduler_safe_point_deadlines(system, &mut scheduler_frame)?;
-    let outcome = {
+    let initial_now_ns = task_runtime::monotonic_ns();
+    let fast_outcome = {
         let mut cpu = runtime_current_cpu_mut(&mut scheduler_frame)?;
-        let current_state = cpu.current_lifecycle_state();
-        if !cpu.needs_reschedule() && !cpu.has_remote_work() {
-            if current_state == Some(ThreadState::Parking) {
-                SchedulerOutcome::ParkingDeferred
-            } else {
-                SchedulerOutcome::Quiescent
-            }
+        if cpu.deadline_work_pending() || cpu.task_deadline_expiry_due(initial_now_ns) {
+            None
         } else {
-            system.schedule_if_requested_after_deadline_service(cpu.as_mut(), now_ns)?
+            Some(schedule_cpu_after_deadline_service(
+                system,
+                cpu.as_mut(),
+                initial_now_ns,
+            )?)
         }
+    };
+    let (outcome, now_ns) = if let Some(outcome) = fast_outcome {
+        (outcome, initial_now_ns)
+    } else {
+        let now_ns = service_scheduler_safe_point_deadlines_at(
+            system,
+            &mut scheduler_frame,
+            initial_now_ns,
+        )?;
+        let mut cpu = runtime_current_cpu_mut(&mut scheduler_frame)?;
+        (
+            schedule_cpu_after_deadline_service(system, cpu.as_mut(), now_ns)?,
+            now_ns,
+        )
     };
     if let Some(decision) = outcome.decision() {
         execute_switch_plan(&mut scheduler_frame, decision, now_ns);
     }
     Ok(outcome)
+}
+
+fn schedule_cpu_after_deadline_service(
+    system: &TaskSystem,
+    mut cpu: Pin<&mut CpuLocal>,
+    now_ns: u64,
+) -> Result<SchedulerOutcome, TaskError> {
+    let current_state = cpu.current_lifecycle_state();
+    if !cpu.needs_reschedule() && !cpu.has_remote_work() {
+        Ok(if current_state == Some(ThreadState::Parking) {
+            SchedulerOutcome::ParkingDeferred
+        } else {
+            SchedulerOutcome::Quiescent
+        })
+    } else {
+        system.schedule_if_requested_after_deadline_service(cpu.as_mut(), now_ns)
+    }
 }
 
 pub(super) fn drain_current_expired_timers(
@@ -107,11 +137,20 @@ pub(super) fn drain_current_expired_timers(
     Ok(drained)
 }
 
+#[cfg(test)]
 pub(super) fn service_scheduler_safe_point_deadlines(
     system: &TaskSystem,
     pin: &mut impl RuntimeCpuPin,
 ) -> Result<u64, TaskError> {
     let now_ns = task_runtime::monotonic_ns();
+    service_scheduler_safe_point_deadlines_at(system, pin, now_ns)
+}
+
+fn service_scheduler_safe_point_deadlines_at(
+    system: &TaskSystem,
+    pin: &mut impl RuntimeCpuPin,
+    now_ns: u64,
+) -> Result<u64, TaskError> {
     let should_run = {
         let mut cpu = runtime_current_cpu_mut(pin)?;
         let expiry_due = cpu.task_deadline_expiry_due(now_ns);

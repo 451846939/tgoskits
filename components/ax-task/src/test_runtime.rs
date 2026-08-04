@@ -20,6 +20,7 @@ std::thread_local! {
     static CURRENT_CPU_REMOTE_HANDLE: Cell<usize> = const { Cell::new(0) };
     static CPU_LOCAL_HANDLE_READS: Cell<usize> = const { Cell::new(0) };
     static CPU_REMOTE_HANDLE_READS: Cell<usize> = const { Cell::new(0) };
+    static CPU_OWNER_CLAIMS: Cell<usize> = const { Cell::new(0) };
     static SCHEDULER_FRAME_DEPTH: Cell<usize> = const { Cell::new(0) };
     static MAX_SCHEDULER_FRAME_DEPTH: Cell<usize> = const { Cell::new(0) };
     static IRQ_ENTER_SCHEDULER_FRAME_DEPTH: Cell<usize> = const { Cell::new(0) };
@@ -670,6 +671,7 @@ pub(crate) fn install_task_handles(task_system: usize, cpu_local: usize) {
 pub(crate) fn reset_cpu_handle_reads() {
     CPU_LOCAL_HANDLE_READS.with(|reads| reads.set(0));
     CPU_REMOTE_HANDLE_READS.with(|reads| reads.set(0));
+    CPU_OWNER_CLAIMS.with(|claims| claims.set(0));
 }
 
 pub(crate) fn cpu_handle_reads() -> (usize, usize) {
@@ -677,6 +679,14 @@ pub(crate) fn cpu_handle_reads() -> (usize, usize) {
         CPU_LOCAL_HANDLE_READS.with(Cell::get),
         CPU_REMOTE_HANDLE_READS.with(Cell::get),
     )
+}
+
+pub(crate) fn record_cpu_owner_claim() {
+    CPU_OWNER_CLAIMS.with(|claims| claims.set(claims.get() + 1));
+}
+
+pub(crate) fn cpu_owner_claims() -> usize {
+    CPU_OWNER_CLAIMS.with(Cell::get)
 }
 
 pub(crate) fn clear_task_handles() {

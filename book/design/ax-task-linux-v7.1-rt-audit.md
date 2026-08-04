@@ -1009,6 +1009,21 @@ wakeup-latency workload 与 Linux PREEMPT_RT 对比。
 current-thread publication 2 次，新路径为 1 次；switch tail 仍以
 `PreviousThreadBinding` 的 epoch 在 incoming continuation 中唯一清除 outgoing 绑定。
 
+常见 scheduler safe point 进一步按 Linux 的一次 pre-switch rq transaction 收敛：先在
+同一个 owner borrow 中检查 task deadline、remote work、`need_resched` 和当前线程状态；
+只有确实存在到期 deadline 时才退出该事务，进入有界 expiry slow path，再重新取得
+owner。旧实现即使没有 deadline 也会先进入 deadline helper、释放 owner，然后再次取得
+owner 做调度，连同 switch tail 一次真实切换固定产生 3 次 owner claim；确定性红测在旧
+路径得到 3，新路径固定为 2，即切换前一次、返回后的 switch tail 一次。这个合并不把
+owner guard 跨越 timer wake 或 context switch，也不改变 deadline batch/backpressure
+语义。
+
+同一 Q35/TCG x86 wakeup-latency 完整组通过正式成功标志。相对前一检查点，OTHER 同 CPU
+p50 从 124.292 微秒变为 122.433 微秒，FIFO 同 CPU p50 从 132.665 微秒变为
+120.195 微秒；跨 CPU 与 timer 场景没有出现功能回退。单轮 TCG 结果只证明该检查点未
+引入明显回退，不能单独证明稳定加速；绝对延迟仍高于同宿主 Linux PREEMPT_RT，后续继续
+审计每次切换的 balance、clockevent 重编程和远程唤醒放大。
+
 ## 模块化结果
 
 - `TaskSystem` orchestration 只负责编排，registry/reap、placement、owner scheduling、deadline、PI、balance、deferred work 分模块；

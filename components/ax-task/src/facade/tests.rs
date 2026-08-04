@@ -930,6 +930,11 @@ mod tests {
             "scheduler entry and switch return must use current-CPU owner snapshots without resolving the current endpoint through the global registry"
         );
         assert_eq!(
+            test_runtime::cpu_owner_claims(),
+            2,
+            "the common scheduler path must use one owner transaction before switch and one switch-tail transaction after return"
+        );
+        assert_eq!(
             test_runtime::scheduler_frame_state(),
             (0, 1, 1),
             "one scheduling operation must use one scheduler baton while irq-safe shared locks nest inside it"
@@ -1451,8 +1456,8 @@ mod tests {
 
         assert_eq!(
             test_runtime::cpu_handle_reads(),
-            (1, 1),
-            "one migration pin must validate its CPU-local identity once"
+            (1, 0),
+            "one migration pin must capture its owner snapshot once without a generic remote lookup"
         );
     }
 
