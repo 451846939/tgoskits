@@ -1,7 +1,10 @@
 //! Task-context wait queues built on the generation-checked park handshake.
 
 use alloc::collections::VecDeque;
-use core::time::Duration;
+use core::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 
 use crate::{
     ParkPrepare, TaskError, ThreadHandle, ThreadId, ThreadWakeHandle,
@@ -35,6 +38,7 @@ pub fn sleep_until(deadline: Duration) {
 #[derive(Debug)]
 pub struct WaitQueue {
     waiters: PreemptTicketLock<VecDeque<Waiter>>,
+    notification_generation: AtomicU64,
 }
 
 impl WaitQueue {
@@ -42,6 +46,7 @@ impl WaitQueue {
     pub const fn new() -> Self {
         Self {
             waiters: PreemptTicketLock::new(VecDeque::new()),
+            notification_generation: AtomicU64::new(0),
         }
     }
 
@@ -52,11 +57,13 @@ impl WaitQueue {
             .expect("wait queue park must satisfy scheduler invariants");
     }
 
-    /// Blocks until `condition` observes true after holding the queue lock.
+    /// Blocks until `condition` observes true.
     ///
-    /// The predicate runs with local IRQs disabled and the internal waiter lock
-    /// held. It must be bounded, non-blocking, and must not re-enter this wait
-    /// queue or any scheduler operation.
+    /// The predicate runs in ordinary task context without the internal waiter
+    /// lock. A producer must publish the state observed by `condition` before
+    /// notifying this queue. The notification generation closes the interval
+    /// between the predicate check and waiter insertion without calling
+    /// arbitrary code from a scheduler-sensitive critical section.
     #[track_caller]
     pub fn wait_until<F>(&self, condition: F)
     where
@@ -68,8 +75,8 @@ impl WaitQueue {
 
     /// Fallible form of [`Self::wait_until`] for runtime and OS glue.
     ///
-    /// The predicate follows the same bounded, non-blocking, non-reentrant
-    /// contract as [`Self::wait_until`].
+    /// The predicate follows the same publish-before-notify contract as
+    /// [`Self::wait_until`].
     ///
     /// # Errors
     ///
@@ -134,7 +141,6 @@ impl WaitQueue {
         let deadline_ns = deadline.as_nanos().min(u64::MAX as u128) as u64;
         loop {
             if task_runtime::monotonic_ns() >= deadline_ns {
-                let _waiters = self.waiters.lock();
                 return !condition();
             }
             let condition_met = self
@@ -157,26 +163,6 @@ impl WaitQueue {
     pub fn notify_one(&self) -> bool {
         assert_task_context_notification();
         let Some(waiter) = self.pop_front_task_context() else {
-            return false;
-        };
-        let _result = waiter.wake.wake_from_task();
-        true
-    }
-
-    /// Selects one waiter, performs handoff bookkeeping under the queue lock,
-    /// then wakes the selected thread after releasing the lock.
-    pub fn notify_one_with<F>(&self, operation: F) -> bool
-    where
-        F: Fn(u64),
-    {
-        assert_task_context_notification();
-        let waiter = {
-            let mut waiters = self.waiters.lock();
-            let waiter = waiters.pop_front();
-            operation(waiter.as_ref().map_or(0, |waiter| waiter.thread.as_u64()));
-            waiter
-        };
-        let Some(waiter) = waiter else {
             return false;
         };
         let _result = waiter.wake.wake_from_task();
@@ -209,11 +195,22 @@ impl WaitQueue {
         condition: Option<&dyn Fn() -> bool>,
     ) -> Result<WaitOutcome, TaskError> {
         let thread = crate::current_thread_handle()?;
-        let mut ticket = {
-            let permit = acquire_blocking_permit()?;
-            let mut waiters = self.waiters.lock();
-            if condition.is_some_and(|condition| condition()) {
+        let permit = acquire_blocking_permit()?;
+        let observed_generation = if let Some(condition) = condition {
+            let generation = self.notification_generation.load(Ordering::Acquire);
+            if condition() {
                 return Ok(WaitOutcome::Condition);
+            }
+            Some(generation)
+        } else {
+            None
+        };
+        let mut ticket = {
+            let mut waiters = self.waiters.lock();
+            if observed_generation.is_some_and(|generation| {
+                self.notification_generation.load(Ordering::Acquire) != generation
+            }) {
+                return Ok(WaitOutcome::OtherWake);
             }
             waiters.push_back(Waiter::new(&thread));
             let mut ticket = match prepare_current_park(&permit) {
@@ -260,7 +257,9 @@ impl WaitQueue {
     }
 
     fn pop_front_task_context(&self) -> Option<Waiter> {
-        self.waiters.lock().pop_front()
+        let mut waiters = self.waiters.lock();
+        self.notification_generation.fetch_add(1, Ordering::Release);
+        waiters.pop_front()
     }
 }
 
@@ -331,26 +330,22 @@ mod tests {
     use crate::{SchedulePolicy, TaskSystem, TaskSystemConfig, ThreadSpec};
 
     #[test]
-    fn elapsed_conditional_deadline_checks_predicate_under_the_waiter_lock() {
+    fn elapsed_conditional_deadline_checks_predicate_outside_the_waiter_lock() {
         crate::test_runtime::reset_irq_state();
         crate::test_runtime::reset_preempt_state();
         crate::test_runtime::set_monotonic_ns(10);
         let queue = WaitQueue::new();
-        let predicate_was_protected = core::cell::Cell::new(false);
+        let predicate_can_take_unrelated_state = core::cell::Cell::new(false);
 
         let timed_out = queue.wait_until_deadline(Duration::from_nanos(10), || {
-            predicate_was_protected.set(
-                crate::test_runtime::active_preempt_guards() != 0
-                    && crate::test_runtime::active_irq_guards() == 0
-                    && queue.waiters.try_lock().is_none(),
-            );
+            predicate_can_take_unrelated_state.set(queue.waiters.try_lock().is_some());
             false
         });
 
         assert!(timed_out);
         assert!(
-            predicate_was_protected.get(),
-            "the timeout boundary must hold the task-only waiter lock without disabling IRQs"
+            predicate_can_take_unrelated_state.get(),
+            "wait predicates must run without the scheduler-sensitive waiter lock"
         );
         assert_eq!(crate::test_runtime::active_irq_guards(), 0);
         assert_eq!(crate::test_runtime::active_preempt_guards(), 0);

@@ -22,6 +22,68 @@ const RUN_QUEUED: usize = 1 << 0;
 const COMPLETE: usize = 1 << 1;
 
 #[test]
+fn wait_notification_generation_closes_the_predicate_enqueue_window() {
+    loom::model(|| {
+        const READY: usize = 1;
+        const RETRY: usize = 2;
+        const QUEUED: usize = 3;
+
+        let notification_generation = Arc::new(AtomicUsize::new(0));
+        let condition = Arc::new(AtomicBool::new(false));
+        let waiter_queued = Arc::new(Mutex::new(false));
+        let waiter_outcome = Arc::new(AtomicUsize::new(0));
+        let waiter_woken = Arc::new(AtomicBool::new(false));
+
+        let waiter = {
+            let notification_generation = Arc::clone(&notification_generation);
+            let condition = Arc::clone(&condition);
+            let waiter_queued = Arc::clone(&waiter_queued);
+            let waiter_outcome = Arc::clone(&waiter_outcome);
+            thread::spawn(move || {
+                let observed = notification_generation.load(Ordering::Acquire);
+                if condition.load(Ordering::Acquire) {
+                    waiter_outcome.store(READY, Ordering::Release);
+                    return;
+                }
+
+                let mut queued = waiter_queued.lock().unwrap();
+                if notification_generation.load(Ordering::Acquire) != observed {
+                    waiter_outcome.store(RETRY, Ordering::Release);
+                } else {
+                    *queued = true;
+                    waiter_outcome.store(QUEUED, Ordering::Release);
+                }
+            })
+        };
+        let notifier = {
+            let notification_generation = Arc::clone(&notification_generation);
+            let condition = Arc::clone(&condition);
+            let waiter_queued = Arc::clone(&waiter_queued);
+            let waiter_woken = Arc::clone(&waiter_woken);
+            thread::spawn(move || {
+                condition.store(true, Ordering::Release);
+                let mut queued = waiter_queued.lock().unwrap();
+                notification_generation.fetch_add(1, Ordering::Release);
+                if *queued {
+                    *queued = false;
+                    waiter_woken.store(true, Ordering::Release);
+                }
+            })
+        };
+
+        waiter.join().unwrap();
+        notifier.join().unwrap();
+        assert!(condition.load(Ordering::Acquire));
+        if waiter_outcome.load(Ordering::Acquire) == QUEUED {
+            assert!(
+                waiter_woken.load(Ordering::Acquire),
+                "a waiter committed before the notification must be selected"
+            );
+        }
+    });
+}
+
+#[test]
 fn cpu_offline_excludes_remote_publication() {
     loom::model(|| {
         const OFFLINE: usize = 1usize << (usize::BITS - 1);

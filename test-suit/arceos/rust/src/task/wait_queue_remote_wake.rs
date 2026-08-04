@@ -1,4 +1,4 @@
-use core::{cell::Cell, sync::atomic::AtomicUsize};
+use core::sync::atomic::AtomicUsize;
 use std::{
     os::arceos::{
         api::task::{self as api, AxCpuMask, AxWaitQueueHandle, ax_set_current_affinity},
@@ -40,14 +40,9 @@ fn pin_current_to_cpu(cpu_id: usize) {
 
 fn wake_sleep_queue_after_waiter_enqueued() {
     for _ in 0..WAITER_ENQUEUE_RETRIES {
-        let woke_waiter = Cell::new(false);
-        api::ax_wait_queue_wake_one_with(&SLEEP_WQ, |task_id| {
-            if task_id != 0 {
-                GO.store(true, Ordering::Release);
-                woke_waiter.set(true);
-            }
-        });
-        if woke_waiter.get() {
+        if api::ax_wait_queue_wake(&SLEEP_WQ, 1) == 1 {
+            GO.store(true, Ordering::Release);
+            let _ = api::ax_wait_queue_wake(&SLEEP_WQ, 1);
             return;
         }
         thread::yield_now();

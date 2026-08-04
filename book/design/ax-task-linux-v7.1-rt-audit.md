@@ -1087,6 +1087,35 @@ width 不使用 online count，避免 hotplug 后改变 affinity mask ABI。RISC
 `task-affinity` 从修复前超过 30 秒仍无结束标志，收敛为 guest 内 44 毫秒完成，runner 正式
 结果为 `1/1 case(s) passed`。
 
+### 2026-08-04 WaitQueue generation 与锁外 predicate
+
+Linux v7.1 的 `prepare_to_wait*()` 只在 waitqueue spinlock 内修改 waiter 链表，调用方的
+条件检查和 `schedule()` 均在该内部锁外执行；唤醒侧先在受限临界区选择 task，再通过
+`wake_q` 于外部完成实际 wake。PREEMPT_RT 的 rtmutex handoff 同样先提交 owner/waiter
+元数据，再在 raw lock 外唤醒，不允许内部 scheduler-sensitive lock 调用任意上层闭包。
+
+旧 `WaitQueue` 恰好相反：`wait_until*()` 在 `PreemptTicketLock<VecDeque<_>>` 内执行任意
+predicate，`notify_one_with()` 也在该锁内执行上层 handoff。Starry TPU、perf CPU worker、
+ax-runtime serial control 等 predicate 会取得各自的任务态锁；生产者通常先修改该任务态
+状态，再调用 `notify_*()`。这形成 `waiters -> domain state` 与
+`domain state -> waiters` 的确定性反向锁序，并把分配、PiMutex 阻塞或重入调度的能力带进
+raw/preempt 临界区。
+
+新协议为每个 WaitQueue 增加单一 `notification_generation`。等待者先 Acquire 读取
+generation，再在内部锁外检查 predicate；进入 waiter lock 后只比较 generation，若有通知
+跨过检查/入队窗口便退出并重新检查，否则提交 waiter 与 park ticket。通知方先取得 waiter
+lock，在同一事务中 Release 推进 generation 并移除目标，随后完全释放内部锁再执行 wake。
+`notify_one_with()` 允许先选 waiter、后由任意闭包发布条件，本质违反 publish-before-notify，
+因此直接删除，不提供兼容入口。上层必须先发布领域状态，再调用普通 notify；ax-api wake
+返回实际选择的 waiter 数，测试和需要精确计数的调用方不再借助锁内回调探测队列。
+
+两个最低层红测在旧实现中稳定失败：elapsed deadline predicate 无法重新取得 waiter lock，
+notification handoff callback 也观察到 waiter lock 被占用；前者作为持续行为回归，后者驱动
+危险 API 整体删除。loom 穷举覆盖 predicate check、generation publication、waiter commit
+和 notify selection 的全部交错，保证已提交 waiter 必被选择，窗口内通知则强制重试。
+x86_64 四 CPU QEMU
+`task-wait-queue-remote-wake` 正式通过，guest 13 毫秒，runner `1/1 case(s) passed`。
+
 ## 模块化结果
 
 - `TaskSystem` orchestration 只负责编排，registry/reap、placement、owner scheduling、deadline、PI、balance、deferred work 分模块；

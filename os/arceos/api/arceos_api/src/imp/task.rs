@@ -189,23 +189,21 @@ cfg_task! {
         }
     }
 
-    pub fn ax_wait_queue_wake(wq: &AxWaitQueueHandle, count: u32) {
+    pub fn ax_wait_queue_wake(wq: &AxWaitQueueHandle, count: u32) -> usize {
+        let mut woken = 0;
         if count == u32::MAX {
-            wq.0.notify_all();
+            while wq.0.notify_one() {
+                woken += 1;
+            }
         } else {
             for _ in 0..count {
                 if !wq.0.notify_one() {
                     break;
                 }
+                woken += 1;
             }
         }
-    }
-
-    pub fn ax_wait_queue_wake_one_with<F>(wq: &AxWaitQueueHandle, func: F)
-    where
-        F: Fn(u64),
-    {
-        wq.0.notify_one_with(func);
+        woken
     }
 
     fn task_result<T>(
