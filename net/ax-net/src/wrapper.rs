@@ -26,7 +26,7 @@
 use alloc::{vec, vec::Vec};
 
 use ax_errno::{AxError, AxResult};
-use ax_sync::SpinMutex;
+use ax_sync::PiMutex;
 use hashbrown::HashMap;
 use smoltcp::{
     iface::{SocketHandle, SocketSet},
@@ -50,17 +50,17 @@ struct UdpBoundEntry {
 /// Global socket container plus protocol-specific side tables.
 pub(crate) struct SocketSetWrapper<'a> {
     /// The shared smoltcp socket set.
-    pub inner: SpinMutex<SocketSet<'a>>,
+    pub inner: PiMutex<SocketSet<'a>>,
     /// UDP bind ownership tracked with Linux-style wildcard/reuseport conflicts.
-    udp_binds: SpinMutex<HashMap<u16, Vec<UdpBoundEntry>>>,
+    udp_binds: PiMutex<HashMap<u16, Vec<UdpBoundEntry>>>,
 }
 
 impl<'a> SocketSetWrapper<'a> {
     /// Creates an empty wrapper around smoltcp's socket set.
     pub fn new() -> Self {
         Self {
-            inner: SpinMutex::new(SocketSet::new(vec![])),
-            udp_binds: SpinMutex::new(HashMap::new()),
+            inner: PiMutex::new(SocketSet::new(vec![])),
+            udp_binds: PiMutex::new(HashMap::new()),
         }
     }
 
@@ -185,6 +185,7 @@ mod tests {
 
     #[test]
     fn udp_bind_rules_allow_distinct_specific_addresses() {
+        let _runtime = crate::test_runtime::install_default();
         let w = SocketSetWrapper::new();
         let h = handles(4);
         w.udp_bind(h[0], addr(192, 0, 2, 10), 5353, false).unwrap();
@@ -206,6 +207,7 @@ mod tests {
 
     #[test]
     fn udp_bind_rejects_specific_after_wildcard() {
+        let _runtime = crate::test_runtime::install_default();
         let w = SocketSetWrapper::new();
         let h = handles(2);
         w.udp_bind(h[0], wildcard(), 5354, false).unwrap();
@@ -218,6 +220,7 @@ mod tests {
 
     #[test]
     fn udp_reuseport_group_shares_a_port_while_plain_binders_conflict() {
+        let _runtime = crate::test_runtime::install_default();
         let w = SocketSetWrapper::new();
         let h = handles(4);
         let local = addr(127, 0, 0, 1);
@@ -257,6 +260,7 @@ mod tests {
 
     #[test]
     fn udp_port_available_avoids_any_active_bind() {
+        let _runtime = crate::test_runtime::install_default();
         let w = SocketSetWrapper::new();
         let h = handles(1);
         assert!(w.udp_port_available(wildcard(), 5355));

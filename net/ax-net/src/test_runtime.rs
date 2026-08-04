@@ -1,9 +1,15 @@
 //! Trait-FFI runtime stubs linked only into the ax-net unit-test binary.
 
-use core::sync::atomic::{AtomicUsize, Ordering};
+use alloc::boxed::Box;
+use core::{
+    cell::Cell,
+    pin::Pin,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use ax_task::{
-    CpuId, CpuRemote, TaskSystem, impl_trait as impl_task_runtime,
+    CpuId, CpuRemote, SchedulePolicy, TaskSystem, TaskSystemConfig, ThreadSpec,
+    impl_trait as impl_task_runtime,
     runtime::{TaskRuntime, *},
 };
 
@@ -13,6 +19,10 @@ static TASK_SYSTEM: AtomicUsize = AtomicUsize::new(0);
 static CPU_LOCAL: AtomicUsize = AtomicUsize::new(0);
 static CPU_REMOTE: AtomicUsize = AtomicUsize::new(0);
 static TEST_RUNTIME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+std::thread_local! {
+    static ACTIVE_PREEMPT_GUARDS: Cell<usize> = const { Cell::new(0) };
+}
 
 struct NetTestTaskRuntime;
 
@@ -146,6 +156,30 @@ pub(crate) struct InstalledTestRuntime {
     _lock: std::sync::MutexGuard<'static, ()>,
 }
 
+pub(crate) struct OwnedTestRuntime {
+    _installed: InstalledTestRuntime,
+    _cpu_local: Pin<Box<ax_task::CpuLocal>>,
+    _task_system: Box<TaskSystem>,
+}
+
+pub(crate) fn install_default() -> OwnedTestRuntime {
+    let task_system = Box::new(TaskSystem::new(TaskSystemConfig::new(1)).unwrap());
+    let mut cpu_local = task_system.create_cpu_local(CpuId::new(0)).unwrap();
+    task_system
+        .install_bootstrap_thread(
+            cpu_local.as_mut(),
+            ThreadSpec::new(SchedulePolicy::default()),
+        )
+        .unwrap();
+    task_system.bring_cpu_online(cpu_local.as_mut()).unwrap();
+    let installed = install(&task_system, cpu_local.as_mut());
+    OwnedTestRuntime {
+        _installed: installed,
+        _cpu_local: cpu_local,
+        _task_system: task_system,
+    }
+}
+
 impl Drop for InstalledTestRuntime {
     fn drop(&mut self) {
         CPU_REMOTE.store(0, Ordering::Release);
@@ -193,7 +227,24 @@ struct NetTestKernelGuard;
 
 #[ax_crate_interface::impl_interface]
 impl ax_kernel_guard::KernelGuardIf for NetTestKernelGuard {
-    fn disable_preempt() {}
+    fn disable_preempt() {
+        ACTIVE_PREEMPT_GUARDS.with(|depth| depth.set(depth.get() + 1));
+    }
 
-    fn enable_preempt() {}
+    fn enable_preempt() {
+        let previous = ACTIVE_PREEMPT_GUARDS.with(|depth| {
+            let previous = depth.get();
+            depth.set(previous.saturating_sub(1));
+            previous
+        });
+        assert_ne!(previous, 0, "test preemption guard depth underflowed");
+    }
+}
+
+pub(crate) fn reset_preempt_guards() {
+    ACTIVE_PREEMPT_GUARDS.with(|depth| depth.set(0));
+}
+
+pub(crate) fn active_preempt_guards() -> usize {
+    ACTIVE_PREEMPT_GUARDS.with(Cell::get)
 }

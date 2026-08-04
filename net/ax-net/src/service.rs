@@ -7,11 +7,11 @@
 //!
 //! **Lock hierarchy (outermost → innermost):**
 //!
-//! 1. **SERVICE** (`SpinMutex<Service>`)
+//! 1. **SERVICE** (`PiMutex<Service>`)
 //!    - Outermost, protects entire protocol stack
 //!    - Held during `Service::poll()` and waker registration
 //!
-//! 2. **SOCKET_SET.inner** (`SpinMutex<SocketSet>`)
+//! 2. **SOCKET_SET.inner** (`PiMutex<SocketSet>`)
 //!    - smoltcp socket set (all TCP/UDP/raw/DNS sockets)
 //!    - Acquired during poll, socket operations, and state queries
 //!    - ⚠️ Never acquire SERVICE while holding this lock

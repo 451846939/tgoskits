@@ -50,7 +50,7 @@ use core::{
 
 use ax_hal::time::{NANOS_PER_MICROS, monotonic_time_nanos};
 use ax_kspin::SpinRwLock as RwLock;
-use ax_sync::SpinMutex;
+use ax_sync::{PiMutex, SpinMutex};
 use ax_task::WaitQueue;
 use axpoll::IoEvents;
 use smoltcp::{
@@ -264,7 +264,7 @@ struct DeviceHandle {
     /// Device name used for logs and userspace queries.
     name: String,
     /// Concrete device implementation.
-    inner: Arc<SpinMutex<Box<dyn Device>>>,
+    inner: Arc<PiMutex<Box<dyn Device>>>,
     /// Shared router RX queue.
     rx_queue: Arc<BoundedPacketQueue<RxPacket>>,
     /// Per-device TX queue.
@@ -346,7 +346,7 @@ impl DeviceHandle {
         Arc::new_cyclic(|weak| Self {
             interface_id,
             name,
-            inner: Arc::new(SpinMutex::new(device)),
+            inner: Arc::new(PiMutex::new(device)),
             rx_queue: queues.rx.clone(),
             tx_queue: Arc::new(BoundedPacketQueue::new(DEVICE_TX_QUEUE_SIZE)),
             rx_wake: Arc::new(WaitQueue::new()),
@@ -1741,6 +1741,7 @@ mod l2_counter_tests {
 
     #[test]
     fn send_returns_frame_len_tx_counts_l2_not_ip_payload() {
+        let _runtime = crate::test_runtime::install_default();
         let device = test_device_handle(Box::new(CountingMockDevice {
             name: "mock",
             send_returns: 1514, // L2 frame length (14 eth hdr + 1500 IP payload)
@@ -1767,6 +1768,7 @@ mod l2_counter_tests {
 
     #[test]
     fn send_returns_zero_no_tx_counted() {
+        let _runtime = crate::test_runtime::install_default();
         let device = test_device_handle(Box::new(CountingMockDevice {
             name: "mock",
             send_returns: 0, // ARP pending or send failure
@@ -1794,6 +1796,7 @@ mod l2_counter_tests {
 
     #[test]
     fn recv_returns_frame_len_rx_counts_it() {
+        let _runtime = crate::test_runtime::install_default();
         let device = test_device_handle(Box::new(CountingMockDevice {
             name: "mock",
             send_returns: 0,
@@ -1820,6 +1823,7 @@ mod l2_counter_tests {
 
     #[test]
     fn recv_returns_zero_no_rx_counted() {
+        let _runtime = crate::test_runtime::install_default();
         let device = test_device_handle(Box::new(CountingMockDevice {
             name: "mock",
             send_returns: 0,
@@ -1968,6 +1972,7 @@ mod l2_counter_tests {
     /// drain_deferred_tx() (ARP TX), and drain_deferred_rx() (ARP RX).
     #[test]
     fn rx_worker_three_path_combined_drain() {
+        let _runtime = crate::test_runtime::install_default();
         let device = test_device_handle(Box::new(CountingMockDevice {
             name: "mock",
             send_returns: 0,

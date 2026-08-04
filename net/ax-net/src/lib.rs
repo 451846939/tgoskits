@@ -49,6 +49,7 @@ mod listen_table;
 /// Socket option types and the [`Configurable`](options::Configurable) trait.
 pub mod options;
 mod orphan;
+mod poll_runtime;
 /// Raw socket implementation.
 pub mod raw;
 mod router;
@@ -83,8 +84,8 @@ use core::{
 };
 
 use ax_errno::{AxError, AxResult, ax_err_type};
-use ax_sync::SpinMutex;
-use ax_task::{IrqRegisterResult, IrqWaitCell, IrqWaitRegistration, WaitQueue, quiesce_irq_wait};
+use ax_sync::{PiMutex, PiMutexGuard};
+use ax_task::{IrqRegisterResult, IrqWaitCell, IrqWaitRegistration, quiesce_irq_wait};
 use axpoll::{IoEvents, PollSet};
 use smoltcp::{
     socket::dns::{self, GetQueryResultError, StartQueryError},
@@ -98,6 +99,7 @@ use self::{
     addr::mask_from_prefix,
     device::{EthernetDevice, LoopbackDevice},
     listen_table::ListenTable,
+    poll_runtime::PollRuntime,
     router::{RouteTable, Router, Rule, SharedRouteTable},
     service::{NetControl, NetInterface, Service},
     wrapper::SocketSetWrapper,
@@ -123,18 +125,15 @@ pub use self::{
 static LISTEN_TABLE: LazyLock<ListenTable> = LazyLock::new(ListenTable::new);
 static SOCKET_SET: LazyLock<SocketSetWrapper> = LazyLock::new(SocketSetWrapper::new);
 
-static SERVICE: Once<SpinMutex<Service>> = Once::new();
+static SERVICE: Once<PiMutex<Service>> = Once::new();
 static NET_CONTROL: Once<Arc<NetControl>> = Once::new();
-static POLLING_INTERFACES: AtomicBool = AtomicBool::new(false);
-static POLL_AGAIN: AtomicBool = AtomicBool::new(false);
-static NET_POLL_REQUESTED: AtomicBool = AtomicBool::new(false);
-static NET_POLL_WAKE: WaitQueue = WaitQueue::new();
+static NET_POLL: PollRuntime = PollRuntime::new();
 static NET_POLL_DEVICE_WAKER: LazyLock<Waker> =
     LazyLock::new(|| Waker::from(Arc::new(NetPollWake)));
 type DeferredPollEntry = (Arc<PollSet>, IoEvents);
 static DEFERRED_POLL_WAKE_PENDING: AtomicBool = AtomicBool::new(false);
-static DEFERRED_POLL_WAKES: LazyLock<SpinMutex<Vec<DeferredPollEntry>>> =
-    LazyLock::new(|| SpinMutex::new(Vec::new()));
+static DEFERRED_POLL_WAKES: LazyLock<PiMutex<Vec<DeferredPollEntry>>> =
+    LazyLock::new(|| PiMutex::new(Vec::new()));
 
 pub(crate) struct DeferPollWake {
     pub(crate) poll: Arc<PollSet>,
@@ -160,8 +159,8 @@ impl Wake for DeferPollWake {
 /// [`rd_net::WifiControlHandle`] before the `Net` is consumed into the data-plane
 /// driver). Lets runtime mode switching (e.g. a StarryOS wireless-extensions
 /// `ioctl`) reach the device's [`WifiControl`] by name.
-static WIFI_CONTROLS: LazyLock<SpinMutex<Vec<(alloc::string::String, rd_net::WifiControlHandle)>>> =
-    LazyLock::new(|| SpinMutex::new(Vec::new()));
+static WIFI_CONTROLS: LazyLock<PiMutex<Vec<(alloc::string::String, rd_net::WifiControlHandle)>>> =
+    LazyLock::new(|| PiMutex::new(Vec::new()));
 
 static NET_IRQ_EVENT: AtomicBool = AtomicBool::new(false);
 static NET_IRQ_WAIT: IrqWaitCell = IrqWaitCell::new();
@@ -174,7 +173,7 @@ fn net_poll_device_waker() -> &'static Waker {
     LazyLock::force(&NET_POLL_DEVICE_WAKER)
 }
 
-fn get_service() -> ax_sync::SpinMutexGuard<'static, Service> {
+fn get_service() -> PiMutexGuard<'static, Service> {
     SERVICE
         .get()
         .expect("Network service not initialized")
@@ -318,7 +317,7 @@ pub fn init_network(mut net_devs: EthernetDeviceList, config: NetworkConfig) {
     let workers = service.prepare_device_workers();
     workers.register_device_waker(net_poll_device_waker());
     NET_CONTROL.call_once(|| control);
-    SERVICE.call_once(|| SpinMutex::new(service));
+    SERVICE.call_once(|| PiMutex::new(service));
     workers.start();
     spawn_permanent_worker("net-poll".to_owned(), net_poll_worker)
         .unwrap_or_else(|error| panic!("failed to start net poll worker: {error}"));
@@ -469,57 +468,17 @@ pub fn init_vsock(mut vsock_devs: device::VsockDeviceList) {
     }
 }
 
-#[derive(Clone, Copy)]
-enum PollOwnership {
-    Opportunistic,
-    Required,
-}
-
-fn acquire_poll_ownership(
-    polling: &AtomicBool,
-    ownership: PollOwnership,
-    mut wait: impl FnMut(),
-) -> bool {
+fn poll_protocol_until_idle() {
     loop {
-        if polling
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Acquire)
-            .is_ok()
-        {
-            return true;
+        let outcome = {
+            let mut service = get_service();
+            let mut sockets = SOCKET_SET.inner.lock();
+            service.poll(&mut sockets)
+        };
+        for waker in outcome.expired_wakers {
+            waker.wake();
         }
-        match ownership {
-            PollOwnership::Opportunistic => return false,
-            PollOwnership::Required => wait(),
-        }
-    }
-}
-
-fn yield_poll_owner() {
-    ax_task::yield_current_cpu().unwrap_or_else(|error| {
-        panic!("failed to yield while waiting for the net poll owner: {error}")
-    });
-}
-
-fn poll_until_idle(ownership: PollOwnership) {
-    POLL_AGAIN.store(true, Ordering::Release);
-    loop {
-        if !acquire_poll_ownership(&POLLING_INTERFACES, ownership, yield_poll_owner) {
-            return;
-        }
-
-        while POLL_AGAIN.swap(false, Ordering::AcqRel) {
-            loop {
-                let outcome = get_service().poll(&mut SOCKET_SET.inner.lock());
-                for waker in outcome.expired_wakers {
-                    waker.wake();
-                }
-                if !outcome.progressed {
-                    break;
-                }
-            }
-        }
-        POLLING_INTERFACES.store(false, Ordering::Release);
-        if !POLL_AGAIN.load(Ordering::Acquire) {
+        if !outcome.progressed {
             return;
         }
     }
@@ -529,33 +488,32 @@ fn poll_until_idle(ownership: PollOwnership) {
 ///
 /// This is the lightweight entry used by socket and device paths.
 pub fn request_poll() {
-    publish_poll_request(&NET_POLL_REQUESTED, || {
-        NET_POLL_WAKE.notify_one();
-    });
+    let _generation = NET_POLL.request();
 }
 
-/// Synchronously drive the interface poll until idle.
+/// Waits until the permanent worker has dispatched queued egress.
 ///
-/// [`request_poll`] only wakes the poll worker; the actual dispatch happens
-/// later. A socket that is closed in the same breath as its last send would
-/// otherwise be torn down before the worker runs, discarding the datagram still
-/// queued in its TX buffer. Draining egress here mirrors Linux, where a sent
-/// datagram already sits in the peer's receive buffer and `close()` cannot
-/// unsend it. Must not be called while holding `SOCKET_SET.inner`.
+/// A socket that is closed in the same breath as its last send would otherwise
+/// discard the datagram still queued in its smoltcp TX buffer. The caller never
+/// takes poll ownership: it publishes a generation and sleeps until the single
+/// net worker completes it. Must not be called by the net worker or while
+/// holding `SERVICE` or `SOCKET_SET.inner`.
 pub(crate) fn flush_egress() {
-    poll_until_idle(PollOwnership::Required);
-}
-
-fn publish_poll_request(requested: &AtomicBool, wake: impl FnOnce()) {
-    if !requested.swap(true, Ordering::AcqRel) {
-        wake();
+    let generation = NET_POLL.request();
+    #[cfg(test)]
+    if NET_IRQ_REGISTRATION.get().is_none() {
+        poll_protocol_until_idle();
+        NET_POLL.complete(NET_POLL.requested_generation());
+        let _more_work = NET_POLL.finish_cycle(|| false);
+        return;
     }
+    NET_POLL.wait_for_completion(generation);
 }
 
 pub(crate) fn defer_poll_wake(poll: Arc<PollSet>, ready: IoEvents) {
     DEFERRED_POLL_WAKES.lock().push((poll, ready));
     if !DEFERRED_POLL_WAKE_PENDING.swap(true, Ordering::AcqRel) {
-        NET_POLL_WAKE.notify_one();
+        NET_POLL.schedule_worker();
     }
 }
 
@@ -827,9 +785,8 @@ fn net_poll_worker() {
             IrqRegisterResult::ConsumedPending => false,
             IrqRegisterResult::Registered(token)
             | IrqRegisterResult::NotificationInFlight(token) => {
-                let timed_out = NET_POLL_WAKE.wait_timeout_until(delay, || {
+                let timed_out = NET_POLL.wait_timeout_until(delay, || {
                     !token.is_attached()
-                        || NET_POLL_REQUESTED.load(Ordering::Acquire)
                         || NET_IRQ_EVENT.load(Ordering::Acquire)
                         || DEFERRED_POLL_WAKE_PENDING.load(Ordering::Acquire)
                 });
@@ -841,16 +798,21 @@ fn net_poll_worker() {
                 panic!("net IRQ waiter was registered concurrently")
             }
         };
-        if !timed_out {
-            take_poll_request(&NET_POLL_REQUESTED, || {});
-        }
         let irq_pending = NET_IRQ_EVENT.swap(false, Ordering::AcqRel);
         if device_poll_fallback_due(timed_out, irq_pending, delay) {
             get_service().wake_all_devices();
         }
         drain_deferred_poll_wakes();
-        poll_until_idle(PollOwnership::Opportunistic);
+        let completed_generation = NET_POLL.requested_generation();
+        poll_protocol_until_idle();
+        NET_POLL.complete(completed_generation);
         drain_deferred_poll_wakes();
+        if NET_POLL.finish_cycle(|| {
+            NET_IRQ_EVENT.load(Ordering::Acquire)
+                || DEFERRED_POLL_WAKE_PENDING.load(Ordering::Acquire)
+        }) {
+            continue;
+        }
     }
 }
 
@@ -872,39 +834,11 @@ fn device_poll_fallback_due(timed_out: bool, irq_pending: bool, delay: Duration)
     irq_pending || (timed_out && delay > Duration::ZERO)
 }
 
-fn take_poll_request(requested: &AtomicBool, after_observe: impl FnOnce()) -> bool {
-    if requested.swap(false, Ordering::AcqRel) {
-        after_observe();
-        true
-    } else {
-        false
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use core::{
-        sync::atomic::{AtomicBool, Ordering},
-        time::Duration,
-    };
+    use core::time::Duration;
 
-    use super::{
-        PollOwnership, acquire_poll_ownership, device_poll_fallback_due, publish_poll_request,
-        take_poll_request,
-    };
-
-    #[test]
-    fn poll_request_after_worker_drain_stays_pending() {
-        let requested = AtomicBool::new(true);
-        let mut wakes = 0;
-
-        assert!(take_poll_request(&requested, || {
-            publish_poll_request(&requested, || wakes += 1);
-        }));
-
-        assert!(requested.load(Ordering::Acquire));
-        assert_eq!(wakes, 1);
-    }
+    use super::device_poll_fallback_due;
 
     #[test]
     fn poll_timeout_wakes_devices_as_polling_fallback() {
@@ -919,21 +853,6 @@ mod tests {
     fn immediate_socket_poll_does_not_force_device_fallback() {
         assert!(!device_poll_fallback_due(true, false, Duration::ZERO));
         assert!(device_poll_fallback_due(false, true, Duration::ZERO));
-    }
-
-    #[test]
-    fn synchronous_flush_waits_for_active_poll_owner() {
-        let polling = AtomicBool::new(true);
-        let mut waits = 0;
-
-        let acquired = acquire_poll_ownership(&polling, PollOwnership::Required, || {
-            waits += 1;
-            polling.store(false, Ordering::Release);
-        });
-
-        assert!(acquired);
-        assert_eq!(waits, 1);
-        assert!(polling.load(Ordering::Acquire));
     }
 }
 
@@ -1084,14 +1003,30 @@ mod initialization_contract_tests {
              PollSet"
         );
     }
+
+    #[test]
+    fn protocol_service_lock_keeps_scheduler_ticks_enabled_while_held() {
+        let _network = crate::test_support::network_test_guard();
+        crate::test_support::init_split_route_network();
+        crate::test_runtime::reset_preempt_guards();
+
+        let service = super::get_service();
+
+        assert_eq!(
+            crate::test_runtime::active_preempt_guards(),
+            0,
+            "the task-context protocol core must remain preemptible while its sleep mutex is held"
+        );
+        drop(service);
+    }
 }
 
 #[cfg(test)]
 pub(crate) mod test_support {
     use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
-    use std::sync::{Mutex as StdMutex, MutexGuard, Once};
+    use std::sync::{Mutex as StdMutex, MutexGuard, Once, PoisonError};
 
-    use ax_sync::SpinMutex;
+    use ax_sync::PiMutex;
     use smoltcp::wire::{IpAddress, Ipv4Address, Ipv4Cidr};
 
     use crate::{
@@ -1110,8 +1045,20 @@ pub(crate) mod test_support {
 
     static NETWORK_TEST_LOCK: StdMutex<()> = StdMutex::new(());
 
-    pub(crate) fn network_test_guard() -> MutexGuard<'static, ()> {
-        NETWORK_TEST_LOCK.lock().unwrap()
+    pub(crate) struct NetworkTestGuard {
+        _runtime: crate::test_runtime::OwnedTestRuntime,
+        _network: MutexGuard<'static, ()>,
+    }
+
+    pub(crate) fn network_test_guard() -> NetworkTestGuard {
+        let network = NETWORK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let runtime = crate::test_runtime::install_default();
+        NetworkTestGuard {
+            _runtime: runtime,
+            _network: network,
+        }
     }
 
     pub(crate) fn init_split_route_network() {
@@ -1175,7 +1122,7 @@ pub(crate) mod test_support {
             });
 
             NET_CONTROL.call_once(|| control);
-            SERVICE.call_once(|| SpinMutex::new(service));
+            SERVICE.call_once(|| PiMutex::new(service));
         });
     }
 }
