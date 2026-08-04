@@ -118,15 +118,30 @@ struct ClockEventFiringGuard {
 }
 
 #[cfg(feature = "irq")]
+fn unclaimed_irq_action(
+    claim: &crate::clock_event::ClockEventIrqClaim,
+) -> Option<crate::clock_event::ClockEventAction> {
+    match claim {
+        crate::clock_event::ClockEventIrqClaim::Ignored => {
+            Some(crate::clock_event::ClockEventAction::Stop)
+        }
+        crate::clock_event::ClockEventIrqClaim::Rearm(deadline) => {
+            Some(crate::clock_event::ClockEventAction::Program(*deadline))
+        }
+        crate::clock_event::ClockEventIrqClaim::Firing(_) => None,
+    }
+}
+
+#[cfg(feature = "irq")]
 impl ClockEventFiringGuard {
     fn begin(now_ns: u64) -> Option<Self> {
         let claim = with_local_clock_event_mut(|clockevent| clockevent.claim_irq(now_ns));
+        if let Some(action) = unclaimed_irq_action(&claim) {
+            apply_clock_event_action(action);
+        }
         let token = match claim {
             crate::clock_event::ClockEventIrqClaim::Ignored => return None,
-            crate::clock_event::ClockEventIrqClaim::Rearm(deadline) => {
-                apply_clock_event_action(crate::clock_event::ClockEventAction::Program(deadline));
-                return None;
-            }
+            crate::clock_event::ClockEventIrqClaim::Rearm(_) => return None,
             crate::clock_event::ClockEventIrqClaim::Firing(token) => token,
         };
         let _scheduler_tick = with_local_clock_event_mut(|clockevent| {
@@ -422,6 +437,15 @@ mod tests {
 
         assert!(handled);
         assert!(irq_enabled.get(), "the caller's IRQ state must be restored");
+    }
+
+    #[cfg(feature = "irq")]
+    #[test]
+    fn stale_edge_without_a_logical_owner_stops_the_physical_clockevent() {
+        assert_eq!(
+            super::unclaimed_irq_action(&crate::clock_event::ClockEventIrqClaim::Ignored),
+            Some(crate::clock_event::ClockEventAction::Stop)
+        );
     }
 
     #[test]

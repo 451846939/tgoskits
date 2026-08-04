@@ -499,13 +499,20 @@ Offline | Idle | Armed(deadline) | Firing
 timer IRQ 顺序：
 
 1. platform claim/ACK；
-2. 对照当前 epoch 与 arm：`Idle/Offline` 的边直接忽略；未到期的旧 pending/early edge
-   只重新写入当前 arm；只有已到期的 `Armed -> Firing(token)` 才失效旧 arm；
+2. 对照当前 epoch 与 arm：`Idle/Offline/Firing` 的 stale edge 不进入 ax-task，但必须先
+   stop/mask 物理 clockevent；未到期的旧 pending/early edge 只重新写入当前 arm；只有
+   已到期的 `Armed -> Firing(token)` 才失效旧 arm；
 3. 非 idle CPU 更新 scheduler tick；idle/nohz 状态不生成 periodic source；
 4. 调用有界 `on_clock_event(now, budget)`；
 5. 发布 sticky deadline work / need-resched；
 6. 合并 task deadline 与当前有效的 scheduler tick，统一编程一次；
 7. 返回平台做 EOI。
+
+clockevent stop/mask 与控制器 ACK/EOI 是两个层次。若逻辑 `Ignored` 只返回而不静默物理
+level/pending source，EOI 后会立即重入并形成 IRQ storm。RISC-V net-loopback 的 GDB
+证据曾观察到超过 140 万个物理 timer edge，却只有 40 次有效 `Firing`；对应最低层回归
+固定要求 `Ignored -> ClockEventAction::Stop`。四架构后端分别负责 mask/disable/compare
+更新，trap/IRQ 入口继续独立完成控制器 claim/ACK/EOI。
 
 `finish/recover` 必须消费同一 move-only firing token。token 的 epoch 已过期时不能发布
 task deadline、periodic advance 或硬件动作。这样 offline 前已经 pending 的 IRQ 即使在

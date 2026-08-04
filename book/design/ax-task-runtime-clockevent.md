@@ -27,12 +27,16 @@
 
 参考提交为 `8cd9520d35a6c38db6567e97dd93b1f11f185dc6`，配置启用 `PREEMPT_RT`、`HIGH_RES_TIMERS`、SMP 和 CPU hotplug。
 
-- `clockevents_program_event()` 是物理事件编程边界；
-- `hrtimer_interrupt()` 先失效已触发的 event，再处理有界 hard timer，并统一计算下一 event；
-- `tick_program_event()` 连接通用 tick 与 per-CPU clockevent；
+- `kernel/time/clockevents.c::clockevents_program_event()` 是物理事件编程边界；
+- `kernel/time/hrtimer.c::hrtimer_interrupt()` 先失效已触发的 event，再处理有界 hard timer，并统一计算下一 event；
+- `kernel/time/tick-sched.c::tick_nohz_stop_tick()`、`tick_nohz_idle_enter()` 和
+  `tick_nohz_idle_exit()` 把 idle/nohz 状态与物理 tick 编程收敛到 per-CPU owner；
 - PREEMPT_RT 只把非 hard hrtimer callback 移到 soft/threaded 上下文，显式 hard timer 仍可在硬中断执行；
 - scheduler placement/migration 由 owner runqueue 保护；
 - `irq_work` 与 scheduler IPI 遵守“先发布 work，后发送门铃；handler 先 claim 旧门铃”的顺序。
+- `net/core/dev.c::__napi_schedule()`、`napi_schedule_prep()`、`napi_poll()` 和
+  `net_rx_action()` 用一个 owner bit 加 sticky missed publication 保证协议 poll 只有一个
+  consumer；hard IRQ 只发布 work，budget drain 发生在后续执行上下文。
 
 TGOSKits 采用相同的所有权与排序，不复制 Linux callback 形态：ax-task 发布调度期限，ax-runtime 独占物理 clockevent。
 
@@ -111,12 +115,19 @@ offline/re-online，旧 token 只能失效，不能提交到新周期。
 
 `Firing` 期间只更新逻辑 source state。handler 结束时从最新 task deadline 和 periodic deadline 计算一次 authoritative minimum，并且只提交一次硬件动作。
 
-物理 IRQ 先执行 claim：
+物理 IRQ 先执行 claim。这里必须区分“逻辑上没有可消费的 arm”和“物理 source 已经
+静默”：
 
-- `Offline/Idle/Firing` 收到的 spurious edge 直接忽略；
+- `Offline/Idle/Firing` 收到的 stale/spurious edge 不进入 ax-task，但返回前必须 stop/mask
+  物理 clockevent；否则 level/pending source 可以在 EOI 后立刻重入，形成 IRQ storm；
 - edge 早于当前 `armed_deadline` 时只重编程当前 arm，不调用 ax-task；这同时处理
   offline 前残留、re-online 后才交付的 pending edge；
 - 只有当前 arm 已到期时才取得 firing token 并进入有界调度处理。
+
+stop/mask 不是中断控制器 ACK/EOI。x86 LAPIC timer mask、AArch64 generic timer disable、
+RISC-V compare 更新和 LoongArch timer disable/clear 由 clockevent backend 实现；控制器的
+claim/ACK/EOI 仍由 trap/IRQ 入口成对完成。若 `Firing` 状态遇到被屏蔽的嵌套旧边，外层
+firing transaction 会在 finish/recover 时根据最新 source state 重新 program。
 
 ### 上下线
 
@@ -140,7 +151,8 @@ min(platform_cpu_count, CPU_CAPACITY)
 
 平台控制器和 timer device 在 runtime handler 前 claim/ACK 或失效 delivered event。runtime 顺序固定为：
 
-1. claim 当前 arm；旧/早到边只重编程并返回，已到期边进入 `Firing(token)` 并忘记旧 arm；
+1. claim 当前 arm；无逻辑 owner 的 stale edge 先 stop/mask，早到边重编程当前 arm，只有
+   已到期边进入 `Firing(token)` 并忘记旧 arm；
 2. 推进 periodic source；
 3. 调用 ax-task 的 bounded `on_clock_event(now, budget)`；
 4. 发布 reschedule 与 deadline/deferred-work sticky state；
@@ -192,6 +204,21 @@ publish payload -> Release sticky/epoch -> send IPI
 handler 入口先消费旧 doorbell，再 drain payload。并发 producer 看到旧 doorbell 已被 claim 后，可以创建新物理边。
 
 ax-runtime 的 `SchedulerIpiDoorbell` 是唯一物理 coalescer。ax-task 不保留第二套 claimed epoch 或 IPI acknowledgement API。
+
+## 网络 poll 的单 owner 交接
+
+网络协议栈采用与 Linux NAPI `SCHED/MISSED` 相同的所有权形态，但不复制 softirq API：
+
+1. socket、设备 worker 和控制路径只推进 wrapping request generation；
+2. `scheduled` 从 false 变为 true 的 producer 唤醒唯一永久 worker；
+3. worker 是 smoltcp poll 的唯一 owner，任务调用者不能 opportunistic 接管；
+4. worker 完成 snapshot generation 后先发布 completion，再释放 owner bit；
+5. 释放前后的并发 request 分别由 generation recheck 或新的 false-to-true wake 捕获；
+6. 同步 egress flush 等待 completion generation，不持有协议锁忙等或反复 yield。
+
+`SERVICE`、socket set、设备协议对象属于纯任务上下文，使用 PiMutex；hard IRQ 只能通过
+`IrqWaitCell`/sticky event 交接。VirtIO transport 的寄存器/virtqueue raw gate 仍是极窄、
+不可睡眠的硬件临界区，task 侧持 gate 时关闭本地 IRQ，IRQ 侧只执行有界 ACK/status 操作。
 
 ## IRQ endpoint 独立生命周期
 
@@ -269,3 +296,9 @@ loom 覆盖 generation publication、publish-before-IPI、park 唯一 winner、`
 UART 测试覆盖 hard IRQ 无分配/无阻塞、有界 drain、overflow、worker wake race、`try_write` 与 emergency/normal TX 互斥。
 
 目标 crate test/clippy 后，串行运行四架构 ArceOS 与 Starry QEMU。只接受正式 success regex。hang 用 GDB 检查 timer begin/finish、IPI consume、idle commit、switch tail 和 IRQ endpoint grace；QEMU 正常退出但没有 success marker 仍视为失败。
+
+一次 RISC-V net-loopback hang 的 GDB 计数中，物理 timer edge 超过 140 万次，而真正取得
+`Firing` token 的逻辑事件只有 40 次。旧 handler 对 `Ignored` 直接返回，没有静默残留的
+物理 source，因而 IRQ storm 饿死了 task deadline 和网络 worker。确定性回归必须断言
+`ClockEventIrqClaim::Ignored` 产生 `ClockEventAction::Stop`；QEMU 只作为该不变量的端到端
+证据，不能替代最低层红绿测试。
