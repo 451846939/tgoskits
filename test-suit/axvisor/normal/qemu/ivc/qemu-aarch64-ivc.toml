@@ -21,11 +21,13 @@ fail_regex = [
     "(?i)unhandled page fault",
     "(?i)page fault",
     "ivc publish failed",
+    "ivc perf test failed",
+    "IVC perf checksum mismatch",
     "(?m)^linux ivc demo failed\\s*$",
 ]
 # Concurrent console streams may prepend ANSI SGR resets to a completion line.
 success_regex = [
-    "(?m)^(?:\\x1b\\[[0-9;]*m)*linux ivc demo pass\\s*$",
+    "(?m)^(?:\\x1b\\[[0-9;]*m)*ivc perf test pass\\s*$",
 ]
 shell_prefix = "~ #"
 shell_init_cmd = '''
@@ -35,10 +37,12 @@ if ! insmod /root/axvisor.ko; then
     echo 'linux ivc demo failed'
 elif ! test -e /dev/axivc; then
     echo 'linux ivc demo failed'
-elif ! /root/ivc-subscribe 1 0x49564301 5; then
+elif ! sleep 1; then
+    echo 'linux ivc demo failed'
+elif ! /root/ivc-subscribe 1 0x49564301 perf; then
     echo 'linux ivc demo failed'
 else
-    echo 'linux ivc subscriber finished'
+    echo 'linux ivc perf subscriber finished'
 fi
 '''
 to_bin = true
