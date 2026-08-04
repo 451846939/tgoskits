@@ -1243,6 +1243,46 @@ block/wake 继续位于 PI metadata 和 rq 锁之外。旧测试专用 park help
 PREEMPT_RT 的数倍，后续必须继续审计 current handle、switch tail 和 clockevent 固定成本，
 不得把这组相对改善描述为已经达到 Linux RT 水平。
 
+### 2026-08-04 current identity 与 PI current token
+
+Linux 的 `current` 是当前执行上下文直接持有的 task identity；只读取 current 或
+`TIF_NEED_RESCHED` 不会取得 rq lock，也不会克隆 task 引用。TGOSKits 原
+`current_thread_id()` 和 `current_cpu_needs_resched()` 却统一进入 IRQ guard、读取三元
+CPU owner handles、claim 可变 `CpuLocal` owner gate，导致 trace、syscall、PI 和 executor
+等所有只读调用者与真正的 rq mutation 竞争。
+
+新的只读路径仅用一个短 task-migration pin，从 `CpuRemote` 的 Acquire publication 复制
+generation-bearing `ThreadId` 或 sticky reschedule word；不关闭 IRQ、不取得 mutable owner
+gate，也不访问全局 registry。运行时 hook 即使位于一个现存 owner transaction 内，也可以
+读取这两个独立 publication；完整 `ThreadHandle` 仍必须经过 owner gate，不能借只读接口
+绕过 Arc 生命周期和 `CpuLocal` 可变借用不变量。最低层计数红测中，两种只读查询的 owner
+claim 都从 1 降为 0，并各保留一次必要的 migration pin。
+
+PI mutex 进一步使用不可复制、不可跨线程传递的 `CurrentThreadToken`。ax-sync 在 owner-word
+fast path 捕获一次当前身份，随后把同一 token 传给 waiter 注册、跨 park 恢复后的 ownerless
+claim 和 contended unlock；ax-task 每次状态修改仍用 token 内的 generation-bearing ID 在
+registry/PI metadata 下重新验证。这样不会把可伪造的裸 `ThreadId` 暴露成安全 API，也不会
+为了“确认还是同一线程”克隆完整 `ThreadHandle`。确定性红测中，PI slow registration 的
+完整 current-handle/owner snapshot 从 1 降为 0，注册阶段的 task-preempt transaction 从 2
+降为 1；剩余一次属于 PI metadata lock 本身。
+
+本轮同时重新核对 Starry futex 锁边界。Linux v7.1 `futex_wait_setup()` 在 hash-bucket lock
+内二次检查用户值、设置 waiter state 并入队，释放 bucket 后才 `schedule()`；wake 在同一锁
+内摘除 waiter 并 release-publish 失效，锁外执行 `wake_up_q()`。PREEMPT_RT 下该
+`spinlock_t` 会成为基于 rtmutex 的可睡眠锁。Starry 对应 bucket 已使用 `PiMutex`，且只在
+锁内执行 nofault condition、park publication 和 waiter insertion，实际 park/wake 都在锁外，
+因此保持现状。ax-task 的内部 blocking permit 不公开给 futex：公开它会允许 arbitrary raw
+或 preempt lock 绕过 `might_sleep()` 风格校验，反而破坏安全边界。
+
+x86_64 Q35/TCG 完整 wakeup-latency 复测通过正式 `WAKEUP_LATENCY_PASSED`，但该轮 guest
+clock-pair 从上一可比轮的 25.437 微秒升到 27.342 微秒，QEMU 时间从 76.75 秒升到
+79.87 秒，不能直接把原始 p50 波动归因给代码。按 clock-pair 比例归一化后，OTHER 同 CPU/
+跨 CPU thread 分别约改善 4.0%/2.3%，跨进程持平；FIFO 四个 futex/timer 项在 -0.8% 到
++2.9% 内，OTHER timer 约慢 7.1%。立即热缓存复跑的 clock-pair 又升到 32.261 微秒，按
+“先看时基、不可比即停止”的规则在第二项开始前终止，没有用更慢宿主样本制造结论。当前
+检查点的确定性收益是 owner claim 和 PI preempt transaction 减少；timer 差异留给独立
+clockevent generation/early-fire 阶段验证，仍不宣称已达到 Linux RT 绝对性能。
+
 ## 模块化结果
 
 - `TaskSystem` orchestration 只负责编排，registry/reap、placement、owner scheduling、deadline、PI、balance、deferred work 分模块；

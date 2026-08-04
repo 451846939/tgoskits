@@ -4,11 +4,13 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use ax_kernel_guard::NoPreempt as PreemptGuard;
 use ax_task::{
-    PiMutexAcquire, PiMutexCore, PiMutexLockResult, PiMutexRef, PiWaitStateError, PiWaitToken,
-    TaskError, ThreadHandle, ThreadId, current_needs_reschedule_pinned, current_thread_handle,
-    current_thread_id_pinned, pi_block_current, pi_mutex_claim, pi_mutex_lock_slow,
-    pi_mutex_release, pi_wake, validate_blocking_context,
+    CurrentThreadToken, PiMutexAcquire, PiMutexCore, PiMutexLockResult, PiMutexRef,
+    PiWaitStateError, PiWaitToken, TaskError, ThreadId, current_needs_reschedule_pinned,
+    current_thread_token, pi_block_current, pi_mutex_claim, pi_mutex_lock_slow, pi_mutex_release,
+    pi_wake, validate_blocking_context,
 };
+#[cfg(test)]
+use ax_task::{ThreadHandle, current_thread_handle};
 
 /// A non-recursive, urgency-ordered PI mutex implementing `lock_api::RawMutex`.
 ///
@@ -75,9 +77,8 @@ impl RawMutex {
 
     /// Returns whether the current thread owns this mutex.
     pub fn is_owned_by_current(&self) -> bool {
-        let _preempt_guard = PreemptGuard::new();
-        let current = pinned_current_thread_identity("query PI mutex ownership");
-        self.core.is_owned_by(current)
+        let current = task_result(current_thread_token(), "query PI mutex ownership");
+        self.core.is_owned_by(current.id())
     }
 
     #[inline(always)]
@@ -104,40 +105,34 @@ impl RawMutex {
                         blocking_context_validated = true;
                         continue;
                     }
-                    self.lock_contended(current);
+                    self.lock_contended(&current);
                     return;
                 }
             }
         }
     }
 
-    fn lock_contended(&self, current: ThreadId) {
-        let current_handle = current_thread("register PI mutex waiter");
-        assert_eq!(
-            current_handle.id(),
-            current,
-            "PI mutex contender identity changed while preemption was disabled"
-        );
+    fn lock_contended(&self, current: &CurrentThreadToken) {
         let sequence = self.next_waiter_sequence.fetch_add(1, Ordering::Relaxed);
         let token = match task_result(
-            pi_mutex_lock_slow(self.mutex_ref(), sequence),
+            pi_mutex_lock_slow(self.mutex_ref(), current, sequence),
             "register PI mutex waiter",
         ) {
             PiMutexLockResult::Acquired => return,
             PiMutexLockResult::Waiting(token) => token,
         };
-        if self.try_claim_waiter(&token) {
+        if self.try_claim_waiter(&token, current) {
             return;
         }
-        self.wait_for_handoff(token);
+        self.wait_for_handoff(token, current);
     }
 
-    fn wait_for_handoff(&self, token: PiWaitToken<'_>) {
+    fn wait_for_handoff(&self, token: PiWaitToken<'_>, current: &CurrentThreadToken) {
         loop {
             if token.is_granted() {
                 break;
             }
-            if self.try_claim_waiter(&token) {
+            if self.try_claim_waiter(&token, current) {
                 break;
             }
             if !token.is_selected() && !self.spin_on_owner(&token) {
@@ -203,10 +198,9 @@ impl RawMutex {
         self.try_or_observe_owner_word(current)
     }
 
-    fn try_or_observe_current(&self) -> (ThreadId, LockAttempt) {
-        let _preempt_guard = PreemptGuard::new();
-        let current = pinned_current_thread_identity("lock PI mutex");
-        let attempt = self.try_or_observe_owner_word(current);
+    fn try_or_observe_current(&self) -> (CurrentThreadToken, LockAttempt) {
+        let current = task_result(current_thread_token(), "capture PI mutex contender");
+        let attempt = self.try_or_observe_owner_word(current.id());
         (current, attempt)
     }
 
@@ -218,9 +212,8 @@ impl RawMutex {
     }
 
     fn try_lock_pi(&self) -> bool {
-        let _preempt_guard = PreemptGuard::new();
-        let current = pinned_current_thread_identity("try PI mutex");
-        match self.core.try_acquire(current) {
+        let current = task_result(current_thread_token(), "try PI mutex");
+        match self.core.try_acquire(current.id()) {
             Ok(PiMutexAcquire::Acquired) => true,
             Ok(PiMutexAcquire::Contended)
             | Err(TaskError::InvalidPiWaitState(PiWaitStateError::WaiterOwnsLock)) => false,
@@ -228,34 +221,34 @@ impl RawMutex {
         }
     }
 
-    fn try_claim_waiter(&self, token: &PiWaitToken<'_>) -> bool {
+    fn try_claim_waiter(&self, token: &PiWaitToken<'_>, current: &CurrentThreadToken) -> bool {
         if token.is_granted() {
             return true;
         }
         if !token.can_claim() {
             return false;
         }
-        task_result(pi_mutex_claim(token), "claim ownerless PI mutex");
+        task_result(pi_mutex_claim(token, current), "claim ownerless PI mutex");
         true
     }
 
     fn unlock_pi(&self) {
-        let current = {
-            let _preempt_guard = PreemptGuard::new();
-            pinned_current_thread_identity("unlock PI mutex")
-        };
-        if task_result(self.core.try_release(current), "try PI mutex release") {
+        let current = task_result(current_thread_token(), "unlock PI mutex");
+        if task_result(self.core.try_release(current.id()), "try PI mutex release") {
             return;
         }
 
-        self.unlock_contended();
+        self.unlock_contended(&current);
     }
 
-    fn unlock_contended(&self) {
+    fn unlock_contended(&self, current: &CurrentThreadToken) {
         // Keep this CPU pinned from owner deboost through the deferred targeted
         // wake, matching Linux's rtmutex wake_q handoff.
         let _preempt_guard = PreemptGuard::new();
-        let wake = task_result(pi_mutex_release(self.mutex_ref()), "release PI mutex");
+        let wake = task_result(
+            pi_mutex_release(self.mutex_ref(), current),
+            "release PI mutex",
+        );
         task_result(pi_wake(&wake), "wake selected PI mutex waiter");
     }
 
@@ -329,14 +322,9 @@ unsafe impl lock_api::RawMutex for RawMutex {
     }
 }
 
+#[cfg(test)]
 fn current_thread(operation: &'static str) -> ThreadHandle {
     task_result(current_thread_handle(), operation)
-}
-
-fn pinned_current_thread_identity(operation: &'static str) -> ThreadId {
-    // SAFETY: every caller retains either a NoPreempt guard or the PI metadata
-    // SpinNoPreempt guard through the matching owner-word transition.
-    task_result(unsafe { current_thread_id_pinned() }, operation)
 }
 
 fn owner_spin_eligible(
@@ -463,6 +451,38 @@ mod tests {
         assert!(matches!(attempt, LockAttempt::Acquired));
         assert_eq!(crate::test_runtime::preempt_depth(), 0);
         assert!(raw.core.is_owned_by(current.id()));
+        crate::test_runtime::clear();
+    }
+
+    #[test]
+    fn slow_registration_reuses_the_captured_current_identity() {
+        let (system, cpu) = install_current_thread();
+        let _runtime = crate::test_runtime::install(
+            (&*system as *const TaskSystem).expose_provenance(),
+            (cpu.as_ref().get_ref() as *const ax_task::CpuLocal).expose_provenance(),
+        );
+        let raw = RawMutex::new();
+        let current = task_result(
+            ax_task::current_thread_token(),
+            "capture PI contender identity",
+        );
+        crate::test_runtime::reset_cpu_owner_handle_reads();
+        crate::test_runtime::reset_preempt_guard_entries();
+
+        raw.lock_contended(&current);
+
+        assert!(raw.core.is_owned_by(current.id()));
+        assert_eq!(
+            crate::test_runtime::cpu_owner_handle_reads(),
+            0,
+            "the slow path must not clone a full current handle only to revalidate a stable \
+             ThreadId"
+        );
+        assert_eq!(
+            crate::test_runtime::preempt_guard_entries(),
+            1,
+            "only the PI metadata lock may pin the CPU after a typed current token was captured"
+        );
         crate::test_runtime::clear();
     }
 

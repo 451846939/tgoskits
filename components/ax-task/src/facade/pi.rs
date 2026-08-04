@@ -9,10 +9,10 @@ pub(super) enum PiParkAttempt {
 /// Enters the scheduler-owned PI mutex slow path.
 pub fn pi_mutex_lock_slow<'lock>(
     lock: PiMutexRef<'lock>,
+    current: &CurrentThreadToken,
     sequence: u64,
 ) -> Result<PiMutexLockResult<'lock>, TaskError> {
-    let waiter = current_thread_id()?;
-    runtime_task_system()?.pi_mutex_lock_slow(lock, waiter, sequence)
+    runtime_task_system()?.pi_mutex_lock_slow(lock, current.id(), sequence)
 }
 
 /// Blocks the calling waiter until it is selected to claim or granted.
@@ -65,13 +65,19 @@ pub fn pi_wait_cancel(token: PiWaitToken<'_>) -> Result<(), TaskError> {
 }
 
 /// Publishes a contended PI mutex release and returns its wake target.
-pub fn pi_mutex_release(lock: PiMutexRef<'_>) -> Result<ThreadWakeHandle, TaskError> {
-    runtime_task_system()?.pi_mutex_release(lock, current_thread_id()?)
+pub fn pi_mutex_release(
+    lock: PiMutexRef<'_>,
+    current: &CurrentThreadToken,
+) -> Result<ThreadWakeHandle, TaskError> {
+    runtime_task_system()?.pi_mutex_release(lock, current.id())
 }
 
 /// Claims the ownerless PI mutex handoff selected for this waiter.
-pub fn pi_mutex_claim(token: &PiWaitToken<'_>) -> Result<(), TaskError> {
-    if current_thread_id()? != token.thread_id() {
+pub fn pi_mutex_claim(
+    token: &PiWaitToken<'_>,
+    current: &CurrentThreadToken,
+) -> Result<(), TaskError> {
+    if current.id() != token.thread_id() {
         return Err(TaskError::InvalidPiState);
     }
     runtime_task_system()?.pi_mutex_claim(token)

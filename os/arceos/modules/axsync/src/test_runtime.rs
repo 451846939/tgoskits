@@ -27,6 +27,8 @@ std::thread_local! {
     static PREEMPT_DEPTH: Cell<usize> = const { Cell::new(0) };
     static SCHEDULE_CONTEXT_SAFE: Cell<bool> = const { Cell::new(true) };
     static IRQ_GUARD_ENTRIES: Cell<usize> = const { Cell::new(0) };
+    static CPU_OWNER_HANDLE_READS: Cell<usize> = const { Cell::new(0) };
+    static PREEMPT_GUARD_ENTRIES: Cell<usize> = const { Cell::new(0) };
 }
 
 #[cfg(feature = "lockdep")]
@@ -71,6 +73,7 @@ impl_task_runtime! {
             unsafe { TaskSystemHandle::from_raw(TASK_SYSTEM.with(Cell::get)) }
         }
         unsafe fn current_cpu_owner_handles() -> CurrentCpuOwnerHandles {
+            CPU_OWNER_HANDLE_READS.with(|reads| reads.set(reads.get() + 1));
             let local = CPU_LOCAL.with(Cell::get);
             let remote = CPU_REMOTE.with(Cell::get);
             // SAFETY: install/clear publish the paired owner and remote handles
@@ -119,6 +122,7 @@ impl_task_runtime! {
         unsafe fn irq_guard_exit(_token: IrqGuardToken) {}
 
         fn preempt_guard_enter() -> PreemptGuardToken {
+            PREEMPT_GUARD_ENTRIES.with(|entries| entries.set(entries.get() + 1));
             PREEMPT_DEPTH.with(|depth| {
                 depth.set(depth.get().checked_add(1).expect("test preempt depth overflow"));
             });
@@ -264,6 +268,8 @@ pub(crate) fn install(task_system: usize, cpu_local: usize) -> InstalledRuntime 
     SCHEDULE_CONTEXT_SAFE.with(|safe| safe.set(true));
     PREEMPT_DEPTH.with(|depth| depth.set(0));
     IRQ_GUARD_ENTRIES.with(|entries| entries.set(0));
+    CPU_OWNER_HANDLE_READS.with(|reads| reads.set(0));
+    PREEMPT_GUARD_ENTRIES.with(|entries| entries.set(0));
     InstalledRuntime
 }
 
@@ -273,6 +279,8 @@ pub(crate) fn clear() {
     TASK_SYSTEM.with(|handle| handle.set(0));
     PREEMPT_DEPTH.with(|depth| depth.set(0));
     IRQ_GUARD_ENTRIES.with(|entries| entries.set(0));
+    CPU_OWNER_HANDLE_READS.with(|reads| reads.set(0));
+    PREEMPT_GUARD_ENTRIES.with(|entries| entries.set(0));
     SCHEDULE_CONTEXT_SAFE.with(|safe| safe.set(true));
 }
 
@@ -286,4 +294,20 @@ pub(crate) fn preempt_depth() -> usize {
 
 pub(crate) fn irq_guard_entries() -> usize {
     IRQ_GUARD_ENTRIES.with(Cell::get)
+}
+
+pub(crate) fn reset_cpu_owner_handle_reads() {
+    CPU_OWNER_HANDLE_READS.with(|reads| reads.set(0));
+}
+
+pub(crate) fn cpu_owner_handle_reads() -> usize {
+    CPU_OWNER_HANDLE_READS.with(Cell::get)
+}
+
+pub(crate) fn reset_preempt_guard_entries() {
+    PREEMPT_GUARD_ENTRIES.with(|entries| entries.set(0));
+}
+
+pub(crate) fn preempt_guard_entries() -> usize {
+    PREEMPT_GUARD_ENTRIES.with(Cell::get)
 }

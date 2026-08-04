@@ -181,6 +181,36 @@ pub(super) fn validate_task_context() -> Result<(), TaskError> {
     }
 }
 
+/// Short task-migration pin for lock-free current-CPU publications.
+///
+/// Hard-IRQ and scheduler-owner callers already own a stronger CPU pin; the
+/// runtime reports that inheritance with `NONE`, so drop must not synthesize a
+/// second preemption exit.
+pub(super) struct RuntimePreemptGuard {
+    token: PreemptGuardToken,
+    _not_send: PhantomData<*mut ()>,
+}
+
+impl RuntimePreemptGuard {
+    pub(super) fn enter() -> Self {
+        Self {
+            token: task_runtime::preempt_guard_enter(),
+            _not_send: PhantomData,
+        }
+    }
+}
+
+impl Drop for RuntimePreemptGuard {
+    fn drop(&mut self) {
+        if self.token.is_none() {
+            return;
+        }
+        // SAFETY: this !Send guard consumes the token returned on the same
+        // execution context after the lock-free publication has been copied.
+        unsafe { task_runtime::preempt_guard_exit(self.token) };
+    }
+}
+
 pub(crate) struct RuntimeIrqGuard {
     token: IrqGuardToken,
     cpu: RuntimeCpuHandles,

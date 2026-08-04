@@ -1465,7 +1465,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_hooks_reject_reentrant_cpu_owner_queries() {
+    fn runtime_hooks_read_remote_publications_without_reentering_the_cpu_owner() {
         let system = Box::pin(TaskSystem::new(crate::TaskSystemConfig::new(1)).unwrap());
         let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
         system
@@ -1487,7 +1487,8 @@ mod tests {
         let _now = task_runtime::monotonic_ns();
         assert_eq!(
             test_runtime::take_hook_reentry_error(),
-            Some(TaskError::CpuOwnerBorrowed)
+            None,
+            "current identity is a lock-free remote publication, not owner-only state"
         );
 
         test_runtime::reenter_needs_reschedule_from_next_hook();
@@ -1500,14 +1501,16 @@ mod tests {
         task_runtime::publish_task_deadline(update);
         assert_eq!(
             test_runtime::take_hook_reentry_error(),
-            Some(TaskError::CpuOwnerBorrowed)
+            None,
+            "the sticky reschedule word is independent from mutable owner state"
         );
 
         test_runtime::reenter_current_thread_from_next_hook();
         let _status = task_runtime::send_scheduler_ipi(RuntimeCpuId::new(0));
         assert_eq!(
             test_runtime::take_hook_reentry_error(),
-            Some(TaskError::CpuOwnerBorrowed)
+            None,
+            "runtime callbacks may inspect the generation-bearing remote identity"
         );
         assert_eq!(owner_pin.as_ref().get_ref().owner(), CpuId::new(0));
     }
@@ -1530,6 +1533,58 @@ mod tests {
             test_runtime::cpu_handle_reads(),
             (0, 0),
             "a pinned current-CPU query must not enter the generic remote-CPU lookup"
+        );
+    }
+
+    #[test]
+    fn current_thread_identity_uses_one_migration_pin_without_claiming_the_cpu_owner() {
+        let system = Box::pin(TaskSystem::new(crate::TaskSystemConfig::new(1)).unwrap());
+        let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
+        let bootstrap = system
+            .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
+            .unwrap();
+        system.bring_cpu_online(cpu.as_mut()).unwrap();
+        let _runtime_handles = InstalledTaskHandles::new(system.as_ref(), cpu.as_mut());
+        test_runtime::reset_cpu_handle_reads();
+        test_runtime::reset_preempt_guard_entries();
+
+        assert_eq!(current_thread_id().unwrap(), bootstrap.id());
+
+        assert_eq!(
+            test_runtime::cpu_owner_claims(),
+            0,
+            "a read-only current identity must not enter the mutable CPU owner gate"
+        );
+        assert_eq!(
+            test_runtime::preempt_guard_entries(),
+            1,
+            "an unpinned current identity read must use one migration pin"
+        );
+    }
+
+    #[test]
+    fn current_reschedule_query_uses_one_migration_pin_without_claiming_the_cpu_owner() {
+        let system = Box::pin(TaskSystem::new(crate::TaskSystemConfig::new(1)).unwrap());
+        let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
+        system
+            .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
+            .unwrap();
+        system.bring_cpu_online(cpu.as_mut()).unwrap();
+        let _runtime_handles = InstalledTaskHandles::new(system.as_ref(), cpu.as_mut());
+        test_runtime::reset_cpu_handle_reads();
+        test_runtime::reset_preempt_guard_entries();
+
+        assert!(!current_cpu_needs_resched().unwrap());
+
+        assert_eq!(
+            test_runtime::cpu_owner_claims(),
+            0,
+            "a read-only reschedule query must not enter the mutable CPU owner gate"
+        );
+        assert_eq!(
+            test_runtime::preempt_guard_entries(),
+            1,
+            "an unpinned reschedule query must use one migration pin"
         );
     }
 

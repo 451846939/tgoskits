@@ -13,8 +13,9 @@ use crate::{
     executor::CoroutineHeader,
     inbox::PublishResult,
     runtime::{
-        IrqGuardToken, RuntimeCpuId, RuntimeScheduleOrigin, RuntimeSchedulerEntry,
-        RuntimeSchedulerReturn, RuntimeStatus, SchedSwitchRecord, task_runtime,
+        IrqGuardToken, PreemptGuardToken, RuntimeCpuId, RuntimeScheduleOrigin,
+        RuntimeSchedulerEntry, RuntimeSchedulerReturn, RuntimeStatus, SchedSwitchRecord,
+        task_runtime,
     },
     timer::{ExpiredTaskDeadline, TaskDeadlineKind},
 };
@@ -39,8 +40,8 @@ pub use pi::{
     pi_block_current, pi_mutex_claim, pi_mutex_lock_slow, pi_mutex_release, pi_wait_cancel, pi_wake,
 };
 use runtime_cpu::{
-    RuntimeCpuPin, RuntimeSchedulerFrameGuard, runtime_current_cpu, validate_schedule_context,
-    validate_task_context,
+    RuntimeCpuPin, RuntimePreemptGuard, RuntimeSchedulerFrameGuard, runtime_current_cpu,
+    validate_schedule_context, validate_task_context,
 };
 pub(crate) use runtime_cpu::{
     RuntimeIrqGuard, current_cpu_remote, runtime_current_cpu_mut, runtime_task_system,
@@ -77,7 +78,38 @@ pub fn current_thread_handle() -> Result<ThreadHandle, TaskError> {
 
 /// Returns the generation-bearing identity of the calling scheduler thread.
 pub fn current_thread_id() -> Result<ThreadId, TaskError> {
-    current_thread_id_from_cpu()
+    Ok(current_thread_token()?.id())
+}
+
+/// Move-only proof of the scheduler thread executing this task context.
+///
+/// Scheduler-adjacent primitives may retain this token across bounded atomic
+/// metadata transitions and reuse it when entering a slow path. The token is
+/// not a thread handle and owns no scheduler resource; its generation-bearing
+/// identity is validated again by every state-changing core operation.
+#[derive(Debug)]
+pub struct CurrentThreadToken {
+    thread: ThreadId,
+    _not_send: PhantomData<*mut ()>,
+}
+
+impl CurrentThreadToken {
+    /// Returns the generation-bearing identity captured for this execution.
+    pub const fn id(&self) -> ThreadId {
+        self.thread
+    }
+}
+
+/// Captures the scheduler thread executing this task context.
+pub fn current_thread_token() -> Result<CurrentThreadToken, TaskError> {
+    let _pin = RuntimePreemptGuard::enter();
+    // SAFETY: `_pin` prevents task migration until the generation-bearing
+    // current identity has been copied from the CPU's remote publication.
+    let thread = unsafe { current_thread_id_pinned()? };
+    Ok(CurrentThreadToken {
+        thread,
+        _not_send: PhantomData,
+    })
 }
 
 /// Returns the calling scheduler thread while the caller retains a CPU pin.
@@ -111,15 +143,6 @@ pub unsafe fn current_needs_reschedule_pinned() -> Result<bool, TaskError> {
     Ok(current_cpu_remote()
         .ok_or(TaskError::NotInitialized)?
         .needs_reschedule())
-}
-
-fn current_thread_id_from_cpu() -> Result<ThreadId, TaskError> {
-    // RuntimeCurrentCpu retains the IRQ pin across handle validation and the
-    // owner-state read. The copied generation-bearing ID remains valid after
-    // that pin is released.
-    runtime_current_cpu()?
-        .current()
-        .ok_or(TaskError::NoRunnableThread)
 }
 
 /// Validates that the caller may publish a waiter or block its current thread.
@@ -324,7 +347,10 @@ pub fn thread_nice(thread: ThreadId) -> Result<Option<Nice>, TaskError> {
 
 /// Tests the sticky reschedule state of the calling CPU.
 pub fn current_cpu_needs_resched() -> Result<bool, TaskError> {
-    Ok(runtime_current_cpu()?.needs_reschedule())
+    let _pin = RuntimePreemptGuard::enter();
+    // SAFETY: `_pin` prevents migration through the remote reschedule-state
+    // observation. Stronger IRQ/scheduler owner scopes are inherited.
+    unsafe { current_needs_reschedule_pinned() }
 }
 
 /// Executes one lossless idle publication/recheck/WFI iteration.
