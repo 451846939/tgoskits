@@ -337,6 +337,13 @@ idle polling 与 work pending 共用原子状态，确保“观察到 polling �
 物理 IPI。旧 `RemoteWake` inbox、嵌入线程的 wake node 和 drain batch 在切换完成后
 直接删除，不保留 feature fallback 或兼容别名。
 
+运行中线程的 notification 采用 Linux `try_to_wake_up()` 的 current-task 快速路径语义：
+在线程 scheduler state 锁内发布 sticky wake bit 后立即返回，不选择目标 CPU、不预约
+runqueue publication，也不取得 rq lock。该 bit 由随后的 `prepare_park()` 消费，因此既
+保留 wake-before-park 唯一胜者语义，也避免普通 channel/completion 的冗余通知为每次 wake
+付出一次全 CPU placement 扫描。确定性回归直接统计 target-selection 边界，旧实现为 1，
+新实现为 0，并继续断言随后 park 返回 `Notified`。
+
 ### Fair/EEVDF 唤醒与迁移
 
 Linux v7.1 的 Fair 唤醒不再用旧的物理时间 `wakeup_granularity` 修正虚拟

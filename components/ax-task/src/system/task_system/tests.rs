@@ -726,9 +726,15 @@ fn same_cpu_task_wake_before_park_preserves_the_notification_until_prepare() {
     system.bring_cpu_online(cpu.as_mut()).unwrap();
     let _runtime_handles = InstalledTaskHandles::new_task_context(system.as_ref(), cpu.as_mut());
 
+    dispatch::reset_wake_target_selections();
     assert_eq!(
         running.wake_handle().wake_from_task(),
         crate::WakeResult::Notified
+    );
+    assert_eq!(
+        dispatch::wake_target_selections(),
+        0,
+        "waking the current running thread must not perform CPU placement"
     );
 
     let token = task_runtime::irq_guard_enter();

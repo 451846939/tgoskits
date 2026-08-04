@@ -2,19 +2,29 @@
 
 use super::*;
 
+#[cfg(test)]
+std::thread_local! {
+    static WAKE_TARGET_SELECTIONS: core::cell::Cell<usize> = const {
+        core::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+pub(super) fn reset_wake_target_selections() {
+    WAKE_TARGET_SELECTIONS.set(0);
+}
+
+#[cfg(test)]
+pub(super) fn wake_target_selections() -> usize {
+    WAKE_TARGET_SELECTIONS.get()
+}
+
 impl TaskSystem {
     fn consume_wake_locked(
         core: &Arc<ThreadCore>,
         sched: &mut ThreadSchedState,
-        preserve_running_notification: bool,
     ) -> Result<bool, TaskError> {
         let lifecycle = sched.lifecycle.state();
-        if preserve_running_notification && lifecycle == ThreadState::Running {
-            // A local task may publish immediately before parking. With no
-            // physical inbox node to consume later, retain both wake bits so
-            // prepare_park observes the notification exactly once.
-            return Ok(false);
-        }
         if !core.consume_wake(lifecycle == ThreadState::Parking) || lifecycle == ThreadState::Exited
         {
             return Ok(false);
@@ -64,9 +74,18 @@ impl TaskSystem {
         if core.publish_wake() {
             return WakeResult::AlreadyPending;
         }
+        if sched.lifecycle.state() == ThreadState::Running {
+            // Match Linux's current-task fast path: publishing the wake is the
+            // complete transaction while the thread is still running. Keep
+            // the bit for the next prepare_park() instead of selecting a CPU
+            // and reserving a runqueue publication that cannot enqueue work.
+            return WakeResult::Notified;
+        }
         let preferred = preferred
             .or_else(|| sched.placement.assigned_cpu())
             .or_else(|| core.wake_cpu_hint());
+        #[cfg(test)]
+        WAKE_TARGET_SELECTIONS.set(WAKE_TARGET_SELECTIONS.get().saturating_add(1));
         let target = preferred
             .filter(|preferred| sched.placement.affinity.contains(*preferred))
             .filter(|preferred| {
@@ -83,13 +102,10 @@ impl TaskSystem {
             core.discard_failed_wake();
             return WakeResult::Unavailable;
         };
-        let lifecycle = sched.lifecycle.state();
-        let preserve_running_notification = lifecycle == ThreadState::Running;
-        let activated =
-            match Self::consume_wake_locked(&core, &mut sched, preserve_running_notification) {
-                Ok(activated) => activated,
-                Err(_) => task_runtime::fatal_invariant(0x574b_0002, core.id().as_u64() as usize),
-            };
+        let activated = match Self::consume_wake_locked(&core, &mut sched) {
+            Ok(activated) => activated,
+            Err(_) => task_runtime::fatal_invariant(0x574b_0002, core.id().as_u64() as usize),
+        };
         if !activated {
             return WakeResult::Notified;
         }
