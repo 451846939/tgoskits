@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.8.6](https://github.com/rcore-os/tgoskits/compare/ax-cpu-v0.8.5...ax-cpu-v0.8.6) - 2026-08-04
+
+### Fixed
+
+- *(ax-cpu)* handle cross-page unaligned faults ([#1855](https://github.com/rcore-os/tgoskits/pull/1855))
+
 ## [0.8.5](https://github.com/rcore-os/tgoskits/compare/ax-cpu-v0.8.4...ax-cpu-v0.8.5) - 2026-08-03
 
 ### Added

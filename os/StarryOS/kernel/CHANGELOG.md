@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.7](https://github.com/rcore-os/tgoskits/compare/starry-kernel-v0.7.6...starry-kernel-v0.7.7) - 2026-08-04
+
+### Fixed
+
+- *(ax-task)* preserve concurrent signal wakeups ([#1857](https://github.com/rcore-os/tgoskits/pull/1857))
+- *(ax-cpu)* handle cross-page unaligned faults ([#1855](https://github.com/rcore-os/tgoskits/pull/1855))
+- *(starry-kernel)* reject unsupported limit sysctl writes ([#1849](https://github.com/rcore-os/tgoskits/pull/1849))
+- *(starry-procfs)* parse oom score adjustments ([#1844](https://github.com/rcore-os/tgoskits/pull/1844))
+- *(starry-kernel)* update existing signalfd masks ([#1850](https://github.com/rcore-os/tgoskits/pull/1850))
+
 ## [0.7.6](https://github.com/rcore-os/tgoskits/compare/starry-kernel-v0.7.5...starry-kernel-v0.7.6) - 2026-08-03
 
 ### Added

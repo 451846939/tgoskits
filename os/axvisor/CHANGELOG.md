@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.24](https://github.com/rcore-os/tgoskits/compare/axvisor-v0.5.23...axvisor-v0.5.24) - 2026-08-04
+
+### Other
+
+- updated the following local packages: axvmconfig, axbuild, axplat-dyn, axplat-dyn, ax-hal, ax-std, axvm
+
 ## [0.5.23](https://github.com/rcore-os/tgoskits/compare/axvisor-v0.5.22...axvisor-v0.5.23) - 2026-08-03
 
 ### Added

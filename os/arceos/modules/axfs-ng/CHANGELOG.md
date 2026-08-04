@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.7](https://github.com/rcore-os/tgoskits/compare/ax-fs-ng-v0.8.6...ax-fs-ng-v0.8.7) - 2026-08-04
+
+### Fixed
+
+- *(ax-fs-ng)* skip metadata updates on read-only mounts ([#1842](https://github.com/rcore-os/tgoskits/pull/1842))
+
 ## [0.8.6](https://github.com/rcore-os/tgoskits/compare/ax-fs-ng-v0.8.5...ax-fs-ng-v0.8.6) - 2026-08-03
 
 ### Added

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.7](https://github.com/rcore-os/tgoskits/compare/ax-task-v0.6.6...ax-task-v0.6.7) - 2026-08-04
+
+### Fixed
+
+- *(ax-task)* preserve concurrent signal wakeups ([#1857](https://github.com/rcore-os/tgoskits/pull/1857))
+
 ## [0.6.6](https://github.com/rcore-os/tgoskits/compare/ax-task-v0.6.5...ax-task-v0.6.6) - 2026-08-03
 
 ### Added

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.23](https://github.com/rcore-os/tgoskits/compare/axbuild-v0.4.22...axbuild-v0.4.23) - 2026-08-04
+
+### Fixed
+
+- *(axbuild)* scope grouped prebuild to selected tests ([#1841](https://github.com/rcore-os/tgoskits/pull/1841))
+
 ## [0.4.22](https://github.com/rcore-os/tgoskits/compare/axbuild-v0.4.21...axbuild-v0.4.22) - 2026-08-03
 
 ### Added
