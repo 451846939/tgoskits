@@ -4,12 +4,12 @@ use alloc::{boxed::Box, string::String, sync::Arc};
 use core::{marker::PhantomData, mem::align_of, ops::Deref, pin::Pin, ptr};
 
 use crate::{
-    CpuId, CpuLocal, CpuLocalOwnerBorrow, CpuRemote, CpuSet, CurrentExitPermit, IrqRegisterResult,
-    IrqWaitCell, IrqWaitRegistration, IrqWaitToken, Nice, ParkCommit, ParkPrepare,
-    PiMutexLockResult, PiMutexRef, PiWaitToken, RtPriority, ScheduleDecision, SchedulePolicy,
-    SchedulerOutcome, TaskError, TaskSystem, ThreadBuilder, ThreadCore, ThreadExtensionLease,
-    ThreadHandle, ThreadId, ThreadRuntimeSnapshot, ThreadState, ThreadWakeHandle, WaitQueue,
-    WakeResult,
+    CpuId, CpuLocal, CpuLocalOwnerBorrow, CpuRemote, CpuSet, CurrentExitPermit, CurrentThreadToken,
+    IrqRegisterResult, IrqWaitCell, IrqWaitRegistration, IrqWaitToken, Nice, ParkCommit,
+    ParkPrepare, PiMutexLockResult, PiMutexRef, PiWaitToken, RtPriority, ScheduleDecision,
+    SchedulePolicy, SchedulerOutcome, TaskError, TaskSystem, ThreadBuilder, ThreadCore,
+    ThreadExtensionLease, ThreadHandle, ThreadId, ThreadRuntimeSnapshot, ThreadState,
+    ThreadWakeHandle, WaitQueue, WakeResult,
     executor::CoroutineHeader,
     inbox::PublishResult,
     runtime::{
@@ -37,7 +37,8 @@ pub(crate) use deadline::{
     begin_current_park_with_permit, cancel_current_park, commit_current_park,
 };
 pub use pi::{
-    pi_block_current, pi_mutex_claim, pi_mutex_lock_slow, pi_mutex_release, pi_wait_cancel, pi_wake,
+    pi_block_current, pi_mutex_claim, pi_mutex_lock_slow, pi_mutex_release_owned, pi_wait_cancel,
+    pi_wake,
 };
 use runtime_cpu::{
     RuntimeCpuPin, RuntimePreemptGuard, RuntimeSchedulerFrameGuard, runtime_current_cpu,
@@ -81,35 +82,13 @@ pub fn current_thread_id() -> Result<ThreadId, TaskError> {
     Ok(current_thread_token()?.id())
 }
 
-/// Move-only proof of the scheduler thread executing this task context.
-///
-/// Scheduler-adjacent primitives may retain this token across bounded atomic
-/// metadata transitions and reuse it when entering a slow path. The token is
-/// not a thread handle and owns no scheduler resource; its generation-bearing
-/// identity is validated again by every state-changing core operation.
-#[derive(Debug)]
-pub struct CurrentThreadToken {
-    thread: ThreadId,
-    _not_send: PhantomData<*mut ()>,
-}
-
-impl CurrentThreadToken {
-    /// Returns the generation-bearing identity captured for this execution.
-    pub const fn id(&self) -> ThreadId {
-        self.thread
-    }
-}
-
 /// Captures the scheduler thread executing this task context.
 pub fn current_thread_token() -> Result<CurrentThreadToken, TaskError> {
     let _pin = RuntimePreemptGuard::enter();
     // SAFETY: `_pin` prevents task migration until the generation-bearing
     // current identity has been copied from the CPU's remote publication.
     let thread = unsafe { current_thread_id_pinned()? };
-    Ok(CurrentThreadToken {
-        thread,
-        _not_send: PhantomData,
-    })
+    Ok(CurrentThreadToken::new(thread))
 }
 
 /// Returns the calling scheduler thread while the caller retains a CPU pin.

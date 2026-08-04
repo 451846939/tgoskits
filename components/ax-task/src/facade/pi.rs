@@ -64,12 +64,18 @@ pub fn pi_wait_cancel(token: PiWaitToken<'_>) -> Result<(), TaskError> {
     runtime_task_system()?.pi_wait_cancel(token)
 }
 
-/// Publishes a contended PI mutex release and returns its wake target.
-pub fn pi_mutex_release(
+/// Publishes a raw-mutex-owner PI handoff and returns its wake target.
+///
+/// # Safety
+///
+/// `old_owner` must come from [`PiMutexCore::try_release_owned`] on `lock`, and
+/// the caller must retain task-preemption exclusion until the returned wake is
+/// published outside scheduler metadata locks.
+pub unsafe fn pi_mutex_release_owned(
     lock: PiMutexRef<'_>,
-    current: &CurrentThreadToken,
+    old_owner: ThreadId,
 ) -> Result<ThreadWakeHandle, TaskError> {
-    runtime_task_system()?.pi_mutex_release(lock, current.id())
+    runtime_task_system()?.pi_mutex_release(lock, old_owner)
 }
 
 /// Claims the ownerless PI mutex handoff selected for this waiter.

@@ -8,7 +8,7 @@ use core::{
 };
 
 use crate::{
-    PiWaitStateError, PiWaitTree, TaskError, ThreadCore, ThreadId,
+    CurrentThreadToken, PiWaitStateError, PiWaitTree, TaskError, ThreadCore, ThreadId,
     lock::{RawTicketGuard, RawTicketLock},
 };
 
@@ -51,7 +51,28 @@ impl PiMutexCore {
     }
 
     /// Attempts the atomic uncontended acquisition path.
-    pub fn try_acquire(&self, current: ThreadId) -> Result<PiMutexAcquire, TaskError> {
+    pub fn try_acquire(&self, current: &CurrentThreadToken) -> Result<PiMutexAcquire, TaskError> {
+        self.try_acquire_thread(current.id())
+    }
+
+    /// Attempts acquisition on behalf of an explicitly authorized thread.
+    ///
+    /// This is the proxy-owner form used by scheduler models and PI-futex-like
+    /// handoff code. Ordinary task-context locks must use [`Self::try_acquire`]
+    /// with a [`CurrentThreadToken`].
+    ///
+    /// # Safety
+    ///
+    /// The caller must own the scheduler authority to establish `current` as
+    /// this physical mutex's executing owner.
+    pub unsafe fn try_acquire_for_thread(
+        &self,
+        current: ThreadId,
+    ) -> Result<PiMutexAcquire, TaskError> {
+        self.try_acquire_thread(current)
+    }
+
+    fn try_acquire_thread(&self, current: ThreadId) -> Result<PiMutexAcquire, TaskError> {
         let current_word = owner_word(current)?;
         match self
             .owner
@@ -65,8 +86,18 @@ impl PiMutexCore {
         }
     }
 
-    /// Attempts the atomic uncontended release path.
-    pub fn try_release(&self, current: ThreadId) -> Result<bool, TaskError> {
+    /// Attempts release on behalf of an explicitly authorized thread.
+    ///
+    /// This proxy-owner form exists for scheduler models and PI-futex-like
+    /// handoff code. Ordinary raw mutexes should use
+    /// [`Self::try_release_owned`], whose authority comes from the raw-mutex
+    /// ownership contract rather than a caller-provided identity.
+    ///
+    /// # Safety
+    ///
+    /// The caller must own the scheduler authority to release `current` and
+    /// must serialize this operation with the physical mutex owner.
+    pub unsafe fn try_release_for_thread(&self, current: ThreadId) -> Result<bool, TaskError> {
         let current_word = owner_word(current)?;
         match self
             .owner
@@ -74,6 +105,29 @@ impl PiMutexCore {
         {
             Ok(_) => Ok(true),
             Err(owner) if owner_from_word(owner) == Some(current) => Ok(false),
+            Err(_) => Err(TaskError::InvalidPiState),
+        }
+    }
+
+    /// Releases the physical owner named by this mutex's owner word.
+    ///
+    /// # Safety
+    ///
+    /// The caller must be the execution context that owns this mutex under a
+    /// higher-level raw-mutex contract. It must keep task preemption disabled
+    /// from a contended result through the scheduler metadata handoff and wake.
+    pub unsafe fn try_release_owned(&self) -> Result<PiMutexOwnedRelease, TaskError> {
+        let observed = self.owner.load(Ordering::Acquire);
+        let owner = owner_from_word(observed).ok_or(TaskError::InvalidPiState)?;
+        let owner_word = owner_word(owner)?;
+        match self
+            .owner
+            .compare_exchange(owner_word, 0, Ordering::Release, Ordering::Relaxed)
+        {
+            Ok(_) => Ok(PiMutexOwnedRelease::Released),
+            Err(current) if owner_from_word(current) == Some(owner) => {
+                Ok(PiMutexOwnedRelease::Contended(owner))
+            }
             Err(_) => Err(TaskError::InvalidPiState),
         }
     }
@@ -222,6 +276,15 @@ pub enum PiMutexAcquire {
     Acquired,
     /// The caller must register in the scheduler-owned waiter tree.
     Contended,
+}
+
+/// Result of an owner-authorized PI mutex release.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PiMutexOwnedRelease {
+    /// The uncontended owner word was released atomically.
+    Released,
+    /// Scheduler waiter metadata must select the next owner before wake.
+    Contended(ThreadId),
 }
 
 impl<'lock> PiMutexRef<'lock> {

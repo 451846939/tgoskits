@@ -1260,11 +1260,37 @@ claim 都从 1 降为 0，并各保留一次必要的 migration pin。
 
 PI mutex 进一步使用不可复制、不可跨线程传递的 `CurrentThreadToken`。ax-sync 在 owner-word
 fast path 捕获一次当前身份，随后把同一 token 传给 waiter 注册、跨 park 恢复后的 ownerless
-claim 和 contended unlock；ax-task 每次状态修改仍用 token 内的 generation-bearing ID 在
-registry/PI metadata 下重新验证。这样不会把可伪造的裸 `ThreadId` 暴露成安全 API，也不会
-为了“确认还是同一线程”克隆完整 `ThreadHandle`。确定性红测中，PI slow registration 的
-完整 current-handle/owner snapshot 从 1 降为 0，注册阶段的 task-preempt transaction 从 2
-降为 1；剩余一次属于 PI metadata lock 本身。
+claim；ax-task 每次 waiter 状态修改仍用 token 内的 generation-bearing ID 在 registry/PI
+metadata 下重新验证。这样不会把可伪造的裸 `ThreadId` 暴露成安全任务态 API，也不会为了
+“确认还是同一线程”克隆完整 `ThreadHandle`。确定性红测中，PI slow registration 的完整
+current-handle/owner snapshot 从 1 降为 0，注册阶段的 task-preempt transaction 从 2 降为
+1；剩余一次属于 PI metadata lock 本身。
+
+解锁权限单独来自 `lock_api::RawMutex::unlock` 的 unsafe owner contract，而不是再次捕获
+current。`PiMutexCore::try_release_owned()` 只能在该 contract 下调用：无争用时直接对 owner
+word 做 release-CAS；发现 waiter bit 后返回 owner word 中的 generation-bearing identity，
+调用方从 scheduler deboost、ownerless handoff 到锁外 targeted wake 全程保持 preempt pin。
+这对应 Linux v7.1 `__rt_mutex_unlock()` 的 owner-word fast path，以及 slow path 在
+`wait_lock` 内完成 deboost/next-owner publication、锁外 `wake_q` 的顺序。区别是 Linux 用
+廉价的 `current` 再校验 owner，而 Rust raw-mutex 边界已经把“调用者持有该锁”作为 unsafe
+前置条件；重复进入 runtime current hook 只会给每次 unlock 增加一次 migration pin，并不能
+把违反 unsafe contract 的调用变成安全调用。需要代理任意线程的模型接口因此改名为
+`try_*_for_thread` 并标记 unsafe，生产任务态获取只能使用 typed current token。
+
+对应确定性红测在旧实现中执行 128 次无争用 lock/unlock 会进入 256 次 task-preempt guard；
+新路径只在 lock 时捕获一次 current，降为 128 次，IRQ facade 始终为 0。contended unlock
+测试继续断言 waiter selection 先于 claim、deboost 先于 wake，且物理 owner 只能由被选
+waiter提交。这个收益是固定成本消除，不依赖 QEMU 主机噪声；端到端性能仍以随后同配置的
+wakeup-latency 检查点为准。
+
+该检查点的 x86_64 Q35/TCG 完整组再次打印 `WAKEUP_LATENCY_PASSED`。guest clock-pair 为
+28.983 微秒，相对上一检查点的 27.342 微秒慢 6.0%；QEMU workload 为 81.30 秒，相对
+79.87 秒慢 1.8%。OTHER 四项 p50 为 129.489、118.924、120.051、219.145 微秒，FIFO
+四项为 129.409、118.168、122.082、225.409 微秒。由于 host TCG 时基不同，不能把 raw
+p50 直接当作代码回退；与 25.437 微秒时基的最近可比检查点归一化后，已知的 OTHER 同核
+futex 和 timer 分别改善约 3.6% 与 10.2%。本检查点据此只确认完整功能通过、固定 guard
+操作数减半且未观察到归一化回退；绝对值仍是 Linux PREEMPT_RT 的数倍，不能宣称已达到
+同一性能水平。
 
 本轮同时重新核对 Starry futex 锁边界。Linux v7.1 `futex_wait_setup()` 在 hash-bucket lock
 内二次检查用户值、设置 waiter state 并入队，释放 bucket 后才 `schedule()`；wake 在同一锁

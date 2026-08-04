@@ -1372,7 +1372,9 @@ mod tests {
         let _runtime_handles = InstalledTaskHandles::new(system.as_ref(), cpu.as_mut());
         let lock = PiMutexCore::new();
         assert_eq!(
-            lock.try_acquire(owner.id()).unwrap(),
+            // SAFETY: this facade test explicitly installs a non-current
+            // modeled owner before registering the current waiter.
+            unsafe { lock.try_acquire_for_thread(owner.id()) }.unwrap(),
             PiMutexAcquire::Acquired
         );
         let PiMutexLockResult::Waiting(token) = system

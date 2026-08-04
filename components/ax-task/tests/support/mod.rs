@@ -19,7 +19,7 @@ pub fn commit_pi_wait<'lock>(
     owner: ThreadId,
 ) -> Result<PiWaitToken<'lock>, TaskError> {
     if !lock.is_owned_by(owner) {
-        if lock.try_acquire(owner)? != PiMutexAcquire::Acquired {
+        if acquire_pi_for_thread(lock, owner)? != PiMutexAcquire::Acquired {
             return Err(TaskError::InvalidPiState);
         }
     }
@@ -27,6 +27,16 @@ pub fn commit_pi_wait<'lock>(
         PiMutexLockResult::Waiting(token) => Ok(token),
         PiMutexLockResult::Acquired => Err(TaskError::InvalidPiState),
     }
+}
+
+/// Establishes an explicit physical owner for scheduler model tests.
+pub fn acquire_pi_for_thread(
+    lock: &PiMutexCore,
+    thread: ThreadId,
+) -> Result<PiMutexAcquire, TaskError> {
+    // SAFETY: integration tests own the complete modeled scheduler and raw
+    // mutex state, so no real execution context can concurrently own `lock`.
+    unsafe { lock.try_acquire_for_thread(thread) }
 }
 
 mod virtual_runtime;

@@ -321,7 +321,7 @@ fn failed_pi_wait_registration_does_not_publish_a_donation_edge() {
     let stale_owner = ThreadId::from_parts(u32::MAX, 1);
 
     assert_eq!(
-        lock.try_acquire(stale_owner).unwrap(),
+        support::acquire_pi_for_thread(&lock, stale_owner).unwrap(),
         PiMutexAcquire::Acquired
     );
     assert!(matches!(
@@ -331,7 +331,9 @@ fn failed_pi_wait_registration_does_not_publish_a_donation_edge() {
         ))
     ));
     assert_eq!(owner.effective_policy(), base_policy);
-    assert!(lock.try_release(stale_owner).unwrap());
+    // SAFETY: this model owns the raw lock and releases the stale owner it
+    // explicitly installed above.
+    assert!(unsafe { lock.try_release_for_thread(stale_owner) }.unwrap());
 
     let committed = support::commit_pi_wait(&system, &lock, waiter.id(), owner.id()).unwrap();
     assert_eq!(
@@ -352,7 +354,7 @@ fn stale_pi_owner_returns_a_typed_error_instead_of_reporting_a_cycle() {
 
     let lock = PiMutexCore::new();
     assert_eq!(
-        lock.try_acquire(stale_owner).unwrap(),
+        support::acquire_pi_for_thread(&lock, stale_owner).unwrap(),
         PiMutexAcquire::Acquired
     );
     assert!(matches!(
@@ -361,7 +363,9 @@ fn stale_pi_owner_returns_a_typed_error_instead_of_reporting_a_cycle() {
             PiWaitStateError::ExitedParticipant
         ))
     ));
-    assert!(lock.try_release(stale_owner).unwrap());
+    // SAFETY: this model owns the raw lock and releases the stale owner it
+    // explicitly installed above.
+    assert!(unsafe { lock.try_release_for_thread(stale_owner) }.unwrap());
 }
 
 #[test]
@@ -394,7 +398,7 @@ fn threads_with_live_pi_edges_cannot_exit_and_leave_dangling_donations() {
         .unwrap();
     let stale_lock = PiMutexCore::new();
     assert_eq!(
-        stale_lock.try_acquire(owner.id()).unwrap(),
+        support::acquire_pi_for_thread(&stale_lock, owner.id()).unwrap(),
         PiMutexAcquire::Acquired
     );
     assert!(matches!(
@@ -407,7 +411,9 @@ fn threads_with_live_pi_edges_cannot_exit_and_leave_dangling_donations() {
             PiWaitStateError::ExitedParticipant
         ))
     ));
-    assert!(stale_lock.try_release(owner.id()).unwrap());
+    // SAFETY: this model owns the raw lock and releases the exited owner it
+    // explicitly installed above.
+    assert!(unsafe { stale_lock.try_release_for_thread(owner.id()) }.unwrap());
 }
 
 fn online_system() -> (TaskSystem, core::pin::Pin<Box<ax_task::CpuLocal>>) {

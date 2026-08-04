@@ -4,10 +4,10 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use ax_kernel_guard::NoPreempt as PreemptGuard;
 use ax_task::{
-    CurrentThreadToken, PiMutexAcquire, PiMutexCore, PiMutexLockResult, PiMutexRef,
-    PiWaitStateError, PiWaitToken, TaskError, ThreadId, current_needs_reschedule_pinned,
-    current_thread_token, pi_block_current, pi_mutex_claim, pi_mutex_lock_slow, pi_mutex_release,
-    pi_wake, validate_blocking_context,
+    CurrentThreadToken, PiMutexAcquire, PiMutexCore, PiMutexLockResult, PiMutexOwnedRelease,
+    PiMutexRef, PiWaitStateError, PiWaitToken, TaskError, ThreadId,
+    current_needs_reschedule_pinned, current_thread_token, pi_block_current, pi_mutex_claim,
+    pi_mutex_lock_slow, pi_mutex_release_owned, pi_wake, validate_blocking_context,
 };
 #[cfg(test)]
 use ax_task::{ThreadHandle, current_thread_handle};
@@ -195,16 +195,24 @@ impl RawMutex {
 
     #[cfg(test)]
     fn try_or_observe_owner(&self, current: ThreadId) -> LockAttempt {
-        self.try_or_observe_owner_word(current)
+        // SAFETY: model tests explicitly install `current` as the executing
+        // scheduler identity before manipulating this raw lock.
+        match task_result(
+            unsafe { self.core.try_acquire_for_thread(current) },
+            "try modeled PI mutex acquisition",
+        ) {
+            PiMutexAcquire::Acquired => LockAttempt::Acquired,
+            PiMutexAcquire::Contended => LockAttempt::Contended,
+        }
     }
 
     fn try_or_observe_current(&self) -> (CurrentThreadToken, LockAttempt) {
         let current = task_result(current_thread_token(), "capture PI mutex contender");
-        let attempt = self.try_or_observe_owner_word(current.id());
+        let attempt = self.try_or_observe_current_token(&current);
         (current, attempt)
     }
 
-    fn try_or_observe_owner_word(&self, current: ThreadId) -> LockAttempt {
+    fn try_or_observe_current_token(&self, current: &CurrentThreadToken) -> LockAttempt {
         match task_result(self.core.try_acquire(current), "try PI mutex acquisition") {
             PiMutexAcquire::Acquired => LockAttempt::Acquired,
             PiMutexAcquire::Contended => LockAttempt::Contended,
@@ -213,7 +221,7 @@ impl RawMutex {
 
     fn try_lock_pi(&self) -> bool {
         let current = task_result(current_thread_token(), "try PI mutex");
-        match self.core.try_acquire(current.id()) {
+        match self.core.try_acquire(&current) {
             Ok(PiMutexAcquire::Acquired) => true,
             Ok(PiMutexAcquire::Contended)
             | Err(TaskError::InvalidPiWaitState(PiWaitStateError::WaiterOwnsLock)) => false,
@@ -232,21 +240,30 @@ impl RawMutex {
         true
     }
 
-    fn unlock_pi(&self) {
-        let current = task_result(current_thread_token(), "unlock PI mutex");
-        if task_result(self.core.try_release(current.id()), "try PI mutex release") {
-            return;
+    unsafe fn unlock_pi(&self) {
+        // SAFETY: the caller is the lock_api raw-mutex owner and retains that
+        // exclusive authority through this complete release transaction.
+        match task_result(
+            unsafe { self.core.try_release_owned() },
+            "try PI mutex release",
+        ) {
+            PiMutexOwnedRelease::Released => {}
+            PiMutexOwnedRelease::Contended(owner) => {
+                // SAFETY: `owner` came from this core's owner-authorized release
+                // result and the raw-mutex contract remains active.
+                unsafe { self.unlock_contended(owner) };
+            }
         }
-
-        self.unlock_contended(&current);
     }
 
-    fn unlock_contended(&self, current: &CurrentThreadToken) {
+    unsafe fn unlock_contended(&self, owner: ThreadId) {
         // Keep this CPU pinned from owner deboost through the deferred targeted
         // wake, matching Linux's rtmutex wake_q handoff.
         let _preempt_guard = PreemptGuard::new();
         let wake = task_result(
-            pi_mutex_release(self.mutex_ref(), current),
+            // SAFETY: `unlock_pi` received owner authority from lock_api and
+            // task preemption remains disabled through the following wake.
+            unsafe { pi_mutex_release_owned(self.mutex_ref(), owner) },
             "release PI mutex",
         );
         task_result(pi_wake(&wake), "wake selected PI mutex waiter");
@@ -313,7 +330,9 @@ unsafe impl lock_api::RawMutex for RawMutex {
     unsafe fn unlock(&self) {
         #[cfg(feature = "lockdep")]
         crate::lockdep::release(self);
-        self.unlock_pi();
+        // SAFETY: lock_api calls `unlock` only for the execution context that
+        // owns this raw mutex, and this method consumes that ownership once.
+        unsafe { self.unlock_pi() };
     }
 
     #[inline(always)]
@@ -367,13 +386,23 @@ mod tests {
         waiter: ThreadId,
         owner: ThreadId,
     ) -> Result<PiWaitToken<'lock>, TaskError> {
-        if !lock.is_owned_by(owner) && lock.try_acquire(owner)? != PiMutexAcquire::Acquired {
+        if !lock.is_owned_by(owner)
+            // SAFETY: this scheduler model explicitly establishes `owner` as
+            // the physical lock owner before publishing the modeled wait.
+            && unsafe { lock.try_acquire_for_thread(owner) }? != PiMutexAcquire::Acquired
+        {
             return Err(TaskError::InvalidPiState);
         }
         match system.pi_mutex_lock_slow(lock.mutex_ref()?, waiter, waiter.as_u64())? {
             PiMutexLockResult::Waiting(token) => Ok(token),
             PiMutexLockResult::Acquired => Err(TaskError::InvalidPiState),
         }
+    }
+
+    fn unlock_test_owner(raw: &RawMutex) {
+        // SAFETY: every caller first installs or acquires the fixture's current
+        // thread as this raw mutex's physical owner.
+        unsafe { raw.unlock_pi() };
     }
 
     #[test]
@@ -534,7 +563,7 @@ mod tests {
         system.enqueue(cpu.as_mut(), waiter_thread.id(), 0).unwrap();
         let token = commit_pi_wait(&system, &raw.core, waiter_thread.id(), owner.id()).unwrap();
 
-        raw.unlock_pi();
+        unlock_test_owner(&raw);
 
         assert!(token.can_claim());
         assert!(
@@ -561,7 +590,7 @@ mod tests {
         system.make_ready(waiter_thread.id()).unwrap();
         system.enqueue(cpu.as_mut(), waiter_thread.id(), 0).unwrap();
         let token = commit_pi_wait(&system, &raw.core, waiter_thread.id(), owner.id()).unwrap();
-        raw.unlock_pi();
+        unlock_test_owner(&raw);
 
         assert!(token.is_selected());
         assert!(token.can_claim());
@@ -585,7 +614,7 @@ mod tests {
         system.enqueue(cpu.as_mut(), waiter_thread.id(), 0).unwrap();
         let token = commit_pi_wait(&system, &raw.core, waiter_thread.id(), owner.id()).unwrap();
 
-        raw.unlock_pi();
+        unlock_test_owner(&raw);
         assert!(token.is_selected());
         assert!(!token.is_granted());
 
@@ -620,7 +649,7 @@ mod tests {
         let second_token =
             commit_pi_wait(&system, &raw.core, second_thread.id(), owner.id()).unwrap();
 
-        raw.unlock_pi();
+        unlock_test_owner(&raw);
         assert!(first_token.is_selected());
         assert!(!second_token.is_selected());
 
@@ -648,11 +677,13 @@ mod tests {
             .create_thread(ThreadSpec::new(SchedulePolicy::default()))
             .unwrap();
         assert_eq!(
-            raw.core.try_acquire(owner.id()).unwrap(),
+            // SAFETY: this fixture explicitly installs `owner` before testing
+            // raw-mutex release without a lock_api guard.
+            unsafe { raw.core.try_acquire_for_thread(owner.id()) }.unwrap(),
             PiMutexAcquire::Acquired
         );
 
-        raw.unlock_pi();
+        unlock_test_owner(&raw);
         assert!(matches!(
             raw.try_or_observe_owner(contender.id()),
             LockAttempt::Acquired
@@ -701,6 +732,12 @@ mod tests {
         }
 
         assert_eq!(
+            crate::test_runtime::preempt_guard_entries(),
+            ITERATIONS,
+            "each uncontended lock pair needs one current capture; RawMutex::unlock already has \
+             exclusive owner authority"
+        );
+        assert_eq!(
             crate::test_runtime::irq_guard_entries(),
             0,
             "Linux rtmutex-style uncontended lock/unlock must remain on the owner-word fast path \
@@ -740,7 +777,9 @@ mod tests {
             .create_thread(ThreadSpec::new(SchedulePolicy::default()))
             .unwrap();
         assert_eq!(
-            raw.core.try_acquire(owner.id()).unwrap(),
+            // SAFETY: this fixture explicitly installs `owner` to force the
+            // current thread through the contended validation path.
+            unsafe { raw.core.try_acquire_for_thread(owner.id()) }.unwrap(),
             PiMutexAcquire::Acquired
         );
         crate::test_runtime::set_schedule_context_safe(false);
