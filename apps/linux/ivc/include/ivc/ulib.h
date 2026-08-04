@@ -4,6 +4,7 @@
 
 #include <stdio.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -23,9 +24,15 @@ typedef struct ivc_subscriber {
     ivc_subscribe_arg_t subscribe_arg;      // Subscription argument structure
     int64_t             fd;                 // File descriptor for the subscriber's device
     uint64_t            read;               // Number of bytes read from the channel
+    ivc_channel_info_arg_t channel_info;    // Optional metadata returned by newer drivers
+    int                 has_channel_info;   // Whether channel_info came from the driver
 } ivc_subscriber_t, *ivc_subscriber_p;
 
 ivc_subscriber_p ivc_subscribe(ivc_manager_p manager, uint64_t publisher_id, uint64_t channel_key);
+void *ivc_mmap_subscriber(ivc_subscriber_p subscriber, size_t size);
+uint64_t ivc_subscriber_shm_base(ivc_subscriber_p subscriber);
+uint64_t ivc_subscriber_shm_size(ivc_subscriber_p subscriber);
+int ivc_subscriber_has_channel_info(ivc_subscriber_p subscriber);
 int ivc_read(ivc_subscriber_p subscriber, void *buf, size_t count);
 int ivc_unsubscribe(ivc_subscriber_p subscriber);
 

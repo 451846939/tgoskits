@@ -3,9 +3,11 @@
 #include <ivc/ivc_dev.h>
 #include <ivc/ioctl_args.h>
 
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 
@@ -70,6 +72,8 @@ ivc_subscriber_p ivc_subscribe(ivc_manager_p manager, uint64_t publisher_id, uin
     subscriber->subscribe_arg.channel_key = channel_key;
     memset(subscriber->subscribe_arg.device_name, 0, sizeof(subscriber->subscribe_arg.device_name));
     subscriber->read = 0;
+    memset(&subscriber->channel_info, 0, sizeof(subscriber->channel_info));
+    subscriber->has_channel_info = 0;
 
     // Perform the subscription operation
     if (ioctl(manager->fd, IVC_SUBSCRIBE_CHANNEL, &subscriber->subscribe_arg) < 0) {
@@ -78,15 +82,52 @@ ivc_subscriber_p ivc_subscribe(ivc_manager_p manager, uint64_t publisher_id, uin
         return NULL;
     }
 
-    // Open the subscriber device
-    subscriber->fd = open(subscriber->subscribe_arg.device_name, O_RDONLY);
+    // Prefer O_RDWR for driver mmap, but keep compatibility with older
+    // axvisor.ko builds that only allowed O_RDONLY subscribers.
+    subscriber->fd = open(subscriber->subscribe_arg.device_name, O_RDWR);
+    if (subscriber->fd < 0 && (errno == EACCES || errno == EPERM)) {
+        subscriber->fd = open(subscriber->subscribe_arg.device_name, O_RDONLY);
+    }
     if (subscriber->fd < 0) {
         perror("Failed to open subscriber device");
         free(subscriber);
         return NULL;
     }
 
+    if (ioctl(subscriber->fd, IVC_GET_CHANNEL_INFO, &subscriber->channel_info) == 0) {
+        subscriber->has_channel_info = 1;
+    }
+
     return subscriber;
+}
+
+void *ivc_mmap_subscriber(ivc_subscriber_p subscriber, size_t size) {
+    if (!subscriber || subscriber->fd < 0 || size == 0) {
+        errno = EINVAL;
+        return MAP_FAILED;
+    }
+
+    return mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, subscriber->fd, 0);
+}
+
+uint64_t ivc_subscriber_shm_base(ivc_subscriber_p subscriber) {
+    if (!subscriber || !subscriber->has_channel_info) {
+        return 0;
+    }
+
+    return subscriber->channel_info.shm_base;
+}
+
+uint64_t ivc_subscriber_shm_size(ivc_subscriber_p subscriber) {
+    if (!subscriber || !subscriber->has_channel_info) {
+        return 0;
+    }
+
+    return subscriber->channel_info.shm_size;
+}
+
+int ivc_subscriber_has_channel_info(ivc_subscriber_p subscriber) {
+    return subscriber && subscriber->has_channel_info;
 }
 
 int ivc_read(ivc_subscriber_p subscriber, void *buf, size_t count) {

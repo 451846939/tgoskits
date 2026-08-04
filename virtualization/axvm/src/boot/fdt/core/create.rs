@@ -23,7 +23,7 @@ use fdt_raw::RegInfo;
 use super::tree::{FdtTree, GuestMemorySpec, prop_empty, prop_string, prop_u32_list};
 use crate::{
     AxVMRef, AxVmResult, GuestPhysAddr, VMMemoryRegion, ax_err_type,
-    boot::images::load_vm_image_from_memory,
+    boot::images::load_vm_image_from_memory, runtime::IVC_LAYOUT_VERSION,
 };
 
 pub fn create_guest_fdt(
@@ -270,8 +270,12 @@ impl FdtTree {
         );
         self.set_property(node_id, prop_string("compatible", "axvisor,ivc-channel"))?;
         self.set_property(node_id, prop_string("status", "okay"))?;
-        self.set_property(node_id, prop_u32_list("axvisor,ivc-version", &[1]))?;
+        self.set_property(
+            node_id,
+            prop_u32_list("axvisor,ivc-version", &[IVC_LAYOUT_VERSION as u32]),
+        )?;
         self.set_property(node_id, prop_u32_list("memory-region", &[reserved_phandle]))?;
+        self.set_property(node_id, prop_empty("dma-coherent"))?;
 
         if let Some(notify_irq) = device
             .cfg_list
@@ -528,6 +532,7 @@ mod tests {
             node.get_property("memory-region").unwrap().get_u32(),
             shm_phandle
         );
+        assert!(node.get_property("dma-coherent").is_some());
     }
 
     #[test]

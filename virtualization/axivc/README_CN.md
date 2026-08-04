@@ -47,6 +47,20 @@ IVC 栈按职责分为三层：
 
 ring 协议使用 Release/Acquire 内存序。生产者写入 slot payload 后 release `tail`；消费者 acquire `tail` 后复制 slot，并 release `head` 归还所有权。
 
+# 内存属性
+
+当前 AxVisor IVC 协议假设所有客户机都把 shared-memory window 映射为 Normal
+cacheable memory，并且目标平台在这些客户机之间提供 cache coherency。aarch64 QEMU
+当前 Zephyr/Linux 测例符合这个口径：
+
+- Zephyr 使用 `K_MEM_CACHE_WB` 映射 channel；
+- Linux 通过 IVC driver mmap reserved-memory 区域；
+- AxVisor 生成的 `ivc-channel` FDT 节点会标注 `dma-coherent`。
+
+Release/Acquire 只保证 CPU 访问顺序，不会在非 cache-coherent 平台上自动 clean 或
+invalidate 私有 cache。非 coherent 平台需要在相同的 publish/observe 同步点外接
+OS 相关 cache maintenance 层，才能安全使用当前协议。
+
 # 客户机使用流程
 
 publisher 通常执行：

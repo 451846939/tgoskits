@@ -24,6 +24,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 // embed the dispatcher as a field and expose it to the vCPU run loop.
 #[allow(unused_imports)]
 pub(crate) use dispatcher::VcpuIrqDispatcher;
+#[allow(unused_imports)]
+pub(crate) use ivc::IVC_LAYOUT_VERSION;
 
 use crate::{AxVmError, AxVmResult, StopReason, VmStatus, ax_err};
 

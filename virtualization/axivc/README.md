@@ -63,6 +63,22 @@ The ring protocol uses Release/Acquire ordering. The producer writes a slot
 payload and releases `tail`; the consumer acquires `tail`, copies the slot, and
 releases `head` to return ownership.
 
+# Memory Attributes
+
+The current AxVisor IVC protocol assumes that the shared-memory window is mapped
+as Normal cacheable memory by every guest and that the target platform provides
+cache coherency between those guests. On aarch64 QEMU this matches the current
+Zephyr/Linux test setup:
+
+- Zephyr maps the channel with `K_MEM_CACHE_WB`.
+- Linux maps the reserved-memory region through the IVC driver mmap path.
+- AxVisor marks the generated `ivc-channel` FDT node as `dma-coherent`.
+
+Release/Acquire ordering only orders CPU accesses. It does not clean or
+invalidate private caches on non-cache-coherent platforms. Such platforms need
+an OS-specific cache maintenance layer around the same protocol publish/observe
+points before this crate can be used safely there.
+
 # Guest Flow
 
 A publisher typically:

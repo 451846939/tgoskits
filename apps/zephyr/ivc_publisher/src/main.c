@@ -40,6 +40,7 @@
 #define AXIVC_PERF_DATA_OFFSET 0x10000U
 #define AXIVC_PERF_READ_MEM_OFFSET AXIVC_PERF_DATA_OFFSET
 #define AXIVC_PERF_WRITE_MEM_OFFSET (AXIVC_PERF_READ_MEM_OFFSET + AXIVC_PERF_PAYLOAD_MAX)
+#define AXIVC_SHM_CACHE_POLICY "normal-cacheable/coherent-required"
 
 #define HIVC_PUBLISH_CHANNEL 3U
 #define HIVC_NOTIFY 7U
@@ -146,6 +147,30 @@ static void *map_shared_region(uint64_t gpa, uint64_t size)
 	return mapped;
 }
 
+static void axivc_shm_sync_before_publish(void)
+{
+	__atomic_thread_fence(__ATOMIC_RELEASE);
+}
+
+static void axivc_shm_sync_after_observe(void)
+{
+	__atomic_thread_fence(__ATOMIC_ACQUIRE);
+}
+
+static uint32_t perf_load_state(struct axivc_perf_control *perf)
+{
+	uint32_t state = __atomic_load_n(&perf->state, __ATOMIC_ACQUIRE);
+
+	axivc_shm_sync_after_observe();
+	return state;
+}
+
+static void perf_store_state(struct axivc_perf_control *perf, uint32_t state)
+{
+	axivc_shm_sync_before_publish();
+	__atomic_store_n(&perf->state, state, __ATOMIC_RELEASE);
+}
+
 static void ring_init(struct axivc_ring *ring, uint32_t direction)
 {
 	memset(ring, 0, sizeof(*ring));
@@ -185,8 +210,7 @@ static void region_init(struct axivc_region *region)
 			 __ATOMIC_RELAXED);
 	__atomic_store_n(&region->perf.version, AXIVC_PERF_VERSION,
 			 __ATOMIC_RELAXED);
-	__atomic_store_n(&region->perf.state, AXIVC_PERF_STATE_IDLE,
-			 __ATOMIC_RELEASE);
+	perf_store_state(&region->perf, AXIVC_PERF_STATE_IDLE);
 	__atomic_store_n(&region->header.version, AXIVC_REGION_VERSION,
 			 __ATOMIC_RELEASE);
 	__atomic_store_n(&region->header.magic, AXIVC_REGION_MAGIC,
@@ -201,7 +225,7 @@ static void notify_linux(void)
 
 static void wait_for_state(struct axivc_perf_control *perf, uint32_t state)
 {
-	while (__atomic_load_n(&perf->state, __ATOMIC_ACQUIRE) != state) {
+	while (perf_load_state(perf) != state) {
 		k_busy_wait(50);
 	}
 }
@@ -251,9 +275,10 @@ int main(void)
 		return 1;
 	}
 
-	printk("zephyr ivc perf shared base=0x%llx size=%llu read_mem=0x%x write_mem=0x%x\n",
+	printk("zephyr ivc perf shared base=0x%llx size=%llu read_mem=0x%x write_mem=0x%x cache=%s\n",
 	       (unsigned long long)shm_base, (unsigned long long)shm_size,
-	       AXIVC_PERF_READ_MEM_OFFSET, AXIVC_PERF_WRITE_MEM_OFFSET);
+	       AXIVC_PERF_READ_MEM_OFFSET, AXIVC_PERF_WRITE_MEM_OFFSET,
+	       AXIVC_SHM_CACHE_POLICY);
 
 	for (uint32_t test = 0; test < AXIVC_PERF_TEST_COUNT; test++) {
 		uint64_t copy_total_ns = 0;
@@ -293,8 +318,7 @@ int main(void)
 			copy_total_ns += end_ns - start_ns;
 			__atomic_store_n(&perf->zephyr_copy_ns, end_ns - start_ns,
 					 __ATOMIC_RELAXED);
-			__atomic_store_n(&perf->state, AXIVC_PERF_STATE_DONE,
-					 __ATOMIC_RELEASE);
+			perf_store_state(perf, AXIVC_PERF_STATE_DONE);
 			notify_linux();
 		}
 
@@ -306,8 +330,7 @@ int main(void)
 	}
 
 	wait_for_state(perf, AXIVC_PERF_STATE_IDLE);
-	__atomic_store_n(&perf->state, AXIVC_PERF_STATE_COMPLETE,
-			 __ATOMIC_RELEASE);
+	perf_store_state(perf, AXIVC_PERF_STATE_COMPLETE);
 	notify_linux();
 	printk("zephyr ivc perf publisher pass\n");
 	return 0;

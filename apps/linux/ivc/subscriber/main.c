@@ -10,8 +10,8 @@
 #include <time.h>
 #include <unistd.h>
 
-#define AXIVC_PERF_SHM_BASE 0xbff00000UL
-#define AXIVC_PERF_SHM_SIZE 0x2000000UL
+#define AXIVC_PERF_LEGACY_SHM_BASE 0xbff00000UL
+#define AXIVC_PERF_LEGACY_SHM_SIZE 0x2000000UL
 #define AXIVC_PERF_MAGIC 0x49565046U
 #define AXIVC_PERF_VERSION 1U
 #define AXIVC_PERF_ITERATIONS 100U
@@ -24,6 +24,7 @@
 #define AXIVC_PERF_DATA_OFFSET 0x10000U
 #define AXIVC_PERF_READ_MEM_OFFSET AXIVC_PERF_DATA_OFFSET
 #define AXIVC_PERF_WRITE_MEM_OFFSET (AXIVC_PERF_READ_MEM_OFFSET + AXIVC_PERF_PAYLOAD_MAX)
+#define AXIVC_SHM_CACHE_POLICY "normal-cacheable/coherent-required"
 
 struct axivc_region_header {
     uint32_t magic;
@@ -112,14 +113,52 @@ static uint64_t now_ns(void)
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
+static uint64_t parse_u64_env(const char *name, uint64_t fallback)
+{
+    const char *value = getenv(name);
+    char *end = NULL;
+    uint64_t parsed;
+
+    if (!value || value[0] == '\0') {
+        return fallback;
+    }
+
+    errno = 0;
+    parsed = strtoull(value, &end, 0);
+    if (errno != 0 || end == value || *end != '\0') {
+        fprintf(stderr, "Invalid %s value '%s', using 0x%" PRIx64 "\n",
+                name, value, fallback);
+        return fallback;
+    }
+    return parsed;
+}
+
 static uint32_t load_state(struct axivc_perf_control *perf)
 {
-    return __atomic_load_n(&perf->state, __ATOMIC_ACQUIRE);
+    uint32_t state = __atomic_load_n(&perf->state, __ATOMIC_ACQUIRE);
+
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    return state;
 }
 
 static void store_state(struct axivc_perf_control *perf, uint32_t state)
 {
+    __atomic_thread_fence(__ATOMIC_RELEASE);
     __atomic_store_n(&perf->state, state, __ATOMIC_RELEASE);
+}
+
+static void publish_perf_request(struct axivc_perf_control *perf,
+                                 uint32_t test, uint32_t iter, uint64_t bytes)
+{
+    __atomic_store_n(&perf->test_index, test, __ATOMIC_RELAXED);
+    __atomic_store_n(&perf->iteration, iter, __ATOMIC_RELAXED);
+    __atomic_store_n(&perf->bytes, bytes, __ATOMIC_RELAXED);
+    store_state(perf, AXIVC_PERF_STATE_READY);
+}
+
+static uint64_t consume_zephyr_copy_ns(struct axivc_perf_control *perf)
+{
+    return __atomic_load_n(&perf->zephyr_copy_ns, __ATOMIC_ACQUIRE);
 }
 
 static double throughput_gbps(uint64_t bytes, uint64_t iterations, uint64_t ns)
@@ -163,6 +202,10 @@ static int run_perf_subscriber(uint64_t target_publisher_id, uint64_t channel_ke
     int ret = 0;
     int memfd = -1;
     void *mapping = MAP_FAILED;
+    size_t mapping_size = 0;
+    const char *mmap_mode = getenv("AXIVC_MMAP");
+    int force_devmem = mmap_mode && strcmp(mmap_mode, "devmem") == 0;
+    int force_driver = mmap_mode && strcmp(mmap_mode, "driver") == 0;
     ivc_manager_p manager = NULL;
     ivc_subscriber_p subscriber = NULL;
     struct axivc_region *region;
@@ -174,6 +217,8 @@ static int run_perf_subscriber(uint64_t target_publisher_id, uint64_t channel_ke
     uint64_t read_ns[AXIVC_PERF_TEST_COUNT] = {0};
     uint64_t write_ns[AXIVC_PERF_TEST_COUNT] = {0};
     uint64_t zephyr_copy_ns[AXIVC_PERF_TEST_COUNT] = {0};
+    uint64_t shm_base = 0;
+    uint64_t shm_size = 0;
 
     manager = ivc_open_manager();
     if (!manager) {
@@ -188,28 +233,58 @@ static int run_perf_subscriber(uint64_t target_publisher_id, uint64_t channel_ke
         goto out_close_manager;
     }
 
-    memfd = open("/dev/mem", O_RDWR | O_SYNC);
-    if (memfd < 0) {
-        perror("Failed to open /dev/mem");
-        ret = 3;
-        goto out_unsubscribe;
+    shm_base = ivc_subscriber_shm_base(subscriber);
+    shm_size = ivc_subscriber_shm_size(subscriber);
+    if (shm_size == 0) {
+        shm_size = AXIVC_PERF_LEGACY_SHM_SIZE;
+    }
+    mapping_size = (size_t)shm_size;
+
+    if (!force_devmem) {
+        mapping = ivc_mmap_subscriber(subscriber, mapping_size);
+        if (mapping != MAP_FAILED) {
+            printf("linux ivc mmap source=driver\n");
+        } else {
+            perror("Failed to mmap IVC shared memory from subscriber device");
+            if (force_driver) {
+                ret = 4;
+                goto out_unsubscribe;
+            }
+        }
     }
 
-    mapping = mmap(NULL, AXIVC_PERF_SHM_SIZE, PROT_READ | PROT_WRITE,
-                   MAP_SHARED, memfd, AXIVC_PERF_SHM_BASE);
     if (mapping == MAP_FAILED) {
-        perror("Failed to mmap IVC shared memory");
-        ret = 4;
-        goto out_close_mem;
+        if (shm_base == 0) {
+            shm_base = AXIVC_PERF_LEGACY_SHM_BASE;
+        }
+        shm_base = parse_u64_env("AXIVC_DEVMEM_BASE", shm_base);
+
+        memfd = open("/dev/mem", O_RDWR | O_SYNC);
+        if (memfd < 0) {
+            perror("Failed to open /dev/mem");
+            ret = 3;
+            goto out_unsubscribe;
+        }
+
+        mapping = mmap(NULL, mapping_size, PROT_READ | PROT_WRITE,
+                       MAP_SHARED, memfd, (off_t)shm_base);
+        if (mapping == MAP_FAILED) {
+            perror("Failed to mmap IVC shared memory from /dev/mem");
+            ret = 4;
+            goto out_close_mem;
+        }
+        printf("linux ivc mmap source=devmem base=0x%" PRIx64 "\n", shm_base);
     }
-    printf("linux ivc mmap source=devmem\n");
+    printf("linux ivc shm cache=%s\n", AXIVC_SHM_CACHE_POLICY);
+    printf("linux ivc shm size=0x%" PRIx64 " info=%s\n", shm_size,
+           ivc_subscriber_has_channel_info(subscriber) ? "driver" : "legacy");
 
     region = (struct axivc_region *)mapping;
     perf = &region->perf;
     read_mem = (uint8_t *)mapping + AXIVC_PERF_READ_MEM_OFFSET;
     write_mem = (uint8_t *)mapping + AXIVC_PERF_WRITE_MEM_OFFSET;
 
-    if (AXIVC_PERF_WRITE_MEM_OFFSET + AXIVC_PERF_PAYLOAD_MAX > AXIVC_PERF_SHM_SIZE) {
+    if (AXIVC_PERF_WRITE_MEM_OFFSET + AXIVC_PERF_PAYLOAD_MAX > mapping_size) {
         fprintf(stderr, "IVC perf shared memory layout exceeds channel size\n");
         ret = 5;
         goto out_unmap;
@@ -242,16 +317,12 @@ static int run_perf_subscriber(uint64_t target_publisher_id, uint64_t channel_ke
             end = now_ns();
             write_ns[test] += end - start;
 
-            __atomic_store_n(&perf->test_index, test, __ATOMIC_RELAXED);
-            __atomic_store_n(&perf->iteration, iter, __ATOMIC_RELAXED);
-            __atomic_store_n(&perf->bytes, bytes, __ATOMIC_RELAXED);
-            store_state(perf, AXIVC_PERF_STATE_READY);
+            publish_perf_request(perf, test, iter, bytes);
 
             while (load_state(perf) != AXIVC_PERF_STATE_DONE) {
                 usleep(50);
             }
-            zephyr_copy_ns[test] += __atomic_load_n(&perf->zephyr_copy_ns,
-                                                    __ATOMIC_ACQUIRE);
+            zephyr_copy_ns[test] += consume_zephyr_copy_ns(perf);
 
             start = now_ns();
             memcpy(sink, write_mem, bytes);
@@ -298,7 +369,7 @@ out_free_buffers:
     free(source);
 out_unmap:
     if (mapping != MAP_FAILED) {
-        munmap(mapping, AXIVC_PERF_SHM_SIZE);
+        munmap(mapping, mapping_size);
     }
 out_close_mem:
     if (memfd >= 0) {

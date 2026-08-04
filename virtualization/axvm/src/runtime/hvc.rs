@@ -20,7 +20,7 @@ use crate::{
     AxVmError, GuestPhysAddr, MappingFlags,
     runtime::{
         VMRef,
-        ivc::{self, IVCChannel},
+        ivc::{self, IVCChannel, IvcPeerRole},
     },
 };
 
@@ -87,6 +87,14 @@ impl HyperCall {
                     };
 
                 let actual_size = ivc_channel.size();
+                let layout = ivc_channel.layout();
+                let permission_plan = ivc_channel.permission_plan(IvcPeerRole::Publisher);
+                trace!(
+                    "VM[{}] publisher IVC layout {:?}, permission plan: {:?}",
+                    self.vm.id(),
+                    layout,
+                    permission_plan
+                );
 
                 if let Err(err) = self.vm.map_region(
                     shm_base_gpa,
@@ -208,7 +216,7 @@ impl HyperCall {
                     self.vm.id(),
                     shm_base_gpa,
                 );
-                let (base_hpa, actual_size) = match subscribe_result {
+                let (base_hpa, actual_size, permission_plan) = match subscribe_result {
                     Ok(channel) => channel,
                     Err(err) => {
                         if let Err(release_err) =
@@ -223,6 +231,11 @@ impl HyperCall {
                         return Err(self.operation_error("register IVC channel subscriber", err));
                     }
                 };
+                trace!(
+                    "VM[{}] subscriber IVC permission plan: {:?}",
+                    self.vm.id(),
+                    permission_plan
+                );
 
                 // TODO: separate the mapping flags of metadata and data.
                 if let Err(err) = self.vm.map_region(

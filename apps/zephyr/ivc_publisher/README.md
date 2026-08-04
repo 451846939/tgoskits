@@ -7,9 +7,14 @@ The app uses the current AxVisor HVC-based IVC ABI:
 
 - publish channel `0x49564301`;
 - initialize the axivc v2 shared-memory region;
-- send five `Request` messages on the publisher-to-subscriber ring;
-- notify Linux VM `2` after each send;
-- receive Linux `Ack` messages on the subscriber-to-publisher ring.
+- map the shared channel as write-back cacheable memory with `K_MEM_CACHE_WB`;
+- run the Zephyr/Linux shared-memory throughput test.
+
+The shared-memory control protocol uses release/acquire state transitions:
+Linux publishes `READY` after writing `read_mem`, Zephyr observes `READY`,
+copies `read_mem` to `write_mem`, and publishes `DONE` after the copy. This
+assumes a cache-coherent platform; non-coherent targets need cache maintenance
+hooks at the same publish/observe points.
 
 Build example:
 

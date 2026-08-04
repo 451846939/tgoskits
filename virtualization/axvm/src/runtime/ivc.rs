@@ -35,6 +35,13 @@ static IVC_CHANNELS: Mutex<BTreeMap<(usize, usize), HostIVCChannel>> = Mutex::ne
 /// the actual granted size back to the guest, so guests must check it.
 pub const MAX_IVC_CHANNEL_SIZE: usize = 0x200_0000;
 
+/// Version of the AxVisor-managed IVC shared-memory layout.
+#[allow(dead_code)]
+pub const IVC_LAYOUT_VERSION: u16 = 1;
+
+const IVC_CONTROL_SECTION_SIZE: usize = PAGE_SIZE_4K;
+const IVC_COMMON_SECTION_SIZE: usize = PAGE_SIZE_4K;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IvcNotifyRoute {
     pub source_vm_id: usize,
@@ -144,7 +151,7 @@ pub fn subscribe_to_channel_of_publisher(
     key: usize,
     subscriber_vm_id: usize,
     subscriber_gpa: GuestPhysAddr,
-) -> AxVmResult<(HostPhysAddr, usize)> {
+) -> AxVmResult<(HostPhysAddr, usize, IvcPermissionPlan)> {
     let mut channels = IVC_CHANNELS.lock();
     let channel = channels.get_mut(&(publisher_vm_id, key)).ok_or_else(|| {
         ax_err_type!(
@@ -168,7 +175,11 @@ pub fn subscribe_to_channel_of_publisher(
     // the gap after `prepare_subscribe_channel()` and preserves the SPSC
     // protocol's one-subscriber invariant.
     channel.add_subscriber(subscriber_vm_id, subscriber_gpa)?;
-    Ok((channel.base_hpa(), channel.size()))
+    Ok((
+        channel.base_hpa(),
+        channel.size(),
+        channel.permission_plan(IvcPeerRole::Subscriber),
+    ))
 }
 
 /// Unsubscribe from a channel of a publisher VM with the given key,
@@ -239,12 +250,7 @@ pub fn prepare_notify_channel(
         ));
     }
 
-    let source_can_notify_target = if source_vm_id == publisher_vm_id {
-        channel.has_subscriber(target_vm_id)
-    } else {
-        channel.has_subscriber(source_vm_id) && target_vm_id == publisher_vm_id
-    };
-    if !source_can_notify_target {
+    if !channel.can_notify(source_vm_id, target_vm_id) {
         return Err(ax_err_type!(
             InvalidInput,
             format!(
@@ -260,6 +266,117 @@ pub fn prepare_notify_channel(
         publisher_vm_id,
         key,
     })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IvcPeerRole {
+    Publisher,
+    Subscriber,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IvcSection {
+    pub offset: usize,
+    pub size: usize,
+}
+
+impl IvcSection {
+    const fn empty_at(offset: usize) -> Self {
+        Self { offset, size: 0 }
+    }
+
+    pub const fn end(&self) -> usize {
+        self.offset + self.size
+    }
+}
+
+/// Guest-visible section plan for one channel.
+///
+/// The current SPSC ABI still maps the whole shared region as read-write for
+/// both peers. This layout records the intended split so later stage-2/NPT
+/// mappings can apply section-level permissions without changing allocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IvcSharedLayout {
+    pub control: IvcSection,
+    pub common: IvcSection,
+    pub publisher_output: IvcSection,
+    pub subscriber_output: IvcSection,
+}
+
+impl IvcSharedLayout {
+    pub fn for_region(size: usize) -> AxVmResult<Self> {
+        if size == 0 {
+            return Err(ax_err_type!(
+                InvalidInput,
+                "IVC shared layout requires a non-empty region"
+            ));
+        }
+
+        let control_size = size.min(IVC_CONTROL_SECTION_SIZE);
+        let control = IvcSection {
+            offset: 0,
+            size: control_size,
+        };
+        let remaining = size - control_size;
+        if remaining == 0 {
+            let empty = IvcSection::empty_at(control.end());
+            return Ok(Self {
+                control,
+                common: empty,
+                publisher_output: empty,
+                subscriber_output: empty,
+            });
+        }
+
+        let common_size = remaining.min(IVC_COMMON_SECTION_SIZE);
+        let common = IvcSection {
+            offset: control.end(),
+            size: common_size,
+        };
+        let output_start = common.end();
+        let output_size = size - output_start;
+        let publisher_output_size = output_size / 2;
+        let publisher_output = IvcSection {
+            offset: output_start,
+            size: publisher_output_size,
+        };
+        let subscriber_output = IvcSection {
+            offset: publisher_output.end(),
+            size: output_size - publisher_output_size,
+        };
+
+        Ok(Self {
+            control,
+            common,
+            publisher_output,
+            subscriber_output,
+        })
+    }
+
+    pub fn permission_plan(&self, role: IvcPeerRole) -> IvcPermissionPlan {
+        match role {
+            IvcPeerRole::Publisher => IvcPermissionPlan {
+                control: self.control,
+                common: self.common,
+                writable_output: self.publisher_output,
+                readonly_output: self.subscriber_output,
+            },
+            IvcPeerRole::Subscriber => IvcPermissionPlan {
+                control: self.control,
+                common: self.common,
+                writable_output: self.subscriber_output,
+                readonly_output: self.publisher_output,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IvcPermissionPlan {
+    pub control: IvcSection,
+    pub common: IvcSection,
+    pub writable_output: IvcSection,
+    pub readonly_output: IvcSection,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -279,6 +396,7 @@ pub struct IVCChannel<H: PagingHandler> {
     subscriber: Option<IvcSubscriberBinding>,
     shared_region_base: HostPhysAddr,
     shared_region_size: usize,
+    layout: IvcSharedLayout,
     /// The base address of the shared memory region in guest physical address of the publisher VM.
     /// `None` if the channel has been unpublished (but still has subscribers).
     base_gpa: Option<GuestPhysAddr>,
@@ -377,6 +495,7 @@ impl<H: PagingHandler> IVCChannel<H> {
                  {MAX_IVC_CHANNEL_SIZE:#x}; truncating to {MAX_IVC_CHANNEL_SIZE:#x}"
             );
         }
+        let layout = IvcSharedLayout::for_region(shared_region_size)?;
         let shared_region_base = H::alloc_frames(shared_region_size / PAGE_SIZE_4K, PAGE_SIZE_4K)
             .ok_or(AxVmError::OutOfMemory {
             operation: "allocate IVC shared region frames",
@@ -388,6 +507,7 @@ impl<H: PagingHandler> IVCChannel<H> {
             subscriber: None,
             shared_region_base,
             shared_region_size,
+            layout,
             base_gpa: Some(base_gpa),
             _phantom: core::marker::PhantomData,
         };
@@ -413,6 +533,14 @@ impl<H: PagingHandler> IVCChannel<H> {
 
     pub fn size(&self) -> usize {
         self.shared_region_size
+    }
+
+    pub fn layout(&self) -> IvcSharedLayout {
+        self.layout
+    }
+
+    pub fn permission_plan(&self, role: IvcPeerRole) -> IvcPermissionPlan {
+        self.layout.permission_plan(role)
     }
 
     /// Number of 4K frames backing the shared region.
@@ -450,6 +578,14 @@ impl<H: PagingHandler> IVCChannel<H> {
     pub fn has_subscriber(&self, subscriber_vm_id: usize) -> bool {
         self.subscriber
             .is_some_and(|binding| binding.vm_id == subscriber_vm_id)
+    }
+
+    fn can_notify(&self, source_vm_id: usize, target_vm_id: usize) -> bool {
+        if source_vm_id == self.publisher_vm_id {
+            self.has_subscriber(target_vm_id)
+        } else {
+            self.has_subscriber(source_vm_id) && target_vm_id == self.publisher_vm_id
+        }
     }
 
     fn ensure_subscriber_available(&self, subscriber_vm_id: usize) -> AxVmResult<()> {
@@ -662,5 +798,86 @@ mod tests {
 
         assert!(!channel.has_subscriber(2));
         assert!(channel.has_subscriber(3));
+    }
+
+    #[test]
+    fn layout_splits_multi_page_channel_into_control_common_and_peer_outputs() {
+        let layout = IvcSharedLayout::for_region(6 * PAGE_SIZE_4K).unwrap();
+
+        assert_eq!(
+            layout.control,
+            IvcSection {
+                offset: 0,
+                size: PAGE_SIZE_4K
+            }
+        );
+        assert_eq!(
+            layout.common,
+            IvcSection {
+                offset: PAGE_SIZE_4K,
+                size: PAGE_SIZE_4K
+            }
+        );
+        assert_eq!(
+            layout.publisher_output,
+            IvcSection {
+                offset: 2 * PAGE_SIZE_4K,
+                size: 2 * PAGE_SIZE_4K
+            }
+        );
+        assert_eq!(
+            layout.subscriber_output,
+            IvcSection {
+                offset: 4 * PAGE_SIZE_4K,
+                size: 2 * PAGE_SIZE_4K
+            }
+        );
+        assert_eq!(layout.subscriber_output.end(), 6 * PAGE_SIZE_4K);
+    }
+
+    #[test]
+    fn permission_plan_assigns_role_owned_output() {
+        let channel = IVCChannel::<MockPagingHandler>::alloc(
+            1,
+            0x106,
+            6 * PAGE_SIZE_4K,
+            GuestPhysAddr::from_usize(0x7000_6000),
+        )
+        .unwrap();
+        let layout = channel.layout();
+
+        let publisher_plan = channel.permission_plan(IvcPeerRole::Publisher);
+        assert_eq!(publisher_plan.writable_output, layout.publisher_output);
+        assert_eq!(publisher_plan.readonly_output, layout.subscriber_output);
+        assert_eq!(publisher_plan.control, layout.control);
+        assert_eq!(publisher_plan.common, layout.common);
+
+        let subscriber_plan = channel.permission_plan(IvcPeerRole::Subscriber);
+        assert_eq!(subscriber_plan.writable_output, layout.subscriber_output);
+        assert_eq!(subscriber_plan.readonly_output, layout.publisher_output);
+        assert_eq!(subscriber_plan.control, layout.control);
+        assert_eq!(subscriber_plan.common, layout.common);
+    }
+
+    #[test]
+    fn notify_route_rejects_unrelated_third_vm() {
+        let mut channel = IVCChannel::<MockPagingHandler>::alloc(
+            1,
+            0x107,
+            6 * PAGE_SIZE_4K,
+            GuestPhysAddr::from_usize(0x7000_7000),
+        )
+        .unwrap();
+
+        channel
+            .add_subscriber(2, GuestPhysAddr::from_usize(0x7100_0000))
+            .unwrap();
+
+        assert!(channel.can_notify(1, 2));
+        assert!(channel.can_notify(2, 1));
+        assert!(!channel.can_notify(1, 3));
+        assert!(!channel.can_notify(2, 3));
+        assert!(!channel.can_notify(3, 1));
+        assert!(!channel.can_notify(3, 2));
     }
 }
