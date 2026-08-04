@@ -58,17 +58,17 @@ impl DmaAllocation {
         })
     }
 
+    pub fn handle(&self) -> &DmaAllocHandle {
+        self.handle
+            .as_ref()
+            .expect("live DMA allocation must retain its handle")
+    }
+
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         let handle = self.handle();
         // SAFETY: `&mut self` gives exclusive CPU access to the live allocation
         // and the slice length comes from its allocation token.
         unsafe { core::slice::from_raw_parts_mut(handle.as_ptr().as_ptr(), handle.size()) }
-    }
-
-    pub fn handle(&self) -> &DmaAllocHandle {
-        self.handle
-            .as_ref()
-            .expect("live DMA allocation must retain its backend token")
     }
 
     pub fn sync_for_device(&self, offset: usize, size: usize) {
@@ -84,21 +84,31 @@ impl DmaAllocation {
                 .sync_alloc_for_cpu(self.handle(), offset, size, direction);
         }
     }
+
+    pub fn try_release(&mut self) -> Result<(), DmaError> {
+        let Some(handle) = self.handle.take() else {
+            return Ok(());
+        };
+        if handle.size() == 0 {
+            return Ok(());
+        }
+
+        unsafe {
+            match self.kind {
+                AllocationKind::Coherent => self.device.dealloc_coherent(handle),
+                AllocationKind::Contiguous { .. } => {
+                    self.device.dealloc_contiguous(handle);
+                    Ok(())
+                }
+            }
+        }
+    }
 }
 
 impl Drop for DmaAllocation {
     fn drop(&mut self) {
-        let handle = self
-            .handle
-            .take()
-            .expect("DMA allocation token must be consumed exactly once");
-        // SAFETY: the move-only token came from this device and is removed from
-        // the owner before the matching backend release operation.
-        unsafe {
-            match self.kind {
-                AllocationKind::Coherent => self.device.dealloc_coherent(handle),
-                AllocationKind::Contiguous { .. } => self.device.dealloc_contiguous(handle),
-            }
+        if let Err(err) = self.try_release() {
+            log::error!("failed to release coherent DMA allocation; allocation quarantined: {err}");
         }
     }
 }

@@ -145,6 +145,8 @@ pub enum DmaError {
     ZeroSizedBuffer,
     #[error("DMA operation is not supported: {operation}")]
     Unsupported { operation: &'static str },
+    #[error("DMA coherent allocation could not be released and was quarantined")]
+    CoherentReleaseFailed,
 }
 
 /// Marker for plain data that can be safely stored in typed DMA buffers.

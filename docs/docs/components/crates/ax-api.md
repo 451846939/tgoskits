@@ -24,7 +24,7 @@
 
 ## 核心功能
 - 功能定位：Public APIs and types for ArceOS modules
-- 对外接口：从源码可见的主要公开入口包括 `ax_get_cpu_num`、`ax_terminate`、`ax_monotonic_time`、`ax_wall_time`、`ax_alloc`、`ax_dealloc`。
+- 对外接口：从源码可见的主要公开入口包括 `ax_get_cpu_num`、`ax_terminate`、`ax_monotonic_time`、`ax_wall_time`、`ax_alloc`、`ax_dealloc`，并从 `modules` 无条件重导出 `dma-api` 与 `axklib`。
 - 典型使用场景：主要作为仓库中的专用支撑 crate 被上层组件调用。
 - 调用边界：各 API 域彼此独立，由 `imp` 模块分别转发到对应的 ArceOS 组件，不构造跨领域的伪调用链。
 
@@ -34,6 +34,8 @@ graph LR
     current["ax-api"]
     current --> ax-alloc["ax-alloc"]
     current --> ax-display["ax-display"]
+    current --> dma_api["dma-api"]
+    current --> axklib["axklib"]
     current --> ax_errno["ax-errno"]
     current --> ax-runtime["ax-runtime"]
     current --> ax-fs-ng["ax-fs-ng"]
@@ -43,6 +45,8 @@ graph LR
 ### 直接依赖
 - `ax-alloc`
 - `ax-display`
+- `dma-api`
+- `axklib`
 - `ax-errno`
 - `ax-runtime`
 - `ax-fs-ng`

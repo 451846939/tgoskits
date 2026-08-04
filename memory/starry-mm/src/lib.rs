@@ -14,6 +14,5 @@ mod stats;
 mod vm_stat;
 
 pub use self::{
-    accounting::*, capability::*, cow::*, fault::*, pages::*, policy::*, stats::*,
-    vm_stat::ProcessVmStat,
+    accounting::*, capability::*, cow::*, fault::*, pages::*, policy::*, stats::*, vm_stat::*,
 };

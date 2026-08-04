@@ -15,6 +15,10 @@ mod owned;
 mod pool;
 mod streaming;
 
+#[cfg(all(axtest, feature = "axtest"))]
+/// Coverage tests for DMA buffer and mapping APIs.
+pub mod axtest;
+
 pub use array::*;
 pub use dbox::*;
 pub use def::*;
@@ -124,7 +128,12 @@ impl DeviceDma {
         match self.check_alloc_handle(&res, constraints) {
             Ok(()) => Ok(res),
             Err(e) => {
-                unsafe { self.op.dealloc_coherent(res) };
+                if let Err(release_err) = unsafe { self.op.dealloc_coherent(res) } {
+                    log::error!(
+                        "failed to release invalid coherent DMA allocation; allocation \
+                         quarantined: {release_err}"
+                    );
+                }
                 Err(e)
             }
         }
@@ -136,7 +145,7 @@ impl DeviceDma {
     ///
     /// `handle` must have been returned by [`Self::alloc_coherent`] for this
     /// device and must not have been consumed previously.
-    pub unsafe fn dealloc_coherent(&self, handle: DmaAllocHandle) {
+    pub unsafe fn dealloc_coherent(&self, handle: DmaAllocHandle) -> Result<(), DmaError> {
         unsafe { self.op.dealloc_coherent(handle) }
     }
 

@@ -15,3 +15,6 @@ ax-errno.workspace = true
 ax-memory-addr.workspace = true
 log.workspace = true
 thiserror = { workspace = true, default-features = false }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(axtest)'] }

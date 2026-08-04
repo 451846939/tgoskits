@@ -8,8 +8,6 @@ use virtio_drivers::{
     transport::{DeviceType, Transport, mmio::MmioTransport},
 };
 
-#[cfg(feature = "virtio-blk")]
-pub mod block;
 #[cfg(feature = "virtio-gpu")]
 pub mod display;
 #[cfg(feature = "virtio-input")]
@@ -40,7 +38,6 @@ fn page_layout(pages: usize) -> Option<Layout> {
 
 pub const fn has_static_mmio_drivers() -> bool {
     cfg!(any(
-        feature = "virtio-blk",
         feature = "virtio-net",
         feature = "virtio-gpu",
         feature = "virtio-input",
@@ -81,8 +78,15 @@ unsafe impl VirtIoHal for VirtIoHalImpl {
         // SAFETY: the VirtIO HAL requires these to be the unchanged values
         // returned by `dma_alloc`, so the raw tuple reconstructs its token.
         let handle = unsafe { DmaAllocHandle::new(vaddr, paddr.into(), layout) };
-        unsafe { axklib::dma::device_with_mask(VIRTIO_DMA_MASK).dealloc_coherent(handle) };
-        0
+        // SAFETY: `handle` reconstructs the unique token returned by
+        // `dma_alloc` for the same device capability.
+        match unsafe { axklib::dma::device_with_mask(VIRTIO_DMA_MASK).dealloc_coherent(handle) } {
+            Ok(()) => 0,
+            Err(error) => {
+                log::error!("failed to release VirtIO coherent DMA allocation: {error}");
+                -1
+            }
+        }
     }
 
     /// # Safety
@@ -179,7 +183,6 @@ pub fn register_static_mmio(
 }
 
 #[cfg(any(
-    feature = "virtio-blk",
     feature = "virtio-net",
     feature = "virtio-gpu",
     feature = "virtio-input",
@@ -191,8 +194,6 @@ pub fn register_static_transport<T: Transport + 'static>(
     transport: T,
 ) -> Result<(), rdrive::probe::OnProbeError> {
     match ty {
-        #[cfg(feature = "virtio-blk")]
-        DeviceType::Block => block::register_transport(plat_dev, transport),
         #[cfg(feature = "virtio-net")]
         DeviceType::Network => net::register_transport(plat_dev, transport),
         #[cfg(feature = "virtio-gpu")]
@@ -206,7 +207,6 @@ pub fn register_static_transport<T: Transport + 'static>(
 }
 
 #[cfg(not(any(
-    feature = "virtio-blk",
     feature = "virtio-net",
     feature = "virtio-gpu",
     feature = "virtio-input",

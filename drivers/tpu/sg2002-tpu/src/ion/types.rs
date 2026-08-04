@@ -1,8 +1,11 @@
 //! Ion 驱动数据结构定义
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::{
+    ptr::NonNull,
+    sync::atomic::{AtomicU32, Ordering},
+};
 
-use dma_api::CoherentArray;
+use dma_api::{CoherentArray, DmaAddr};
 
 /// Ion 堆类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,7 +58,7 @@ impl IonHandle {
 pub struct IonBuffer {
     /// 缓冲区句柄
     pub handle: IonHandle,
-    /// DMA coherent allocation owned for the lifetime of this buffer.
+    /// Owned DMA-coherent storage.
     dma: CoherentArray<u8>,
     /// 缓冲区大小
     pub size: usize,
@@ -71,13 +74,13 @@ impl IonBuffer {
     }
 
     /// Returns the device-visible base address.
-    pub fn dma_addr(&self) -> u64 {
-        self.dma.dma_addr().as_u64()
+    pub fn dma_addr(&self) -> DmaAddr {
+        self.dma.dma_addr()
     }
 
-    /// Returns the kernel virtual base address.
-    pub fn cpu_addr(&self) -> usize {
-        self.dma.as_ptr().as_ptr() as usize
+    /// Returns the kernel virtual base pointer.
+    pub fn cpu_ptr(&self) -> NonNull<u8> {
+        self.dma.as_ptr()
     }
 }
 
@@ -198,3 +201,91 @@ macro_rules! ioctl_ior {
 
 pub(crate) use ioctl_iow;
 pub(crate) use ioctl_iowr;
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use alloc::sync::Arc;
+    use core::{
+        alloc::Layout,
+        num::NonZeroUsize,
+        ptr::NonNull,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    use dma_api::{
+        DeviceDma, DmaAllocHandle, DmaConstraints, DmaDirection, DmaError, DmaMapHandle, DmaOp,
+    };
+
+    use self::std::alloc::{alloc_zeroed, dealloc};
+    use super::*;
+
+    struct TestDma;
+
+    static TEST_DMA: TestDma = TestDma;
+    static RELEASES: AtomicUsize = AtomicUsize::new(0);
+
+    impl DmaOp for TestDma {
+        fn page_size(&self) -> usize {
+            4096
+        }
+
+        unsafe fn alloc_contiguous(
+            &self,
+            _constraints: DmaConstraints,
+            _layout: Layout,
+        ) -> Option<DmaAllocHandle> {
+            None
+        }
+
+        unsafe fn dealloc_contiguous(&self, _handle: DmaAllocHandle) {}
+
+        unsafe fn alloc_coherent(
+            &self,
+            _constraints: DmaConstraints,
+            layout: Layout,
+        ) -> Option<DmaAllocHandle> {
+            let ptr = NonNull::new(unsafe { alloc_zeroed(layout) })?;
+            Some(unsafe { DmaAllocHandle::new(ptr, 0x4000_u64.into(), layout) })
+        }
+
+        unsafe fn dealloc_coherent(&self, handle: DmaAllocHandle) -> Result<(), DmaError> {
+            RELEASES.fetch_add(1, Ordering::SeqCst);
+            unsafe { dealloc(handle.as_ptr().as_ptr(), handle.layout()) };
+            Ok(())
+        }
+
+        unsafe fn map_streaming(
+            &self,
+            _constraints: DmaConstraints,
+            _addr: NonNull<u8>,
+            _size: NonZeroUsize,
+            _direction: DmaDirection,
+        ) -> Result<DmaMapHandle, DmaError> {
+            Err(DmaError::NoMemory)
+        }
+
+        unsafe fn unmap_streaming(&self, _handle: DmaMapHandle) {}
+    }
+
+    #[test]
+    fn ion_buffer_preserves_size_address_and_last_arc_release() {
+        RELEASES.store(0, Ordering::SeqCst);
+        let dma = DeviceDma::new_legacy(u64::MAX, &TEST_DMA)
+            .coherent_array_zero_with_align::<u8>(123, 8)
+            .unwrap();
+        let cpu_ptr = dma.as_ptr();
+        let buffer = Arc::new(IonBuffer::new(dma, 123));
+
+        assert_eq!(buffer.size, 123);
+        assert_eq!(buffer.dma_addr().as_u64(), 0x4000);
+        assert_eq!(buffer.cpu_ptr(), cpu_ptr);
+
+        let mmap_owner = buffer.clone();
+        drop(buffer);
+        assert_eq!(RELEASES.load(Ordering::SeqCst), 0);
+        drop(mmap_owner);
+        assert_eq!(RELEASES.load(Ordering::SeqCst), 1);
+    }
+}

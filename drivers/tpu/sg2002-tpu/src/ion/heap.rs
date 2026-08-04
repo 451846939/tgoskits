@@ -1,8 +1,9 @@
 //! Ion 堆管理
 
 use alloc::sync::Arc;
+use core::alloc::Layout;
 
-use dma_api::DeviceDma;
+use dma_api::{CoherentArray, DeviceDma, DmaError};
 
 use super::{
     error::{IonError, IonResult},
@@ -37,10 +38,14 @@ impl IonHeapManager {
         }
 
         let dma = match heap_type {
-            IonHeapType::System | IonHeapType::DmaCoherent => self
-                .dma
-                .coherent_array_zero_with_align(size, align)
-                .map_err(|_| IonError::NoMemory)?,
+            IonHeapType::System => {
+                // 系统堆使用普通的 DMA 内存
+                self.alloc_dma_buffer(size, align)?
+            }
+            IonHeapType::DmaCoherent => {
+                // DMA coherent 堆
+                self.alloc_dma_buffer(size, align)?
+            }
             IonHeapType::Carveout => {
                 return Err(IonError::NotSupported);
             }
@@ -50,5 +55,16 @@ impl IonHeapManager {
         debug!("Allocated Ion buffer with handle: {:?}", buffer.handle);
 
         Ok(buffer)
+    }
+
+    /// 分配 DMA 内存
+    fn alloc_dma_buffer(&self, size: usize, align: usize) -> IonResult<CoherentArray<u8>> {
+        Layout::from_size_align(size, align).map_err(|_| IonError::InvalidArg)?;
+        self.dma
+            .coherent_array_zero_with_align(size, align)
+            .map_err(|err| match err {
+                DmaError::LayoutError(_) => IonError::InvalidArg,
+                _ => IonError::NoMemory,
+            })
     }
 }

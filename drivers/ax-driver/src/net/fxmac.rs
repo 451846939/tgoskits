@@ -421,6 +421,10 @@ impl fxmac_rs::KernelFunc for FxmacKernelFunc {
         };
         let paddr = axklib::mem::virt_to_phys((vaddr.as_ptr() as usize).into()).as_usize();
         let handle = unsafe { DmaAllocHandle::new(vaddr, DmaAddr::from(paddr as u64), layout) };
-        unsafe { axklib::dma::device_with_mask(DMA_MASK).dealloc_coherent(handle) };
+        if let Err(err) =
+            unsafe { axklib::dma::device_with_mask(DMA_MASK).dealloc_coherent(handle) }
+        {
+            log::error!("FXmac DMA release failed; allocation quarantined: {err}");
+        }
     }
 }

@@ -53,7 +53,8 @@ impl TlbInvalidator<VirtAddr> for RuntimeTlbInvalidator {
 
     fn invalidate(vaddr: Option<VirtAddr>) {
         if let Some(vaddr) = vaddr {
-            crate::cache::flush_tlb_range_all_cpus(vaddr, PAGE_SIZE_4K);
+            crate::cache::flush_tlb_range_all_cpus(vaddr, PAGE_SIZE_4K)
+                .expect("page-table invalidation must reach every online CPU");
         } else {
             crate::cache::flush_tlb_all_cpus();
         }

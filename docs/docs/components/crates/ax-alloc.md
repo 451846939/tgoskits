@@ -3,7 +3,7 @@
 > 路径：`memory/ax-alloc`
 > 类型：`no_std` 库 crate
 > 分层：公共内存层 / 运行时分配入口
-> 版本：`0.8.12`
+> 版本：`0.8.14`
 
 `ax-alloc` 是原有同名 crate 从 `os/arceos/modules/axalloc` 迁移后的公共组件，不是由 `ax-allocator` 改名而来。原 `ax-allocator` 是可切换算法集合，整改后已经删除；其职责没有整体迁入 `ax-alloc`，生产后端固定为独立的 `buddy-slab-allocator`。
 

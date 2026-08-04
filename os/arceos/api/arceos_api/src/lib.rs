@@ -393,4 +393,6 @@ pub mod modules {
     pub use ax_sync;
     #[cfg(feature = "multitask")]
     pub use ax_task;
+    pub use axklib;
+    pub use dma_api;
 }

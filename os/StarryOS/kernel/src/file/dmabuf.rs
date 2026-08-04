@@ -13,11 +13,13 @@ use core::{any::Any, ffi::c_int};
 use ax_errno::{AxError, AxResult};
 use ax_memory_addr::{PAGE_SIZE_4K, PhysAddr, PhysAddrRange};
 use axpoll::{IoEvents, Pollable};
-use dma_api::CoherentArray;
+use dma_api::{CoherentArray, DmaError};
 use linux_raw_sys::general::O_RDWR;
 
 use super::{FileLike, Kstat};
 use crate::pseudofs::DeviceMmap;
+
+const DMA_BUF_MASK: u64 = u32::MAX as u64;
 
 /// The owned contiguous allocation. Freed when the last reference (the fd's
 /// `DmaBufFile` and any mmap retainer) drops.
@@ -34,6 +36,10 @@ pub struct DmaBufFile {
 impl DmaBufFile {
     /// Allocate a page-aligned contiguous buffer of at least `len` bytes.
     pub fn alloc(len: usize) -> AxResult<Self> {
+        Self::alloc_with_device(len, &axklib::dma::device_with_mask(DMA_BUF_MASK))
+    }
+
+    fn alloc_with_device(len: usize, dma: &dma_api::DeviceDma) -> AxResult<Self> {
         let align = PAGE_SIZE_4K;
         let size = len
             .checked_next_multiple_of(align)
@@ -44,10 +50,12 @@ impl DmaBufFile {
         // backing pages must live below 4 GiB. Plain `alloc_coherent_pages` draws
         // from anywhere in RAM and returns >4 GiB pages on large-memory boards,
         // which the 32-bit address registers cannot reach.
-        let device = axklib::dma::device_with_mask(u32::MAX as u64);
-        let dma = device
+        let dma = dma
             .coherent_array_zero_with_align::<u8>(size, align)
-            .map_err(|_| AxError::NoMemory)?;
+            .map_err(|err| match err {
+                DmaError::LayoutError(_) => AxError::InvalidInput,
+                _ => AxError::NoMemory,
+            })?;
         Ok(Self {
             alloc: Arc::new(DmaBufAlloc { dma, size }),
         })
@@ -160,5 +168,92 @@ impl FileLike for DmaBufFile {
         // not freed if userspace closes the fd while it is still mapped.
         let retainer: Arc<dyn Any + Send + Sync> = self.alloc.clone();
         Ok(DeviceMmap::Physical(self.phys_range(), Some(retainer)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use core::{
+        alloc::Layout,
+        num::NonZeroUsize,
+        ptr::NonNull,
+        sync::atomic::{AtomicU64, AtomicUsize, Ordering},
+    };
+
+    use dma_api::{
+        DeviceDma, DmaAllocHandle, DmaConstraints, DmaDirection, DmaError, DmaMapHandle, DmaOp,
+    };
+
+    use self::std::alloc::{alloc_zeroed, dealloc};
+    use super::*;
+
+    struct TestDma;
+
+    static TEST_DMA: TestDma = TestDma;
+    static ALLOC_MASK: AtomicU64 = AtomicU64::new(0);
+    static RELEASES: AtomicUsize = AtomicUsize::new(0);
+
+    impl DmaOp for TestDma {
+        fn page_size(&self) -> usize {
+            PAGE_SIZE_4K
+        }
+
+        unsafe fn alloc_contiguous(
+            &self,
+            _constraints: DmaConstraints,
+            _layout: Layout,
+        ) -> Option<DmaAllocHandle> {
+            None
+        }
+
+        unsafe fn dealloc_contiguous(&self, _handle: DmaAllocHandle) {}
+
+        unsafe fn alloc_coherent(
+            &self,
+            constraints: DmaConstraints,
+            layout: Layout,
+        ) -> Option<DmaAllocHandle> {
+            ALLOC_MASK.store(constraints.addr_mask, Ordering::SeqCst);
+            let ptr = NonNull::new(unsafe { alloc_zeroed(layout) })?;
+            Some(unsafe { DmaAllocHandle::new(ptr, 0x2000_u64.into(), layout) })
+        }
+
+        unsafe fn dealloc_coherent(&self, handle: DmaAllocHandle) -> Result<(), DmaError> {
+            RELEASES.fetch_add(1, Ordering::SeqCst);
+            unsafe { dealloc(handle.as_ptr().as_ptr(), handle.layout()) };
+            Ok(())
+        }
+
+        unsafe fn map_streaming(
+            &self,
+            _constraints: DmaConstraints,
+            _addr: NonNull<u8>,
+            _size: NonZeroUsize,
+            _direction: DmaDirection,
+        ) -> Result<DmaMapHandle, DmaError> {
+            Err(DmaError::NoMemory)
+        }
+
+        unsafe fn unmap_streaming(&self, _handle: DmaMapHandle) {}
+    }
+
+    #[test]
+    fn dma_buf_preserves_dma32_size_address_and_arc_lifetime() {
+        RELEASES.store(0, Ordering::SeqCst);
+        ALLOC_MASK.store(0, Ordering::SeqCst);
+        let device = DeviceDma::new_legacy(DMA_BUF_MASK, &TEST_DMA);
+        let file = DmaBufFile::alloc_with_device(1, &device).unwrap();
+
+        assert_eq!(file.alloc.size, PAGE_SIZE_4K);
+        assert_eq!(file.phys_base(), 0x2000);
+        assert_eq!(ALLOC_MASK.load(Ordering::SeqCst), DMA_BUF_MASK);
+
+        let mmap_owner = file.alloc.clone();
+        drop(file);
+        assert_eq!(RELEASES.load(Ordering::SeqCst), 0);
+        drop(mmap_owner);
+        assert_eq!(RELEASES.load(Ordering::SeqCst), 1);
     }
 }

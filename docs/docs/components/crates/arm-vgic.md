@@ -65,6 +65,8 @@ flowchart TD
 - `VGicD` 会维护 `assigned_irqs` 位图，只允许 guest 访问被分配的 SPI。
 - `VGicR` 面向每个 vCPU 暴露 GICR 窗口。
 - `Gits` 负责 ITS/LPI 相关窗口，但当前实现仍带有明显的场景限制和 TODO。
+- 设备本体直接实现 `Device`，资源在构造时固定声明。
+- AxVM 注册路径直接注册原生设备，vtimer 系统寄存器设备直接进入 SysReg bus dispatch。
 
 ### 1.5 虚拟中断注入与 vCPU 的分工
 这是阅读 `arm_vgic` 时最容易误解的地方：
