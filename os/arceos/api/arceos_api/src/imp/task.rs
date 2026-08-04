@@ -250,6 +250,7 @@ cfg_task! {
             | TaskError::NotExited
             | TaskError::NoRunnableThread
             | TaskError::InvalidPiState
+            | TaskError::InvalidPiWaitState(_)
             | TaskError::PiCycle
             | TaskError::PiChainLimit { .. }
             | TaskError::RuntimeFailure(_) => crate::AxError::BadState,

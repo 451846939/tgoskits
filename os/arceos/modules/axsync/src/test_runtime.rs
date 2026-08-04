@@ -8,7 +8,7 @@ use ax_task::{
     CpuId, CpuRemote, TaskSystem, impl_trait as impl_task_runtime,
     runtime::{
         AddressSpaceActivation, AddressSpaceDestroyOutcome, AddressSpaceHandle,
-        AddressSpaceReclaimArmOutcome, ContextThreadBinding, CpuRemoteHandle,
+        AddressSpaceReclaimArmOutcome, ContextSwitch, ContextThreadBinding, CpuRemoteHandle,
         CurrentCpuLocalHandle, CurrentCpuOwnerHandles, ExecutionContextHandle, IrqGuardToken,
         KernelContextRequest, PreemptGuardToken, RuntimeCpuId, RuntimeHandleResult,
         RuntimeScheduleOrigin, RuntimeSchedulerEntry, RuntimeSchedulerReturn, RuntimeStatus,

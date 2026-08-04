@@ -7,12 +7,13 @@
 
 ## Primitives
 
-- **Mutex**: With `multitask`, an urgency-ordered sleeping mutex with targeted ownership handoff. It reports ownership and wait edges to `ax-task`, which owns transitive donation, scheduler requeue, and Deadline donor-budget semantics. Otherwise it is an alias of `ax_kspin::SpinNoIrq`.
+- **Mutex**: A compatibility alias of the non-sleeping `ax_kspin::SpinNoIrq` lock.
+- **PiMutex**: With `multitask`, an urgency-ordered sleeping mutex with targeted ownership handoff. It reports ownership and wait edges to `ax-task`, which owns transitive donation, scheduler requeue, and Deadline donor-budget semantics.
 - **spin**: Re-export of the [ax-kspin](https://crates.io/crates/ax-kspin) crate (spinlocks).
 
 ## Features
 
-- `multitask`: Enable the task scheduler's PI mutex protocol. Short owner and waiter metadata transitions use `ax-kspin`; donation, blocking, handoff, and wake operations run after the metadata lock is released.
+- `multitask`: Enable the task scheduler's PI mutex protocol. One per-lock slow-path gate commits the physical owner word, pinned waiter lifetime, donation graph, and handoff selection as a single transaction. Blocking and targeted wake run after the gate is released.
 - `lockdep`: Enable sleeping-lock dependency validation in addition to PI.
 
 ## License

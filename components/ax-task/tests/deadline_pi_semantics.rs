@@ -1,6 +1,7 @@
 use ax_task::{
-    CpuId, DeadlineFlags, DeadlinePolicy, FairMode, Nice, PiLockIdentity, PiWaitOwner, RtPriority,
-    SchedulePolicy, TaskError, TaskSystem, TaskSystemConfig, ThreadId, ThreadSpec,
+    CpuId, DeadlineFlags, DeadlinePolicy, FairMode, Nice, PiLockIdentity, PiWaitOwner,
+    PiWaitStateError, RtPriority, SchedulePolicy, TaskError, TaskSystem, TaskSystemConfig,
+    ThreadId, ThreadSpec,
 };
 
 mod support;
@@ -388,7 +389,9 @@ fn threads_with_live_pi_edges_cannot_exit_and_leave_dangling_donations() {
     let stale_lock = PiLockIdentity::new();
     assert!(matches!(
         support::commit_pi_wait(&system, &stale_lock, live_waiter.id(), owner.id()),
-        Err(TaskError::InvalidPiState)
+        Err(TaskError::InvalidPiWaitState(
+            PiWaitStateError::ExitedParticipant
+        ))
     ));
 }
 

@@ -531,23 +531,29 @@ ax-sync 与 ax-task 的 PI registration、release 和 claim 遵循 Linux rtmutex
 
 1. mutex-local metadata 只在任务上下文由短暂的 `SpinNoPreempt` 门保护；硬中断不访问
    该状态，也不为这个局部临界区关闭中断；
-2. 在局部门内只读取 owner、waiter、pending head 和单调 sequence，形成不可变快照；
-3. 释放局部门后，锁定并验证 ax-task 的 donation graph，得到 move-only 的 prepared
-   transaction；禁止以 `metadata -> scheduler` 锁序调用 PI 图操作；
-4. 保持 scheduler transaction 排他权，重新进入局部门并校验 sequence。若快照过期，
-   不发布任何局部状态，丢弃 transaction 后重试；
-5. 新 waiter 先把 pinned local node 插入无序生命周期链；调度顺序只发布到 ax-task 的
-   per-lock 有序 waiter tree。release/claim 则发布 ownerless 状态或
-   新 owner/grant，然后立即释放局部门。局部 publication 失败时直接丢弃 prepared
-   transaction，donation graph 中从未出现需要补偿撤销的临时边；
-6. 提交 donation graph 的 registration、deboost、selected claim 或 grant，最后通过定向 wake 唤醒被选中的
-   waiter。wake 不得发生在局部门或 scheduler graph lock 内。
+2. 这个局部门就是该 mutex 唯一的 slow-path gate，对应 Linux 的 `rtmutex->wait_lock`。
+   固定锁序为 `slow-path gate -> TaskSystemState -> PiLockWaitState`；ax-task 不反向取得
+   ax-sync 的 gate；
+3. registration 在 gate 内先用 owner word 的 waiters bit 排除 fast unlock，再验证 donation
+   graph、插入 pinned local node，并在释放 gate 前提交 per-lock 有序 waiter tree 与 owner
+   donation。其他 contender 不可能拿到仅完成一半的 local/scheduler 状态；
+4. release 在 gate 内选择 cached top，先发布 ownerless owner word，再立即提交 scheduler
+   selected/deboost；claim 同样在 gate 内删除 local node、发布新 owner/grant 并提交 scheduler
+   claim。ownerless 状态一旦对下一个 slow path 可见，selected token 必然已经可见；
+5. 本地无序链只拥有 pinned waiter 的生命周期，不参与 urgency 排序。原先用于跨 gate
+   重试的 `pending_head`、metadata sequence 和 snapshot 校验全部删除，不再维护重复的
+   handoff 真值；
+6. 所有 local、donation graph 与 token publication 完成并释放 gate 后，才通过定向 wake
+   唤醒被选中的 waiter。wake 不得发生在局部门或 scheduler graph lock 内。
 
-这个顺序对应 Linux `rt_mutex` 的 `wait_lock`/`pi_lock` 分层和 `wake_q` 锁外唤醒语义。
-局部 sequence 不是第二套 owner 真值，只用于判断准备全局事务期间 local snapshot 是否仍
-有效；owner word 与 ax-task donation graph 分别保持各自层次的唯一权威。旧实现把可能
-遍历 donation chain 的 ax-task PI 调用放在 `SpinNoIrq` metadata 门内，会形成广域
-IRQ-off 临界区和反向锁序，现已删除，不保留兼容路径。
+这个顺序对应 Linux `rt_mutex` 的 `wait_lock -> task->pi_lock` 分层和 `wake_q` 锁外唤醒语义。
+owner word 是物理持有者的唯一权威，ax-task per-lock tree 是调度顺序与 selected token 的
+唯一权威。旧的跨 gate prepared transaction 会短暂发布 ownerless word、却尚未发布
+selected token；claim 或新 waiter 恰好跨过该窗口时会把旧快照带进下一次 scheduler
+事务，最终得到 `ownerless handoff has no selected scheduler waiter`。QEMU/GDB 已在
+`test-cargo-jobserver-wait` 的 pthread/pipe 波次确定性定位到这一状态，因此不采用局部重试，
+而是恢复 Linux 的单 gate 事务边界。这个 gate 使用 `SpinNoPreempt` 而非 `SpinNoIrq`，硬中断
+不访问 PI metadata；实际 wake 始终在 gate 外完成。
 
 Linux v7.1 的 `rt_mutex_adjust_prio_chain()` 默认允许较深的链并在遍历中提供可抢占点；当前
 ax-task 的 donation graph 仍由一个不可抢占事务保护，因此不能照搬 Linux 的 1024 层默认

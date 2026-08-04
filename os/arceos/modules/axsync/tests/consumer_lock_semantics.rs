@@ -70,7 +70,7 @@ fn selected_consumers_reject_the_ambiguous_ax_sync_mutex_alias() {
     let consumers = [
         "os/arceos/modules/axinput/src",
         "os/arceos/modules/axdisplay/src",
-        "os/arceos/modules/axfs-ng/src",
+        "fs/ax-fs-ng/src",
         "os/arceos/api/arceos_posix_api/src",
     ];
     let mut violations = Vec::new();
@@ -136,14 +136,14 @@ fn consumer_lock_classes_match_their_waiting_behavior() {
         "use ax_sync::{PiMutex, SpinMutex};",
     );
     assert_contains(
-        &workspace.join("os/arceos/modules/axfs-ng/src/os/sync.rs"),
+        &workspace.join("fs/ax-fs-ng/src/os/sync.rs"),
         "pub use ax_sync::{PiMutex, PiMutexGuard, SpinMutex, SpinMutexGuard};",
     );
-    let fat = workspace.join("os/arceos/modules/axfs-ng/src/fs/fat/fs.rs");
+    let fat = workspace.join("fs/ax-fs-ng/src/fs/fat/fs.rs");
     assert_contains(&fat, "inner: PiMutex<FatFilesystemInner>");
     assert_contains(&fat, "root_dir: SpinMutex<Option<DirEntry>>");
     assert_unique_source_contains(
-        &workspace.join("os/arceos/modules/axfs-ng/src/file/cache"),
+        &workspace.join("fs/ax-fs-ng/src/file/cache"),
         "static CACHED_FILE_BY_INODE: spin::LazyLock<SpinMutex<InodeCacheIndex>>",
     );
 }
@@ -152,11 +152,11 @@ fn consumer_lock_classes_match_their_waiting_behavior() {
 fn sleepable_consumer_features_enable_pi_mutex_support() {
     let workspace = workspace_root();
     assert_contains(
-        &workspace.join("os/arceos/modules/axfs-ng/Cargo.toml"),
+        &workspace.join("fs/ax-fs-ng/Cargo.toml"),
         "ax-sync = { workspace = true, features = [\"multitask\"] }",
     );
     assert_contains(
-        &workspace.join("os/arceos/modules/axfs-ng/Cargo.toml"),
+        &workspace.join("fs/ax-fs-ng/Cargo.toml"),
         "lockdep = [\"axfs-ng-vfs/lockdep\", \"ax-sync/lockdep\"]",
     );
     let posix_manifest = workspace.join("os/arceos/api/arceos_posix_api/Cargo.toml");

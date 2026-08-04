@@ -1,5 +1,28 @@
 //! Errors returned by the scheduler model.
 
+/// Invariant that rejected a PI waiter graph transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum PiWaitStateError {
+    /// A thread attempted to wait on a mutex it already owns.
+    #[error("waiter is the physical lock owner")]
+    WaiterOwnsLock,
+    /// The first physical waiter found scheduler ownership left behind.
+    #[error("first waiter observed stale scheduler lock ownership")]
+    StaleSchedulerOwnership,
+    /// Physical ownership disagrees with the existing scheduler waiter graph.
+    #[error("owned lock disagrees with its scheduler waiter graph")]
+    PhysicalOwnerMismatch,
+    /// An ownerless physical handoff has no scheduler-selected waiter.
+    #[error("ownerless handoff has no selected scheduler waiter")]
+    OwnerlessSelectionMissing,
+    /// The waiter or physical owner has already exited.
+    #[error("waiter or physical owner has already exited")]
+    ExitedParticipant,
+    /// The waiter already owns a different PI wait edge.
+    #[error("waiter is already blocked on a PI lock")]
+    WaiterAlreadyBlocked,
+}
+
 /// Errors produced by task-system operations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum TaskError {
@@ -115,6 +138,9 @@ pub enum TaskError {
     /// PI ownership or waiter metadata does not match the requested transition.
     #[error("invalid priority-inheritance state")]
     InvalidPiState,
+    /// A PI waiter could not enter the lock graph because one checked invariant failed.
+    #[error("invalid priority-inheritance wait state: {0}")]
+    InvalidPiWaitState(PiWaitStateError),
     /// A transitive priority donation would form a lock dependency cycle.
     #[error("priority-inheritance dependency cycle")]
     PiCycle,

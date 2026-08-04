@@ -4,7 +4,7 @@ use core::{fmt, marker::PhantomData};
 
 use super::*;
 use crate::{
-    PiLockIdentity, PiLockRef, PiLockWaitState, PiWaitOwner, ThreadWakeHandle,
+    PiLockIdentity, PiLockRef, PiLockWaitState, PiWaitOwner, PiWaitStateError, ThreadWakeHandle,
     lock::{PreemptTicketGuard, RawTicketGuard},
 };
 
@@ -206,9 +206,10 @@ impl<'lock> PiWaitStart<'_, 'lock> {
     ///
     /// # Safety
     ///
-    /// The owning mutex must have inserted the matching pinned waiter into its
-    /// local metadata queue and published a sequence change. The local waiter
-    /// must remain present until the returned token is cancelled or granted.
+    /// The owning mutex must hold its slow-path gate and have inserted the
+    /// matching pinned waiter into its local metadata queue. The gate must stay
+    /// held through this commit, and the waiter must remain present until the
+    /// returned token is cancelled or granted.
     pub unsafe fn commit_after_local_registration(mut self) -> PiWaitToken<'lock> {
         if self.initialize_owner {
             self.lock_state.owner = self.owner;
@@ -273,8 +274,8 @@ impl PiMutexRelease<'_, '_> {
     ///
     /// # Safety
     ///
-    /// The mutex must have published its ownerless state and `selected` local
-    /// identity, then released the local metadata gate.
+    /// The mutex must hold its slow-path gate and have published its ownerless
+    /// owner word. The gate must stay held through this scheduler selection.
     pub unsafe fn commit_after_local_release(mut self) -> ThreadWakeHandle {
         let top = self.lock_state.waiters.first();
         self.state
@@ -321,9 +322,9 @@ impl PiMutexClaim<'_, '_> {
     ///
     /// # Safety
     ///
-    /// The mutex must have removed `claimant` from local waiter metadata,
-    /// published it as owner, cleared ownerless selection, and released the
-    /// local metadata gate.
+    /// The mutex must hold its slow-path gate, have removed `claimant` from
+    /// local waiter metadata, and have published it as physical owner. The gate
+    /// must stay held through this scheduler claim commit.
     pub unsafe fn commit_after_local_claim(mut self) {
         let registration = self
             .state
@@ -369,17 +370,23 @@ impl TaskSystem {
         let (owner, initialize_owner) = match owner {
             PiWaitOwner::Owned(owner) => {
                 if waiter == owner {
-                    return Err(TaskError::InvalidPiState);
+                    return Err(TaskError::InvalidPiWaitState(
+                        PiWaitStateError::WaiterOwnsLock,
+                    ));
                 }
                 if lock_state.waiters.is_empty() {
                     if lock_state.owner.is_some() || lock_state.selected.is_some() {
-                        return Err(TaskError::InvalidPiState);
+                        return Err(TaskError::InvalidPiWaitState(
+                            PiWaitStateError::StaleSchedulerOwnership,
+                        ));
                     }
                     (Some(owner), true)
                 } else if lock_state.owner == Some(owner) && lock_state.selected.is_none() {
                     (Some(owner), false)
                 } else {
-                    return Err(TaskError::InvalidPiState);
+                    return Err(TaskError::InvalidPiWaitState(
+                        PiWaitStateError::PhysicalOwnerMismatch,
+                    ));
                 }
             }
             PiWaitOwner::Ownerless => {
@@ -387,7 +394,9 @@ impl TaskSystem {
                     || lock_state.selected.is_none()
                     || lock_state.waiters.is_empty()
                 {
-                    return Err(TaskError::InvalidPiState);
+                    return Err(TaskError::InvalidPiWaitState(
+                        PiWaitStateError::OwnerlessSelectionMissing,
+                    ));
                 }
                 (None, false)
             }
@@ -399,13 +408,17 @@ impl TaskSystem {
                 })
             })
         {
-            return Err(TaskError::InvalidPiState);
+            return Err(TaskError::InvalidPiWaitState(
+                PiWaitStateError::ExitedParticipant,
+            ));
         }
         if let Some(owner) = owner {
             state.ensure_pi_acyclic(waiter, owner, self.config.pi_chain_limit())?;
         }
         if state.thread_record(waiter)?.blocked_on.is_some() {
-            return Err(TaskError::InvalidPiState);
+            return Err(TaskError::InvalidPiWaitState(
+                PiWaitStateError::WaiterAlreadyBlocked,
+            ));
         }
         state.validate_pi_donor(waiter)?;
         let waiter_core = Arc::clone(&state.thread_record(waiter)?.core);
