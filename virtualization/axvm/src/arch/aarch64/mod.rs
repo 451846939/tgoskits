@@ -228,7 +228,6 @@ impl ArchOps for Aarch64Arch {
                         })?;
                     }
                 }
-                crate::check_timer_events();
             }
         }
         Ok(VcpuRunAction {
@@ -310,7 +309,6 @@ impl ArmHostOps for AxvmArmHostOps {
         {
             warn!("{error}");
         }
-        crate::check_timer_events();
     }
 }
 

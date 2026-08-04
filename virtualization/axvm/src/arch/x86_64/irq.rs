@@ -5,7 +5,7 @@ use axdevice::*;
 use axvm_types::VmArchVcpuOps;
 
 use crate::{
-    InterruptTriggerMode,
+    AxVmResult, InterruptTriggerMode,
     arch::x86_64::{
         X86InterruptDomain, X86InterruptDomainRuntimeKey,
         host_irq::{self as irq, IrqSource},
@@ -441,16 +441,18 @@ impl X86InterruptDomain {
     }
 }
 
-pub fn start_deferred_irq_delivery(vm: &VMRef) {
+pub fn start_deferred_irq_delivery(vm: &crate::AxVM) -> AxVmResult {
     if let Some(domain) = interrupt_domain_for_vm(vm) {
-        domain.start_kick_worker();
+        domain.start_kick_worker()?;
     }
+    Ok(())
 }
 
-pub fn stop_deferred_irq_delivery(vm: &VMRef) {
+pub fn stop_deferred_irq_delivery(vm: &crate::AxVM) -> AxVmResult {
     if let Some(domain) = interrupt_domain_for_vm(vm) {
-        domain.stop_kick_worker();
+        domain.stop_kick_worker()?;
     }
+    Ok(())
 }
 
 pub fn drain_pending_wired_irqs(vm: &VMRef, vcpu: &VCpuRef) {

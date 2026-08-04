@@ -5,13 +5,13 @@
 //! publishes only the target-vCPU bit and wakes one pre-created worker.
 
 use std::sync::{
-    Arc, Mutex,
+    Arc,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
-use ax_std::os::arceos::modules::ax_task::IrqNotify;
+use ax_kspin::SpinNoIrq;
 
-use crate::{AxVmResult, ax_err, sync::MutexExt};
+use crate::{AxVmError, AxVmResult, ax_err, host::task::IrqNotification};
 
 const KICK_WORKER_STACK_SIZE: usize = 0x20_000;
 
@@ -21,8 +21,8 @@ pub(crate) struct DeferredVcpuKick {
     pending_vcpus: AtomicUsize,
     worker_started: AtomicBool,
     stopping: AtomicBool,
-    notify: IrqNotify,
-    worker: Mutex<Option<crate::AxTaskRef>>,
+    notify: IrqNotification,
+    worker: SpinNoIrq<Option<crate::ThreadHandle>>,
 }
 
 impl DeferredVcpuKick {
@@ -33,29 +33,38 @@ impl DeferredVcpuKick {
             pending_vcpus: AtomicUsize::new(0),
             worker_started: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
-            notify: IrqNotify::new(),
-            worker: Mutex::new(None),
+            notify: IrqNotification::new(),
+            worker: SpinNoIrq::new(None),
         })
     }
 
     /// Starts the task-context worker before an architecture enables IRQ input.
-    pub(crate) fn start(self: &Arc<Self>) {
-        let mut worker = self.worker.lock_unpoisoned();
+    pub(crate) fn start(self: &Arc<Self>) -> AxVmResult {
+        let mut worker = self.worker.lock();
         if worker.is_some() {
-            return;
+            return Ok(());
         }
         self.stopping.store(false, Ordering::Release);
         let state = self.clone();
-        let task = crate::TaskInner::new(
-            move || state.run_worker(),
-            std::format!("VM[{}]-irq-kick", self.vm_id),
-            KICK_WORKER_STACK_SIZE,
-        );
-        *worker = Some(crate::host::task::spawn_task(task));
+        let thread = unsafe {
+            // SAFETY: no OS extension or affinity capability is transferred;
+            // the worker closure and VM-owned state move exactly once.
+            crate::host::task::spawn_thread_with_extension_and_affinity(
+                move || state.run_worker(),
+                std::format!("VM[{}]-irq-kick", self.vm_id),
+                KICK_WORKER_STACK_SIZE,
+                None,
+                None,
+            )
+        }
+        .map_err(|error| AxVmError::host("start deferred vCPU kick worker", error))?;
+        *worker = Some(thread);
+        drop(worker);
         self.worker_started.store(true, Ordering::Release);
         if self.pending_vcpus.load(Ordering::Acquire) != 0 {
-            self.notify.notify();
+            self.notify.notify_from_task();
         }
+        Ok(())
     }
 
     /// Publishes that `vcpu_id` needs to observe controller-owned IRQ state.
@@ -74,21 +83,22 @@ impl DeferredVcpuKick {
         };
         self.pending_vcpus.fetch_or(bit, Ordering::Release);
         if self.worker_started.load(Ordering::Acquire) {
-            self.notify.notify_irq();
+            self.notify.notify_from_irq();
         }
         Ok(())
     }
 
     /// Stops and joins the worker after architecture IRQ input is quiesced.
-    pub(crate) fn stop(&self) {
+    pub(crate) fn stop(&self) -> AxVmResult {
         self.worker_started.store(false, Ordering::Release);
         self.stopping.store(true, Ordering::Release);
-        self.notify.notify();
-        let worker = self.worker.lock_unpoisoned().take();
-        if let Some(worker) = worker {
-            worker.join();
-        }
+        self.notify.notify_from_task();
+        let worker = self.worker.lock().take();
+        let join_result = worker.map_or(Ok(0), crate::host::task::join_thread);
         self.pending_vcpus.store(0, Ordering::Release);
+        join_result
+            .map(|_exit_code| ())
+            .map_err(|error| AxVmError::host("join deferred vCPU kick worker", error))
     }
 
     fn run_worker(&self) {
