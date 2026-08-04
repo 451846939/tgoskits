@@ -3,12 +3,24 @@ use super::*;
 const INCOMING_MIGRATION_OVERFLOW_INVARIANT: u32 = 0x4d49_474f;
 const INCOMING_MIGRATION_RELEASE_INVARIANT: u32 = 0x4d49_4752;
 
+struct RunQueueLoadPublication {
+    current_key: Option<SchedulingKey>,
+    pushable_key: Option<SchedulingKey>,
+    runnable_count: usize,
+    workload_count: usize,
+    fair_demand: u64,
+    workload_demand: u64,
+    overloaded: bool,
+}
+
 #[derive(Debug)]
 pub(super) struct RemoteLoadState {
     sequence: AtomicU64,
     runnable: AtomicUsize,
     workload: AtomicUsize,
-    incoming_migrations: AtomicUsize,
+    fair_demand: AtomicU64,
+    workload_demand: AtomicU64,
+    incoming_migration_demand: AtomicU64,
     flags: AtomicU8,
     current_primary: AtomicU64,
     current_sequence: AtomicU64,
@@ -23,7 +35,9 @@ impl RemoteLoadState {
             sequence: AtomicU64::new(0),
             runnable: AtomicUsize::new(0),
             workload: AtomicUsize::new(0),
-            incoming_migrations: AtomicUsize::new(0),
+            fair_demand: AtomicU64::new(0),
+            workload_demand: AtomicU64::new(0),
+            incoming_migration_demand: AtomicU64::new(0),
             flags: AtomicU8::new(0),
             current_primary: AtomicU64::new(0),
             current_sequence: AtomicU64::new(0),
@@ -35,14 +49,16 @@ impl RemoteLoadState {
 }
 
 impl CpuRemote {
-    fn publish_load_summary(
-        &self,
-        current_key: Option<SchedulingKey>,
-        pushable_key: Option<SchedulingKey>,
-        runnable_count: usize,
-        workload_count: usize,
-        overloaded: bool,
-    ) {
+    fn publish_load_summary(&self, publication: RunQueueLoadPublication) {
+        let RunQueueLoadPublication {
+            current_key,
+            pushable_key,
+            runnable_count,
+            workload_count,
+            fair_demand,
+            workload_demand,
+            overloaded,
+        } = publication;
         let write_sequence = self.load.sequence.fetch_add(1, Ordering::AcqRel);
         debug_assert_eq!(
             write_sequence & 1,
@@ -51,6 +67,10 @@ impl CpuRemote {
         );
         self.load.runnable.store(runnable_count, Ordering::Relaxed);
         self.load.workload.store(workload_count, Ordering::Relaxed);
+        self.load.fair_demand.store(fair_demand, Ordering::Relaxed);
+        self.load
+            .workload_demand
+            .store(workload_demand, Ordering::Relaxed);
         let mut flags = 0;
         if let Some(key) = current_key {
             flags |= SUMMARY_CURRENT_PRESENT;
@@ -95,13 +115,25 @@ impl CpuRemote {
         let pushable_key = run_queue.pushable_key();
         let runnable = run_queue.len();
         let workload = runnable.saturating_add(usize::from(current_non_idle));
-        self.publish_load_summary(
+        let current_fair_demand = current
+            .filter(|_| current_non_idle)
+            .map_or(0, CurrentSchedule::fair_demand);
+        let current_placement_demand = current
+            .filter(|_| current_non_idle)
+            .map_or(0, CurrentSchedule::placement_demand);
+        let fair_demand = run_queue.fair_demand().saturating_add(current_fair_demand);
+        let workload_demand = run_queue
+            .placement_demand()
+            .saturating_add(current_placement_demand);
+        self.publish_load_summary(RunQueueLoadPublication {
             current_key,
             pushable_key,
-            runnable,
-            workload,
-            pushable_key.is_some() && workload > 1,
-        );
+            runnable_count: runnable,
+            workload_count: workload,
+            fair_demand,
+            workload_demand,
+            overloaded: pushable_key.is_some() && workload > 1,
+        });
     }
 
     /// Attempts to return a coherent remotely observable scheduling snapshot.
@@ -119,6 +151,8 @@ impl CpuRemote {
             }
             let runnable_count = self.load.runnable.load(Ordering::Relaxed);
             let workload_count = self.load.workload.load(Ordering::Relaxed);
+            let fair_demand = self.load.fair_demand.load(Ordering::Relaxed);
+            let workload_demand = self.load.workload_demand.load(Ordering::Relaxed);
             let flags = self.load.flags.load(Ordering::Relaxed);
             let current_primary = self.load.current_primary.load(Ordering::Relaxed);
             let current_sequence = self.load.current_sequence.load(Ordering::Relaxed);
@@ -133,6 +167,8 @@ impl CpuRemote {
                 epoch,
                 runnable_count,
                 workload_count,
+                fair_demand,
+                workload_demand,
                 current_key: (flags & SUMMARY_CURRENT_PRESENT != 0)
                     .then(|| SchedulingKey::new(current_rank, current_primary, current_sequence)),
                 pushable_key: (flags & SUMMARY_PUSHABLE_PRESENT != 0).then(|| {
@@ -151,20 +187,20 @@ impl CpuRemote {
         self.try_load_summary().map(CpuLoadSummary::runnable_count)
     }
 
-    pub(crate) fn try_placement_load(&self) -> Option<usize> {
+    pub(crate) fn try_placement_demand(&self) -> Option<u64> {
         self.try_load_summary().map(|summary| {
             summary
-                .workload_count()
-                .saturating_add(self.load.incoming_migrations.load(Ordering::Acquire))
+                .workload_demand()
+                .saturating_add(self.load.incoming_migration_demand.load(Ordering::Acquire))
         })
     }
 
-    pub(super) fn reserve_incoming_migration(&self) {
+    pub(super) fn reserve_incoming_migration(&self, demand: u64) {
         if self
             .load
-            .incoming_migrations
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                count.checked_add(1)
+            .incoming_migration_demand
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(demand)
             })
             .is_err()
         {
@@ -175,15 +211,15 @@ impl CpuRemote {
         }
     }
 
-    pub(crate) fn complete_incoming_migrations(&self, count: usize) {
-        if count == 0 {
+    pub(crate) fn release_incoming_migration_demand(&self, demand: u64) {
+        if demand == 0 {
             return;
         }
-        let previous = self
+        let previous_demand = self
             .load
-            .incoming_migrations
-            .fetch_sub(count, Ordering::AcqRel);
-        if previous < count {
+            .incoming_migration_demand
+            .fetch_sub(demand, Ordering::AcqRel);
+        if previous_demand < demand {
             task_runtime::fatal_invariant(
                 INCOMING_MIGRATION_RELEASE_INVARIANT,
                 self.owner.as_u32() as usize,

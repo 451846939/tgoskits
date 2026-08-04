@@ -713,6 +713,7 @@ mod tests {
                 CpuId::new(0),
                 CpuId::new(0),
                 u64::from(slot),
+                1_024,
             );
             let node = unsafe {
                 // The pinned fixture is declared before the task system, so it

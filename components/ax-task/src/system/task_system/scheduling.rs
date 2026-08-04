@@ -58,7 +58,12 @@ impl TaskSystem {
                 {
                     return None;
                 }
-                Some((class, key, summary.runnable_count(), source))
+                let load = if class == SchedulingClass::Fair {
+                    summary.workload_demand()
+                } else {
+                    summary.runnable_count() as u64
+                };
+                Some((class, key, load, source))
             })
             .min_by_key(|(class, key, load, source)| {
                 let cross_cpu_urgency =

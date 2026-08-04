@@ -192,6 +192,32 @@ pub enum SchedulePolicy {
 }
 
 impl SchedulePolicy {
+    /// Returns the instantaneous cross-CPU demand represented by this policy.
+    ///
+    /// Fair policies use the same Linux nice weights as EEVDF. Fixed-priority
+    /// and Deadline work consume one normal-capacity unit until a future
+    /// utilization tracker can provide a stronger class-specific estimate.
+    pub(crate) const fn placement_demand(self) -> u64 {
+        match self {
+            Self::Fair {
+                mode: FairMode::Idle,
+                ..
+            } => Nice::LOWEST.weight() as u64,
+            Self::Fair { nice, .. } => nice.weight() as u64,
+            Self::Fifo { .. } | Self::RoundRobin { .. } | Self::Deadline(_) => {
+                Nice::ZERO.weight() as u64
+            }
+        }
+    }
+
+    /// Returns the nice-weighted Fair component of cross-CPU demand.
+    pub(crate) const fn fair_demand(self) -> u64 {
+        match self {
+            Self::Fair { .. } => self.placement_demand(),
+            Self::Fifo { .. } | Self::RoundRobin { .. } | Self::Deadline(_) => 0,
+        }
+    }
+
     /// Validates policy fields that remain directly constructible through enum variants.
     pub const fn validate(self) -> Result<(), TaskError> {
         match self {

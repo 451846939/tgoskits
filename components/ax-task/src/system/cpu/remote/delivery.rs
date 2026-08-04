@@ -37,14 +37,14 @@ impl CpuRemote {
         let _idle_pull_work = self.begin_idle_pull_work();
         let migration = message.operation() == InboxOperation::Migration;
         if migration {
-            self.reserve_incoming_migration();
+            self.reserve_incoming_migration(message.placement_demand());
         }
         let (result, head_became_non_empty) = self
             .delivery
             .owner_control_inbox
             .publish_with_head_transition(node, message);
         if migration && result != PublishResult::Published {
-            self.complete_incoming_migrations(1);
+            self.release_incoming_migration_demand(message.placement_demand());
         }
         if matches!(
             result,

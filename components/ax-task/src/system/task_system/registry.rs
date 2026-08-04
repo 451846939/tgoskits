@@ -513,7 +513,7 @@ impl TaskSystemState {
                 }
                 registration
                     .remote
-                    .try_placement_load()
+                    .try_placement_demand()
                     .map(|load| (load, cpu != preferred, cpu))
             })
             .min_by_key(|(load, not_preferred, cpu)| (*load, *not_preferred, cpu.as_u32()))

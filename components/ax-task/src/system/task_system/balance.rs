@@ -20,6 +20,21 @@ impl OwnerBalanceSelection {
     }
 }
 
+fn fair_migration_imbalance(
+    source_demand: u64,
+    target_demand: u64,
+    candidate_demand: u64,
+) -> Option<u64> {
+    if candidate_demand == 0 || source_demand <= target_demand {
+        return None;
+    }
+    let imbalance_before = source_demand - target_demand;
+    let source_after = source_demand.saturating_sub(candidate_demand);
+    let target_after = target_demand.saturating_add(candidate_demand);
+    let imbalance_after = source_after.abs_diff(target_after);
+    (imbalance_after < imbalance_before).then_some(imbalance_after)
+}
+
 #[cfg(test)]
 std::thread_local! {
     static BALANCE_CANDIDATE_VISITS: core::cell::Cell<usize> = const {
@@ -485,21 +500,22 @@ impl TaskSystem {
         self.ensure_owner_cpu_online(&cpu)?;
         self.publish_owner_cpu_load_summary(cpu.as_mut());
         let source = cpu.owner();
-        let result = if let Some(source_load) = cpu.try_runnable_summary() {
+        let result = if let Some(source_demand) = cpu.remote().try_placement_demand() {
             let lower_load_target_seen =
                 self.cpu_remotes.iter().enumerate().any(|(index, remote)| {
                     let target = CpuId::new(index as u32);
                     remote.accepts_placement()
                         && target != source
                         && remote
-                            .try_load_summary()
-                            .is_some_and(|summary| summary.runnable_count() < source_load)
+                            .try_placement_demand()
+                            .is_some_and(|demand| demand < source_demand)
                 });
             let selection = self.select_owner_balance_transfer_by(
                 cpu.as_ref().get_ref(),
                 now_ns,
                 BalanceReason::FairPeriodic,
-                |_, sched| {
+                |candidate, sched| {
+                    let candidate_demand = candidate.placement_demand();
                     self.cpu_remotes
                         .iter()
                         .enumerate()
@@ -512,12 +528,14 @@ impl TaskSystem {
                             {
                                 return None;
                             }
-                            let target_summary = remote.try_load_summary()?;
-                            (target_summary.runnable_count() < source_load)
-                                .then_some((target_summary.runnable_count(), target))
+                            let target_demand = remote.try_placement_demand()?;
+                            fair_migration_imbalance(source_demand, target_demand, candidate_demand)
+                                .map(|imbalance| (imbalance, target_demand, target))
                         })
-                        .min_by_key(|(load, target)| (*load, target.as_u32()))
-                        .map(|(_, target)| target)
+                        .min_by_key(|(imbalance, demand, target)| {
+                            (*imbalance, *demand, target.as_u32())
+                        })
+                        .map(|(_, _, target)| target)
                 },
             );
             if let Some(selection) = selection {

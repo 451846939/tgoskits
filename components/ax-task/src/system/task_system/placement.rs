@@ -39,6 +39,7 @@ pub(super) struct PreparedOwnerMigration<'remote> {
     core: Option<Arc<ThreadCore>>,
     source: CpuId,
     inbox_cpu: CpuId,
+    placement_demand: u64,
 }
 
 impl PreparedOwnerMigration<'_> {
@@ -63,6 +64,7 @@ impl PreparedOwnerMigration<'_> {
             self.source,
             self.inbox_cpu,
             thread.generation() as u64,
+            self.placement_demand,
             pointer.expose_provenance(),
         );
         match publication.publish_owner_control(node, message) {
@@ -150,6 +152,7 @@ impl TaskSystem {
             core: Some(Arc::clone(core)),
             source,
             inbox_cpu,
+            placement_demand: core.effective_placement_demand(),
         })
     }
 

@@ -31,6 +31,8 @@ pub struct CpuLoadSummary {
     pub(super) epoch: u64,
     pub(super) runnable_count: usize,
     pub(super) workload_count: usize,
+    pub(super) fair_demand: u64,
+    pub(super) workload_demand: u64,
     pub(super) current_key: Option<SchedulingKey>,
     pub(super) pushable_key: Option<SchedulingKey>,
     pub(super) pushable_class: Option<SchedulingClass>,
@@ -81,6 +83,20 @@ impl CpuLoadSummary {
     /// Returns queued work plus the currently running non-idle thread.
     pub const fn workload_count(self) -> usize {
         self.workload_count
+    }
+
+    /// Returns the Linux nice-weighted Fair demand owned by this CPU.
+    pub const fn fair_demand(self) -> u64 {
+        self.fair_demand
+    }
+
+    /// Returns instantaneous scheduling demand in normal-nice weight units.
+    ///
+    /// Fair work contributes its exact nice weight. RT and Deadline work each
+    /// contribute one normal-nice capacity unit until class-specific
+    /// utilization tracking is available.
+    pub const fn workload_demand(self) -> u64 {
+        self.workload_demand
     }
 
     /// Returns the effective urgency of the current dispatch, including PI.

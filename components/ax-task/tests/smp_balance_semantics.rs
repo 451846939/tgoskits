@@ -158,6 +158,8 @@ fn load_summary_publishes_effective_current_and_top_pushable_keys() {
     assert_eq!(summary.current_key().unwrap().primary(), 9);
     assert_eq!(summary.pushable_class(), Some(SchedulingClass::Realtime));
     assert_eq!(summary.pushable_key().unwrap().primary(), 19);
+    assert_eq!(summary.fair_demand(), 0);
+    assert_eq!(summary.workload_demand(), 2_048);
     assert!(summary.is_overloaded());
     system.pi_wait_cancel(wait).unwrap();
 }
@@ -227,6 +229,34 @@ fn initial_fair_placement_accounts_for_in_flight_migrations() {
 }
 
 #[test]
+fn in_flight_migration_reserves_the_exact_fair_demand() {
+    let (system, mut cpu0, mut cpu1, _idle1) = online_pair();
+    for _ in 0..2 {
+        let local = ready_thread(&system, SchedulePolicy::default());
+        system.enqueue(cpu0.as_mut(), local.id(), 0).unwrap();
+    }
+    let heavy = ready_thread(
+        &system,
+        SchedulePolicy::fair(Nice::new(-20).unwrap(), FairMode::Normal),
+    );
+    system
+        .set_affinity(heavy.id(), singleton_affinity(2, 1))
+        .unwrap();
+    system.place_ready(cpu0.as_mut(), heavy.id(), 1).unwrap();
+
+    let local = ready_thread(&system, SchedulePolicy::default());
+    system.place_ready(cpu0.as_mut(), local.id(), 1).unwrap();
+
+    assert_eq!(
+        cpu0.try_runnable_summary(),
+        Some(3),
+        "the pending nice -20 carrier must outweigh two local normal tasks during placement"
+    );
+    system.drain_policy_updates(cpu1.as_mut(), 1).unwrap();
+    assert_eq!(cpu1.try_runnable_summary(), Some(1));
+}
+
+#[test]
 fn rt_push_keeps_the_more_urgent_current_task_on_its_owner() {
     let (system, mut cpu0, mut cpu1, _idle1) = online_pair();
     let current = ready_thread(&system, SchedulePolicy::fifo(RtPriority::new(90).unwrap()));
@@ -279,7 +309,7 @@ fn idle_pull_prefers_rt_work_over_a_larger_fair_queue() {
 }
 
 #[test]
-fn idle_pull_uses_load_not_cross_cpu_eevdf_deadline_within_fair_class() {
+fn idle_pull_uses_weighted_demand_not_task_count_within_fair_class() {
     let (system, mut cpus, _idle2) = online_triple();
     for cpu in &mut cpus {
         let _idle = system.schedule(cpu.as_mut(), 0).unwrap();
@@ -327,11 +357,34 @@ fn idle_pull_uses_load_not_cross_cpu_eevdf_deadline_within_fair_class() {
         .unwrap()
         .next();
     assert!(
-        heavily_loaded.iter().any(|thread| thread.id() == pulled),
-        "the idle CPU must pull from the busiest fair source, not the source with the smallest \
-         unrelated runqueue-local EEVDF deadline"
+        lightly_loaded.iter().any(|thread| thread.id() == pulled),
+        "the idle CPU must pull from the source with the greatest nice-weighted demand, not the \
+         source with the largest task count"
     );
-    assert!(lightly_loaded.iter().all(|thread| thread.id() != pulled));
+    assert!(heavily_loaded.iter().all(|thread| thread.id() != pulled));
+}
+
+#[test]
+fn initial_fair_placement_uses_weighted_demand_not_task_count() {
+    let (system, mut cpu0, mut cpu1, _idle1) = online_pair();
+    let heavy = ready_thread(
+        &system,
+        SchedulePolicy::fair(Nice::new(-20).unwrap(), FairMode::Normal),
+    );
+    system.enqueue(cpu0.as_mut(), heavy.id(), 0).unwrap();
+    let light_policy = SchedulePolicy::fair(Nice::new(19).unwrap(), FairMode::Normal);
+    for _ in 0..2 {
+        let light = ready_thread(&system, light_policy);
+        system.enqueue(cpu1.as_mut(), light.id(), 0).unwrap();
+    }
+
+    let placed = ready_thread(&system, SchedulePolicy::default());
+    system.place_ready(cpu0.as_mut(), placed.id(), 1).unwrap();
+
+    assert!(
+        cpu1.has_remote_work(),
+        "the new fair task must target the lower weighted-demand CPU even when it owns more tasks"
+    );
 }
 
 #[test]

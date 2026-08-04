@@ -40,8 +40,8 @@ fn owner_control_publication_coalesces_and_drain_is_bounded() {
     let inbox = SchedulerInbox::new(InboxKind::OwnerControl);
     let first = inbox_node(InboxKind::OwnerControl);
     let second = inbox_node(InboxKind::OwnerControl);
-    let first_message = InboxMessage::migration(thread(1), CpuId::new(0), CpuId::new(1), 1);
-    let second_message = InboxMessage::migration(thread(2), CpuId::new(0), CpuId::new(1), 2);
+    let first_message = InboxMessage::migration(thread(1), CpuId::new(0), CpuId::new(1), 1, 1_024);
+    let second_message = InboxMessage::migration(thread(2), CpuId::new(0), CpuId::new(1), 2, 1_024);
     assert_eq!(
         inbox.publish(first.pin(), first_message),
         PublishResult::Published

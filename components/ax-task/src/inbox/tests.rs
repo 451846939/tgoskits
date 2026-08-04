@@ -44,7 +44,7 @@ fn bounds_each_drain_and_reports_remaining_work() {
     ];
     for (index, node) in nodes.iter().enumerate() {
         let message =
-            InboxMessage::migration(thread(index as u32), CpuId::new(0), CpuId::new(1), 9);
+            InboxMessage::migration(thread(index as u32), CpuId::new(0), CpuId::new(1), 9, 1_024);
         assert_eq!(inbox.publish(node.pin(), message), PublishResult::Published);
     }
     let mut output = [InboxMessage::EMPTY; 3];
@@ -173,5 +173,11 @@ fn thread(slot: u32) -> ThreadId {
 }
 
 fn message(slot: u32) -> InboxMessage {
-    InboxMessage::migration(thread(slot), CpuId::new(0), CpuId::new(1), u64::from(slot))
+    InboxMessage::migration(
+        thread(slot),
+        CpuId::new(0),
+        CpuId::new(1),
+        u64::from(slot),
+        1_024,
+    )
 }

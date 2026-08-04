@@ -11,8 +11,8 @@ use realtime::RealtimeRunQueue;
 
 use super::fair_queue::FairRunQueue;
 use crate::{
-    FairEntity, FairMode, SchedulePolicy, SchedulingEntity, SchedulingKey, TaskError, ThreadCore,
-    ThreadId,
+    FairEntity, FairMode, Nice, SchedulePolicy, SchedulingEntity, SchedulingKey, TaskError,
+    ThreadCore, ThreadId,
 };
 
 /// Scheduling-class linkage prepared with each thread, like Linux embedding
@@ -210,6 +210,10 @@ impl QueuedThread {
             },
         )
     }
+
+    pub(crate) const fn placement_demand(&self) -> u64 {
+        self.policy.placement_demand()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -293,6 +297,19 @@ impl RunQueue {
 
     pub(crate) const fn len(&self) -> usize {
         self.len
+    }
+
+    pub(crate) fn fair_demand(&self) -> u64 {
+        self.fair
+            .total_weight()
+            .saturating_add(self.idle_fair.total_weight())
+    }
+
+    pub(crate) fn placement_demand(&self) -> u64 {
+        let fair_count = self.fair.len().saturating_add(self.idle_fair.len());
+        let non_fair_count = self.len.saturating_sub(fair_count);
+        self.fair_demand()
+            .saturating_add((non_fair_count as u64).saturating_mul(u64::from(Nice::ZERO.weight())))
     }
 
     #[cfg(test)]

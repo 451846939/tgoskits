@@ -30,6 +30,7 @@ fn publish_test_scheduler_work(
         remote.owner(),
         remote.owner(),
         u64::from(slot),
+        1_024,
     );
     let result = remote.publish_owner_control(node, message);
     assert_eq!(result, PublishResult::Published);
@@ -1311,8 +1312,13 @@ fn successful_fair_balance_resets_the_minimum_interval() {
     let movable = system
         .create_thread(ThreadSpec::new(SchedulePolicy::default()))
         .unwrap();
-    system.make_ready(movable.id()).unwrap();
-    system.enqueue(cpu0.as_mut(), movable.id(), 0).unwrap();
+    let peer = system
+        .create_thread(ThreadSpec::new(SchedulePolicy::default()))
+        .unwrap();
+    for thread in [&movable, &peer] {
+        system.make_ready(thread.id()).unwrap();
+        system.enqueue(cpu0.as_mut(), thread.id(), 0).unwrap();
+    }
 
     crate::test_runtime::set_monotonic_ns(INTERVAL_NS);
     balance::reset_balance_candidate_visits();
@@ -1349,8 +1355,13 @@ fn fair_balance_selects_one_candidate_across_multiple_destinations() {
     let movable = system
         .create_thread(ThreadSpec::new(SchedulePolicy::default()))
         .unwrap();
-    system.make_ready(movable.id()).unwrap();
-    system.enqueue(cpus[0].as_mut(), movable.id(), 0).unwrap();
+    let peer = system
+        .create_thread(ThreadSpec::new(SchedulePolicy::default()))
+        .unwrap();
+    for thread in [&movable, &peer] {
+        system.make_ready(thread.id()).unwrap();
+        system.enqueue(cpus[0].as_mut(), thread.id(), 0).unwrap();
+    }
 
     crate::test_runtime::set_monotonic_ns(INTERVAL_NS);
     balance::reset_balance_candidate_visits();
@@ -1398,6 +1409,43 @@ fn fair_balance_scans_past_an_affinity_constrained_candidate() {
         system.balance_fair(cpu0.as_mut(), INTERVAL_NS),
         Ok(Some(movable.id())),
         "one constrained EEVDF candidate must not hide another movable entity"
+    );
+}
+
+#[test]
+fn periodic_fair_balance_does_not_move_light_work_toward_a_heavier_cpu() {
+    const INTERVAL_NS: u64 = 1_000;
+
+    let system =
+        TaskSystem::new(TaskSystemConfig::new(2).with_balance_interval_ns(INTERVAL_NS)).unwrap();
+    let mut cpu0 = system.create_cpu_local(CpuId::new(0)).unwrap();
+    let mut cpu1 = system.create_cpu_local(CpuId::new(1)).unwrap();
+    for cpu in [&mut cpu0, &mut cpu1] {
+        system
+            .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
+            .unwrap();
+        system.bring_cpu_online_at(cpu.as_mut(), 0).unwrap();
+    }
+    let light_policy = SchedulePolicy::fair(Nice::new(19).unwrap(), FairMode::Normal);
+    for _ in 0..2 {
+        let light = system.create_thread(ThreadSpec::new(light_policy)).unwrap();
+        system.make_ready(light.id()).unwrap();
+        system.enqueue(cpu0.as_mut(), light.id(), 0).unwrap();
+    }
+    let heavy = system
+        .create_thread(ThreadSpec::new(SchedulePolicy::fair(
+            Nice::new(-20).unwrap(),
+            FairMode::Normal,
+        )))
+        .unwrap();
+    system.make_ready(heavy.id()).unwrap();
+    system.enqueue(cpu1.as_mut(), heavy.id(), 0).unwrap();
+
+    crate::test_runtime::set_monotonic_ns(INTERVAL_NS);
+    assert_eq!(
+        system.balance_fair(cpu0.as_mut(), INTERVAL_NS),
+        Ok(None),
+        "count balancing must not move nice +19 work toward a CPU already carrying nice -20 demand"
     );
 }
 
@@ -2472,6 +2520,7 @@ fn failed_owner_batch_releases_all_detached_payloads() {
         CpuId::new(0),
         CpuId::new(1),
         thread_id.generation() as u64,
+        1_024,
         pointer.expose_provenance(),
     );
     assert_eq!(
@@ -3004,6 +3053,7 @@ fn bounded_inbox_remainder_stays_sticky_across_scheduler_entry() {
             CpuId::new(0),
             CpuId::new(0),
             slot as u64,
+            1_024,
         );
         assert_eq!(
             cpu.remote()

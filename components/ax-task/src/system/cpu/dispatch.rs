@@ -91,6 +91,14 @@ impl CurrentSchedule {
         }
     }
 
+    pub(crate) const fn placement_demand(self) -> u64 {
+        self.policy.placement_demand()
+    }
+
+    pub(crate) const fn fair_demand(self) -> u64 {
+        self.policy.fair_demand()
+    }
+
     pub(crate) fn should_preempt(
         self,
         woken_policy: SchedulePolicy,

@@ -366,6 +366,20 @@ deadline。当前实现直接使用 wrap-safe 的虚拟时间顺序，并保留�
 实体允许平均值前后移动；公平性由 dequeue 前保存的 `vlag` 保证，不能再用第二个
 单调 `virtual_time` 把平均值强行取大。
 
+跨 CPU placement 与 balance 不能使用线程数量替代负载。Linux v7.1 的
+`cfs_rq::avg`/PELT 以 `load.weight` 维护可运行负载，并结合 CPU capacity 计算 imbalance；
+因此一个 nice -20 实体与多个 nice +19 实体绝不等价。当前阶段采用不引入第二时间源的
+瞬时 demand 模型：Fair 实体直接累计 Linux nice weight，RT/Deadline 实体暂按一个
+nice-0 capacity unit 计入总 demand。runqueue 已维护的 Fair total-weight 是唯一数据源，
+发布 load summary 不扫描线程；current 与 queued demand 在 rq lock 的同一事务内发布。
+
+初始 placement、空闲 CPU source 选择和周期 Fair balance 统一使用该 demand。周期迁移
+只有在候选移动后 source/target 的绝对 imbalance 严格下降时才允许提交，避免把两个
+nice +19 轻任务从低负载 CPU 推向已有 nice -20 重任务的 CPU。owner-to-owner carrier
+显式携带并预留候选 demand，drain 或 publication 回滚时精确释放，因此并发 placement
+不能把尚未物理入队的重任务当成一个普通计数。后续若引入 PELT/CPU capacity，应扩展这一
+权威 summary，而不是重建按线程数的兼容旁路。
+
 sleep 与 migration 语义分开：sleep 保存 `vlag`，wake 时开启新请求；runnable
 migration 同时保存 `vlag` 和相对 deadline，在目标 runqueue 恢复同一个活动请求。
 所有 queued migration 统一执行：

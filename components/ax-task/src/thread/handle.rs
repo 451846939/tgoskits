@@ -847,6 +847,13 @@ impl ThreadCore {
         self.effective_key_sequence.fetch_add(1, Ordering::Release);
     }
 
+    pub(crate) fn effective_placement_demand(&self) -> u64 {
+        // Demand depends on the policy atom alone, unlike the scheduling key
+        // which also needs a coherent Deadline timestamp. Avoid waiting on a
+        // preempted sequence writer from migration publication context.
+        self.effective_policy.load().placement_demand()
+    }
+
     fn effective_scheduling_key(&self) -> SchedulingKey {
         loop {
             let sequence = self.effective_key_sequence.load(Ordering::Acquire);

@@ -46,6 +46,7 @@ pub struct InboxMessage {
     source_cpu: u32,
     target_cpu: u32,
     generation: u64,
+    placement_demand: u64,
     payload: usize,
 }
 
@@ -60,6 +61,7 @@ impl InboxMessage {
         source_cpu: Self::NO_CPU,
         target_cpu: Self::NO_CPU,
         generation: 0,
+        placement_demand: 0,
         payload: 0,
     };
 
@@ -69,8 +71,16 @@ impl InboxMessage {
         source_cpu: CpuId,
         target_cpu: CpuId,
         generation: u64,
+        placement_demand: u64,
     ) -> Self {
-        Self::migration_with_payload(thread_id, source_cpu, target_cpu, generation, 0)
+        Self::migration_with_payload(
+            thread_id,
+            source_cpu,
+            target_cpu,
+            generation,
+            placement_demand,
+            0,
+        )
     }
 
     /// Creates a migration/policy-update transfer with retained payload data.
@@ -79,6 +89,7 @@ impl InboxMessage {
         source_cpu: CpuId,
         target_cpu: CpuId,
         generation: u64,
+        placement_demand: u64,
         payload: usize,
     ) -> Self {
         Self {
@@ -88,6 +99,7 @@ impl InboxMessage {
             source_cpu: source_cpu.as_u32(),
             target_cpu: target_cpu.as_u32(),
             generation,
+            placement_demand,
             payload,
         }
     }
@@ -106,6 +118,7 @@ impl InboxMessage {
             source_cpu: owner.as_u32(),
             target_cpu: owner.as_u32(),
             generation,
+            placement_demand: 0,
             payload,
         }
     }
@@ -124,6 +137,7 @@ impl InboxMessage {
             source_cpu: owner.as_u32(),
             target_cpu: target_cpu.as_u32(),
             generation: thread_id.generation() as u64,
+            placement_demand: 0,
             payload,
         }
     }
@@ -146,6 +160,7 @@ impl InboxMessage {
             source_cpu: owner.as_u32(),
             target_cpu: owner.as_u32(),
             generation,
+            placement_demand: 0,
             payload,
         }
     }
@@ -159,6 +174,7 @@ impl InboxMessage {
             source_cpu: source_cpu.as_u32(),
             target_cpu: target_cpu.as_u32(),
             generation: reservation,
+            placement_demand: 0,
             payload: 0,
         }
     }
@@ -186,6 +202,7 @@ impl InboxMessage {
             source_cpu: Self::NO_CPU,
             target_cpu: Self::NO_CPU,
             generation,
+            placement_demand: 0,
             payload,
         }
     }
@@ -199,6 +216,7 @@ impl InboxMessage {
             source_cpu: Self::NO_CPU,
             target_cpu: Self::NO_CPU,
             generation: thread_id.generation() as u64,
+            placement_demand: 0,
             payload,
         }
     }
@@ -212,6 +230,7 @@ impl InboxMessage {
             source_cpu: Self::NO_CPU,
             target_cpu: Self::NO_CPU,
             generation: thread_id.generation() as u64,
+            placement_demand: 0,
             payload,
         }
     }
@@ -252,6 +271,11 @@ impl InboxMessage {
     /// Returns the transfer or reclaim generation.
     pub const fn generation(self) -> u64 {
         self.generation
+    }
+
+    /// Returns the scheduling demand reserved by a migration carrier.
+    pub const fn placement_demand(self) -> u64 {
+        self.placement_demand
     }
 
     /// Returns opaque resource data for reclaim requests.

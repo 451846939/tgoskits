@@ -267,12 +267,17 @@ impl TaskSystem {
         };
         let mut detached = [InboxMessage::EMPTY; crate::DEFAULT_BATCH_LIMIT];
         detached[..drained].copy_from_slice(&cpu.drain_state().owner_control_buffer[..drained]);
-        let completed_incoming_migrations = detached[..drained]
+        let completed_incoming_migration_demand = detached[..drained]
             .iter()
             .filter(|message| message.operation() == InboxOperation::Migration)
-            .count();
+            .try_fold(0_u64, |demand, message| {
+                demand.checked_add(message.placement_demand())
+            })
+            .unwrap_or_else(|| {
+                task_runtime::fatal_invariant(0x4d49_4744, cpu.owner().as_u32() as usize)
+            });
         cpu.remote()
-            .complete_incoming_migrations(completed_incoming_migrations);
+            .release_incoming_migration_demand(completed_incoming_migration_demand);
         let mut messages = DetachedOwnerMessageBatch::new(&detached[..drained]);
         while let Some(message) = messages.next() {
             let operation = message.operation();
