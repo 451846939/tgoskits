@@ -37,6 +37,23 @@ trap 'rm -rf "$build_dir"' EXIT
     -Werror \
     -pthread \
     -static \
+    -I"$app_dir" \
+    "$app_dir/tests/clock-source.c" \
+    "$app_dir/tests/clock-gettime-wrap.c" \
+    "$app_dir/stats.c" \
+    -Wl,--wrap=clock_gettime \
+    -lm \
+    -o "$build_dir/clock-source-test"
+"$build_dir/clock-source-test"
+
+"$cc" \
+    -std=c11 \
+    -O2 \
+    -Wall \
+    -Wextra \
+    -Werror \
+    -pthread \
+    -static \
     "$app_dir/main.c" \
     "$app_dir/handoff.c" \
     "$app_dir/timer.c" \

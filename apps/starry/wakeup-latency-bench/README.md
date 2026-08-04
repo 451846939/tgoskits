@@ -28,8 +28,10 @@ futex 场景只把 `FUTEX_WAIT` 确实返回“已被唤醒”的样本计入分
 - 固定纳秒区间直方图。
 
 默认预热 1,000 次，futex 测量 20,000 次，timer 测量 10,000 次、周期 1 ms。
-`clock_resolution_ns` 与连续两次 `clock_gettime` 的最小开销单独报告，不从结果中
-猜测性扣除。
+`clock_resolution_ns` 与连续两次 raw `SYS_clock_gettime` 的最小开销单独报告，
+不从结果中猜测性扣除。Linux 与 StarryOS 都强制走同一个 syscall ABI，不能让 Linux
+的 vDSO 快路径把用户态取时成本伪装成调度收益；metadata 中的
+`clock_read=raw_syscall` 用来确认这条测量边界。
 
 ## 运行
 
@@ -48,9 +50,15 @@ cargo xtask starry app qemu -t wakeup-latency-bench --arch x86_64
   --case thread_futex_same_cpu
 ```
 
-每个场景分别输出 `WAKEUP_LATENCY_CASE_START` 和
-`WAKEUP_LATENCY_CASE_DONE`，后跟 `case=<name> policy=<policy>`。qperf 应用这两个
-marker 收窄采样窗口，不能用完整应用的启动和结束 marker 混合多个调用链。
+每个场景分别在策略和亲和性配置完成后、正式 workload 前输出
+`WAKEUP_LATENCY_CASE_START`，并在 workload 返回后、排序和报告前输出
+`WAKEUP_LATENCY_CASE_DONE`，后跟 `case=<name> policy=<policy>`。单场景 qperf 运行可
+用这两个 marker 收窄窗口。
+
+完整运行只使用唯一的 `WAKEUP_LATENCY_PROFILE_START` 和
+`WAKEUP_LATENCY_PROFILE_DONE`。前者位于 metadata、CPU 数量检查和调度策略能力探测
+之后，后者位于最后一个场景报告之后。qperf monitor 只消费第一次 start/stop，因此
+不能在完整运行中把多组 case marker 当作多个窗口。
 
 Linux 对照必须从本目录的 `main.c`、`handoff.c`、`timer.c`、`stats.c` 构建，定义
 `BENCH_INIT` 后静态链接为 initramfs 的 `/init`。三方保持以下 QEMU 参数一致：

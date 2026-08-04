@@ -10,7 +10,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <time.h>
+#include <unistd.h>
 
 static const uint64_t HISTOGRAM_BOUNDS_NS[] = {
     1000,    2000,    5000,    10000,   20000,    50000,   100000,
@@ -20,7 +22,7 @@ static const uint64_t HISTOGRAM_BOUNDS_NS[] = {
 uint64_t bench_monotonic_ns(void)
 {
     struct timespec now;
-    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+    if (syscall(SYS_clock_gettime, CLOCK_MONOTONIC, &now) != 0) {
         perror("clock_gettime");
         exit(EXIT_FAILURE);
     }
@@ -60,7 +62,7 @@ void bench_prefault_samples(uint64_t *samples, size_t sample_count)
 void bench_print_metadata(const struct bench_config *config)
 {
     struct timespec resolution;
-    if (clock_getres(CLOCK_MONOTONIC, &resolution) != 0) {
+    if (syscall(SYS_clock_getres, CLOCK_MONOTONIC, &resolution) != 0) {
         perror("clock_getres");
         exit(EXIT_FAILURE);
     }
@@ -78,6 +80,7 @@ void bench_print_metadata(const struct bench_config *config)
     }
 
     printf("WAKEUP_LATENCY_METADATA {\"clock\":\"CLOCK_MONOTONIC\","
+           "\"clock_read\":\"raw_syscall\","
            "\"clock_resolution_ns\":%llu,\"clock_pair_min_ns\":%llu,"
            "\"sender_cpu\":%d,\"receiver_cpu\":%d,"
            "\"warmup\":%zu,\"handoff_samples\":%zu,"

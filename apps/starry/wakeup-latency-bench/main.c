@@ -138,6 +138,11 @@ static void print_case_marker(const char *phase, const char *case_name,
            bench_policy_name(policy));
 }
 
+static void print_profile_marker(const char *phase)
+{
+    printf("WAKEUP_LATENCY_PROFILE_%s\n", phase);
+}
+
 static int configure_current(enum bench_policy policy, int cpu)
 {
     int error = bench_pin_current_thread(cpu);
@@ -179,6 +184,7 @@ static int run_benchmark(const struct bench_selection *selection)
         BENCH_POLICY_OTHER,
         BENCH_POLICY_FIFO,
     };
+    int policy_supported[sizeof(policies) / sizeof(policies[0])] = { 0 };
     for (size_t policy_index = 0;
         policy_index < sizeof(policies) / sizeof(policies[0]);
          policy_index++) {
@@ -205,87 +211,103 @@ static int run_benchmark(const struct bench_selection *selection)
             perror("restore policy after capability probe");
             return 1;
         }
+        policy_supported[policy_index] = 1;
+    }
+
+    print_profile_marker("START");
+    for (size_t policy_index = 0;
+        policy_index < sizeof(policies) / sizeof(policies[0]);
+         policy_index++) {
+        enum bench_policy policy = policies[policy_index];
+        if (!policy_supported[policy_index]) {
+            continue;
+        }
 
         if (case_selected(selection, BENCH_CASE_THREAD_FUTEX_SAME_CPU)) {
-            print_case_marker("START", "thread_futex_same_cpu", policy);
             struct latency_result same_cpu;
-            error = configure_current(policy, DEFAULT_CONFIG.sender_cpu);
+            int error =
+                configure_current(policy, DEFAULT_CONFIG.sender_cpu);
             if (error != 0) {
                 errno = error;
                 perror("configure same-CPU sender");
                 return 1;
             }
+            print_case_marker("START", "thread_futex_same_cpu", policy);
             if (bench_thread_handoff(&DEFAULT_CONFIG, policy, 1, &same_cpu) !=
                 0) {
                 perror("same-CPU thread handoff");
                 return 1;
             }
+            print_case_marker("DONE", "thread_futex_same_cpu", policy);
             if (finish_result(&same_cpu) != 0) {
                 return 1;
             }
-            print_case_marker("DONE", "thread_futex_same_cpu", policy);
         }
 
         if (case_selected(selection, BENCH_CASE_THREAD_FUTEX_CROSS_CPU)) {
-            print_case_marker("START", "thread_futex_cross_cpu", policy);
             struct latency_result cross_cpu;
-            error = configure_current(policy, DEFAULT_CONFIG.sender_cpu);
+            int error =
+                configure_current(policy, DEFAULT_CONFIG.sender_cpu);
             if (error != 0) {
                 errno = error;
                 perror("configure cross-CPU sender");
                 return 1;
             }
+            print_case_marker("START", "thread_futex_cross_cpu", policy);
             if (bench_thread_handoff(&DEFAULT_CONFIG, policy, 0, &cross_cpu) !=
                 0) {
                 perror("cross-CPU thread handoff");
                 return 1;
             }
+            print_case_marker("DONE", "thread_futex_cross_cpu", policy);
             if (finish_result(&cross_cpu) != 0) {
                 return 1;
             }
-            print_case_marker("DONE", "thread_futex_cross_cpu", policy);
         }
 
         if (case_selected(selection, BENCH_CASE_PROCESS_FUTEX_CROSS_CPU)) {
-            print_case_marker("START", "process_futex_cross_cpu", policy);
             struct latency_result process;
-            error = configure_current(policy, DEFAULT_CONFIG.sender_cpu);
+            int error =
+                configure_current(policy, DEFAULT_CONFIG.sender_cpu);
             if (error != 0) {
                 errno = error;
                 perror("configure process sender");
                 return 1;
             }
+            print_case_marker("START", "process_futex_cross_cpu", policy);
             if (bench_process_handoff(&DEFAULT_CONFIG, policy, &process) !=
                 0) {
                 perror("cross-CPU process handoff");
                 return 1;
             }
+            print_case_marker("DONE", "process_futex_cross_cpu", policy);
             if (finish_result(&process) != 0) {
                 return 1;
             }
-            print_case_marker("DONE", "process_futex_cross_cpu", policy);
         }
 
         if (case_selected(selection, BENCH_CASE_ABSOLUTE_TIMER_SAME_CPU)) {
-            print_case_marker("START", "absolute_timer_same_cpu", policy);
-            error = configure_current(policy, DEFAULT_CONFIG.receiver_cpu);
+            int error =
+                configure_current(policy, DEFAULT_CONFIG.receiver_cpu);
             if (error != 0) {
                 errno = error;
                 perror("configure timer thread");
                 return 1;
             }
+            print_case_marker("START", "absolute_timer_same_cpu", policy);
             struct latency_result timer;
             if (bench_absolute_timer(&DEFAULT_CONFIG, policy, &timer) != 0) {
                 perror("absolute timer wakeup");
                 return 1;
             }
+            print_case_marker("DONE", "absolute_timer_same_cpu", policy);
             if (finish_result(&timer) != 0) {
                 return 1;
             }
-            print_case_marker("DONE", "absolute_timer_same_cpu", policy);
         }
     }
 
+    print_profile_marker("DONE");
     printf("WAKEUP_LATENCY_PASSED\n");
     return 0;
 }

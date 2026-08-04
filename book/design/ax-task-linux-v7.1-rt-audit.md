@@ -1363,6 +1363,50 @@ area 校验的中间版（clock-pair 26.872 微秒），最终版八项 p50 全�
 其中 OTHER/FIFO timer 分别下降 12.8%/29.8%。这与确定性删除完整 area 重验的
 方向一致，但绝对延迟仍明显高于 Linux PREEMPT_RT，不宣称已达到同一水平。
 
+### 2026-08-05 唤醒基准的 syscall 测量边界
+
+重新沿用户态取时调用链核对后发现，旧基准使用 libc `clock_gettime()`：同一份静态
+源码在 Linux 上可以由 vDSO 完成，而 StarryOS 当前必须进入内核。因此上文历史表中的
+Linux RT 与 StarryOS 绝对 p50 混入了不同的取时路径，不能继续用来判断两者是否已经达到
+同一水平；这些数字只保留为发现该测量缺陷前的历史趋势。
+
+当前基准强制通过 raw `SYS_clock_gettime` 读取每个 producer/consumer 时间戳，metadata
+也用 raw `SYS_clock_getres` 并发布 `clock_read=raw_syscall`。确定性红测把真实 `stats.c`
+与 `--wrap=clock_gettime` 的故障注入链接：旧实现必然进入被替换的 libc 符号并以
+`ENOSYS` 失败，新实现绕过 libc 后同一测试通过。这个测试随 `prebuild.sh` 执行，避免将来
+无意恢复 vDSO/Starry syscall 不对称。
+
+qperf 的 monitor 每次运行只消费第一对 start/stop marker。完整 workload 因此只发布唯一的
+`WAKEUP_LATENCY_PROFILE_START/DONE`：策略能力探测和 metadata 位于窗口外，全部已选择
+场景位于窗口内。逐场景 marker 则移动到策略/亲和性配置之后、正式 benchmark 前，以及
+benchmark 返回后、排序和报告前；它只用于一次 QEMU 运行选择单个 case 时收窄调用链。
+下一轮 Linux RT/StarryOS 绝对对比必须重建同源 initramfs，并同时观察
+`clock_read=raw_syscall` 与正式通过标志，不能沿用旧产物或旧绝对表。
+
+在同一宿主、Q35/TCG、2 vCPU、512 MiB 下重建 Linux v7.1 PREEMPT_RT initramfs 后，
+Linux 与当前 StarryOS 均打印 `clock_read=raw_syscall` 和正式通过标志。新的 p50 如下，
+单位为微秒：
+
+| 策略与场景 | Linux RT | StarryOS | 倍数 |
+| --- | ---: | ---: | ---: |
+| OTHER，同 CPU 线程 | 15.068 | 129.410 | 8.59x |
+| OTHER，跨 CPU 线程 | 25.488 | 120.884 | 4.74x |
+| OTHER，跨 CPU 进程 | 28.276 | 122.579 | 4.34x |
+| OTHER，绝对 timer | 92.019 | 195.493 | 2.12x |
+| FIFO:80，同 CPU 线程 | 11.912 | 128.747 | 10.81x |
+| FIFO:80，跨 CPU 线程 | 21.859 | 119.713 | 5.48x |
+| FIFO:80，跨 CPU 进程 | 23.739 | 123.540 | 5.20x |
+| FIFO:80，绝对 timer | 126.121 | 181.625 | 1.44x |
+
+Linux/Starry 的 raw clock-pair 最小值分别为 0.693/28.407 微秒。这个固定取时成本已经
+进入每个样本，但不能从分位数中猜测性相减；它说明下一轮 profile 必须分别观察 syscall
+entry/return、futex wake、rq transaction 和 switch tail，不能把全部差值归给 scheduler。
+相对上一检查点，Starry clock-pair 慢 9.8%，四个 futex p50 变化为 +1.4% 到 +6.0%，
+两个 timer p50 下降 1.7%/12.0%；QEMU 运行由 79.19 秒变为 81.39 秒。当前提交没有修改
+scheduler，且取时基线同步变慢，因此这些单轮变化只证明修正后的协议可完整运行，不作为
+调度性能回退或改善声明。可信的绝对结果确认当前仍未达到 Linux RT 同一水平，最大固定
+差距位于同 CPU futex/FIFO 路径，下一阶段优先剖析该调用链。
+
 ## 模块化结果
 
 - `TaskSystem` orchestration 只负责编排，registry/reap、placement、owner scheduling、deadline、PI、balance、deferred work 分模块；
