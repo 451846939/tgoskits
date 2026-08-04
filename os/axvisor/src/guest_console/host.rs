@@ -40,8 +40,9 @@ fn console_reader_isolation_cpu(
 pub(crate) fn configure_host_console_reader(vms: &[AxVMRef]) -> Result<()> {
     axvm::host::console::set_input_irq_enabled(false);
 
+    let host_cpu_count = axvm::host::cpu::count();
     let isolation_cpu = console_reader_isolation_cpu(
-        axvm::host::cpu::count(),
+        host_cpu_count,
         vms.iter()
             .flat_map(|vm| vm.vcpu_snapshots())
             .map(|vcpu| vcpu.phys_cpu_set),
@@ -66,7 +67,7 @@ pub(crate) fn configure_host_console_reader(vms: &[AxVMRef]) -> Result<()> {
     let owner_cpu_id = u32::try_from(owner_cpu)
         .map(CpuId::new)
         .map_err(|_| anyhow::anyhow!("host console CPU {owner_cpu} exceeds scheduler CPU IDs"))?;
-    let mut owner_affinity = CpuSet::empty(ax_hal::cpu_num());
+    let mut owner_affinity = CpuSet::empty(host_cpu_count);
     if !owner_affinity.insert(owner_cpu_id) {
         bail!("host console CPU {owner_cpu} is outside the scheduler topology");
     }
