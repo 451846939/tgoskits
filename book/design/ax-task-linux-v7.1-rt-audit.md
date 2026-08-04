@@ -84,6 +84,23 @@ Linux 用于核对状态所有权、锁序和发布顺序，不复制其对象�
 
 `PreparedThreadSwitch::commit()` 只发布 runtime anchor。AArch64/RISC-V/LoongArch 的裸切换尾必须随后写 current-task 寄存器；x86 的 anchor 即 GS current 来源，不需要第二个寄存器写入。漏掉第二阶段会由 `CurrentThreadMismatch` 检出。
 
+### CPU-owner per-CPU 安全边界
+
+`scheduler_current_thread()` 只服务 task-owned 状态。IRQ depth、scheduler baton、CPU remote endpoint
+等物理 CPU 状态不得先经 current-task header 再反查 CPU area。Linux v7.1 也将
+runqueue 与 IRQ/context 状态通过 `raw_cpu_ptr()`/`this_cpu_ptr()` 选择；x86
+`__preempt_count` 直接使用 GS per-CPU 操作，不依赖 `current_task` 反查。
+
+本分支的内部 `with_scheduler_cpu[_mut]()` 因此只从架构 CPU-area 来源构造
+非逃逸 `SchedulerCpuArea` token，不经 task header，也不在每次 guard 访问时
+重建并重验完整 `CpuAreaRef`。HRTB callback 禁止 token 逃逸。它不替代常规
+`CpuPin`：调用者必须已经保证不迁移/不切换，可变访问还必须排除本地
+IRQ 重入和远程别名。RISC-V LinuxCurrent 模式的 `tp` 同时是 current header，
+因此该后端仍可从 header 导出 area；这是物理寄存器差异，不改变前端
+“访问 CPU-owned 状态”的单一语义。host 确定性回归对每次 CPU-owner 选择要求
+`cpu_base=1, current_thread=0, initialized_area_validations=0`，防止
+x86/AArch64/LoongArch 退回 task-header 绕行或重复 area bootstrap/identity 验证。
+
 ## 总体所有权分层
 
 ```text
@@ -1308,6 +1325,43 @@ clock-pair 从上一可比轮的 25.437 微秒升到 27.342 微秒，QEMU 时间
 “先看时基、不可比即停止”的规则在第二项开始前终止，没有用更慢宿主样本制造结论。当前
 检查点的确定性收益是 owner claim 和 PI preempt transaction 减少；timer 差异留给独立
 clockevent generation/early-fire 阶段验证，仍不宣称已达到 Linux RT 绝对性能。
+
+### 2026-08-05 CPU-owner per-CPU 直接访问
+
+qperf leaf 样本中 `cpu_local::register::current_thread()`、`current_area()` 与 guard enter/exit
+反复出现。完整调用链显示 `RuntimeGuardState` 和 `CPU_REMOTE_HANDLE` 都是
+物理 CPU 所有状态，但旧 `with_scheduler_current[_mut]()` 每次先读 current
+thread，再从 `CurrentThreadHeader::cpu_area_base()` 反查 per-CPU 符号。这与 Linux
+v7.1 scheduler/IRQ 状态直接使用 `raw_cpu_ptr()`/`this_cpu_ptr()` 的 owner 边界不同。
+
+首个确定性红测统计架构寄存读：旧实现每次 CPU-owner 访问为
+`cpu_base=0, current_thread=1`。第一版直接使用 `CpuAreaRef` 后虽变为
+`1/0`，第二个红测仍稳定观察到每次重建完整 area 并重复检查
+bootstrap header/identity 一次。最终实现以不可逃逸的 `SchedulerCpuArea`
+token 只选择架构 CPU base，宏生成符号只能在 HRTB callback 内构造 typed
+pointer。最终操作数为 `cpu_base=1, current_thread=0,
+initialized_area_validations=0`；常规 `CpuPin` 仍保留 current-task 与 area 的双源完整
+校验，不因热路优化降低通用安全边界。
+
+与远端上一检查点相同的 x86_64 Q35/TCG 完整组打印正式
+`WAKEUP_LATENCY_PASSED`，QEMU workload 由 81.30 秒降到 79.19 秒（-2.6%）。
+guest clock-pair 由 28.983 微秒降到 25.877 微秒，因此原始 p50 只作阶段趋势：
+
+| 场景 p50 | 上一检查点 | 当前 | 单轮变化 |
+| --- | ---: | ---: | ---: |
+| OTHER 同 CPU futex | 129.489 us | 122.544 us | -5.4% |
+| OTHER 跨 CPU thread | 118.924 us | 115.928 us | -2.5% |
+| OTHER 跨 CPU process | 120.051 us | 115.597 us | -3.7% |
+| OTHER absolute timer | 219.145 us | 222.061 us | +1.3% |
+| FIFO 同 CPU futex | 129.409 us | 127.012 us | -1.9% |
+| FIFO 跨 CPU thread | 118.168 us | 117.093 us | -0.9% |
+| FIFO 跨 CPU process | 122.082 us | 117.515 us | -3.7% |
+| FIFO absolute timer | 225.409 us | 184.774 us | -18.0% |
+
+首次基线恶化到 33.220 微秒的复跑按规则中止，没有混入表格。相对那个仍重复
+area 校验的中间版（clock-pair 26.872 微秒），最终版八项 p50 全部下降，
+其中 OTHER/FIFO timer 分别下降 12.8%/29.8%。这与确定性删除完整 area 重验的
+方向一致，但绝对延迟仍明显高于 Linux PREEMPT_RT，不宣称已达到同一水平。
 
 ## 模块化结果
 

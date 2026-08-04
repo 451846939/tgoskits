@@ -371,10 +371,10 @@ pub(super) fn current_cpu_owner_handles(cpu_pin: &CpuPin) -> CurrentCpuOwnerHand
 ///
 /// # Safety
 ///
-/// The caller must keep the scheduler-owned current thread alive and prevent
-/// context switches and local IRQ re-entry for the complete observation.
+/// The caller must prevent migration, context switches, and local IRQ re-entry
+/// for the complete observation.
 pub(super) unsafe fn scheduler_current_cpu_remote_handle() -> usize {
-    unsafe { CPU_REMOTE_HANDLE.with_scheduler_current(|slot| slot.get().copied().unwrap_or(0)) }
+    unsafe { CPU_REMOTE_HANDLE.with_scheduler_cpu(|slot| slot.get().copied().unwrap_or(0)) }
         .unwrap_or(0)
 }
 

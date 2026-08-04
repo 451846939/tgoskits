@@ -208,16 +208,17 @@ fn exercise_current_area(pin: &CpuPin<'_>, cpu0: PerCpuArea) {
     // migration, IRQ/re-entry, and remote access for the complete callback.
     unsafe {
         STRUCT
-            .with_scheduler_current_mut(|value| value.foo = 0x2333)
+            .with_scheduler_cpu_mut(|value| value.foo = 0x2333)
             .unwrap();
     }
     assert_eq!(
         cpu_local::host_test::register_read_counts(),
         cpu_local::host_test::RegisterReadCounts {
-            cpu_base: 0,
-            current_thread: 1,
+            cpu_base: 1,
+            current_thread: 0,
+            initialized_area_validations: 0,
         },
-        "pre-guard access must not reconstruct a full CpuPin"
+        "CPU-owner access must not route through task state or rebuild the installed CPU area"
     );
 
     assert!(BOOL.read_current(pin));

@@ -458,9 +458,9 @@ fn current_preempt_depth() -> u32 {
 
 fn with_guard_state<R>(operation: impl for<'value> FnOnce(&'value RuntimeGuardState) -> R) -> R {
     // SAFETY: callers run on an offline CPU or with raw local IRQ exclusion,
-    // so the current thread and every guard-state mutation remain fixed for
-    // the complete non-escaping callback.
-    unsafe { RUNTIME_GUARD_STATE.with_scheduler_current(operation) }
+    // so the selected physical CPU and every guard-state mutation remain
+    // fixed for the complete non-escaping callback.
+    unsafe { RUNTIME_GUARD_STATE.with_scheduler_cpu(operation) }
         .unwrap_or_else(|error| panic!("runtime guard CPU-local state is invalid: {error}"))
 }
 
@@ -474,7 +474,7 @@ fn with_guard_state_mut<R>(
     );
     // SAFETY: local IRQ exclusion prevents migration, re-entry, and every
     // conflicting owner access for the complete callback.
-    unsafe { RUNTIME_GUARD_STATE.with_scheduler_current_mut(operation) }
+    unsafe { RUNTIME_GUARD_STATE.with_scheduler_cpu_mut(operation) }
         .unwrap_or_else(|error| panic!("runtime guard CPU-local state is invalid: {error}"))
 }
 

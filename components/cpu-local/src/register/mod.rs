@@ -149,6 +149,8 @@ pub(crate) mod host_test {
         pub cpu_base: usize,
         /// Reads of the architecture current-thread pointer.
         pub current_thread: usize,
+        /// Full reconstructions and identity checks of an initialized area.
+        pub initialized_area_validations: usize,
     }
 
     /// Resets the current host thread's modeled register read counters.
@@ -159,6 +161,10 @@ pub(crate) mod host_test {
     /// Returns the current host thread's modeled register read counters.
     pub fn register_read_counts() -> RegisterReadCounts {
         super::imp::register_read_counts()
+    }
+
+    pub(crate) fn record_initialized_area_validation() {
+        super::imp::record_initialized_area_validation();
     }
 }
 
@@ -189,6 +195,24 @@ pub(crate) fn current_area() -> Result<CpuAreaRef, CpuLocalError> {
     // SAFETY: only install_cpu_area writes the architecture-owned base, and
     // its contract requires a shutdown-lifetime initialized area.
     unsafe { CpuAreaRef::from_initialized_base(area_base) }
+}
+
+/// Reads the architecture CPU-area base for a scheduler-owned access.
+///
+/// # Safety
+///
+/// The caller must prevent migration and context switches while using the
+/// selected CPU. The installed area must retain its shutdown lifetime.
+#[inline(always)]
+pub(crate) unsafe fn scheduler_current_cpu_base() -> Result<usize, CpuLocalError> {
+    let area_base = unsafe { imp::read_cpu_base()? };
+    if area_base == 0 {
+        return Err(CpuLocalError::AreaNotInstalled);
+    }
+    if !area_base.is_multiple_of(core::mem::align_of::<crate::CpuAreaPrefix>()) {
+        return Err(CpuLocalError::InvalidAreaBase { base: area_base });
+    }
+    Ok(area_base)
 }
 
 /// Publishes the scheduler anchor before the architecture switch tail.

@@ -88,21 +88,25 @@ where
         operation(unsafe { pointer.as_mut() })
     }
 
-    /// Mutates the scheduler's current CPU object before a [`CpuPin`] exists.
+    /// Mutates a CPU-owned scheduler object before a [`CpuPin`] exists.
     ///
     /// # Safety
     ///
-    /// The caller must keep the scheduler-owned current thread alive, prevent
-    /// context switches and local IRQ/re-entry for the complete callback, and
-    /// exclude every conflicting remote access to this object. Offline CPU
-    /// bootstrap satisfies the same contract before interrupt publication.
+    /// The caller must prevent migration, context switches, and local
+    /// IRQ/re-entry for the complete callback, and exclude every conflicting
+    /// remote access to this object. Offline CPU bootstrap satisfies the same
+    /// contract before interrupt publication.
     #[doc(hidden)]
-    pub unsafe fn with_scheduler_current_mut<R>(
+    pub unsafe fn with_scheduler_cpu_mut<R>(
         &self,
         operation: impl for<'value> FnOnce(&'value mut T) -> R,
     ) -> Result<R, cpu_local::CpuLocalError> {
-        let mut pointer = unsafe { scheduler_current_ptr::<T, S>()? };
-        Ok(operation(unsafe { pointer.as_mut() }))
+        unsafe {
+            cpu_local::with_scheduler_cpu_area(|area| {
+                let mut pointer = area.symbol_ptr::<T>(S::offset())?;
+                Ok(operation(pointer.as_mut()))
+            })?
+        }
     }
 }
 
@@ -121,37 +125,25 @@ where
         operation(unsafe { S::current_ptr(pin).as_ref() })
     }
 
-    /// Borrows the scheduler's current CPU object before a [`CpuPin`] exists.
+    /// Borrows a CPU-owned scheduler object before a [`CpuPin`] exists.
     ///
     /// # Safety
     ///
-    /// The caller must keep the scheduler-owned current thread alive, prevent
-    /// context switches and local IRQ/re-entry for the complete callback, and
-    /// exclude every conflicting mutation of this object. Offline CPU
-    /// bootstrap satisfies the same contract before interrupt publication.
+    /// The caller must prevent migration and context switches for the complete
+    /// callback and exclude every conflicting mutation of this object. Offline
+    /// CPU bootstrap satisfies the same contract before interrupt publication.
     #[doc(hidden)]
-    pub unsafe fn with_scheduler_current<R>(
+    pub unsafe fn with_scheduler_cpu<R>(
         &self,
         operation: impl for<'value> FnOnce(&'value T) -> R,
     ) -> Result<R, cpu_local::CpuLocalError> {
-        let pointer = unsafe { scheduler_current_ptr::<T, S>()? };
-        Ok(operation(unsafe { pointer.as_ref() }))
+        unsafe {
+            cpu_local::with_scheduler_cpu_area(|area| {
+                let pointer = area.symbol_ptr::<T>(S::offset())?;
+                Ok(operation(pointer.as_ref()))
+            })?
+        }
     }
-}
-
-#[inline(always)]
-unsafe fn scheduler_current_ptr<T, S>() -> Result<NonNull<T>, cpu_local::CpuLocalError>
-where
-    S: PerCpuSymbol<T>,
-{
-    let thread = unsafe { cpu_local::scheduler_current_thread()? };
-    let area_base = unsafe { thread.as_ref() }
-        .cpu_area_base()
-        .ok_or(cpu_local::CpuLocalError::CurrentThreadMismatch)?;
-    let address = area_base
-        .checked_add(S::offset())
-        .ok_or(cpu_local::CpuLocalError::AddressOverflow)?;
-    NonNull::new(address as *mut T).ok_or(cpu_local::CpuLocalError::CurrentThreadMismatch)
 }
 
 mod primitive {
