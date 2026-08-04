@@ -412,7 +412,7 @@ impl TaskRuntime for UnitTestRuntime {
     ) -> AddressSpaceReclaimArmOutcome {
         ADDRESS_SPACE_RECLAIM_ARM_OUTCOME.with(Cell::get)
     }
-    unsafe fn switch_context(_previous: ExecutionContextHandle, _next: ExecutionContextHandle) {
+    unsafe fn switch_context(_switch: ContextSwitch) {
         assert!(
             ALLOW_CONTEXT_SWITCH.with(Cell::get),
             "unit-test context switches must be explicitly scoped"

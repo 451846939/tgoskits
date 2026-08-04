@@ -194,10 +194,7 @@ impl_task_runtime! {
         ) -> AddressSpaceReclaimArmOutcome {
             panic!("ax-sync unit tests do not own address-space tokens")
         }
-        unsafe fn switch_context(
-            _previous: ExecutionContextHandle,
-            _next: ExecutionContextHandle,
-        ) {
+        unsafe fn switch_context(_switch: ContextSwitch) {
             panic!("unit-test runtime has no execution contexts")
         }
         fn activate_address_space(_activation: AddressSpaceActivation) -> RuntimeStatus {

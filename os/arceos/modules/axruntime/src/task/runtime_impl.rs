@@ -361,13 +361,10 @@ impl_task_runtime! {
             arm_runtime_address_space_reclaim(address_space)
         }
 
-        unsafe fn switch_context(
-            previous: ExecutionContextHandle,
-            next: ExecutionContextHandle,
-        ) {
-            // SAFETY: the TaskRuntime contract passes the committed previous
-            // and next handles under the active scheduler baton.
-            unsafe { switch_runtime_context(previous, next) };
+        unsafe fn switch_context(switch: ContextSwitch) {
+            // SAFETY: the TaskRuntime contract passes one committed move-only
+            // switch transaction under the active scheduler baton.
+            unsafe { switch_runtime_context(switch) };
         }
 
         fn activate_address_space(activation: AddressSpaceActivation) -> RuntimeStatus {

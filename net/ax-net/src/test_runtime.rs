@@ -128,10 +128,7 @@ impl_task_runtime! {
         ) -> AddressSpaceReclaimArmOutcome {
             panic!("ax-net unit tests do not own address-space tokens")
         }
-        unsafe fn switch_context(
-            _previous: ExecutionContextHandle,
-            _next: ExecutionContextHandle,
-        ) {
+        unsafe fn switch_context(_switch: ContextSwitch) {
             panic!("ax-net unit tests do not switch scheduler contexts")
         }
         fn activate_address_space(_activation: AddressSpaceActivation) -> RuntimeStatus {

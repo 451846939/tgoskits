@@ -7,12 +7,14 @@ use core::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use ax_hal::percpu::{CpuPin, CurrentContext, CurrentThreadHeader, PreviousThreadBinding};
+use ax_hal::percpu::{
+    CpuPin, CurrentContext, CurrentThreadHeader, PreparedThreadSwitch, PreviousThreadBinding,
+};
 use ax_task::{
     TaskError,
     runtime::{
-        ContextThreadBinding, ExecutionContextHandle, KernelContextRequest, RuntimeHandleResult,
-        RuntimeStatus, StackHandle, UserContextRequest,
+        ContextSwitch, ContextThreadBinding, ExecutionContextHandle, KernelContextRequest,
+        RuntimeHandleResult, RuntimeStatus, StackHandle, UserContextRequest,
     },
 };
 
@@ -328,6 +330,21 @@ pub(super) fn bind_runtime_context_thread(binding: ContextThreadBinding) -> Runt
     RuntimeStatus::Success
 }
 
+fn prepare_runtime_thread_switch<'switch>(
+    pin: &'switch CpuPin<'_>,
+    previous: &'static RuntimeContext,
+    next: &'static RuntimeContext,
+) -> (PreparedThreadSwitch<'switch>, PreviousThreadBinding) {
+    // `prepare_thread_switch` is the single production authority for current
+    // publication, previous binding and next-unbound validation. Repeating
+    // those checks here would reread the architecture current-thread register
+    // and split one switch transaction across two facts.
+    // SAFETY: the scheduler baton pins this CPU, and both runtime contexts stay
+    // live through the raw switch and incoming tail.
+    unsafe { ax_hal::percpu::prepare_thread_switch(pin, previous.header(), next.header()) }
+        .unwrap_or_else(|error| panic!("failed to prepare runtime context switch: {error}"))
+}
+
 #[cfg(all(target_arch = "riscv64", feature = "fp-simd"))]
 pub(super) fn install_initial_fp_state(context: usize, fp_state: ax_hal::cpu::FpState) {
     let context = ptr::with_exposed_provenance_mut::<RuntimeContext>(context);
@@ -336,69 +353,37 @@ pub(super) fn install_initial_fp_state(context: usize, fp_state: ax_hal::cpu::Fp
     unsafe { (*(*context).inner.get()).fp_state = fp_state };
 }
 
-pub(super) unsafe fn switch_runtime_context(
-    previous: ExecutionContextHandle,
-    next: ExecutionContextHandle,
-) {
-    assert!(!previous.is_none(), "previous task context is missing");
-    assert!(!next.is_none(), "next task context is missing");
-    assert_ne!(
-        previous, next,
-        "raw context switch requires distinct contexts"
-    );
+pub(super) unsafe fn switch_runtime_context(switch: ContextSwitch) {
     crate::guard::assert_scheduler_switch_baton();
-    let previous_raw = previous.into_raw();
-    let next_raw = next.into_raw();
+    let previous_raw = switch.previous().into_raw();
+    let next_raw = switch.next().into_raw();
     let previous = ptr::with_exposed_provenance_mut::<RuntimeContext>(previous_raw);
     let next = ptr::with_exposed_provenance_mut::<RuntimeContext>(next_raw);
     // SAFETY: the active scheduler baton keeps local IRQs disabled for
     // preparation, publication, and the naked switch tail.
     unsafe {
         with_current_cpu_pin(|pin| {
-            let published_previous = current_runtime_context(pin)
-                .unwrap_or_else(|status| panic!("current runtime context is invalid: {status:?}"));
-            assert!(
-                ptr::eq(published_previous, previous),
-                "scheduler previous context differs from the pinned current header"
-            );
             // SAFETY: both handles stay live and are uniquely owned by the
             // committed scheduler switch plan.
             let previous_context = &*previous;
             let next_context = &*next;
             let previous_arch_context = &mut *previous_context.inner.get();
             let next_arch_context = &mut *next_context.inner.get();
-            assert_eq!(
+            debug_assert_eq!(
                 previous_arch_context.current_header(),
                 Some(previous_context.header().as_non_null()),
                 "outgoing architecture context retained a different current header"
             );
-            assert_eq!(
+            debug_assert_eq!(
                 next_arch_context.current_header(),
                 Some(next_context.header().as_non_null()),
                 "incoming architecture context retained a different current header"
             );
-            assert!(
-                previous_context.header.cpu_area() == Some(pin.area()),
-                "scheduler previous context is not bound to this CPU"
-            );
-            assert!(
-                next_context.header.cpu_area().is_none(),
-                "scheduler next context is already CPU-bound"
-            );
-            assert!(
-                !next_context.has_switch_tail(),
-                "scheduler next context retained an unfinished switch tail"
-            );
-
             // All fallible CPU binding validation and FP preparation precede
             // the irreversible baton transfer. Address-space activation is an
             // independent ax-runtime transaction and is never repeated here.
-            let (prepared, previous_binding) = ax_hal::percpu::prepare_thread_switch(
-                pin,
-                previous_context.header(),
-                next_context.header(),
-            )
-            .unwrap_or_else(|error| panic!("failed to prepare runtime context switch: {error}"));
+            let (prepared, previous_binding) =
+                prepare_runtime_thread_switch(pin, previous_context, next_context);
             previous_arch_context.prepare_switch_to(next_arch_context);
             let tail = RuntimeSwitchTail {
                 previous: previous_context.header().as_non_null(),
@@ -467,5 +452,46 @@ mod tests {
         })
         .join()
         .expect("modeled CPU must complete the switch tail");
+    }
+
+    #[test]
+    fn switch_prepare_reads_the_current_thread_register_once() {
+        std::thread::spawn(|| {
+            let storage = Box::leak(Box::new(MaybeUninit::<CpuAreaPrefix>::uninit()));
+            let base = storage.as_mut_ptr() as usize;
+            storage.write(CpuAreaPrefix::initialize(CpuIndex::try_from(0).unwrap(), base).unwrap());
+            // SAFETY: the leaked prefix is initialized and remains mapped for
+            // this modeled CPU's complete process lifetime.
+            let area = unsafe { CpuAreaRef::from_initialized_base(base) }.unwrap();
+            // SAFETY: this fresh host thread owns its CPU-local register model.
+            unsafe { cpu_local::install_cpu_area(area) }.unwrap();
+
+            let previous =
+                RuntimeContext::allocate(ax_hal::context::TaskContext::new(), StackHandle::NONE);
+            let next =
+                RuntimeContext::allocate(ax_hal::context::TaskContext::new(), StackHandle::NONE);
+
+            // SAFETY: both leaked contexts remain pinned while the modeled CPU
+            // validates and then rolls back this uncommitted switch.
+            unsafe {
+                cpu_local::with_cpu_pin(|pin| {
+                    let previous = &*previous;
+                    let next = &*next;
+                    cpu_local::install_bootstrap_thread(pin, previous.header()).unwrap();
+                    cpu_local::host_test::reset_register_read_counts();
+
+                    let (prepared, _binding) = prepare_runtime_thread_switch(pin, previous, next);
+                    let reads = cpu_local::host_test::register_read_counts();
+                    assert_eq!(
+                        reads.current_thread, 1,
+                        "switch preparation must validate current publication exactly once"
+                    );
+                    drop(prepared);
+                })
+            }
+            .unwrap();
+        })
+        .join()
+        .expect("modeled CPU must complete switch preparation");
     }
 }

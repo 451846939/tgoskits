@@ -1,4 +1,5 @@
 use super::*;
+use crate::runtime::ContextSwitch;
 
 /// Runs one scheduler decision at a task/IRQ-return safe point.
 ///
@@ -276,9 +277,11 @@ pub(super) fn execute_switch_plan(
     prepare_next_address_space(next.address_space(), next.thread());
     #[cfg(feature = "qperf-metrics")]
     crate::metrics::record_context_switch();
+    let switch = ContextSwitch::new(previous.context(), next.context())
+        .unwrap_or_else(|| task_runtime::fatal_invariant(6, next.thread().as_u64() as usize));
     // SAFETY: the scheduler committed both endpoint states before releasing its
     // locks. Runtime handles remain live, and local IRQs stay disabled here.
-    unsafe { task_runtime::switch_context(previous.context(), next.context()) };
+    unsafe { task_runtime::switch_context(switch) };
     scheduler_frame.refresh_current_cpu();
     if complete_current_context_switch_tail(scheduler_frame).is_err() {
         task_runtime::fatal_invariant(5, 0);

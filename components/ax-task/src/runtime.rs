@@ -77,6 +77,42 @@ opaque_handle!(
     /// Opaque handle to an architecture execution context.
     ExecutionContextHandle
 );
+
+/// Move-only runtime transaction for one committed context switch.
+///
+/// ax-task constructs this value only after the scheduler has committed two
+/// distinct live endpoints and released its internal locks. Consuming the
+/// transaction at the runtime boundary prevents a switch plan from being
+/// replayed or partially reinterpreted by callers.
+#[derive(Debug, Eq, PartialEq)]
+#[repr(C)]
+pub struct ContextSwitch {
+    previous: ExecutionContextHandle,
+    next: ExecutionContextHandle,
+}
+
+impl ContextSwitch {
+    pub(crate) fn new(
+        previous: ExecutionContextHandle,
+        next: ExecutionContextHandle,
+    ) -> Option<Self> {
+        if previous.is_none() || next.is_none() || previous == next {
+            None
+        } else {
+            Some(Self { previous, next })
+        }
+    }
+
+    /// Returns the outgoing runtime context.
+    pub const fn previous(&self) -> ExecutionContextHandle {
+        self.previous
+    }
+
+    /// Returns the incoming runtime context.
+    pub const fn next(&self) -> ExecutionContextHandle {
+        self.next
+    }
+}
 opaque_handle!(
     /// Opaque handle to a runtime-owned stack allocation.
     StackHandle
@@ -892,13 +928,15 @@ pub trait TaskRuntime {
         address_space: AddressSpaceHandle,
     ) -> AddressSpaceReclaimArmOutcome;
 
-    /// Switches from `previous` to `next` with local interrupts disabled.
+    /// Consumes one committed context-switch transaction with local interrupts
+    /// disabled.
     ///
     /// # Safety
     ///
-    /// Both handles must identify live contexts owned by the runtime. The
-    /// caller must have committed scheduler state and released runqueue locks.
-    unsafe fn switch_context(previous: ExecutionContextHandle, next: ExecutionContextHandle);
+    /// Both handles in `switch` must identify live contexts owned by the
+    /// runtime. The caller must have committed scheduler state and released
+    /// runqueue locks. The provider must consume the transaction exactly once.
+    unsafe fn switch_context(switch: ContextSwitch);
 
     /// Activates the next context's explicit address-space state.
     ///

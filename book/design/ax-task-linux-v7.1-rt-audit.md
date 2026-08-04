@@ -1000,6 +1000,15 @@ registry lookup 为 0。旧实现稳定得到 `(2, 2)`，新实现得到 `(2, 0)
 调用路径缩减，不把未复测的端到端延迟声明为性能提升；后续仍用同一 Q35/TCG
 wakeup-latency workload 与 Linux PREEMPT_RT 对比。
 
+同一阶段把两个可复制的 context handle 参数替换为 move-only `ContextSwitch`。ax-task
+只能在调度决定已提交且 previous/next 非空、互异时构造该事务，ax-runtime 只能消费
+一次。runtime 的 production 校验权威收敛到 `cpu-local::prepare_thread_switch()`：它在
+同一 pin 下核对 current publication、previous CPU binding 并预绑定 next，失败时 token
+析构回滚。RuntimeContext 与 TaskContext 的不可变构造关系只保留 debug assertion，不再
+在每次 release switch 中重复验证。host 寄存器红测中，旧 prepare 路径读取
+current-thread publication 2 次，新路径为 1 次；switch tail 仍以
+`PreviousThreadBinding` 的 epoch 在 incoming continuation 中唯一清除 outgoing 绑定。
+
 ## 模块化结果
 
 - `TaskSystem` orchestration 只负责编排，registry/reap、placement、owner scheduling、deadline、PI、balance、deferred work 分模块；

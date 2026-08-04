@@ -29,7 +29,7 @@ use ax_task::{
     impl_trait as impl_task_runtime,
     runtime::{
         AddressSpaceActivation, AddressSpaceDestroyOutcome, AddressSpaceHandle,
-        AddressSpaceReclaimArmOutcome, ContextThreadBinding, CpuRemoteHandle,
+        AddressSpaceReclaimArmOutcome, ContextSwitch, ContextThreadBinding, CpuRemoteHandle,
         CurrentCpuLocalHandle, CurrentCpuOwnerHandles, ExecutionContextHandle, IrqGuardToken,
         KernelContextRequest, RuntimeCpuId, RuntimeHandleResult, RuntimeStatus, StackHandle,
         StackRequest, TaskRuntime, TaskSystemHandle, TlsHandle, TlsRequest, UserContextRequest,

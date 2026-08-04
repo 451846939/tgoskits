@@ -427,14 +427,12 @@ impl_trait! {
         ) -> AddressSpaceReclaimArmOutcome {
             AddressSpaceReclaimArmOutcome::Ready
         }
-        unsafe fn switch_context(
-            previous: ExecutionContextHandle,
-            next: ExecutionContextHandle,
-        ) {
+        unsafe fn switch_context(switch: ContextSwitch) {
             let cpu = CURRENT_CPU.with(Cell::get);
             VIRTUAL_RUNTIME.with(|runtime| {
                 let mut runtime = runtime.borrow_mut();
-                let (previous_raw, next_raw) = (previous.into_raw(), next.into_raw());
+                let (previous_raw, next_raw) =
+                    (switch.previous().into_raw(), switch.next().into_raw());
                 {
                     let state = runtime
                         .cpu_mut(cpu)
