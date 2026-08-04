@@ -1455,6 +1455,46 @@ Linux v7.1 `entry_SYSCALL_64`（`arch/x86/entry/entry_64.S:87-121`）不在普�
 固定 syscall 成本下降后仍未达到同一水平，下一阶段继续处理剩余 user-return MSR owner
 publication，以及 qperf 已显示的 current identity、owner pick 和 guard 固定成本。
 
+#### per-CPU 用户 TLS 物理 owner
+
+第一版继续照搬 Linux `__switch_to()` 的位置，在每次 scheduler context switch 保存和安装
+用户 FS/GS。确定性边界测试虽然通过，但同一 benchmark 立即暴露了设计错误：Starry 的
+kernel worker 与 idle 不使用用户 TLS，这种做法仍会在用户线程与内核线程之间无条件清零、
+恢复 MSR。OTHER 同核/跨核 p50 分别从 123.100/113.047 微秒退化到
+125.893/118.823 微秒（+2.3%/+5.1%）。该中间实现未提交，不能作为兼容路径保留。
+
+最终模型把“任务期望值”和“CPU 物理值”分离：
+
+- `UserContext` 继续独占任务期望的 FS/GS base；
+- `CpuUserTlsState` 位于 CPU area 的 architecture reserve，独占当前 CPU 已安装的物理镜像
+  及非零 generation；只允许本 CPU 在 IRQ 关闭时访问；
+- scheduler switch 不搬运用户 TLS，kernel worker/idle 也不清零 TLS；
+- `UserContext::run()` 在最后一次返回 ring 3 的边界比较 task image 与 CPU image，只对变化
+  的寄存器执行 `WRMSR`，更新完成后再发布 generation；
+- syscall/异常入口和 `enter_user` 汇编均不再含 TLS `RDMSR/WRMSR`。同一用户 owner 的稳态
+  syscall 因而从上一检查点的 2 次 `WRMSR` 收敛为 0，迁移、clone、`arch_prctl` 或首次
+  用户返回仍会正确安装变化值。
+
+这不是复制 Linux 的函数位置，而是复用 Linux 的单一物理 owner 原则。Linux 同时在 kernel
+task 中使用统一的 `thread_struct` 切换边界；TGOSKits 的 LinuxCurrent image 已把 user context
+与 kernel scheduler thread 分开，因此最窄且不会干扰内核线程的 owner 交接边界是 ring-3
+返回点。
+
+确定性红测先要求 `prepare_switch_to()` 不得安装用户 TLS、`enter_user` 的 MSR 读写数必须为
+0，并要求 CPU-local generation 与 changed-only 比较同时存在；它在中间实现上稳定失败，最终
+实现通过。ax-cpu host test 覆盖未初始化时写两个寄存器、单字段变化时只写一个、相同 owner
+不写寄存器。x86 `arch_prctl-tls` 与 `clone-tls` 两组 QEMU 均正式通过：FS/GS 7/7、
+clone/pthread/`CLONE_SETTLS` 21/21、futex wake-op SMP 80,000/80,000 和 AVX context
+switch 4/4。
+
+最终完整 benchmark 的 QEMU 用时为 78.53 秒，上一检查点为 78.11 秒（+0.5%，视为持平）。
+raw clock-pair 从 25.458 变为 27.433 微秒（+7.8%）；八个场景的 raw p50 变化范围为
+-1.6% 到 +4.2%，但按各次 clock-pair 归一后全部改善 3.3% 到 8.7%。原始 p50 与 Linux RT
+的倍数仍为：OTHER 8.10x/4.51x/4.18x/2.42x，FIFO 10.19x/5.33x/5.04x/1.73x。
+因此本检查点只证明消除了稳态用户返回的架构性 MSR 开销；绝对性能仍未达到 Linux RT
+同一水平，后续必须继续审计 current identity、guard 与 wake/rq transaction，不能把
+clock-normalized 改善表述成已经完成性能对齐。
+
 ## 模块化结果
 
 - `TaskSystem` orchestration 只负责编排，registry/reap、placement、owner scheduling、deadline、PI、balance、deferred work 分模块；
@@ -1481,6 +1521,7 @@ publication，以及 qperf 已显示的 current identity、owner pick 和 guard 
 - #1772：Starry ktest 错误启用 `log/std` 的 feature graph；
 - #1773：Starry target-aware clippy 永久 CI 能力；
 - #1838：Starry USBFS no-std `event-listener` wake transport 可能在长序列 USB audio 中永久自旋；
+- #1877：Axvisor NUC guest smoke 完成后宿主延迟触发 `#PF`，需单独追踪设备/IRQ teardown 生命周期；
 - USB 控制器、USBFS、第三方 connection manager 的外围协议缺陷，除非它们破坏调度交接契约。
 
 ## 验证策略

@@ -133,6 +133,7 @@ impl UserContext {
         assert_eq!(self.ss, gdt::UDATA.0 as _);
 
         crate::asm::disable_irqs();
+        super::local_state::install_current_user_tls(self.fs_base as _, self.gs_base as _);
 
         unsafe { enter_user(self) };
 
@@ -226,6 +227,7 @@ pub(super) fn init_syscall() {
         !Cr4::read().contains(Cr4Flags::FSGSBASE),
         "LinuxCurrent user TLS requires trapping all FS/GS base changes"
     );
+    super::local_state::initialize_cpu_user_tls();
     LStar::write(x86_64::VirtAddr::new_truncate(
         syscall_entry as *const () as usize as _,
     ));

@@ -131,13 +131,14 @@ fn public_api_exposes_user_registers_but_not_the_internal_trap_layout() {
 }
 
 #[test]
-fn x86_linux_current_keeps_user_tls_live_until_the_next_user_return() {
+fn x86_linux_current_installs_user_tls_only_at_user_owner_transitions() {
     let user = read_source("x86_64/uspace.rs");
     let run = function_body(&user, "pub fn run");
     assert!(!run.contains("write_user_thread_pointer"));
     assert!(!run.contains("write_thread_pointer"));
     assert!(!run.contains("KernelGsBase::write"));
     assert!(!run.contains("KernelGsBase::read"));
+    assert!(run.contains("install_current_user_tls"));
     assert!(user.contains("kernel_stack_pointer: u64"));
     assert!(!user.contains("kernel_fs_base"));
 
@@ -157,11 +158,22 @@ fn x86_linux_current_keeps_user_tls_live_until_the_next_user_return() {
         .split_once("enter_user:")
         .expect("x86 enter_user section must exist")
         .1;
-    assert_eq!(user_return.matches("wrmsr").count(), 2);
+    assert_eq!(user_return.matches("wrmsr").count(), 0);
     assert!(!user_return.contains("rdmsr"));
-    assert!(user_return.contains("user_fs_base_offset"));
-    assert!(user_return.contains("user_gs_base_offset"));
+    assert!(!user_return.contains("user_fs_base_offset"));
+    assert!(!user_return.contains("user_gs_base_offset"));
     assert!(user_return.contains("kernel_stack_pointer_offset"));
+
+    let context = read_source("x86_64/context.rs");
+    let prepare_switch = function_body(&context, "pub fn prepare_switch_to");
+    assert!(!prepare_switch.contains("switch_user_tls"));
+
+    let local_state = read_source("x86_64/local_state.rs");
+    assert!(local_state.contains("struct CpuUserTlsState"));
+    assert!(local_state.contains("CPU_AREA_ARCH_STATE_OFFSET"));
+    assert!(local_state.contains("generation"));
+    assert!(local_state.contains("previous.fs_base != next.fs_base"));
+    assert!(local_state.contains("previous.gs_base != next.gs_base"));
 }
 
 #[cfg(all(target_arch = "x86_64", feature = "uspace"))]

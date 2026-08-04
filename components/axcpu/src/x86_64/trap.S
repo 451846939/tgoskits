@@ -3,9 +3,7 @@
 
 .code64
 .equ NUM_INT, 256
-.equ IA32_FS_BASE, 0xc0000100
 .equ IA32_GS_BASE, 0xc0000101
-.equ IA32_KERNEL_GS_BASE, 0xc0000102
 
 .altmacro
 .macro DEF_HANDLER, i
@@ -161,19 +159,6 @@ enter_user:
     push r13
     push r14
     push r15
-    # Install the user TLS image before SWAPGS. Rust never treats FS as a
-    # kernel-owned register in a LinuxCurrent image.
-    mov     rax, [rdi + {user_gs_base_offset}]
-    mov     rdx, rax
-    shr     rdx, 32
-    mov     ecx, IA32_KERNEL_GS_BASE
-    wrmsr
-
-    mov     rax, [rdi + {user_fs_base_offset}]
-    mov     rdx, rax
-    shr     rdx, 32
-    mov     ecx, IA32_FS_BASE
-    wrmsr
 
     mov [rdi + {kernel_stack_pointer_offset}], rsp
 
