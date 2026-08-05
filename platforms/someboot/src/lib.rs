@@ -117,7 +117,12 @@ pub trait ArchTrait {
         Self::shutdown()
     }
     fn secondary_entry_fn_address() -> *const ();
-    fn cpu_on(hartid: usize, entry: usize, arg: usize) -> Result<(), CpuOnError>;
+    /// Delivers the architecture-specific wake request to one secondary CPU.
+    ///
+    /// This method owns only the hardware/firmware transport. The generic
+    /// someboot CPU lifecycle publishes `KICKED`, waits for the target CPU to
+    /// report `ALIVE`, and releases it into the OS entry path.
+    fn kick_secondary_cpu(hartid: usize, entry: usize, arg: usize) -> Result<(), CpuOnError>;
 
     /// Prepares the per-CPU one-shot timer in a masked, non-firing state.
     fn systimer_prepare_oneshot();

@@ -2191,6 +2191,48 @@ ax-sync 全部 unit test 已通过；`cargo xtask clippy --package ax-task` 2 �
 这一步消除了重复的 facade/preempt 进入，但尚未重新测量 x86_64 Starry 完整耗时或 Linux RT
 wake-latency，不能据结构收敛声称端到端性能变化。
 
+### 2026-08-06 四架构 secondary boot 同步所有权
+
+x86_64 ArceOS CI 曾在 CPU1 完成运行时初始化后，以
+`timeout waiting APIC ID 0x2 online` 偶发终止。相同提交前后两次 CI 和本地四核完整测试都能
+启动 CPU1/2/3，说明这不是固定 APIC 映射错误。旧 someboot 把架构 wake transport、AP 进入
+Rust 和运行时 online 三个阶段压进 x86 私有的全局 `AP_BOOTED_ID`；BSP 只给 QEMU 500 ms，
+而报错把 `_secondary_entry` 之前的超时错误描述成 scheduler online 失败。AArch64、RISC-V、
+LoongArch 的固件或 IPI `cpu_on` 又只确认请求已接受，四架构因此没有共同的 AP 启动完成语义。
+
+修改前完整核对 Linux v7.1 `kernel/cpu.c::cpuhp_can_boot_ap()`、
+`cpuhp_ap_sync_alive()`、`cpuhp_bp_sync_alive()` 和
+`arch/x86/kernel/smpboot.c::native_kick_ap()/do_boot_cpu()/start_secondary()`：
+
+- 架构层只拥有 PSCI/SBI/mailbox 或 INIT/SIPI 的 wake transport；
+- 通用 CPUHP 为每个 CPU 独立拥有 `DEAD / KICKED / ALIVE / SHOULD_ONLINE` 同步状态；
+- AP 以 full-barrier 原子交换发布 `ALIVE`，BSP 只允许把匹配 CPU 的 `ALIVE` 原子推进为
+  `SHOULD_ONLINE`，未知 limbo 状态不得猜测或重试；
+- x86 当前 SIPI 使用 `APIC_DM_STARTUP == 0x600`，不携带 INIT 的 level-assert 位；
+- BP 的 alive 等待上限是 10 秒，超时保留原状态并返回错误，不把延迟启动误当成功，也不创建
+  另一条启动路径。
+
+someboot 现在采用同一所有权模型：`PerCpuMeta` 继续只保存稳定的 trampoline ABI；每个动态
+CPU area 另有一个 shutdown-lifetime `CpuBootSync`，避免原子状态与 metadata 的 Copy/cache
+生命周期混合。通用 `power::cpu_on()` 在全局 CPU boot 写事务内发布 `KICKED`，调用更名后的
+`ArchTrait::kick_secondary_cpu()`，等待目标 `ALIVE` 后发布 `SHOULD_ONLINE`。四架构都在完成各自
+页表、最终栈并进入共享 `entry::secondary_entry()` 后报告 alive，再进入 OS secondary entry。
+x86 私有 `AP_BOOTED_ID`、私有启动锁和 500 ms 轮询全部删除；INIT/SIPI 只负责投递，SIPI 编码
+直接使用 Linux 的 `0x600`。运行时 scheduler online、IRQ ready 和 `INITED_CPUS` 仍由
+ax-runtime 分阶段发布，不能被平台 alive 状态替代。
+
+确定性红测 `startup_ipi_matches_linux_edge_triggered_delivery_mode` 在旧实现上得到
+`0x4600 != 0x600`；新的 per-CPU 行为测试还固定了错误 CPU 的 alive 不能释放目标 CPU，以及
+已经进入 `SHOULD_ONLINE` 的 limbo 状态不能重新 kick。该模型没有增加超时重试、APIC fallback
+或旧全局确认值兼容路径。
+
+当前检查点已通过 `cargo test -p someboot`（52 个单元测试及全部 integration test）、
+`cargo xtask clippy --package someboot`（8 组配置）和
+`cargo xtask clippy --package ax-runtime`（27 组配置）。四架构 ArceOS `rust/all` 与 C 套件均
+在四核 QEMU 上通过；LoongArch 额外的单核 unaligned-fixup 也通过。每个架构的 AP 都在共享
+同步点之后进入 ax-runtime，并完成 CPU1/2/3 的运行时初始化，因而验证覆盖的不只是固件接受
+启动请求，还包括最终栈、页表、CPU-local 绑定和 OS secondary entry。
+
 ## 模块化结果
 
 - `TaskSystem` orchestration 只负责编排，registry/reap、placement、owner scheduling、deadline、PI、balance、deferred work 分模块；
