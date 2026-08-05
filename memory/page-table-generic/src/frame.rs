@@ -168,14 +168,20 @@ where
         (vaddr.as_usize() >> shift) & mask
     }
 
-    pub fn page_size_from_level(level: usize) -> PageSize {
+    pub(crate) fn page_size_from_level(level: usize) -> PagingResult<PageSize> {
         match Self::level_size(level) {
-            0x1000 => PageSize::Size4K,
-            0x10_0000 => PageSize::Size1M,
-            0x20_0000 => PageSize::Size2M,
-            0x4000_0000 => PageSize::Size1G,
-            _ => PageSize::Size4K,
+            0x1000 => Ok(PageSize::Size4K),
+            0x10_0000 => Ok(PageSize::Size1M),
+            0x20_0000 => Ok(PageSize::Size2M),
+            0x4000_0000 => Ok(PageSize::Size1G),
+            _ => Err(PagingError::invalid_size(
+                "Page-table level has no corresponding PageSize",
+            )),
         }
+    }
+
+    pub(crate) fn level_for_page_size(page_size: PageSize) -> Option<usize> {
+        (1..=Self::PT_LEVEL).find(|level| Self::level_size(*level) == usize::from(page_size))
     }
 
     pub fn protect_recursive(
@@ -192,7 +198,7 @@ where
         if config.huge || level == 1 {
             self.as_slice_mut()[index] =
                 T::P::from_config(PteConfig::page(config.paddr, flags, config.huge));
-            return Ok(Self::page_size_from_level(level));
+            return Self::page_size_from_level(level);
         }
 
         let mut child = Self::from_paddr(config.paddr, self.allocator.clone());
@@ -212,7 +218,7 @@ where
             return Err(PagingError::not_mapped());
         }
         if config.huge || level == 1 {
-            let page_size = Self::page_size_from_level(level);
+            let page_size = Self::page_size_from_level(level)?;
             let aligned_paddr =
                 PhysAddr::from_usize(paddr.as_usize() & !(usize::from(page_size) - 1));
             self.as_slice_mut()[index] =

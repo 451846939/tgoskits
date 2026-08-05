@@ -233,21 +233,6 @@ impl PteConfig {
             },
         }
     }
-
-    /// Builds a next-level table entry config.
-    pub fn table(paddr: PhysAddr) -> Self {
-        Self {
-            paddr,
-            valid: true,
-            read: true,
-            writable: true,
-            executable: false,
-            lower: true,
-            global: false,
-            is_dir: true,
-            ..Default::default()
-        }
-    }
 }
 
 impl From<PteConfig> for MappingFlags {

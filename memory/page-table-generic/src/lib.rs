@@ -67,6 +67,12 @@ pub trait TableMeta: Sync + Send + Clone + Copy + 'static {
     /// Whether addresses must fit the address width described by [`LEVEL_BITS`].
     const STRICT_ADDRESS_WIDTH: bool = false;
 
+    /// Converts an address reconstructed from page-table indexes into the
+    /// architecture's virtual-address representation.
+    fn canonicalize_vaddr(vaddr: VirtAddr) -> VirtAddr {
+        vaddr
+    }
+
     /// 刷新TLB
     fn flush(vaddr: Option<VirtAddr>);
 }

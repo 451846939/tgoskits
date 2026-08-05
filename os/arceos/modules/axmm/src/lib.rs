@@ -47,7 +47,9 @@ fn reg_flag_to_map_flag(f: MemRegionFlags) -> MappingFlags {
 pub fn new_user_aspace(base: VirtAddr, size: usize) -> AxResult<AddrSpace> {
     let mut aspace = AddrSpace::new_empty(base, size)?;
     if ax_hal::mem::user_aspace_needs_kernel_mappings() {
-        aspace.copy_mappings_from(&kernel_aspace().lock())?;
+        // SAFETY: the global kernel address space outlives every user address
+        // space, whose memory areas never cover the shared kernel range.
+        unsafe { aspace.share_mappings_from(&kernel_aspace().lock())? };
     }
     Ok(aspace)
 }

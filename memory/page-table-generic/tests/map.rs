@@ -1123,3 +1123,50 @@ fn test_unmap_multi_level() {
 
     println!("🎉 多级页表取消映射测试通过！");
 }
+
+#[test]
+fn map_region_rejects_unaligned_range_before_mapping() {
+    let mut page_table = PageTable::<T4kL4, Fram4k>::new(Fram4k).unwrap();
+
+    let unaligned_start = VirtAddr::from_usize(0x20_0001);
+    assert!(matches!(
+        page_table.map_region(
+            unaligned_start,
+            |_| PhysAddr::from_usize(0x40_0000),
+            0x1000,
+            MappingFlags::READ,
+            false,
+        ),
+        Err(PagingError::AlignmentError { .. })
+    ));
+    assert!(!page_table.is_mapped(VirtAddr::from_usize(0x20_0000)));
+
+    let aligned_start = VirtAddr::from_usize(0x30_0000);
+    assert!(matches!(
+        page_table.map_region(
+            aligned_start,
+            |_| PhysAddr::from_usize(0x50_0000),
+            0x1001,
+            MappingFlags::READ,
+            false,
+        ),
+        Err(PagingError::AlignmentError { .. })
+    ));
+    assert!(!page_table.is_mapped(aligned_start));
+}
+
+#[test]
+fn map_page_rejects_page_size_missing_from_table_levels() {
+    let mut page_table = PageTable::<T4kL4, Fram4k>::new(Fram4k).unwrap();
+
+    assert!(matches!(
+        page_table.map_page(
+            VirtAddr::from_usize(0x20_0000),
+            PhysAddr::from_usize(0x40_0000),
+            PageSize::Size1M,
+            MappingFlags::READ,
+        ),
+        Err(PagingError::InvalidSize { .. })
+    ));
+    assert!(!page_table.is_mapped(VirtAddr::from_usize(0x20_0000)));
+}

@@ -1,3 +1,5 @@
+#[cfg(feature = "copy-from")]
+use core::ops::Range;
 use core::ops::{Deref, DerefMut};
 
 use crate::{
@@ -10,6 +12,8 @@ use crate::{
 
 pub struct PageTable<T: TableMeta, A: FrameAllocator> {
     inner: PageTableRef<T, A>,
+    #[cfg(feature = "copy-from")]
+    borrowed_root_entries: Option<Range<usize>>,
 }
 
 impl<T: TableMeta, A: FrameAllocator> PageTable<T, A> {
@@ -18,7 +22,11 @@ impl<T: TableMeta, A: FrameAllocator> PageTable<T, A> {
     /// 创建一个新的页表
     pub fn new(allocator: A) -> PagingResult<Self> {
         let inner = unsafe { PageTableRef::new(allocator) }?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            #[cfg(feature = "copy-from")]
+            borrowed_root_entries: None,
+        })
     }
 
     pub fn valid_bits(&self) -> usize {
@@ -28,10 +36,71 @@ impl<T: TableMeta, A: FrameAllocator> PageTable<T, A> {
     pub const fn root_paddr(&self) -> PhysAddr {
         self.inner.root.paddr
     }
+
+    /// Shares root page-table entries from another page table.
+    ///
+    /// Mappings below the shared root entries remain owned by the source and
+    /// changes made there are visible through both page tables.
+    ///
+    /// # Safety
+    ///
+    /// The source page table must outlive this page table. The caller must
+    /// also prevent this page table from modifying or unmapping the shared
+    /// virtual-address range.
+    #[cfg(feature = "copy-from")]
+    pub unsafe fn share_root_entries_from(
+        &mut self,
+        other: &Self,
+        start_vaddr: VirtAddr,
+        size: usize,
+    ) -> PagingResult {
+        if size == 0 {
+            return Ok(());
+        }
+        if self.borrowed_root_entries.is_some() {
+            return Err(PagingError::hierarchy_error(
+                "Page table already contains shared root entries",
+            ));
+        }
+
+        let end_vaddr = start_vaddr
+            .as_usize()
+            .checked_add(size)
+            .ok_or_else(|| PagingError::address_overflow("share_root_entries_from"))?;
+        let root_level = Frame::<T, A>::PT_LEVEL;
+        let start_index = Frame::<T, A>::virt_to_index(start_vaddr, root_level);
+        let end_index =
+            Frame::<T, A>::virt_to_index(VirtAddr::from_usize(end_vaddr - 1), root_level) + 1;
+        if start_index >= end_index {
+            return Err(PagingError::invalid_range(
+                "Shared range must be contiguous in the root page table",
+            ));
+        }
+
+        for index in start_index..end_index {
+            self.inner.root.dealloc_entry_recursive(index, root_level);
+            self.inner.root.as_slice_mut()[index] = other.inner.root.as_slice()[index];
+        }
+        self.borrowed_root_entries = Some(start_index..end_index);
+        T::flush(None);
+        Ok(())
+    }
+
+    #[cfg(feature = "copy-from")]
+    fn detach_borrowed_root_entries(&mut self) {
+        let Some(entries) = self.borrowed_root_entries.take() else {
+            return;
+        };
+        for index in entries {
+            self.inner.root.as_slice_mut()[index] = T::P::from_config(PteConfig::default());
+        }
+    }
 }
 
 impl<T: TableMeta, A: FrameAllocator> Drop for PageTable<T, A> {
     fn drop(&mut self) {
+        #[cfg(feature = "copy-from")]
+        self.detach_borrowed_root_entries();
         unsafe {
             // 释放所有页表帧，但不释放映射的物理页
             self.deallocate();
@@ -99,6 +168,16 @@ impl<T: TableMeta, A: FrameAllocator> PageTableRef<T, A> {
         page_size: PageSize,
         flags: MappingFlags,
     ) -> PagingResult {
+        let Some(level) = Frame::<T, A>::level_for_page_size(page_size) else {
+            return Err(PagingError::invalid_size(
+                "Page size is not represented by the page-table levels",
+            ));
+        };
+        if level > 1 && level > T::MAX_BLOCK_LEVEL {
+            return Err(PagingError::invalid_size(
+                "Page size exceeds the architecture's block-mapping level",
+            ));
+        }
         let size = usize::from(page_size);
         self.map(&MapConfig {
             vaddr: align_vaddr_down(vaddr, size),
@@ -119,12 +198,23 @@ impl<T: TableMeta, A: FrameAllocator> PageTableRef<T, A> {
         flags: MappingFlags,
         allow_huge: bool,
     ) -> PagingResult {
+        if size == 0 {
+            return Err(PagingError::invalid_size("Region size cannot be zero"));
+        }
+        if !start_vaddr.as_usize().is_multiple_of(T::PAGE_SIZE)
+            || !size.is_multiple_of(T::PAGE_SIZE)
+        {
+            return Err(PagingError::alignment_error(
+                "Region start and size must be base-page aligned",
+            ));
+        }
+
         let mut offset = 0;
         while offset < size {
             let vaddr = start_vaddr + offset;
             let paddr = get_paddr(vaddr);
             let remaining = size - offset;
-            let page_size = largest_page_size(vaddr, paddr, remaining, allow_huge);
+            let page_size = largest_page_size::<T, A>(vaddr, paddr, remaining, allow_huge);
             self.map_page(vaddr, paddr, page_size, flags)?;
             offset += usize::from(page_size);
         }
@@ -203,33 +293,8 @@ impl<T: TableMeta, A: FrameAllocator> PageTableRef<T, A> {
         Ok((
             paddr,
             MappingFlags::from(config),
-            Frame::<T, A>::page_size_from_level(level),
+            Frame::<T, A>::page_size_from_level(level)?,
         ))
-    }
-
-    /// Copies final mappings from another page table.
-    #[cfg(feature = "copy-from")]
-    pub fn copy_from(&mut self, other: &Self, start_vaddr: VirtAddr, size: usize) -> PagingResult {
-        let end_vaddr = start_vaddr
-            .as_usize()
-            .checked_add(size)
-            .map(VirtAddr::from_usize)
-            .ok_or_else(|| PagingError::address_overflow("copy_from"))?;
-        for entry in other
-            .walk(start_vaddr, end_vaddr)
-            .filter(|entry| entry.is_final_mapping)
-        {
-            let config = entry.pte.to_config(entry.level > 1);
-            let page_size = Frame::<T, A>::page_size_from_level(entry.level);
-            self.map_page(
-                entry.vaddr,
-                config.paddr,
-                page_size,
-                MappingFlags::from(config),
-            )?;
-        }
-        T::flush(None);
-        Ok(())
     }
 
     /// 映射虚拟地址范围到物理地址范围
@@ -579,32 +644,24 @@ fn align_paddr_down(addr: PhysAddr, align: usize) -> PhysAddr {
     PhysAddr::from_usize(ax_memory_addr::align_down(addr.as_usize(), align))
 }
 
-fn largest_page_size(
+fn largest_page_size<T: TableMeta, A: FrameAllocator>(
     vaddr: VirtAddr,
     paddr: PhysAddr,
     remaining: usize,
     allow_huge: bool,
 ) -> PageSize {
-    if allow_huge
-        && PageSize::Size1G.is_aligned(vaddr.as_usize())
-        && PageSize::Size1G.is_aligned(paddr.as_usize())
-        && remaining >= usize::from(PageSize::Size1G)
-    {
-        return PageSize::Size1G;
-    }
-    if allow_huge
-        && PageSize::Size2M.is_aligned(vaddr.as_usize())
-        && PageSize::Size2M.is_aligned(paddr.as_usize())
-        && remaining >= usize::from(PageSize::Size2M)
-    {
-        return PageSize::Size2M;
-    }
-    if allow_huge
-        && PageSize::Size1M.is_aligned(vaddr.as_usize())
-        && PageSize::Size1M.is_aligned(paddr.as_usize())
-        && remaining >= usize::from(PageSize::Size1M)
-    {
-        return PageSize::Size1M;
+    if allow_huge {
+        for page_size in [PageSize::Size1G, PageSize::Size2M, PageSize::Size1M] {
+            let supported = Frame::<T, A>::level_for_page_size(page_size)
+                .is_some_and(|level| level > 1 && level <= T::MAX_BLOCK_LEVEL);
+            if supported
+                && page_size.is_aligned(vaddr.as_usize())
+                && page_size.is_aligned(paddr.as_usize())
+                && remaining >= usize::from(page_size)
+            {
+                return page_size;
+            }
+        }
     }
     PageSize::Size4K
 }

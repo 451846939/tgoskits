@@ -99,8 +99,11 @@ impl<'a, T: TableMeta, A: FrameAllocator> PageTableWalker<'a, T, A> {
             state.index += 1;
 
             // 获取当前条目的虚拟地址 - 重建完整的虚拟地址
-            let current_vaddr =
-                Frame::<T, A>::reconstruct_vaddr(state.index - 1, state.level, state.base_vaddr);
+            let current_vaddr = T::canonicalize_vaddr(Frame::<T, A>::reconstruct_vaddr(
+                state.index - 1,
+                state.level,
+                state.base_vaddr,
+            ));
 
             // 跳过不在范围内的地址
             if current_vaddr < self.config.start_vaddr {
