@@ -548,6 +548,16 @@ impl Thread {
         unsafe { self.signals.signalfd_waker.wake(axpoll::IoEvents::IN) };
     }
 
+    pub(crate) fn register_signalfd_waker(&self, waker: &core::task::Waker) {
+        // PollSet retains its own waker reference; the caller only needs to
+        // prove that this Thread is the current task for the registration.
+        unsafe {
+            self.signals
+                .signalfd_waker
+                .register(waker, axpoll::IoEvents::IN);
+        }
+    }
+
     /// Returns the OOM score adjustment value.
     pub fn oom_score_adj(&self) -> i32 {
         self.security.oom_score_adj.load(Ordering::SeqCst)

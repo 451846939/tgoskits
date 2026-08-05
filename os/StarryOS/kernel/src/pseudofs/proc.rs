@@ -954,16 +954,18 @@ impl SimpleDirOps for ThreadFdDir {
 /// The /proc/[pid]/fdinfo directory.
 struct ThreadFdInfoDir {
     fs: Arc<SimpleFs>,
-    task: WeakAxTaskRef,
+    task: WeakUserTaskRef,
 }
 
 impl SimpleDirOps for ThreadFdInfoDir {
     fn child_names<'a>(&'a self) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a> {
-        let Some(task) = self.task.upgrade() else {
-            return Box::new(iter::empty());
+        let task = match upgrade_proc_task(&self.task) {
+            Ok(Some(task)) => task,
+            Ok(None) => return Box::new(iter::empty()),
+            Err(error) => panic!("procfs fdinfo directory has an invalid user extension: {error}"),
         };
-        let ids = FD_TABLE
-            .scope(&task.as_thread().scope.read())
+        let fd_table = task.as_thread().clone_scope_item(&FD_TABLE);
+        let ids = fd_table
             .read()
             .ids()
             .map(|id| Cow::Owned(id.to_string()))
@@ -973,10 +975,10 @@ impl SimpleDirOps for ThreadFdInfoDir {
 
     fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
         let fs = self.fs.clone();
-        let task = self.task.upgrade().ok_or(VfsError::NotFound)?;
+        let task = require_proc_task(&self.task)?;
         let fd = name.parse::<u32>().map_err(|_| VfsError::NotFound)?;
-        let pidfd = FD_TABLE
-            .scope(&task.as_thread().scope.read())
+        let fd_table = task.as_thread().clone_scope_item(&FD_TABLE);
+        let pidfd = fd_table
             .read()
             .get(fd as _)
             .ok_or(VfsError::NotFound)?
@@ -996,7 +998,12 @@ impl SimpleDirOps for ThreadFdInfoDir {
             let pids: Vec<i32> = if identity.is_exited() {
                 vec![-1]
             } else {
-                let observer_pid_ns = task.as_thread().proc_data.nsproxy.lock().pid_ns.clone();
+                let observer_pid_ns = task
+                    .as_thread()
+                    .proc_data
+                    .namespace_snapshot()
+                    .pid_ns
+                    .clone();
                 PidNamespace::visible_pid_chain(
                     &observer_pid_ns,
                     &identity.pid_namespace(),
@@ -1527,7 +1534,7 @@ impl SimpleDirOps for ThreadDir {
                 fs.clone(),
                 Arc::new(ThreadFdInfoDir {
                     fs,
-                    task: Arc::downgrade(&task),
+                    task: task.downgrade(),
                 }),
             )
             .into(),

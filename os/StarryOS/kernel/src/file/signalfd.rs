@@ -192,11 +192,10 @@ impl Pollable for Signalfd {
             // registered with both sources.
             unsafe {
                 self.poll_rx.register(context.waker(), IoEvents::IN);
-                current()
-                    .as_thread()
-                    .signalfd_waker
-                    .register(context.waker(), IoEvents::IN);
             }
+            current_user_task()
+                .as_thread()
+                .register_signalfd_waker(context.waker());
         }
     }
 }
