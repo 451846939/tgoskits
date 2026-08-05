@@ -236,7 +236,7 @@ pub fn enable_mmu_secondary(cpu_meta_paddr: usize) -> ! {
     setup();
     super::trap::init_entries_for_secondary();
 
-    let mut crmd_bits = crmd::read().as_usize();
+    let mut crmd_bits = crmd::read().raw();
     crmd_bits &= !(1 << 3);
     crmd_bits |= 1 << 4;
     crmd_bits &= !(0b11 << 5);

@@ -297,7 +297,7 @@ impl PageTableEntry for Entry {
         };
 
         page_table_generic::PteConfig {
-            paddr: paddr.into(),
+            paddr: page_table_generic::PhysAddr::from_usize(paddr as usize),
             valid,
             read: valid, // LoongArch64: 假设有效项可读
             writable: self.as_base().is_set(PTE::WRITE),
