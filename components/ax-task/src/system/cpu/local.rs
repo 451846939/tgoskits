@@ -179,7 +179,6 @@ impl CpuLocal {
         self: Pin<&mut Self>,
         runtime_ns: u64,
         reclaimed_ns: u64,
-        deadline_extra_bw_scaled: u64,
     ) -> Result<DispatchCharge, TaskError> {
         // SAFETY: the owner scheduler serializes this pinned runqueue state.
         // These disjoint projections avoid reference-count traffic on every
@@ -196,7 +195,6 @@ impl CpuLocal {
             now_ns,
             runtime_ns,
             reclaimed_ns,
-            deadline_extra_bw_scaled,
         )
     }
 
@@ -207,12 +205,11 @@ impl CpuLocal {
         now_ns: u64,
         runtime_ns: u64,
         reclaimed_ns: u64,
-        deadline_extra_bw_scaled: u64,
     ) -> Result<DispatchCharge, TaskError> {
         let bandwidth = run_queue.deadline_bandwidth();
-        let admitted_bw_scaled = bandwidth.this_bw_scaled();
-        let running_bw_scaled = bandwidth.running_bw_scaled();
+        let inactive_bw_scaled = bandwidth.inactive_bw_scaled();
         let max_bw_scaled = bandwidth.max_bw_scaled();
+        let extra_bw_scaled = remote.deadline_extra_bw_scaled();
         let current_is_non_idle =
             dispatch_state.current.is_some() && dispatch_state.current != dispatch_state.idle;
         let grub_reclaimed_ns = dispatch_state
@@ -221,8 +218,8 @@ impl CpuLocal {
             .map_or(0, |dispatch| {
                 dispatch.grub_reclaimed_ns(
                     runtime_ns,
-                    admitted_bw_scaled.saturating_sub(running_bw_scaled),
-                    deadline_extra_bw_scaled,
+                    inactive_bw_scaled,
+                    extra_bw_scaled,
                     max_bw_scaled,
                 )
             });
@@ -263,7 +260,6 @@ impl CpuLocal {
     pub(crate) fn settle_current_dispatch(
         self: Pin<&mut Self>,
         reclaimed_ns: u64,
-        deadline_extra_bw_scaled: u64,
     ) -> Result<(DispatchCharge, RunQueueClockSnapshot), TaskError> {
         // SAFETY: the owner scheduler serializes this pinned runqueue state.
         let this = unsafe { self.get_unchecked_mut() };
@@ -273,20 +269,12 @@ impl CpuLocal {
         let clock = run_queue
             .clock_snapshot()
             .ok_or(TaskError::InvalidConfiguration)?;
-        Self::settle_current_dispatch_locked(
-            remote,
-            dispatch,
-            &mut run_queue,
-            clock,
-            reclaimed_ns,
-            deadline_extra_bw_scaled,
-        )
+        Self::settle_current_dispatch_locked(remote, dispatch, &mut run_queue, clock, reclaimed_ns)
     }
 
     pub(crate) fn settle_current_dispatch_with_clock(
         self: Pin<&mut Self>,
         reclaimed_ns: u64,
-        deadline_extra_bw_scaled: u64,
     ) -> Result<(DispatchCharge, RunQueueClockSnapshot), TaskError> {
         // SAFETY: the owner scheduler serializes this pinned runqueue state.
         let this = unsafe { self.get_unchecked_mut() };
@@ -294,14 +282,7 @@ impl CpuLocal {
         let dispatch = &mut this.dispatch;
         let mut run_queue = remote.lock_run_queue();
         let clock = run_queue.update_clock();
-        Self::settle_current_dispatch_locked(
-            remote,
-            dispatch,
-            &mut run_queue,
-            clock,
-            reclaimed_ns,
-            deadline_extra_bw_scaled,
-        )
+        Self::settle_current_dispatch_locked(remote, dispatch, &mut run_queue, clock, reclaimed_ns)
     }
 
     fn settle_current_dispatch_locked(
@@ -310,7 +291,6 @@ impl CpuLocal {
         run_queue: &mut CpuRunQueueState,
         clock: RunQueueClockSnapshot,
         reclaimed_ns: u64,
-        deadline_extra_bw_scaled: u64,
     ) -> Result<(DispatchCharge, RunQueueClockSnapshot), TaskError> {
         let now_ns = clock.as_nanos();
         let runtime_ns = dispatch
@@ -325,7 +305,6 @@ impl CpuLocal {
             now_ns,
             runtime_ns,
             reclaimed_ns,
-            deadline_extra_bw_scaled,
         )?;
         Ok((charge, clock))
     }
@@ -462,6 +441,11 @@ impl CpuLocal {
     /// Returns the owner runqueue's GRUB bandwidth accounting.
     pub fn deadline_bandwidth(&self) -> DeadlineBandwidthSnapshot {
         self.remote.lock_run_queue().deadline_bandwidth()
+    }
+
+    /// Returns Linux `dl_rq.extra_bw` published for this owner runqueue.
+    pub fn deadline_extra_bw_scaled(&self) -> u64 {
+        self.remote.deadline_extra_bw_scaled()
     }
 
     pub(crate) fn scheduler_work_due(

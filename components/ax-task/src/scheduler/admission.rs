@@ -8,8 +8,8 @@ pub(crate) const DEADLINE_UTILIZATION_SCALE: u64 = 1_000_000_000;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DeadlineAdmission {
     cap_percent: u8,
-    online_cpus: usize,
-    reserved_scaled: u128,
+    online_cpus: u32,
+    reserved_scaled: u64,
 }
 
 impl DeadlineAdmission {
@@ -23,7 +23,7 @@ impl DeadlineAdmission {
     }
 
     /// Updates the number of CPUs belonging to the online root domain.
-    pub const fn set_online_cpus(&mut self, online_cpus: usize) {
+    pub const fn set_online_cpus(&mut self, online_cpus: u32) {
         self.online_cpus = online_cpus;
     }
 
@@ -33,14 +33,28 @@ impl DeadlineAdmission {
     ///
     /// Returns [`TaskError::DeadlineAdmission`] if the reservation exceeds the
     /// configured root-domain cap.
-    pub fn reserve(&mut self, policy: DeadlinePolicy) -> Result<u128, TaskError> {
+    pub fn reserve(&mut self, policy: DeadlinePolicy) -> Result<u64, TaskError> {
         let utilization = Self::utilization(policy);
         self.reserve_utilization(utilization)?;
         Ok(utilization)
     }
 
-    pub(crate) fn reserve_utilization(&mut self, utilization: u128) -> Result<(), TaskError> {
-        let next = self.reserved_scaled.saturating_add(utilization);
+    pub(crate) fn reserve_utilization(&mut self, utilization: u64) -> Result<(), TaskError> {
+        self.replace_utilization(0, utilization)
+    }
+
+    pub(crate) fn replace_utilization(
+        &mut self,
+        old_utilization: u64,
+        new_utilization: u64,
+    ) -> Result<(), TaskError> {
+        let without_old = self
+            .reserved_scaled
+            .checked_sub(old_utilization)
+            .ok_or(TaskError::InvalidConfiguration)?;
+        let next = without_old
+            .checked_add(new_utilization)
+            .ok_or(TaskError::DeadlineAdmission)?;
         if next > self.capacity_scaled() {
             return Err(TaskError::DeadlineAdmission);
         }
@@ -48,34 +62,31 @@ impl DeadlineAdmission {
         Ok(())
     }
 
-    pub(crate) const fn utilization(policy: DeadlinePolicy) -> u128 {
+    pub(crate) fn utilization(policy: DeadlinePolicy) -> u64 {
         scaled_utilization(policy)
     }
 
     /// Releases a value returned by [`Self::reserve`].
-    pub fn release(&mut self, utilization: u128) {
-        self.reserved_scaled = self.reserved_scaled.saturating_sub(utilization);
+    pub fn release(&mut self, utilization: u64) -> Result<(), TaskError> {
+        self.replace_utilization(utilization, 0)
     }
 
     /// Returns the currently reserved fixed-point utilization.
-    pub const fn reserved_scaled(self) -> u128 {
+    pub const fn reserved_scaled(self) -> u64 {
         self.reserved_scaled
     }
 
     /// Returns the fixed-point capacity of the online root domain.
-    pub const fn capacity_scaled(self) -> u128 {
-        (self.online_cpus as u128)
-            .saturating_mul(self.cap_percent as u128)
-            .saturating_mul(DEADLINE_UTILIZATION_SCALE as u128)
-            / 100
+    pub const fn capacity_scaled(self) -> u64 {
+        (self.online_cpus as u64) * (self.cap_percent as u64) * DEADLINE_UTILIZATION_SCALE / 100
     }
 }
 
-const fn scaled_utilization(policy: DeadlinePolicy) -> u128 {
-    let numerator =
-        (policy.runtime_ns() as u128).saturating_mul(DEADLINE_UTILIZATION_SCALE as u128);
+fn scaled_utilization(policy: DeadlinePolicy) -> u64 {
+    let numerator = (policy.runtime_ns() as u128) * (DEADLINE_UTILIZATION_SCALE as u128);
     let period = policy.period_ns() as u128;
-    numerator.saturating_add(period - 1) / period
+    u64::try_from(numerator.div_ceil(period))
+        .expect("a validated Deadline reservation cannot exceed one CPU")
 }
 
 #[cfg(test)]
@@ -91,5 +102,14 @@ mod tests {
         let first = admission.reserve(half).unwrap();
         assert_eq!(first, 500_000_000);
         assert_eq!(admission.reserve(half), Err(TaskError::DeadlineAdmission));
+    }
+
+    #[test]
+    fn rejects_release_that_has_no_matching_reservation() {
+        let mut admission = DeadlineAdmission::new(95);
+        admission.set_online_cpus(1);
+
+        assert_eq!(admission.release(1), Err(TaskError::InvalidConfiguration));
+        assert_eq!(admission.reserved_scaled(), 0);
     }
 }

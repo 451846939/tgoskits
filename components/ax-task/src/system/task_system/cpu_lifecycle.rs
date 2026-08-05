@@ -131,9 +131,10 @@ impl TaskSystem {
             .online_cpu_count()
             .checked_add(1)
             .ok_or(TaskError::InvalidConfiguration)?;
+        let deadline_rebuild = state.deadline_bandwidth_rebuild(online_count)?;
         self.topology_sequence.write_begin();
         assert!(
-            root_domain.online.insert(id),
+            root_domain.insert_online(id, deadline_rebuild),
             "validated offline CPU must be absent from the root domain"
         );
         self.online_count.store(online_count, Ordering::Release);
@@ -176,6 +177,14 @@ impl TaskSystem {
         if state.online_cpu_count() <= 1 {
             return Err(TaskError::LastOnlineCpu(id.as_u32()));
         }
+        if !root_domain.can_deactivate_cpu(id) {
+            return Err(TaskError::DeadlineAdmission);
+        }
+        let remaining_online = state
+            .online_cpu_count()
+            .checked_sub(1)
+            .ok_or(TaskError::InvalidConfiguration)?;
+        let deadline_rebuild = state.deadline_bandwidth_rebuild(remaining_online)?;
 
         self.topology_sequence.write_begin();
         let result = if !remote.try_deactivate() {
@@ -195,7 +204,7 @@ impl TaskSystem {
         )) {
             remote.cancel_draining();
             Err(error)
-        } else if !root_domain.online.remove(id) {
+        } else if !root_domain.remove_online(id, deadline_rebuild) {
             remote.cancel_draining();
             Err(TaskError::InvalidConfiguration)
         } else {
@@ -351,7 +360,7 @@ mod tests {
     use alloc::boxed::Box;
 
     use super::*;
-    use crate::{FairMode, Nice, ThreadSpec};
+    use crate::{DeadlineFlags, DeadlinePolicy, FairMode, Nice, SchedulePolicy, ThreadSpec};
 
     fn blocked_thread_fixture() -> (
         Pin<Box<TaskSystem>>,
@@ -386,6 +395,72 @@ mod tests {
         system.complete_context_switch(cpu1.as_mut()).unwrap();
         assert_eq!(sleeper.state(), ThreadState::Blocked);
         (system, cpu0, cpu1, sleeper)
+    }
+
+    #[test]
+    fn deadline_bandwidth_rejects_cpu_capacity_shrink() {
+        let system = TaskSystem::new(TaskSystemConfig::new(2)).unwrap();
+        let mut cpu0 = system.create_cpu_local(CpuId::new(0)).unwrap();
+        let mut cpu1 = system.create_cpu_local(CpuId::new(1)).unwrap();
+        for cpu in [&mut cpu0, &mut cpu1] {
+            system
+                .register_idle_thread(
+                    cpu.as_mut(),
+                    ThreadSpec::new(SchedulePolicy::fair(Nice::ZERO, FairMode::Idle)),
+                )
+                .unwrap();
+            system.bring_cpu_online(cpu.as_mut()).unwrap();
+        }
+
+        let policy =
+            SchedulePolicy::deadline(DeadlinePolicy::new(3, 4, 4, DeadlineFlags::NONE).unwrap());
+        let _first = system.create_thread(ThreadSpec::new(policy)).unwrap();
+        let _second = system.create_thread(ThreadSpec::new(policy)).unwrap();
+
+        assert_eq!(
+            system.take_cpu_offline(cpu1.as_mut()),
+            Err(TaskError::DeadlineAdmission),
+            "Linux dl_bw_deactivate rejects a CPU-down transition that would overcommit the root \
+             domain",
+        );
+        assert!(
+            cpu1.is_online(),
+            "a rejected capacity shrink keeps the CPU active"
+        );
+        assert_eq!(system.online_cpu_count(), 2);
+    }
+
+    #[test]
+    fn deadline_extra_bandwidth_tracks_cpu_hotplug_topology() {
+        let system = TaskSystem::new(TaskSystemConfig::new(2)).unwrap();
+        let mut cpu0 = system.create_cpu_local(CpuId::new(0)).unwrap();
+        let mut cpu1 = system.create_cpu_local(CpuId::new(1)).unwrap();
+        for cpu in [&mut cpu0, &mut cpu1] {
+            system
+                .register_idle_thread(
+                    cpu.as_mut(),
+                    ThreadSpec::new(SchedulePolicy::fair(Nice::ZERO, FairMode::Idle)),
+                )
+                .unwrap();
+        }
+        system.bring_cpu_online(cpu0.as_mut()).unwrap();
+
+        let policy =
+            SchedulePolicy::deadline(DeadlinePolicy::new(3, 4, 4, DeadlineFlags::NONE).unwrap());
+        let _deadline = system.create_thread(ThreadSpec::new(policy)).unwrap();
+        assert_eq!(cpu0.deadline_extra_bw_scaled(), 200_000_000);
+
+        system.bring_cpu_online(cpu1.as_mut()).unwrap();
+        assert_eq!(cpu0.deadline_extra_bw_scaled(), 575_000_000);
+        assert_eq!(cpu1.deadline_extra_bw_scaled(), 575_000_000);
+
+        system.take_cpu_offline(cpu1.as_mut()).unwrap();
+        assert_eq!(cpu0.deadline_extra_bw_scaled(), 200_000_000);
+        assert_eq!(
+            cpu1.deadline_extra_bw_scaled(),
+            950_000_000,
+            "an offline dl_rq resets to its configured maximum before reuse"
+        );
     }
 
     #[test]

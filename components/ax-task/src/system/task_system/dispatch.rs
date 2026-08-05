@@ -727,9 +727,7 @@ impl TaskSystem {
         if cpu.dispatch_state().current_dispatch.is_none() {
             return Ok(());
         }
-        let (_charge, clock) = cpu
-            .as_mut()
-            .settle_current_dispatch(0, self.root_domain.deadline_extra_bw_scaled())?;
+        let (_charge, clock) = cpu.as_mut().settle_current_dispatch(0)?;
         let now_ns = clock.as_nanos();
         let Some(mut dispatch) = cpu.as_mut().take_dispatch() else {
             return Ok(());
@@ -943,12 +941,13 @@ impl TaskSystem {
         sched.deadline.active_reservation = sched.deadline.desired_reservation;
         sched.policy.applied_generation = sched.policy.generation;
         sched.policy.dispatch_generation = next_dispatch_generation;
-        let released = previous_held.saturating_sub(sched.deadline.desired_reservation);
+        let new_held = sched.deadline.desired_reservation;
         let effective_policy = sched.policy.effective;
         let effective_entity = sched.policy.effective_entity;
         let running_policy_changed = sched.placement.execution_cpu().is_some();
         core.publish_effective_schedule(effective_policy, effective_entity);
         drop(sched);
+        self.replace_deadline_admission(previous_held, new_held);
         if running_policy_changed && let Some(extension) = core.extension_view() {
             let now_ns = owner_now_ns.ok_or(TaskError::InvalidConfiguration)?;
             // SAFETY: the thread-state lock is released. A running update
@@ -956,9 +955,6 @@ impl TaskSystem {
             // baton. Construction guarantees that the callback is bounded and
             // valid for this retained ThreadCore.
             unsafe { extension.notify_running_policy_applied(core.id(), base_policy, now_ns) };
-        }
-        if self.defer_deadline_admission_release(released).is_err() {
-            task_runtime::fatal_invariant(0x504f_0001, core.id().as_u64() as usize);
         }
         Ok(true)
     }

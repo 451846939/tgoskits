@@ -177,8 +177,8 @@ impl TaskSystem {
                 return Err(TaskError::NotReady);
             }
             affinity.copy_from_set(&sched.placement.affinity)?;
-            let active_reservation = u128::from(sched.deadline.active_reservation);
-            let desired_reservation = u128::from(sched.deadline.desired_reservation);
+            let active_reservation = sched.deadline.active_reservation;
+            let desired_reservation = sched.deadline.desired_reservation;
             let owner = sched
                 .placement
                 .execution_cpu()
@@ -201,14 +201,8 @@ impl TaskSystem {
             let reservation = root_domain.deadline_reservation_for(policy, &affinity)?;
             let old_held = active_reservation.max(desired_reservation);
             let new_held = active_reservation.max(reservation);
-            if new_held > old_held {
-                root_domain
-                    .deadline_admission
-                    .reserve_utilization(new_held - old_held)?;
-            } else {
-                root_domain.deadline_admission.release(old_held - new_held);
-            }
-            sched.deadline.desired_reservation = u64::try_from(reservation).unwrap_or(u64::MAX);
+            root_domain.replace_deadline_utilization(old_held, new_held)?;
+            sched.deadline.desired_reservation = reservation;
             sched.policy.requested = policy;
             sched.policy.generation = generation;
             (core, owner, generation, owner_publication)

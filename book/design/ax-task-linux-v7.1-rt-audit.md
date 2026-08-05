@@ -174,7 +174,7 @@ USB/vsock 控制器协议属于外围驱动；除非它们违反上述调度交�
 | Fair/EEVDF | `avg_vruntime()`、`place_entity()`、`pick_eevdf()` | 唯一加权平均 V；sleep/migration 保存 `vlag`；eligible current 保留请求保护 | 已删除旧 wakeup granularity 与重复单调 V，迁移使用 detach 事务 |
 | RT/DL 选核 | `cpupri`、`cpudl`、`RT_PUSH_IPI` | 优先级与 load 正交；DL runnable CPU 属于 cpupri HIGHER；只有可迁移候选才能发布 overload | root-domain cpupri/cpudl 已接入 wake placement；cpupri 包含 101 个桶，DL current/queued 发布 HIGHER；pushable summary 随 affinity generation 更新，不可迁移 RT/DL 不触发 owner balance doorbell |
 | 远程投递 | `try_to_wake_up()`、`ttwu_queue()`、`resched_curr()`、`irq_work_claim()` | PREEMPT_RT 关闭 `TTWU_QUEUE`，waker 直接锁目标 rq 激活；仅实际需要抢占时发送 reschedule IPI；IPI claim 必须先于 callback/drain | 已删除 task-level remote-wake inbox；migration/control 继续使用 typed owner inbox；runtime 门铃改为 generation + physical edge ownership，coalescing 只返回成功，不再把 `Busy` 暴露为模糊的 transport 状态 |
-| CPU 生命周期 | `sched_cpu_deactivate()`、`sched_cpu_dying()` | 先关 placement，再 drain producer，最后 offline | `Online/Inactive/Draining/Offline` 已实现 |
+| CPU 生命周期 | `sched_cpu_deactivate()`、`dl_bw_deactivate()`、`sched_cpu_dying()` | 先验证剩余 Deadline capacity，再关 placement、drain producer，最后 offline | `Online/Inactive/Draining/Offline` 已实现；Deadline 过量预留会在 topology mutation 前拒绝 CPU down |
 | active mm | `exit_mm()`、`context_switch()`、`enter_lazy_tlb()`、`finish_task_switch()` | task-mm 所有权在 zombie 前解除；lazy CPU carrier 与页表根存储保留到最后 CPU lease | move-only token + task detach + per-CPU active lease 已实现 |
 | 用户 TLB 回收 | `mmu_gather`、`mm_cpumask()`、各架构 `flush_tlb_mm_range()` | 先改 PTE，再同步 active-mm CPU，最后释放物理所有权 | 共享 mm CPU tracker + typed gather 已实现；调度 token 不再各自维护错误的 CPU footprint |
 | task deadline | `hrtimer`、`sched/deadline.c` | IRQ 只处理 generation-bearing 值记录；CBS 状态机是唯一期限真值 | Deadline 已改为 class-owned 有序 AVL rq，并在节点内增广最早 CBS 事件；pick/dequeue/rekey 为 O(log n)；CBS 记账与物理入队同属目标 rq 事务；CBS 生命周期改为互斥状态，删除 `base_deadline` 镜像 |
@@ -1934,21 +1934,50 @@ cpupri/cpudl 作为 `TaskSystem` 的第三个平级字段。GRUB 热路径只能
 - cpupri/cpudl 继续由目标 rq 锁串行发布，并作为 root-domain 的派生索引存在。没有为每次
   wake 增加全局 root-domain 锁；同一 CPU 的两个 publisher 已由该 CPU 的 raw rq lock
   排除，不能把并不存在的双写竞态当作理由退化热路径；
-- admission 变更按在线 CPU 数发布 `Uextra = Umax - Ureserved / nr_online`。普通 runtime
-  charge 只 Acquire 读取这个值，不进入 root-domain 锁；owner policy apply 不能取得冷域锁
-  时，release 先进入单调 pending counter，读取侧只会增加已确认释放的 spare bandwidth，
-  下一次 root-domain 事务再合并精确值；
-- runqueue 仍是本地 `this_bw/running_bw` 的唯一 owner。GRUB 按 Linux 公式使用
-  `max{u, Umax - Uinactive - Uextra}`，没有增加第二份 per-rq admission 镜像。
+- 每个稳定 `CpuRemote` 与它拥有的 rq 一一对应，并保存自己的原子
+  `deadline_extra_bw_scaled`，即 Linux `dl_rq.extra_bw`。root-domain reservation 使用与 Linux
+  `dl_bw.total_bw`、`dl_se.dl_bw` 相同的 `u64` 固定点类型；只有比例乘法的中间值使用
+  `u128`，不存在写入线程状态时的截断或 `u64::MAX` 兜底；
+- admission add/remove 按 Linux `__dl_add()`/`__dl_sub()` 对每个 reservation 先执行
+  `reservation / nr_online`，再增减每个 online rq 的 `extra_bw`，不能先聚合 reservation
+  再统一除法。策略替换使用一个 `replace(old, new)` 事务，等价于
+  `total_bw - old + new`，并分别舍入 old/new，不能用 `(new - old) / nr_online` 替代；
+- CPU topology 改变时等价执行 Linux `dl_clear_root_domain()` 与逐 task
+  `dl_add_task_root_domain()`：registry 扫描每个 committed thread 的
+  `max(active_reservation, desired_reservation)`，并包含 thread construction 尚未发布到
+  registry record 的 slot-owned reservation；offline rq 重置为 `Umax`，online rq 从每个
+  reservation 重新构建 `extra_bw`，不会从聚合 total 反推而丢失逐 reservation 舍入；
+- 普通 runtime charge 在持有本 rq raw lock 时只 Acquire 读取本 rq 的 `extra_bw`，不进入
+  root-domain 锁，也不存在一个可被所有 CPU 共同读取的全局 `extra_bw` 标量；
+- reservation 新增、策略应用、退出和 registry removal 都由显式 root-domain 事务同步提交。
+  registry 只返回待释放的精确值，无权直接修改 admission；旧
+  `pending_deadline_releases`、读取侧补偿和 `RootDomainGuard::drop()` 隐式发布已经删除；
+- CPU down 在关闭 placement 前执行 Linux `dl_bw_deactivate()` 等价容量检查。若
+  `Ureserved > (nr_online - 1) * Umax`，直接返回 `DeadlineAdmission`，CPU lifecycle 与
+  online mask 均保持原状；通过检查后，online mask、admission capacity 和所有 rq 的
+  `extra_bw` 在同一 root-domain 事务中更新；
+- runqueue 继续唯一拥有本地 `this_bw/running_bw`。GRUB 按 Linux 公式使用
+  `max{u, Umax - Uinactive - Uextra}`，而不是从 root-domain 读取一个兼容镜像。
 
 确定性红测使用单 CPU、`U=0.5` 的唯一 RECLAIM Deadline 任务。旧实现忽略
 `Uextra=0.45`，100 ns 墙钟后预算从 500 降到 400；新实现与 Linux `grub_reclaim()` 一样
 按固定点乘法向下截断，`floor(100 * 0.5 / 0.95)` 只扣 52，剩余 448。换算、带宽相减和
 runtime charge 都以 admission/runqueue 不变量为前提；不再用 `unwrap_or(u64::MAX)`、
 `saturating_sub()` 或向上取整把异常吞成保守计费。同一测试先稳定失败，再由上述 owner
-重构转绿。这一阶段补齐 A4，但尚未把
-blocked Deadline reservation 从原 rq 的 zero-lag/CBS 生命周期中拆出；跨 CPU runtime
-borrowing 与 running-in-rq 仍需在下一阶段分别处理。
+重构转绿。后续复审又增加 CPU hotplug 红测：两 CPU 已预留 150% 带宽时，旧实现错误允许
+下线一个 CPU；新实现按 Linux 在 topology mutation 前拒绝。另有确定性测试约束 75%
+reservation 在 1 CPU、2 CPU、再次 1 CPU 时的 per-rq `extra_bw` 分别为 20%、57.5%、20%，
+以及 detached policy release 在 API 返回前把本 rq `extra_bw` 从 45% 恢复到 95%。两个额外
+红测使用每个 reservation 仅 1 个固定点单位的边界值：旧聚合除法在两 CPU 上错误扣除 1，
+且旧差值式策略更新遗漏 `old/n` 与 `new/n` 的舍入差；新实现逐 reservation add/rebuild 和
+原子 replace 后均与 Linux 一致。`DeadlineAdmission::release()` 另有 underflow 红测，旧
+`saturating_sub()` 会返回成功，新实现明确返回 `InvalidConfiguration`，root-domain owner
+把这种情况视为内部账本不变量破坏。
+
+这一阶段补齐 A4 与 Deadline CPU-down admission，但尚未把 blocked Deadline reservation
+从原 rq 的 zero-lag/CBS 生命周期中拆出；跨 CPU runtime borrowing 仍需单独建立
+root-domain bandwidth owner/baton 协议。running-in-rq 已由下一节完成，不能再把它列为
+未实现前置项。
 
 ### 2026-08-05 RT/DL running-in-rq 与独立 pushable 所有权
 

@@ -51,10 +51,8 @@ impl TaskSystem {
             drop(sched);
             state.queue_exited_thread(thread);
             let mut root_domain = self.root_domain.lock();
-            state.release_deadline_reservation_on_exit(
-                &mut root_domain.deadline_admission,
-                thread,
-            )?;
+            let released = state.release_deadline_reservation_on_exit(thread)?;
+            root_domain.release_deadline(released);
             exited_core
         };
         exited_core.notify_affinity_waiters();
@@ -105,7 +103,9 @@ impl TaskSystem {
         let record = {
             let mut state = self.state.lock();
             let mut root_domain = self.root_domain.lock();
-            state.remove_exited_thread(&mut root_domain.deadline_admission, thread)?
+            let (record, released) = state.remove_exited_thread(thread)?;
+            root_domain.release_deadline(released);
+            record
         };
         self.release_thread_record(record);
         Ok(())
@@ -123,10 +123,11 @@ impl TaskSystem {
         let record = {
             let mut state = self.state.lock();
             let mut root_domain = self.root_domain.lock();
-            match state
-                .remove_exited_thread_with_handle(&mut root_domain.deadline_admission, &handle)
-            {
-                Ok(record) => record,
+            match state.remove_exited_thread_with_handle(&handle) {
+                Ok((record, released)) => {
+                    root_domain.release_deadline(released);
+                    record
+                }
                 Err(error) => return Err(OwnedThreadReapError::new(error, handle)),
             }
         };
@@ -152,12 +153,16 @@ impl TaskSystem {
     pub(super) fn reap_unreferenced_exited_inner(&self, limit: usize) -> Result<usize, TaskError> {
         let mut reaped = 0;
         while reaped < limit {
-            let record = {
+            let removed = {
                 let mut state = self.state.lock();
                 let mut root_domain = self.root_domain.lock();
-                state.take_unreferenced_exited(&mut root_domain.deadline_admission)?
+                let removed = state.take_unreferenced_exited()?;
+                if let Some((_, released)) = &removed {
+                    root_domain.release_deadline(*released);
+                }
+                removed
             };
-            let Some(record) = record else {
+            let Some((record, _released)) = removed else {
                 break;
             };
             self.release_thread_record(record);

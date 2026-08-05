@@ -512,9 +512,7 @@ impl TaskSystem {
             }
             if queued_cpu == Some(owner) && execution_cpu.is_none() {
                 if cpu.dispatch_state().current_dispatch.is_some() {
-                    let _settled = cpu
-                        .as_mut()
-                        .settle_current_dispatch(0, self.root_domain.deadline_extra_bw_scaled())?;
+                    let _settled = cpu.as_mut().settle_current_dispatch(0)?;
                 } else {
                     cpu.lock_run_queue().update_fair_virtual_time(None);
                 }

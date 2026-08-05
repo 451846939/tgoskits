@@ -1806,6 +1806,7 @@ fn exhausted_thread_slot_generation_never_wraps_to_the_first_identity() {
     let mut slot = ThreadSlot {
         generation: MAX_THREAD_GENERATION,
         record: None,
+        pending_deadline_reservation: 0,
     };
     assert!(
         !advance_thread_slot_generation(&mut slot),

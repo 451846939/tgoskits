@@ -48,7 +48,7 @@ use registry::{
     CpuRegistration, DeadlineCallbackClaim, DetachedThreadRecord, PiWaitRegistration,
     TaskSystemState, ThreadRecord, ThreadSlot,
 };
-use root_domain::{RootDomain, RootDomainState};
+use root_domain::{DeadlineBandwidthRebuild, RootDomain, RootDomainState};
 use thread_callbacks::ThreadCallbackState;
 
 use super::thread_sched::{DeadlineActivity, ThreadSchedCell, ThreadSchedState};
@@ -132,8 +132,11 @@ impl Drop for UnpublishedThreadGuard<'_> {
 }
 
 impl TaskSystem {
-    fn defer_deadline_admission_release(&self, released: u64) -> Result<(), TaskError> {
-        self.root_domain.defer_deadline_release(released)
+    fn replace_deadline_admission(&self, old_reservation: u64, new_reservation: u64) {
+        self.root_domain
+            .lock()
+            .replace_deadline_utilization(old_reservation, new_reservation)
+            .expect("owner policy apply must replace its admitted Deadline reservation");
     }
 
     /// Creates an empty scheduler instance for a fixed topology.
@@ -154,6 +157,7 @@ impl TaskSystem {
             .cloned()
             .map(|remote| CpuRegistration { remote })
             .collect();
+        let root_domain = RootDomain::new(config, cpu_remotes.clone());
         Ok(Self {
             config,
             cpu_remotes,
@@ -166,7 +170,7 @@ impl TaskSystem {
                 address_space_reclaim_first: true,
                 exited_work: ExitedThreadWork::new(),
             }),
-            root_domain: RootDomain::new(config),
+            root_domain,
             deferred_coroutine_reclaims: SchedulerInbox::new(InboxKind::Reclaim),
             deferred_deadline_callbacks: SchedulerInbox::new(InboxKind::TaskWork),
             deferred_scheduler_ticks: SchedulerInbox::new(InboxKind::TaskWork),
@@ -239,6 +243,10 @@ const fn next_generation(generation: u32) -> u32 {
 }
 
 fn advance_thread_slot_generation(slot: &mut ThreadSlot) -> bool {
+    assert_eq!(
+        slot.pending_deadline_reservation, 0,
+        "a reusable thread slot must not retain Deadline admission"
+    );
     let next = next_generation(slot.generation);
     if next == slot.generation {
         // The empty slot remains in the registry so every stale identity still

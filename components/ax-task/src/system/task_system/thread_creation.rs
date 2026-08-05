@@ -24,10 +24,11 @@ impl TaskSystem {
             {
                 Ok(identity) => identity,
                 Err(error) => {
-                    root_domain.deadline_admission.release(reservation);
+                    root_domain.release_deadline(reservation);
                     return Err(error);
                 }
             };
+            state.slots[slot as usize].pending_deadline_reservation = reservation;
             (slot, generation, reservation)
         };
         let id = ThreadId::from_parts(slot, generation);
@@ -55,7 +56,7 @@ impl TaskSystem {
                 policy,
                 entity,
                 affinity.clone(),
-                u64::try_from(reservation).unwrap_or(u64::MAX),
+                reservation,
                 resources.context(),
                 resources.address_space(),
             ),
@@ -90,10 +91,12 @@ impl TaskSystem {
                     let failed_slot = &mut state.slots[slot as usize];
                     debug_assert_eq!(failed_slot.generation, generation);
                     debug_assert!(failed_slot.record.is_none());
+                    debug_assert_eq!(failed_slot.pending_deadline_reservation, reservation);
+                    failed_slot.pending_deadline_reservation = 0;
                     if advance_thread_slot_generation(failed_slot) {
                         state.free_slots.push(slot);
                     }
-                    root_domain.deadline_admission.release(reservation);
+                    root_domain.release_deadline(reservation);
                 }
                 drop(core);
                 self.release_thread_record(record);
@@ -112,10 +115,12 @@ impl TaskSystem {
                 let failed_slot = &mut state.slots[slot as usize];
                 debug_assert_eq!(failed_slot.generation, generation);
                 debug_assert!(failed_slot.record.is_none());
+                debug_assert_eq!(failed_slot.pending_deadline_reservation, reservation);
+                failed_slot.pending_deadline_reservation = 0;
                 if advance_thread_slot_generation(failed_slot) {
                     state.free_slots.push(slot);
                 }
-                root_domain.deadline_admission.release(reservation);
+                root_domain.release_deadline(reservation);
                 Some(if topology_rejects_deadline {
                     TaskError::DeadlineAffinity
                 } else {
@@ -125,6 +130,8 @@ impl TaskSystem {
                 let reserved_slot = &mut state.slots[slot as usize];
                 debug_assert_eq!(reserved_slot.generation, generation);
                 debug_assert!(reserved_slot.record.is_none());
+                debug_assert_eq!(reserved_slot.pending_deadline_reservation, reservation);
+                reserved_slot.pending_deadline_reservation = 0;
                 reserved_slot.record = record.take();
                 None
             }
@@ -249,10 +256,9 @@ impl TaskSystem {
         let record = {
             let mut state = self.state.lock();
             let mut root_domain = self.root_domain.lock();
-            state.remove_unpublished_thread_with_handle(
-                &mut root_domain.deadline_admission,
-                &handle,
-            )?
+            let (record, released) = state.remove_unpublished_thread_with_handle(&handle)?;
+            root_domain.release_deadline(released);
+            record
         };
         drop(handle);
         self.release_thread_record(record);

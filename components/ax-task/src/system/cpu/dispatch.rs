@@ -296,10 +296,7 @@ impl CurrentDispatch {
         if !policy.flags().contains(crate::DeadlineFlags::RECLAIM) || max_bw_scaled == 0 {
             return 0;
         }
-        let utilization = DeadlineAdmission::utilization(policy);
-        let Ok(own_bw_scaled) = u64::try_from(utilization) else {
-            task_runtime::fatal_invariant(0x444c_1010, self.thread.as_u64() as usize);
-        };
+        let own_bw_scaled = DeadlineAdmission::utilization(policy);
         if own_bw_scaled > max_bw_scaled {
             task_runtime::fatal_invariant(0x444c_1011, self.thread.as_u64() as usize);
         }

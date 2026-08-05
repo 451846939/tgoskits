@@ -456,9 +456,7 @@ impl TaskSystem {
             }
             state.queue_exited_thread(previous);
             let mut root_domain = self.root_domain.lock();
-            root_domain
-                .deadline_admission
-                .release(u128::from(held_reservation));
+            root_domain.release_deadline(held_reservation);
             cpu.as_mut().clear_current();
             let next = self
                 .pick_owner_next(cpu.as_mut(), now_ns, Some(previous))

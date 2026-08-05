@@ -12,6 +12,11 @@ use support::TaskSystemClockTestExt;
 fn reclaim_includes_unreserved_root_domain_bandwidth() {
     let (system, mut cpu) = online_system();
     let reclaimer = ready_deadline(&system, 500, 1_000, 1_000, DeadlineFlags::RECLAIM);
+    assert_eq!(
+        cpu.deadline_extra_bw_scaled(),
+        450_000_000,
+        "the owner runqueue must receive its Linux dl_rq.extra_bw share"
+    );
     system.enqueue_at(cpu.as_mut(), reclaimer.id(), 0).unwrap();
     assert_eq!(
         system.schedule_at(cpu.as_mut(), 0).unwrap().next(),
@@ -36,6 +41,90 @@ fn reclaim_includes_unreserved_root_domain_bandwidth() {
         448,
         "GRUB must include the root domain's unreserved capacity in Uextra"
     );
+}
+
+#[test]
+fn detached_policy_release_updates_runqueue_extra_bandwidth_synchronously() {
+    let (system, cpu) = online_system();
+    let deadline = system
+        .create_thread(ThreadSpec::new(SchedulePolicy::deadline(
+            DeadlinePolicy::new(1, 2, 2, DeadlineFlags::NONE).unwrap(),
+        )))
+        .unwrap();
+    assert_eq!(cpu.deadline_extra_bw_scaled(), 450_000_000);
+
+    system
+        .set_thread_policy(deadline.id(), SchedulePolicy::default())
+        .unwrap();
+    assert_eq!(
+        cpu.deadline_extra_bw_scaled(),
+        950_000_000,
+        "policy apply must release dl_bw before returning, not through a pending fallback"
+    );
+}
+
+#[test]
+fn root_domain_extra_bandwidth_uses_linux_per_reservation_rounding() {
+    support::clear_handles();
+    let system = TaskSystem::new(TaskSystemConfig::new(2)).unwrap();
+    let mut cpu0 = system.create_cpu_local(CpuId::new(0)).unwrap();
+    let mut cpu1 = system.create_cpu_local(CpuId::new(1)).unwrap();
+    for cpu in [&mut cpu0, &mut cpu1] {
+        system
+            .register_idle_thread(
+                cpu.as_mut(),
+                ThreadSpec::new(SchedulePolicy::fair(Nice::ZERO, FairMode::Idle)),
+            )
+            .unwrap();
+        system.bring_cpu_online(cpu.as_mut()).unwrap();
+    }
+    let policy = SchedulePolicy::deadline(
+        DeadlinePolicy::new(1, 1_000_000_000, 1_000_000_000, DeadlineFlags::NONE).unwrap(),
+    );
+    system.create_thread(ThreadSpec::new(policy)).unwrap();
+    system.create_thread(ThreadSpec::new(policy)).unwrap();
+
+    assert_eq!(cpu0.deadline_extra_bw_scaled(), 950_000_000);
+    assert_eq!(cpu1.deadline_extra_bw_scaled(), 950_000_000);
+    system.take_cpu_offline(cpu1.as_mut()).unwrap();
+    assert_eq!(cpu0.deadline_extra_bw_scaled(), 949_999_998);
+    system.bring_cpu_online(cpu1.as_mut()).unwrap();
+    assert_eq!(cpu0.deadline_extra_bw_scaled(), 950_000_000);
+    assert_eq!(cpu1.deadline_extra_bw_scaled(), 950_000_000);
+}
+
+#[test]
+fn deadline_policy_replace_rounds_old_and_new_reservations_separately() {
+    support::clear_handles();
+    let system = TaskSystem::new(TaskSystemConfig::new(2)).unwrap();
+    let mut cpu0 = system.create_cpu_local(CpuId::new(0)).unwrap();
+    let mut cpu1 = system.create_cpu_local(CpuId::new(1)).unwrap();
+    for cpu in [&mut cpu0, &mut cpu1] {
+        system
+            .register_idle_thread(
+                cpu.as_mut(),
+                ThreadSpec::new(SchedulePolicy::fair(Nice::ZERO, FairMode::Idle)),
+            )
+            .unwrap();
+        system.bring_cpu_online(cpu.as_mut()).unwrap();
+    }
+    let two = SchedulePolicy::deadline(
+        DeadlinePolicy::new(2, 1_000_000_000, 1_000_000_000, DeadlineFlags::NONE).unwrap(),
+    );
+    let thread = ready_deadline(
+        &system,
+        1,
+        1_000_000_000,
+        1_000_000_000,
+        DeadlineFlags::NONE,
+    );
+    system.enqueue_at(cpu0.as_mut(), thread.id(), 0).unwrap();
+
+    system.set_thread_policy(thread.id(), two).unwrap();
+
+    assert_eq!(cpu0.deadline_extra_bw_scaled(), 949_999_999);
+    assert_eq!(cpu1.deadline_extra_bw_scaled(), 949_999_999);
+    system.drain_policy_updates_at(cpu0.as_mut(), 0).unwrap();
 }
 
 #[test]
@@ -283,6 +372,8 @@ fn deadline_bandwidth_moves_between_owner_runqueues() {
     }
     let first = ready_deadline(&system, 2, 10, 20, DeadlineFlags::NONE);
     let second = ready_deadline(&system, 2, 10, 20, DeadlineFlags::NONE);
+    assert_eq!(cpu0.deadline_extra_bw_scaled(), 850_000_000);
+    assert_eq!(cpu1.deadline_extra_bw_scaled(), 850_000_000);
     system.enqueue_at(cpu0.as_mut(), first.id(), 0).unwrap();
     system.enqueue_at(cpu0.as_mut(), second.id(), 0).unwrap();
     assert_eq!(cpu0.deadline_bandwidth().this_bw_scaled(), 200_000_000);

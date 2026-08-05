@@ -207,11 +207,9 @@ impl TaskSystem {
         if !cpu.is_online() {
             return Err(TaskError::CpuOffline(cpu.owner().as_u32()));
         }
-        let charge = cpu.as_mut().charge_current_dispatch(
-            runtime_ns,
-            reclaimed_ns,
-            self.root_domain.deadline_extra_bw_scaled(),
-        )?;
+        let charge = cpu
+            .as_mut()
+            .charge_current_dispatch(runtime_ns, reclaimed_ns)?;
         Ok(ChargeOutcome {
             slice_expired: charge.slice_expired,
             deadline_overrun: charge.deadline_overrun,
@@ -238,10 +236,9 @@ impl TaskSystem {
         if !cpu.is_online() {
             return Err(TaskError::CpuOffline(cpu.owner().as_u32()));
         }
-        let (charge, clock) = cpu.as_mut().settle_current_dispatch_with_clock(
-            reclaimed_ns,
-            self.root_domain.deadline_extra_bw_scaled(),
-        )?;
+        let (charge, clock) = cpu
+            .as_mut()
+            .settle_current_dispatch_with_clock(reclaimed_ns)?;
         Ok((
             ChargeOutcome {
                 slice_expired: charge.slice_expired,
@@ -363,9 +360,7 @@ impl TaskSystem {
         }
         let mut switch_requested = cpu.as_mut().scheduler_enter();
         if cpu.dispatch_state().current_dispatch.is_some() {
-            let _settled = cpu
-                .as_mut()
-                .settle_current_dispatch(0, self.root_domain.deadline_extra_bw_scaled())?;
+            let _settled = cpu.as_mut().settle_current_dispatch(0)?;
         }
         if matches!(deadline_entry, DeadlineEntry::Service) {
             self.service_deadline_timers(cpu.as_mut(), now_ns)?;
