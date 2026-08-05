@@ -7,6 +7,8 @@ use page_table_generic::*;
 
 const PAGE_SIZE: usize = 0x1000;
 const ROOT_ENTRY_SIZE: usize = 1 << 39;
+const KERNEL_SPACE_BASE: usize = 0xffff_8000_0000_0000;
+const KERNEL_IMAGE_BASE: usize = 0xffff_ffff_8000_0000;
 
 #[derive(Clone, Copy)]
 struct CanonicalT4kL4;
@@ -92,6 +94,43 @@ fn copied_root_entries_remain_shared_and_borrowed() {
     assert_eq!(
         source.translate_phys(VirtAddr::from_usize(SECOND_PAGE)),
         Ok(PhysAddr::from_usize(0x80_0000))
+    );
+}
+
+#[test]
+fn cloned_missing_root_entries_preserve_boot_only_kernel_mappings() {
+    const DIRECT_PAGE: usize = KERNEL_SPACE_BASE + 0x20_0000;
+    const KERNEL_IMAGE_PAGE: usize = KERNEL_IMAGE_BASE + 0x40_0000;
+
+    let allocator = TrackedFram4k::new();
+    let mut boot = PageTable::<T4kL4, TrackedFram4k>::new(allocator).unwrap();
+    map_page(&mut boot, DIRECT_PAGE, 0x20_0000);
+    map_page(&mut boot, KERNEL_IMAGE_PAGE, 0x40_0000);
+
+    let mut managed = PageTable::<T4kL4, TrackedFram4k>::new(allocator).unwrap();
+    map_page(&mut managed, DIRECT_PAGE, 0x20_0000);
+    managed
+        .clone_missing_root_entries_from(
+            &boot,
+            VirtAddr::from_usize(KERNEL_SPACE_BASE),
+            usize::MAX - KERNEL_SPACE_BASE,
+        )
+        .unwrap();
+    drop(boot);
+
+    let mut user = PageTable::<T4kL4, TrackedFram4k>::new(allocator).unwrap();
+    unsafe {
+        user.share_root_entries_from(
+            &managed,
+            VirtAddr::from_usize(KERNEL_SPACE_BASE),
+            usize::MAX - KERNEL_SPACE_BASE,
+        )
+    }
+    .unwrap();
+
+    assert_eq!(
+        user.translate_phys(VirtAddr::from_usize(KERNEL_IMAGE_PAGE)),
+        Ok(PhysAddr::from_usize(0x40_0000))
     );
 }
 

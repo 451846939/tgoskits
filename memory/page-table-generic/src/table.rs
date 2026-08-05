@@ -1,6 +1,4 @@
-#[cfg(feature = "copy-from")]
-use core::ops::Range;
-use core::ops::{Deref, DerefMut};
+use core::ops::{Deref, DerefMut, Range};
 
 use crate::{
     FrameAllocator, MappingFlags, PageSize, PageTableEntry, PagingError, PagingResult, PhysAddr,
@@ -39,6 +37,43 @@ impl<T: TableMeta, A: FrameAllocator> PageTable<T, A> {
         self.inner.root.paddr
     }
 
+    /// Deep-copies source root entries that are absent from this page table.
+    ///
+    /// Leaf mappings keep referring to the same physical memory, while every
+    /// copied intermediate page-table frame is independently owned by this
+    /// page table. Existing destination root entries are left unchanged.
+    ///
+    /// If allocation fails, entries copied before the failure remain installed
+    /// and are reclaimed normally when this page table is dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the range overflows or wraps around the root table,
+    /// or if an intermediate page-table frame cannot be allocated.
+    pub fn clone_missing_root_entries_from(
+        &mut self,
+        other: &PageTableRef<T, A>,
+        start_vaddr: VirtAddr,
+        size: usize,
+    ) -> PagingResult {
+        let Some(entries) = Self::root_entry_range(start_vaddr, size)? else {
+            return Ok(());
+        };
+
+        let root_level = Frame::<T, A>::PT_LEVEL;
+        let mut changed = false;
+        for index in entries {
+            changed |= self
+                .inner
+                .root
+                .clone_entry_from(&other.root, index, root_level)?;
+        }
+        if changed {
+            T::flush(None);
+        }
+        Ok(())
+    }
+
     /// Shares root page-table entries from another page table.
     ///
     /// Mappings below the shared root entries remain owned by the source and
@@ -65,27 +100,38 @@ impl<T: TableMeta, A: FrameAllocator> PageTable<T, A> {
             ));
         }
 
+        let Some(entries) = Self::root_entry_range(start_vaddr, size)? else {
+            return Ok(());
+        };
+        let root_level = Frame::<T, A>::PT_LEVEL;
+
+        for index in entries.clone() {
+            self.inner.root.dealloc_entry_recursive(index, root_level);
+            self.inner.root.as_slice_mut()[index] = other.inner.root.as_slice()[index];
+        }
+        self.borrowed_root_entries = Some(entries);
+        T::flush(None);
+        Ok(())
+    }
+
+    fn root_entry_range(start_vaddr: VirtAddr, size: usize) -> PagingResult<Option<Range<usize>>> {
+        if size == 0 {
+            return Ok(None);
+        }
         let end_vaddr = start_vaddr
             .as_usize()
             .checked_add(size)
-            .ok_or_else(|| PagingError::address_overflow("share_root_entries_from"))?;
+            .ok_or_else(|| PagingError::address_overflow("root_entry_range"))?;
         let root_level = Frame::<T, A>::PT_LEVEL;
         let start_index = Frame::<T, A>::virt_to_index(start_vaddr, root_level);
         let end_index =
             Frame::<T, A>::virt_to_index(VirtAddr::from_usize(end_vaddr - 1), root_level) + 1;
         if start_index >= end_index {
             return Err(PagingError::invalid_range(
-                "Shared range must be contiguous in the root page table",
+                "Range must be contiguous in the root page table",
             ));
         }
-
-        for index in start_index..end_index {
-            self.inner.root.dealloc_entry_recursive(index, root_level);
-            self.inner.root.as_slice_mut()[index] = other.inner.root.as_slice()[index];
-        }
-        self.borrowed_root_entries = Some(start_index..end_index);
-        T::flush(None);
-        Ok(())
+        Ok(Some(start_index..end_index))
     }
 
     #[cfg(feature = "copy-from")]

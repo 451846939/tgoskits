@@ -405,6 +405,51 @@ where
             false
         }
     }
+
+    pub(crate) fn clone_entry_from(
+        &mut self,
+        source: &Self,
+        index: usize,
+        level: usize,
+    ) -> PagingResult<bool> {
+        if index >= self.len() || index >= source.len() {
+            return Err(PagingError::hierarchy_error(
+                "Entry index exceeds page-table frame size",
+            ));
+        }
+        if self.as_slice()[index].valid() {
+            return Ok(false);
+        }
+
+        let source_entry = source.as_slice()[index];
+        let source_config = source_entry.to_config(level > 1);
+        if !source_config.valid {
+            return Ok(false);
+        }
+        if level == 1 || source_config.huge {
+            self.as_slice_mut()[index] = source_entry;
+            return Ok(true);
+        }
+
+        let source_child = Self::from_paddr(source_config.paddr, source.allocator.clone());
+        let mut target_child = Self::new(self.allocator.clone())?;
+        if let Err(err) = target_child.clone_children_from(&source_child, level - 1) {
+            target_child.deallocate_recursive(level - 1);
+            return Err(err);
+        }
+
+        let mut target_config = source_config;
+        target_config.paddr = target_child.paddr;
+        self.as_slice_mut()[index] = T::P::from_config(target_config);
+        Ok(true)
+    }
+
+    fn clone_children_from(&mut self, source: &Self, level: usize) -> PagingResult {
+        for index in 0..source.len() {
+            self.clone_entry_from(source, index, level)?;
+        }
+        Ok(())
+    }
 }
 
 const fn cal_index_bits<T: TableMeta>() -> usize {
