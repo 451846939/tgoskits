@@ -10,6 +10,21 @@ const CPU_PUBLICATION_RELEASE_INVARIANT: u32 = 0x4350_5544;
 
 pub(super) const INITIAL_CPU_LIFECYCLE_STATE: usize = CPU_LIFECYCLE_OFFLINE;
 
+#[derive(Clone, Copy)]
+enum CpuPublicationClass {
+    Placement,
+    OwnerControl,
+}
+
+impl CpuPublicationClass {
+    const fn accepts(self, state: usize) -> bool {
+        match self {
+            Self::Placement => state & CPU_LIFECYCLE_MASK == 0,
+            Self::OwnerControl => state & CPU_LIFECYCLE_OFFLINE == 0,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct CpuPublicationState {
     state: AtomicUsize,
@@ -170,10 +185,15 @@ impl CpuRemote {
     }
 
     pub(crate) fn begin_publication(&self) -> Option<CpuRemotePublication<'_>> {
+        self.try_acquire_publication(CpuPublicationClass::Placement)
+            .then(|| CpuRemotePublication { remote: self })
+    }
+
+    fn try_acquire_publication(&self, class: CpuPublicationClass) -> bool {
         let mut current = self.publication.state.load(Ordering::Acquire);
         loop {
-            if current & CPU_LIFECYCLE_MASK != 0 {
-                return None;
+            if !class.accepts(current) {
+                return false;
             }
             let count = current & CPU_PUBLICATION_COUNT_MASK;
             if count == CPU_PUBLICATION_COUNT_MASK {
@@ -188,35 +208,28 @@ impl CpuRemote {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return Some(CpuRemotePublication { remote: self }),
+                Ok(_) => return true,
                 Err(actual) => current = actual,
             }
         }
     }
 
+    /// Pins an online placement target across an owner context switch.
+    ///
+    /// Linux holds the CPU-hotplug/read-side ownership that makes the selected
+    /// destination runqueue stable before it commits `TASK_ON_RQ_MIGRATING`.
+    /// The owned form carries the same lifetime proof through switch tail,
+    /// where a borrowed runqueue guard cannot survive the architecture switch.
+    pub(crate) fn begin_owned_publication(self: &Arc<Self>) -> Option<OwnedCpuRemotePublication> {
+        self.try_acquire_publication(CpuPublicationClass::Placement)
+            .then(|| OwnedCpuRemotePublication {
+                remote: Arc::clone(self),
+            })
+    }
+
     pub(crate) fn begin_owner_delivery(&self) -> Option<CpuRemotePublication<'_>> {
-        let mut current = self.publication.state.load(Ordering::Acquire);
-        loop {
-            if current & CPU_LIFECYCLE_OFFLINE != 0 {
-                return None;
-            }
-            let count = current & CPU_PUBLICATION_COUNT_MASK;
-            if count == CPU_PUBLICATION_COUNT_MASK {
-                task_runtime::fatal_invariant(
-                    CPU_PUBLICATION_OVERFLOW_INVARIANT,
-                    self.owner.as_u32() as usize,
-                );
-            }
-            match self.publication.state.compare_exchange_weak(
-                current,
-                current + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return Some(CpuRemotePublication { remote: self }),
-                Err(actual) => current = actual,
-            }
-        }
+        self.try_acquire_publication(CpuPublicationClass::OwnerControl)
+            .then(|| CpuRemotePublication { remote: self })
     }
 
     pub(crate) fn is_quiescent_for_offline(&self) -> bool {
@@ -233,6 +246,21 @@ pub(crate) struct CpuRemotePublication<'remote> {
     remote: &'remote CpuRemote,
 }
 
+#[derive(Debug)]
+pub(crate) struct OwnedCpuRemotePublication {
+    remote: Arc<CpuRemote>,
+}
+
+impl OwnedCpuRemotePublication {
+    pub(crate) fn publish_owner_control(
+        self,
+        node: Pin<&'static InboxNode>,
+        message: InboxMessage,
+    ) -> PublishResult {
+        self.remote.publish_owner_control_owned(node, message)
+    }
+}
+
 impl CpuRemotePublication<'_> {
     pub(crate) fn publish_owner_control(
         self,
@@ -245,23 +273,33 @@ impl CpuRemotePublication<'_> {
 
 impl Drop for CpuRemotePublication<'_> {
     fn drop(&mut self) {
-        let mut current = self.remote.publication.state.load(Ordering::Acquire);
-        loop {
-            if current & CPU_LIFECYCLE_OFFLINE != 0 || current & CPU_PUBLICATION_COUNT_MASK == 0 {
-                task_runtime::fatal_invariant(
-                    CPU_PUBLICATION_RELEASE_INVARIANT,
-                    self.remote.owner.as_u32() as usize,
-                );
-            }
-            match self.remote.publication.state.compare_exchange_weak(
-                current,
-                current - 1,
-                Ordering::Release,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return,
-                Err(actual) => current = actual,
-            }
+        release_publication(self.remote);
+    }
+}
+
+impl Drop for OwnedCpuRemotePublication {
+    fn drop(&mut self) {
+        release_publication(&self.remote);
+    }
+}
+
+fn release_publication(remote: &CpuRemote) {
+    let mut current = remote.publication.state.load(Ordering::Acquire);
+    loop {
+        if current & CPU_LIFECYCLE_OFFLINE != 0 || current & CPU_PUBLICATION_COUNT_MASK == 0 {
+            task_runtime::fatal_invariant(
+                CPU_PUBLICATION_RELEASE_INVARIANT,
+                remote.owner.as_u32() as usize,
+            );
+        }
+        match remote.publication.state.compare_exchange_weak(
+            current,
+            current - 1,
+            Ordering::Release,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return,
+            Err(actual) => current = actual,
         }
     }
 }

@@ -7,9 +7,7 @@ use ax_task::{
     CpuId, FairMode, Nice, SchedulePolicy, SchedulerTickGate, SchedulerTickWorkDisposition,
     TaskError, TaskSystem, TaskSystemConfig, ThreadExtension, ThreadExtensionOps, ThreadId,
     ThreadSpec, ThreadState, WakeResult, current_cpu_needs_resched, current_thread_extension,
-    current_thread_id, on_clock_event, on_clock_event_with_scheduler_tick, schedule_current_cpu,
-    take_current_expired_task_deadlines,
-    timer::{ExpiredTaskDeadline, TaskDeadlineKind, TaskDeadlineNode},
+    current_thread_id, on_clock_event_with_scheduler_tick, schedule_current_cpu,
 };
 
 mod support;
@@ -77,95 +75,14 @@ fn facade_reports_uninitialized_then_uses_runtime_owned_objects() {
     assert_eq!(sleeper.wake_handle().wake(), WakeResult::Notified);
     assert_eq!(
         system.thread_state(sleeper.id()).unwrap(),
+        ThreadState::Waking
+    );
+    system.complete_context_switch(cpu.as_mut()).unwrap();
+    assert_eq!(
+        system.thread_state(sleeper.id()).unwrap(),
         ThreadState::Ready
     );
 
-    support::clear_handles();
-}
-
-#[test]
-fn timer_irq_facade_bounds_and_preserves_unconsumed_expirations() {
-    let _test_lock = TEST_LOCK.lock().expect("facade test lock poisoned");
-    support::clear_handles();
-    let system = Box::pin(
-        TaskSystem::new(
-            TaskSystemConfig::new(1)
-                .with_timer_capacity(3)
-                .with_batch_limit(2),
-        )
-        .unwrap(),
-    );
-    let timers = [timer(1), timer(2), timer(3)];
-    let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
-    system
-        .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
-        .unwrap();
-    system.bring_cpu_online(cpu.as_mut()).unwrap();
-    let _registrations = timers
-        .iter()
-        .enumerate()
-        .map(|(generation, node)| {
-            cpu.as_mut()
-                .task_deadlines()
-                .arm(
-                    node.as_ref(),
-                    0,
-                    TaskDeadlineKind::park_timeout(generation as u64 + 1),
-                )
-                .unwrap()
-        })
-        .collect::<Vec<_>>();
-    support::install_handles(
-        (system.as_ref().get_ref() as *const TaskSystem).expose_provenance(),
-        cpu.as_mut(),
-    );
-
-    let first = on_clock_event(1, 2).unwrap();
-    assert_eq!(first.expired(), 2);
-    assert!(first.pending());
-    assert!(first.update().deferred_work());
-    assert!(current_cpu_needs_resched().unwrap());
-    assert!(
-        first.next_deadline_ns().is_none_or(|deadline| deadline > 2),
-        "the overdue bounded backlog must be advanced by sticky safe-point work, not by an \
-         immediate follow-up timer interrupt"
-    );
-    let before_drain = on_clock_event(1, 2).unwrap();
-    assert_eq!(before_drain.expired(), 0);
-    assert!(before_drain.pending(), "{before_drain:?}");
-    assert!(before_drain.update().deferred_work());
-    assert_eq!(
-        before_drain.update().generation(),
-        first.update().generation(),
-        "an unchanged logical deadline publication must retain its generation"
-    );
-
-    let mut expired = [ExpiredTaskDeadline::EMPTY; 2];
-    assert_eq!(
-        take_current_expired_task_deadlines(&mut expired).unwrap(),
-        2
-    );
-    let mut owners = [
-        expired[0].thread().unwrap().slot(),
-        expired[1].thread().unwrap().slot(),
-    ];
-    support::set_monotonic_ns(1);
-    let decision = schedule_current_cpu()
-        .unwrap()
-        .decision()
-        .expect("the timer IRQ's owner preemption request must reach one scheduler decision");
-    assert!(
-        !decision.requires_context_switch(),
-        "draining timer work with no runnable peer must preserve the current execution context"
-    );
-    assert!(!current_cpu_needs_resched().unwrap());
-    let (_, next_deadline_ns, deferred_work) = support::last_task_deadline_update();
-    assert_ne!(next_deadline_ns, 2);
-    assert!(!deferred_work);
-    assert!(cpu.as_mut().task_deadlines().is_empty());
-    owners.sort_unstable();
-    assert_ne!(owners[0], owners[1]);
-    assert!(owners.iter().all(|owner| (1..=3).contains(owner)));
     support::clear_handles();
 }
 
@@ -585,119 +502,6 @@ fn scheduler_tick_delivery_pins_extension_across_thread_exit() {
     );
 
     support::clear_handles();
-}
-
-#[test]
-fn partial_deadline_drain_preserves_buffered_events() {
-    let _test_lock = TEST_LOCK.lock().expect("facade test lock poisoned");
-    support::clear_handles();
-    let system = Box::pin(
-        TaskSystem::new(
-            TaskSystemConfig::new(1)
-                .with_timer_capacity(2)
-                .with_batch_limit(2),
-        )
-        .unwrap(),
-    );
-    let timers = [timer(21), timer(22)];
-    let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
-    system
-        .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
-        .unwrap();
-    system.bring_cpu_online(cpu.as_mut()).unwrap();
-    let _registrations = timers
-        .iter()
-        .enumerate()
-        .map(|(generation, node)| {
-            cpu.as_mut()
-                .task_deadlines()
-                .arm(
-                    node.as_ref(),
-                    0,
-                    TaskDeadlineKind::park_timeout(generation as u64 + 1),
-                )
-                .unwrap()
-        })
-        .collect::<Vec<_>>();
-    support::install_handles(
-        (system.as_ref().get_ref() as *const TaskSystem).expose_provenance(),
-        cpu.as_mut(),
-    );
-
-    assert_eq!(on_clock_event(1, 2).unwrap().expired(), 2);
-
-    let mut first = [ExpiredTaskDeadline::EMPTY; 1];
-    assert_eq!(take_current_expired_task_deadlines(&mut first).unwrap(), 1);
-    let mut second = [ExpiredTaskDeadline::EMPTY; 1];
-    assert_eq!(
-        take_current_expired_task_deadlines(&mut second).unwrap(),
-        1,
-        "a short consumer buffer must not discard the remaining expiration"
-    );
-    assert_ne!(first[0].thread(), second[0].thread());
-    assert_eq!(take_current_expired_task_deadlines(&mut second).unwrap(), 0);
-
-    support::clear_handles();
-}
-
-#[test]
-fn scheduler_safe_points_finish_an_exhausted_timer_batch_without_another_irq() {
-    let _test_lock = TEST_LOCK.lock().expect("facade test lock poisoned");
-    support::clear_handles();
-    let system = Box::pin(
-        TaskSystem::new(
-            TaskSystemConfig::new(1)
-                .with_timer_capacity(3)
-                .with_batch_limit(1),
-        )
-        .unwrap(),
-    );
-    let timers = [timer(11), timer(12), timer(13)];
-    let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
-    system
-        .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
-        .unwrap();
-    system.bring_cpu_online(cpu.as_mut()).unwrap();
-    let _registrations = timers
-        .iter()
-        .enumerate()
-        .map(|(generation, node)| {
-            cpu.as_mut()
-                .task_deadlines()
-                .arm(
-                    node.as_ref(),
-                    0,
-                    TaskDeadlineKind::park_timeout(generation as u64 + 1),
-                )
-                .unwrap()
-        })
-        .collect::<Vec<_>>();
-    support::install_handles(
-        (system.as_ref().get_ref() as *const TaskSystem).expose_provenance(),
-        cpu.as_mut(),
-    );
-
-    let irq = on_clock_event(0, 1).unwrap();
-    assert_eq!(irq.expired(), 1);
-    assert!(irq.pending());
-
-    assert!(schedule_current_cpu().is_ok());
-    assert!(
-        current_cpu_needs_resched().unwrap(),
-        "the per-CPU deadline worker must retain a sticky retry"
-    );
-    assert!(schedule_current_cpu().is_ok());
-    assert!(
-        cpu.as_mut().task_deadlines().is_empty(),
-        "ordinary-context safe points must drain every due node without another timer IRQ"
-    );
-    assert!(!current_cpu_needs_resched().unwrap());
-
-    support::clear_handles();
-}
-
-fn timer(slot: u32) -> Box<TaskDeadlineNode> {
-    Box::new(TaskDeadlineNode::for_thread(ThreadId::from_parts(slot, 1)))
 }
 
 static TEST_EXTENSION_OPS: ThreadExtensionOps = ThreadExtensionOps {

@@ -786,7 +786,12 @@ fn rt_placement_does_not_select_a_cpu_running_deadline_work() {
     system.place_ready(cpu1.as_mut(), realtime.id(), 2).unwrap();
 
     assert_eq!(
-        realtime.core.sched().lock().placement.migration_target(),
+        realtime
+            .core
+            .sched()
+            .lock()
+            .placement
+            .committed_migration_target(),
         Some(CpuId::new(0)),
         "cpupri must publish a CPU with runnable Deadline work in the HIGHER bucket"
     );
@@ -837,7 +842,12 @@ fn wide_affinity_deadline_placement_uses_latest_cpu_deadline() {
         .place_ready(cpu0.as_mut(), contender.id(), 4)
         .unwrap();
     assert_eq!(
-        contender.core.sched().lock().placement.migration_target(),
+        contender
+            .core
+            .sched()
+            .lock()
+            .placement
+            .committed_migration_target(),
         Some(CpuId::new(1)),
         "Deadline placement must choose the allowed CPU whose earliest runnable deadline is latest"
     );
@@ -1272,7 +1282,7 @@ fn pending_local_scheduler_work_prevents_cpu_offline() {
 }
 
 #[test]
-fn migration_publication_recovers_through_source_when_target_starts_draining() {
+fn migration_reservation_rejects_a_draining_target_before_placement_changes() {
     let system = TaskSystem::new(TaskSystemConfig::new(2)).unwrap();
     let mut cpu0 = system.create_cpu_local(CpuId::new(0)).unwrap();
     let mut cpu1 = system.create_cpu_local(CpuId::new(1)).unwrap();
@@ -1295,28 +1305,15 @@ fn migration_publication_recovers_through_source_when_target_starts_draining() {
     // committed and published the detached migration.
     assert!(cpu1.remote().try_deactivate());
     assert!(cpu1.remote().try_begin_draining());
-    {
-        let mut sched = thread.core.sched().lock();
-        sched
-            .placement
-            .set_migration_target(Some(CpuId::new(1)))
-            .unwrap();
-        thread.core.set_wake_cpu_hint(CpuId::new(1));
-    }
-
-    system
-        .deliver_owner_migration(&thread.core, CpuId::new(0), CpuId::new(1))
-        .unwrap();
-    system.drain_policy_updates(cpu0.as_mut(), 0).unwrap();
+    assert!(matches!(
+        system.prepare_owner_migration(&thread.core, CpuId::new(0), CpuId::new(1)),
+        Err(TaskError::CpuOffline(1))
+    ));
 
     let state = system.state.lock();
     let sched = state.thread_record(thread.id()).unwrap().sched.lock();
-    assert_eq!(
-        sched.placement.queued_cpu(),
-        Some(CpuId::new(0)),
-        "the still-online source must recover a migration rejected by a draining target"
-    );
-    assert_eq!(sched.placement.migration_target(), None);
+    assert_eq!(sched.placement.queued_cpu(), None);
+    assert!(!sched.placement.has_pending_migration());
 }
 
 #[test]
@@ -1347,7 +1344,7 @@ fn migration_carrier_closes_hotplug_before_detached_placement_commits() {
 
     let sched = thread.core.sched().lock();
     assert_eq!(sched.placement.queued_cpu(), Some(CpuId::new(1)));
-    assert_eq!(sched.placement.migration_target(), None);
+    assert!(!sched.placement.has_pending_migration());
 }
 
 #[test]
@@ -2722,7 +2719,7 @@ fn prepared_exit_rejects_new_remote_affinity_delivery() {
         .upgrade()
         .expect("the registry still retains the exited core before reaping");
     assert_eq!(core.scheduler_inbox_delivery_count(), 0);
-    assert_eq!(core.sched().lock().placement.migration_target(), None);
+    assert!(!core.sched().lock().placement.has_pending_migration());
     drop(core);
     assert!(
         system
@@ -2821,13 +2818,6 @@ fn failed_owner_batch_releases_all_detached_payloads() {
     system.make_ready(thread_id).unwrap();
     system.enqueue(cpu1.as_mut(), thread_id, 0).unwrap();
 
-    thread
-        .core
-        .sched()
-        .lock()
-        .placement
-        .set_migration_target(Some(CpuId::new(1)))
-        .unwrap();
     assert!(thread.core.reserve_scheduler_inbox_delivery());
     let pointer = Arc::as_ptr(&thread.core);
     unsafe {
@@ -3701,7 +3691,7 @@ fn queued_affinity_migration_captures_lag_before_detaching_from_source() {
         let mut sched = thread.core.sched().lock();
         sched.policy.base_entity = entity;
         sched.policy.effective_entity = entity;
-        sched.placement.set_queued_cpu(Some(CpuId::new(0))).unwrap();
+        sched.placement.activate(CpuId::new(0));
         thread.core.set_wake_cpu_hint(CpuId::new(0));
     }
 
@@ -3747,16 +3737,18 @@ fn placement_rejects_an_unrelated_cpu_claim() {
 
     // A stale remote publication cannot manufacture an independent `on_cpu`
     // owner alongside the runqueue owner.
-    let result = system
-        .state
-        .lock()
-        .thread_record_mut(thread.id())
-        .unwrap()
-        .sched
-        .lock()
-        .placement
-        .set_on_cpu(Some(CpuId::new(1)));
-    assert_eq!(result, Err(TaskError::InvalidConfiguration));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        system
+            .state
+            .lock()
+            .thread_record_mut(thread.id())
+            .unwrap()
+            .sched
+            .lock()
+            .placement
+            .set_next_task(CpuId::new(1));
+    }));
+    assert!(result.is_err());
     assert_eq!(
         system
             .state
@@ -3854,7 +3846,7 @@ fn schedule_out_rechecks_affinity_under_the_thread_lock() {
     {
         let mut sched = running.core.sched().lock();
         sched.placement.affinity = target_only;
-        sched.placement.set_migration_target(None).unwrap();
+        sched.placement.request_migration(None);
     }
     running.core.set_wake_cpu_hint(CpuId::new(1));
 
@@ -3864,7 +3856,12 @@ fn schedule_out_rechecks_affinity_under_the_thread_lock() {
     assert_eq!(cpu0.current(), Some(idle0.id()));
     assert_eq!(system.thread_state(running.id()), Ok(ThreadState::Ready));
     assert_eq!(
-        running.core.sched().lock().placement.migration_target(),
+        running
+            .core
+            .sched()
+            .lock()
+            .placement
+            .committed_migration_target(),
         Some(CpuId::new(1))
     );
 }
@@ -3911,7 +3908,12 @@ fn owner_pick_reconciles_affinity_changed_after_inbox_drain() {
         .core;
     assert_eq!(next.id(), idle0.id());
     assert_eq!(
-        candidate.core.sched().lock().placement.migration_target(),
+        candidate
+            .core
+            .sched()
+            .lock()
+            .placement
+            .committed_migration_target(),
         Some(CpuId::new(1))
     );
     assert!(cpu1.has_remote_work());
@@ -3948,12 +3950,12 @@ fn affinity_update_preserves_an_in_flight_switch_handoff() {
             EnqueueReason::Yield,
         )
         .unwrap();
-    assert_eq!(initial_target, None);
+    assert!(initial_target.is_none());
     {
         let sched = running.core.sched().lock();
         assert_eq!(sched.placement.queued_cpu(), Some(CpuId::new(0)));
         assert_eq!(sched.placement.on_cpu(), Some(CpuId::new(0)));
-        assert_eq!(sched.placement.migration_target(), None);
+        assert!(!sched.placement.has_pending_migration());
     }
 
     // The remote setter may update task metadata now, but it must not rewrite
@@ -3965,7 +3967,7 @@ fn affinity_update_preserves_an_in_flight_switch_handoff() {
         let sched = running.core.sched().lock();
         assert_eq!(sched.placement.queued_cpu(), Some(CpuId::new(0)));
         assert_eq!(sched.placement.on_cpu(), Some(CpuId::new(0)));
-        assert_eq!(sched.placement.migration_target(), None);
+        assert!(!sched.placement.has_pending_migration());
     }
 
     let next = system
@@ -3973,7 +3975,9 @@ fn affinity_update_preserves_an_in_flight_switch_handoff() {
         .unwrap();
     assert_eq!(next.core.id(), idle0.id());
     assert_eq!(
-        next.outgoing_migration_target,
+        next.outgoing_migration
+            .as_ref()
+            .map(PreparedMigrationDelivery::target),
         Some(CpuId::new(1)),
         "the owner must carry the late affinity change in switch tail"
     );
@@ -3982,7 +3986,7 @@ fn affinity_update_preserves_an_in_flight_switch_handoff() {
         Some(running.id()),
         Some(Arc::clone(&running.core)),
         next.core.id(),
-        next.outgoing_migration_target,
+        next.outgoing_migration,
     )
     .unwrap();
     assert!(
@@ -3992,6 +3996,53 @@ fn affinity_update_preserves_an_in_flight_switch_handoff() {
 
     system.complete_context_switch(cpu0.as_mut()).unwrap();
     assert!(cpu1.has_remote_work());
+}
+
+#[test]
+fn rt_deadline_put_prev_keeps_one_runqueue_owner() {
+    let system = TaskSystem::new(TaskSystemConfig::new(1)).unwrap();
+    let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
+    system
+        .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
+        .unwrap();
+    system
+        .register_idle_thread(
+            cpu.as_mut(),
+            ThreadSpec::new(SchedulePolicy::fair(Nice::ZERO, FairMode::Idle)),
+        )
+        .unwrap();
+    system.bring_cpu_online(cpu.as_mut()).unwrap();
+
+    let policy =
+        SchedulePolicy::deadline(DeadlinePolicy::new(10, 100, 1_000, DeadlineFlags::NONE).unwrap());
+    let deadline = system.create_thread(ThreadSpec::new(policy)).unwrap();
+    system.make_ready(deadline.id()).unwrap();
+    system.enqueue(cpu.as_mut(), deadline.id(), 1).unwrap();
+    assert_eq!(
+        system.schedule(cpu.as_mut(), 1).unwrap().next(),
+        deadline.id()
+    );
+    system.complete_context_switch(cpu.as_mut()).unwrap();
+    assert!(cpu.lock_run_queue().is_linked_current(deadline.id()));
+    let queued_before = cpu.lock_run_queue().len();
+    system
+        .schedule_out_owner_running(
+            cpu.as_mut(),
+            Arc::clone(&deadline.core),
+            2,
+            EnqueueReason::Preempted,
+        )
+        .unwrap();
+
+    let sched = deadline.core.sched().lock();
+    assert_eq!(sched.lifecycle.state(), ThreadState::Ready);
+    assert_eq!(sched.placement.execution_cpu(), Some(CpuId::new(0)));
+    assert_eq!(sched.placement.queued_cpu(), Some(CpuId::new(0)));
+    drop(sched);
+    assert_eq!(cpu.current(), None);
+    let run_queue = cpu.lock_run_queue();
+    assert!(run_queue.queued_thread(deadline.id()).is_some());
+    assert_eq!(run_queue.len(), queued_before + 1);
 }
 
 #[test]
@@ -4202,7 +4253,8 @@ fn active_sleep_timer_pins_affinity_placement_to_its_owner_cpu() {
     let mut includes_owner = CpuSet::empty(2);
     includes_owner.insert(CpuId::new(1));
     system.set_affinity(thread.id(), includes_owner).unwrap();
-    assert_eq!(thread.assigned_cpu(), Some(CpuId::new(1)));
+    assert_eq!(thread.assigned_cpu(), None);
+    assert_eq!(thread.core.wake_cpu_hint(), Some(CpuId::new(1)));
     assert!(thread.core.complete_sleep_timer(7));
 }
 
@@ -4775,9 +4827,7 @@ fn remote_pi_owner_exclusively_borrows_the_donor_cbs_entity() {
         "the donor CPU must start the baton-return check without stale work"
     );
 
-    cpu1.as_mut()
-        .add_deadline_bandwidth(500_000_000, false)
-        .unwrap();
+    cpu1.as_mut().add_deadline_bandwidth(500_000_000, false);
     system.charge_current(cpu1.as_mut(), 5, 5, 0).unwrap();
     system
         .commit_owner_current_dispatch(cpu1.as_mut(), 5)
@@ -4824,7 +4874,7 @@ fn coalesced_old_deadline_refresh_reconciles_the_latest_cbs_state() {
     };
     let latest_generation = {
         let mut sched = core.sched().lock();
-        TaskSystem::cancel_owner_deadline_timers_locked(&core, &mut sched, cpu.as_mut()).unwrap();
+        TaskSystem::cancel_owner_deadline_timers_locked(&core, &mut sched, cpu.as_mut());
         sched.pi.deadline_cbs_generation += 2;
         sched.pi.deadline_cbs_generation
     };

@@ -15,85 +15,13 @@ pub(super) fn drain_next_migration_cpus_before_publication() {
 }
 
 #[cfg(test)]
-pub(super) fn inject_migration_publication_race(system: &TaskSystem, source: CpuId, target: CpuId) {
+pub(super) fn inject_migration_publication_race(system: &TaskSystem, target: CpuId) {
     if !DRAIN_MIGRATION_CPUS_BEFORE_PUBLICATION.replace(false) {
         return;
     }
-    for cpu in [target, source] {
-        let remote = &system.cpu_remotes[cpu.as_usize()];
-        if remote.try_deactivate() {
-            assert!(remote.try_begin_draining());
-        }
-    }
-}
-
-/// Move-only owner-control carrier reserved before physical placement changes.
-///
-/// Holding the CPU publication lease prevents hotplug from crossing the
-/// `Queued/Detached -> Migrating` transaction. Holding the thread delivery
-/// lease gives `Migrating` a concrete lifetime owner before the source
-/// runqueue entry is detached, matching Linux's `TASK_ON_RQ_MIGRATING`
-/// invariant.
-pub(super) struct PreparedOwnerMigration<'remote> {
-    publication: Option<CpuRemotePublication<'remote>>,
-    core: Option<Arc<ThreadCore>>,
-    source: CpuId,
-    inbox_cpu: CpuId,
-    placement_demand: u64,
-}
-
-impl PreparedOwnerMigration<'_> {
-    pub(super) fn commit(mut self) {
-        let publication = self
-            .publication
-            .take()
-            .expect("prepared migration must retain its CPU publication lease");
-        let core = self
-            .core
-            .take()
-            .expect("prepared migration must retain its thread delivery lease");
-        let thread = core.id();
-        let pointer = Arc::into_raw(core);
-        let node = unsafe {
-            // SAFETY: the transferred Arc count keeps the embedded node pinned
-            // until one owner drain reconstructs and releases the reference.
-            Pin::new_unchecked((*pointer).migration_node())
-        };
-        let message = InboxMessage::migration_with_payload(
-            thread,
-            self.source,
-            self.inbox_cpu,
-            thread.generation() as u64,
-            self.placement_demand,
-            pointer.expose_provenance(),
-        );
-        match publication.publish_owner_control(node, message) {
-            PublishResult::Published => {}
-            PublishResult::AlreadyPending => unsafe {
-                // SAFETY: a coalesced publication did not consume this Arc.
-                // The older carrier remains responsible for observing the
-                // latest generation-bearing placement state.
-                let retained = Arc::from_raw(pointer);
-                retained.cancel_scheduler_inbox_delivery();
-                drop(retained);
-            },
-            PublishResult::WrongKind => unsafe {
-                // SAFETY: the typed carrier and embedded migration node have
-                // matching kinds, so rejection is an internal invariant.
-                let retained = Arc::from_raw(pointer);
-                retained.cancel_scheduler_inbox_delivery();
-                drop(retained);
-                task_runtime::fatal_invariant(0x4d49_4701, thread.as_u64() as usize);
-            },
-        }
-    }
-}
-
-impl Drop for PreparedOwnerMigration<'_> {
-    fn drop(&mut self) {
-        if let Some(core) = self.core.take() {
-            core.cancel_scheduler_inbox_delivery();
-        }
+    let remote = &system.cpu_remotes[target.as_usize()];
+    if remote.try_deactivate() {
+        assert!(remote.try_begin_draining());
     }
 }
 
@@ -102,14 +30,13 @@ impl TaskSystem {
         core: &Arc<ThreadCore>,
         sched: &ThreadSchedState,
     ) -> bool {
-        if sched.lifecycle.state() == ThreadState::Exited
-            || sched.placement.migration_target().is_some()
+        if sched.lifecycle.state() == ThreadState::Exited || sched.placement.has_pending_migration()
         {
             return false;
         }
         let placement_is_allowed = [
             sched.placement.queued_cpu(),
-            sched.placement.running_cpu(),
+            sched.placement.execution_cpu(),
             sched.placement.on_cpu(),
         ]
         .into_iter()
@@ -124,46 +51,12 @@ impl TaskSystem {
         core: &Arc<ThreadCore>,
         source: CpuId,
         target: CpuId,
-    ) -> Result<PreparedOwnerMigration<'_>, TaskError> {
+    ) -> Result<PreparedMigrationDelivery, TaskError> {
         let target_remote = self
             .cpu_remotes
             .get(target.as_usize())
             .ok_or(TaskError::InvalidCpu(target.as_u32()))?;
-        let source_remote = self
-            .cpu_remotes
-            .get(source.as_usize())
-            .ok_or(TaskError::InvalidCpu(source.as_u32()))?;
-        let (inbox_cpu, publication) = target_remote
-            .begin_publication()
-            .map_or_else(
-                || {
-                    source_remote
-                        .begin_owner_delivery()
-                        .map(|publication| (source, publication))
-                },
-                |publication| Some((target, publication)),
-            )
-            .ok_or(TaskError::CpuOffline(source.as_u32()))?;
-        if !core.reserve_scheduler_inbox_delivery() {
-            return Err(TaskError::NotReady);
-        }
-        Ok(PreparedOwnerMigration {
-            publication: Some(publication),
-            core: Some(Arc::clone(core)),
-            source,
-            inbox_cpu,
-            placement_demand: core.effective_placement_demand(),
-        })
-    }
-
-    pub(super) fn deliver_owner_migration(
-        &self,
-        core: &Arc<ThreadCore>,
-        source: CpuId,
-        target: CpuId,
-    ) -> Result<(), TaskError> {
-        self.prepare_owner_migration(core, source, target)?.commit();
-        Ok(())
+        PreparedMigrationDelivery::prepare(target_remote, core, source, target)
     }
 
     pub(super) fn publish_owner_policy_retry(
@@ -366,10 +259,10 @@ impl TaskSystem {
         // switch-tail `on_cpu` publication in place.
         let owner = sched
             .placement
-            .running_cpu()
+            .execution_cpu()
             .or(sched.placement.queued_cpu())
             .or(sched.placement.on_cpu())
-            .or(sched.placement.migration_target())
+            .or(sched.placement.committed_migration_target())
             .or(sched.deadline.bandwidth_cpu);
         let target = owner
             .filter(|owner| sched.placement.affinity.contains(*owner))
@@ -416,7 +309,7 @@ impl TaskSystem {
             .cloned()
             .ok_or(TaskError::InvalidConfiguration)?;
         let mut sched = core.sched().lock();
-        if sched.placement.running_cpu() != Some(cpu.owner())
+        if sched.placement.execution_cpu() != Some(cpu.owner())
             || sched.placement.on_cpu() != Some(cpu.owner())
         {
             return Err(TaskError::InvalidConfiguration);
@@ -444,7 +337,7 @@ impl TaskSystem {
         sched.placement.affinity = affinity;
         sched
             .placement
-            .set_migration_target(must_migrate.then_some(target))?;
+            .request_migration(must_migrate.then_some(target));
         core.set_wake_cpu_hint(if must_migrate { target } else { owner });
         let completed = Self::complete_affinity_if_satisfied_locked(&core, &sched);
         drop(sched);

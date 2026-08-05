@@ -212,14 +212,6 @@ impl FairRunQueue {
         earliest_eligible_key(self.root.as_deref(), virtual_time).map(|key| key.thread)
     }
 
-    pub(super) fn first(&self) -> Option<&QueuedThread> {
-        let mut node = self.root.as_deref()?;
-        while let Some(left) = node.left.as_deref() {
-            node = left;
-        }
-        Some(node.thread())
-    }
-
     pub(super) fn find_first_matching(
         &self,
         predicate: &mut impl FnMut(&QueuedThread) -> bool,

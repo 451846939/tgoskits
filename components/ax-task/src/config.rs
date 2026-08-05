@@ -7,15 +7,20 @@ pub const DEFAULT_TIMING_GRANULARITY_NS: u64 = 1_000_000;
 /// Default periodic fair balancing interval in nanoseconds.
 pub const DEFAULT_BALANCE_INTERVAL_NS: u64 = 10_000_000;
 /// Default round-robin quantum in nanoseconds.
-pub const DEFAULT_RR_QUANTUM_NS: u64 = 5_000_000;
+pub const DEFAULT_RR_QUANTUM_NS: u64 = 100_000_000;
 /// Default RT bandwidth period in nanoseconds.
 pub const DEFAULT_RT_PERIOD_NS: u64 = 1_000_000_000;
 /// Default RT runtime budget in nanoseconds.
 pub const DEFAULT_RT_RUNTIME_NS: u64 = 950_000_000;
 /// Default Deadline admission percentage.
 pub const DEFAULT_DEADLINE_CAP_PERCENT: u8 = 95;
-/// Default maximum active timers owned by one CPU.
-pub const DEFAULT_TIMER_CAPACITY: usize = 4096;
+/// Default maximum number of scheduler threads.
+///
+/// Every CPU reserves class linkage, task-deadline, and Deadline membership
+/// storage for this many generation-bearing tasks. Like Linux embedding these
+/// nodes in `task_struct`, scheduler hot paths therefore never discover a
+/// capacity failure after a thread has been published.
+pub const DEFAULT_THREAD_CAPACITY: usize = 4096;
 /// Default bounded work budget for scheduler inboxes and timers.
 pub const DEFAULT_BATCH_LIMIT: usize = 64;
 /// Maximum PI owner-chain depth walked in one non-preemptible transaction.
@@ -59,7 +64,7 @@ pub struct TaskSystemConfig {
     rt_period_ns: u64,
     rt_runtime_ns: u64,
     deadline_cap_percent: u8,
-    timer_capacity: usize,
+    thread_capacity: usize,
     batch_limit: usize,
     pi_chain_limit: usize,
 }
@@ -76,7 +81,7 @@ impl TaskSystemConfig {
             rt_period_ns: DEFAULT_RT_PERIOD_NS,
             rt_runtime_ns: DEFAULT_RT_RUNTIME_NS,
             deadline_cap_percent: DEFAULT_DEADLINE_CAP_PERCENT,
-            timer_capacity: DEFAULT_TIMER_CAPACITY,
+            thread_capacity: DEFAULT_THREAD_CAPACITY,
             batch_limit: DEFAULT_BATCH_LIMIT,
             pi_chain_limit: DEFAULT_PI_CHAIN_LIMIT,
         }
@@ -122,9 +127,9 @@ impl TaskSystemConfig {
         self.deadline_cap_percent
     }
 
-    /// Returns the per-CPU active timer capacity.
-    pub const fn timer_capacity(self) -> usize {
-        self.timer_capacity
+    /// Returns the maximum number of published scheduler threads.
+    pub const fn thread_capacity(self) -> usize {
+        self.thread_capacity
     }
 
     /// Returns the maximum work items processed at one safe point.
@@ -149,9 +154,9 @@ impl TaskSystemConfig {
         self
     }
 
-    /// Overrides the per-CPU timer capacity.
-    pub const fn with_timer_capacity(mut self, capacity: usize) -> Self {
-        self.timer_capacity = capacity;
+    /// Overrides the scheduler thread capacity prepared by every CPU.
+    pub const fn with_thread_capacity(mut self, capacity: usize) -> Self {
+        self.thread_capacity = capacity;
         self
     }
 
@@ -182,6 +187,11 @@ const fn linux_logarithmic_cpu_factor(cpu_count: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_rr_quantum_matches_linux_v71() {
+        assert_eq!(TaskSystemConfig::new(1).rr_quantum_ns(), 100_000_000);
+    }
 
     #[test]
     fn single_cpu_fair_request_uses_the_normalized_linux_v71_base_slice() {

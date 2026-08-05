@@ -135,12 +135,12 @@ impl ThreadHandle {
         self.core.sched().scheduler_fence_cpu()
     }
 
-    /// Returns the CPU currently owning the thread's scheduler placement.
+    /// Returns Linux `task_cpu()`: the last committed runqueue assignment.
     ///
-    /// A switching-out thread remains assigned to its physical source until
-    /// switch tail releases `on_cpu`. A detached sleeper falls back to its
-    /// Linux-style wake CPU hint without presenting that hint as runqueue
-    /// ownership.
+    /// This remains the previous CPU while a task sleeps and changes to the
+    /// destination when an rq-to-rq migration commits. Physical execution
+    /// ownership is exposed separately by [`Self::scheduler_fence_cpu`].
+    /// A wake-placement hint is never reported as scheduler placement.
     pub fn assigned_cpu(&self) -> Option<CpuId> {
         self.core.assigned_cpu()
     }
@@ -901,7 +901,7 @@ impl ThreadCore {
     }
 
     fn assigned_cpu(&self) -> Option<CpuId> {
-        self.sched.assigned_cpu().or_else(|| self.wake_cpu_hint())
+        self.sched.assigned_cpu()
     }
 
     pub(crate) const fn id(&self) -> ThreadId {
@@ -1177,6 +1177,15 @@ mod tests {
     fn test_core(id: ThreadId, policy: SchedulePolicy) -> Arc<ThreadCore> {
         let sched = Arc::new(ThreadSchedCell::new_test(id, policy));
         Arc::new(ThreadCore::new(id, policy, sched, None, None, None))
+    }
+
+    #[test]
+    fn wake_cpu_hint_is_not_scheduler_placement() {
+        let core = test_core(ThreadId::from_parts(0, 1), SchedulePolicy::default());
+        core.set_wake_cpu_hint(CpuId::new(1));
+
+        assert_eq!(core.wake_cpu_hint(), Some(CpuId::new(1)));
+        assert_eq!(core.assigned_cpu(), None);
     }
 
     #[test]

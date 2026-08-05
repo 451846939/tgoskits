@@ -103,6 +103,44 @@ fn rearm_replaces_the_existing_entry_without_consuming_capacity() {
 }
 
 #[test]
+fn preparing_a_timer_batch_does_not_partially_replace_live_entries() {
+    let old_cbs_node = Box::new(TaskDeadlineNode::deadline_cbs_for_thread(thread(70)));
+    let occupied_zero_lag = Box::new(TaskDeadlineNode::deadline_zero_lag_for_thread(thread(71)));
+    let rejected_zero_lag = Box::new(TaskDeadlineNode::deadline_zero_lag_for_thread(thread(72)));
+    let mut timers = TaskDeadlineQueue::new(1);
+    let old_cbs = timers
+        .arm(old_cbs_node.as_ref(), 10, TaskDeadlineKind::DeadlineCbs)
+        .unwrap();
+    let _occupied = timers
+        .arm(
+            occupied_zero_lag.as_ref(),
+            15,
+            TaskDeadlineKind::DeadlineZeroLag,
+        )
+        .unwrap();
+
+    let prepared_cbs = timers
+        .prepare_arm(old_cbs_node.as_ref(), 20, TaskDeadlineKind::DeadlineCbs)
+        .unwrap();
+    assert!(matches!(
+        timers.prepare_arm(
+            rejected_zero_lag.as_ref(),
+            25,
+            TaskDeadlineKind::DeadlineZeroLag,
+        ),
+        Err(TaskDeadlineError::Capacity)
+    ));
+    drop(prepared_cbs);
+
+    let mut expired = [ExpiredTaskDeadline::EMPTY; 2];
+    let batch = timers.expire(TaskDeadlineExpireRequest::new(15, 2), &mut expired);
+    assert_eq!(batch.expired(), 2);
+    assert_eq!(expired[0].token(), old_cbs.token());
+    assert_eq!(expired[0].deadline_ns(), 10);
+    assert_eq!(expired[1].deadline_ns(), 15);
+}
+
+#[test]
 fn one_thread_can_own_independent_park_cbs_and_zero_lag_entries() {
     let park_node = timer(8);
     let cbs_node = Box::new(TaskDeadlineNode::deadline_cbs_for_thread(thread(8)));

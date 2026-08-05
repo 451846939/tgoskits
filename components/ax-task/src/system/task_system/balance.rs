@@ -46,9 +46,6 @@ std::thread_local! {
     static OWNER_BALANCE_PASSES: core::cell::Cell<usize> = const {
         core::cell::Cell::new(0)
     };
-    static FAIL_BALANCE_TRANSFER_AFTER_DETACH: core::cell::Cell<bool> = const {
-        core::cell::Cell::new(false)
-    };
     static FAIL_BALANCE_TRANSFER_PUBLICATION_RESERVATION: core::cell::Cell<bool> = const {
         core::cell::Cell::new(false)
     };
@@ -82,11 +79,6 @@ pub(super) fn reset_owner_balance_passes() {
 #[cfg(test)]
 pub(super) fn owner_balance_passes() -> usize {
     OWNER_BALANCE_PASSES.get()
-}
-
-#[cfg(test)]
-fn fail_next_balance_transfer_after_detach() {
-    FAIL_BALANCE_TRANSFER_AFTER_DETACH.set(true);
 }
 
 #[cfg(test)]
@@ -247,7 +239,7 @@ impl TaskSystem {
             if target == source
                 || !target_is_allowed(target)
                 || sched.placement.queued_cpu() != Some(source)
-                || sched.placement.migration_target().is_some()
+                || sched.placement.has_pending_migration()
                 || sched.placement.on_cpu().is_some()
                 || candidate.core.sleep_timer_cpu().is_some()
                 || !deadline_covers_online
@@ -351,7 +343,7 @@ impl TaskSystem {
             });
         if sched.lifecycle.state() != ThreadState::Ready
             || sched.placement.queued_cpu() != Some(source)
-            || sched.placement.migration_target().is_some()
+            || sched.placement.has_pending_migration()
             || sched.placement.on_cpu().is_some()
             || !sched.placement.affinity.contains(target)
             || core.sleep_timer_cpu().is_some()
@@ -391,27 +383,17 @@ impl TaskSystem {
             };
             detached
         };
-        let queued_entity = detached.thread.entity;
-        let prepare_result: Result<(), TaskError> = (|| {
-            Self::detach_owner_deadline_bandwidth_locked(&core, &mut sched, cpu.as_mut())?;
-            #[cfg(test)]
-            if FAIL_BALANCE_TRANSFER_AFTER_DETACH.replace(false) {
-                return Err(TaskError::InvalidConfiguration);
-            }
-            sched.policy.effective_entity = queued_entity;
-            if !sched.is_pi_boosted() {
-                sched.policy.base_entity = queued_entity;
-            }
-            self.capture_owner_fair_migration(cpu.as_ref().get_ref(), &mut sched);
-            sched.placement.begin_queued_migration(source, target)?;
-            core.set_wake_cpu_hint(target);
-            Ok(())
-        })();
-        drop(sched);
-        if prepare_result.is_err() {
-            self.rollback_owner_queued_migration(cpu.as_mut(), &core, detached, source, target)?;
-            return Ok(BalanceTransferOutcome::Retry);
+        let queued_entity = detached.entity;
+        Self::detach_owner_deadline_bandwidth_locked(&core, &mut sched, cpu.as_mut());
+        sched.policy.effective_entity = queued_entity;
+        if !sched.is_pi_boosted() {
+            sched.policy.base_entity = queued_entity;
         }
+        self.capture_owner_fair_migration(cpu.as_ref().get_ref(), &mut sched);
+        sched.placement.begin_migration(source, target);
+        core.set_wake_cpu_hint(target);
+        drop(sched);
+        drop(detached);
         carrier.commit();
         self.publish_owner_cpu_load_summary(cpu.as_mut());
         if migrated_fair && reason != BalanceReason::FairPeriodic {
@@ -436,42 +418,6 @@ impl TaskSystem {
             return Ok(BalanceTransferOutcome::NoCandidate);
         };
         self.commit_owner_balance_transfer(cpu, selection)
-    }
-
-    pub(super) fn rollback_owner_queued_migration(
-        &self,
-        mut cpu: Pin<&mut CpuLocal>,
-        core: &Arc<ThreadCore>,
-        detached: DetachedQueueEntry,
-        source: CpuId,
-        target: CpuId,
-    ) -> Result<(), TaskError> {
-        let state_result = {
-            let mut sched = core.sched().lock();
-            match sched.placement.rollback_queued_migration(source, target) {
-                Err(error) => Err(error),
-                Ok(()) => {
-                    core.set_wake_cpu_hint(source);
-                    sched.policy.effective_entity.cancel_fair_migration();
-                    if !sched.is_pi_boosted() {
-                        sched.policy.base_entity = sched.policy.effective_entity;
-                    } else {
-                        sched.policy.base_entity.cancel_fair_migration();
-                    }
-                    Self::activate_owner_deadline_bandwidth(core, &mut sched, cpu.as_mut(), source)
-                        .and_then(|()| {
-                            Self::refresh_owner_deadline_timers_locked(
-                                core,
-                                &mut sched,
-                                cpu.as_mut(),
-                            )
-                        })
-                }
-            }
-        };
-        cpu.lock_run_queue().restore_detached(detached);
-        self.publish_owner_cpu_load_summary(cpu);
-        state_result
     }
 
     /// Returns whether this owner has scheduler-class balance work to service.
@@ -613,7 +559,7 @@ mod tests {
     use alloc::boxed::Box;
 
     use super::*;
-    use crate::{DeadlineFlags, DeadlinePolicy, Nice, RtPriority, ThreadSpec};
+    use crate::{Nice, RtPriority, ThreadSpec};
 
     fn online_pair() -> (TaskSystem, Pin<Box<CpuLocal>>, Pin<Box<CpuLocal>>) {
         let system = TaskSystem::new(TaskSystemConfig::new(2)).unwrap();
@@ -629,77 +575,6 @@ mod tests {
             system.bring_cpu_online(cpu.as_mut()).unwrap();
         }
         (system, cpu0, cpu1)
-    }
-
-    #[test]
-    fn failed_balance_transfer_restores_source_ownership_and_deadline_bandwidth() {
-        let (system, mut cpu0, cpu1) = online_pair();
-        let policy =
-            SchedulePolicy::deadline(DeadlinePolicy::new(2, 10, 20, DeadlineFlags::NONE).unwrap());
-        let first = system.create_thread(ThreadSpec::new(policy)).unwrap();
-        let second = system.create_thread(ThreadSpec::new(policy)).unwrap();
-        for thread in [&first, &second] {
-            system.make_ready(thread.id()).unwrap();
-            system.enqueue(cpu0.as_mut(), thread.id(), 0).unwrap();
-        }
-        let bandwidth_before = cpu0.deadline_bandwidth();
-
-        fail_next_balance_transfer_after_detach();
-        assert_eq!(
-            system.transfer_owner_balance_candidate(
-                cpu0.as_mut(),
-                CpuId::new(1),
-                0,
-                BalanceReason::RtDeadlinePush,
-            ),
-            Ok(BalanceTransferOutcome::Retry)
-        );
-
-        assert_eq!(
-            cpu0.runnable_count(),
-            2,
-            "a failed transfer must restore physical source runqueue ownership"
-        );
-        assert_eq!(cpu1.runnable_count(), 0);
-        assert_eq!(
-            cpu0.deadline_bandwidth(),
-            bandwidth_before,
-            "a failed transfer must restore the source Deadline bandwidth ledger"
-        );
-        let sched = first.core.sched().lock();
-        assert_eq!(sched.lifecycle.state(), ThreadState::Ready);
-        assert_eq!(sched.placement.queued_cpu(), Some(CpuId::new(0)));
-        assert_eq!(sched.placement.migration_target(), None);
-        assert_eq!(sched.deadline.bandwidth_cpu, Some(CpuId::new(0)));
-    }
-
-    #[test]
-    fn failed_balance_transfer_preserves_rt_fifo_position() {
-        let (system, mut cpu0, _cpu1) = online_pair();
-        let policy = SchedulePolicy::fifo(RtPriority::new(50).unwrap());
-        let first = system.create_thread(ThreadSpec::new(policy)).unwrap();
-        let second = system.create_thread(ThreadSpec::new(policy)).unwrap();
-        for thread in [&first, &second] {
-            system.make_ready(thread.id()).unwrap();
-            system.enqueue(cpu0.as_mut(), thread.id(), 0).unwrap();
-        }
-
-        fail_next_balance_transfer_after_detach();
-        assert_eq!(
-            system.transfer_owner_balance_candidate(
-                cpu0.as_mut(),
-                CpuId::new(1),
-                0,
-                BalanceReason::RtDeadlinePush,
-            ),
-            Ok(BalanceTransferOutcome::Retry)
-        );
-
-        assert_eq!(
-            system.schedule(cpu0.as_mut(), 0).unwrap().next(),
-            first.id(),
-            "rollback must restore the candidate at its original FIFO position"
-        );
     }
 
     #[test]
@@ -733,28 +608,6 @@ mod tests {
     }
 
     #[test]
-    fn committed_local_switch_survives_a_recoverable_balance_race() {
-        let (system, mut cpu0, _cpu1) = online_pair();
-        let policy = SchedulePolicy::fifo(RtPriority::new(50).unwrap());
-        let first = system.create_thread(ThreadSpec::new(policy)).unwrap();
-        let second = system.create_thread(ThreadSpec::new(policy)).unwrap();
-        for thread in [&first, &second] {
-            system.make_ready(thread.id()).unwrap();
-            system.enqueue(cpu0.as_mut(), thread.id(), 0).unwrap();
-        }
-
-        // Model an affinity/offline/publication race after the owner has
-        // detached a balance candidate. The transfer transaction rolls back
-        // completely, so the already committed local selection must remain
-        // usable instead of being converted into a fatal scheduler error.
-        fail_next_balance_transfer_after_detach();
-        let decision = system.schedule(cpu0.as_mut(), 0).unwrap();
-
-        assert_eq!(decision.next(), first.id());
-        assert_eq!(cpu0.runnable_count(), 1);
-    }
-
-    #[test]
     fn failed_migration_reservation_restores_the_source_carrier() {
         let (system, mut cpu0, _cpu1) = online_pair();
         let policy = SchedulePolicy::fifo(RtPriority::new(50).unwrap());
@@ -779,7 +632,7 @@ mod tests {
         assert_eq!(cpu0.runnable_count(), 2);
         let sched = first.core.sched().lock();
         assert_eq!(sched.placement.queued_cpu(), Some(CpuId::new(0)));
-        assert_eq!(sched.placement.migration_target(), None);
+        assert!(!sched.placement.has_pending_migration());
         drop(sched);
         assert_eq!(first.assigned_cpu(), Some(CpuId::new(0)));
     }

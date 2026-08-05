@@ -112,8 +112,8 @@ impl CpuLocal {
         self.remote.needs_reschedule()
     }
 
-    /// Returns the preallocated task-deadline capacity selected at construction.
-    pub fn timer_capacity(&self) -> usize {
+    /// Returns the scheduler thread capacity prepared for this CPU.
+    pub fn thread_capacity(&self) -> usize {
         self.task_deadlines.queue.capacity()
     }
 
@@ -126,6 +126,7 @@ impl CpuLocal {
         // SAFETY: the scheduler owns this pinned object; projecting disjoint
         // fields does not move the CpuLocal identity.
         let this = unsafe { self.get_unchecked_mut() };
+        this.remote.lock_run_queue().set_current(None);
         this.dispatch.current = None;
         this.dispatch.current_core = None;
         this.dispatch.current_dispatch = None;
@@ -271,7 +272,7 @@ impl CpuLocal {
     pub(crate) fn stage_switch_handoff(
         self: Pin<&mut Self>,
         previous: Arc<ThreadCore>,
-        migration_target: Option<CpuId>,
+        migration: Option<PreparedMigrationDelivery>,
     ) -> Result<(), TaskError> {
         let handoff = &mut self.dispatch_state_mut().switch_handoff;
         if handoff.is_some() {
@@ -279,7 +280,7 @@ impl CpuLocal {
         }
         *handoff = Some(SwitchHandoff {
             previous,
-            migration_target,
+            migration,
             runtime_tail_finished: false,
         });
         Ok(())
@@ -296,7 +297,7 @@ impl CpuLocal {
             .as_mut()
             .ok_or(TaskError::InvalidConfiguration)?;
         if handoff.previous.id() != previous
-            || handoff.migration_target != migration_target
+            || handoff.migration_target() != migration_target
             || handoff.runtime_tail_finished
         {
             return Err(TaskError::InvalidConfiguration);
@@ -377,10 +378,10 @@ impl CpuLocal {
         self: Pin<&mut Self>,
         utilization_scaled: u64,
         active: bool,
-    ) -> Result<(), TaskError> {
+    ) {
         self.remote
             .lock_run_queue()
-            .add_deadline_bandwidth(utilization_scaled, active)
+            .add_deadline_bandwidth(utilization_scaled, active);
     }
 
     /// Returns the owner runqueue's GRUB bandwidth accounting.
@@ -608,8 +609,8 @@ impl CpuLocal {
         this.remote.defer_fair_balance(now_ns, next_interval_ns);
     }
 
-    /// Returns mutable owner-only access to the preallocated task-deadline heap.
-    pub fn task_deadlines(self: Pin<&mut Self>) -> &mut TaskDeadlineQueue {
+    /// Returns scheduler-internal owner access to the preallocated deadline heap.
+    pub(crate) fn task_deadlines(self: Pin<&mut Self>) -> &mut TaskDeadlineQueue {
         // SAFETY: the pinned mutable owner borrow excludes every concurrent
         // timer consumer and does not move CpuLocal or its heap.
         &mut unsafe { self.get_unchecked_mut() }.task_deadlines.queue

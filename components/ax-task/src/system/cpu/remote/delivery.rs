@@ -7,6 +7,100 @@ pub(super) struct RemoteDeliveryState {
     balance_request_node: InboxNode,
 }
 
+/// A fully reserved queued-task migration publication.
+///
+/// The target CPU hotplug lease and the task's intrusive inbox reservation are
+/// acquired before the source runqueue changes `on_rq` or `task_cpu`. Once this
+/// value exists, migration publication is an invariant-only commit, matching
+/// Linux's rq-locked `deactivate_task -> set_task_cpu -> activate_task` path.
+#[derive(Debug)]
+pub(crate) struct PreparedMigrationDelivery {
+    publication: Option<OwnedCpuRemotePublication>,
+    core: Option<Arc<ThreadCore>>,
+    source: CpuId,
+    target: CpuId,
+    placement_demand: u64,
+}
+
+impl PreparedMigrationDelivery {
+    pub(crate) fn prepare(
+        target_remote: &Arc<CpuRemote>,
+        core: &Arc<ThreadCore>,
+        source: CpuId,
+        target: CpuId,
+    ) -> Result<Self, TaskError> {
+        let publication = target_remote
+            .begin_owned_publication()
+            .ok_or(TaskError::CpuOffline(target.as_u32()))?;
+        if !core.reserve_scheduler_inbox_delivery() {
+            return Err(TaskError::NotReady);
+        }
+        Ok(Self {
+            publication: Some(publication),
+            core: Some(Arc::clone(core)),
+            source,
+            target,
+            placement_demand: core.effective_placement_demand(),
+        })
+    }
+
+    pub(crate) const fn target(&self) -> CpuId {
+        self.target
+    }
+
+    pub(crate) fn commit(mut self) {
+        let publication = self
+            .publication
+            .take()
+            .expect("prepared migration must retain its target CPU lease");
+        let core = self
+            .core
+            .take()
+            .expect("prepared migration must retain its thread delivery lease");
+        let thread = core.id();
+        let pointer = Arc::into_raw(core);
+        let node = unsafe {
+            // SAFETY: the transferred Arc count keeps the embedded node pinned
+            // until one target-owner drain reconstructs and releases it.
+            Pin::new_unchecked((*pointer).migration_node())
+        };
+        let message = InboxMessage::migration_with_payload(
+            thread,
+            self.source,
+            self.target,
+            thread.generation() as u64,
+            self.placement_demand,
+            pointer.expose_provenance(),
+        );
+        match publication.publish_owner_control(node, message) {
+            PublishResult::Published => {}
+            PublishResult::AlreadyPending => unsafe {
+                // SAFETY: a coalesced publication did not consume this Arc.
+                // The older carrier observes the generation-bearing state.
+                let retained = Arc::from_raw(pointer);
+                retained.cancel_scheduler_inbox_delivery();
+                drop(retained);
+            },
+            PublishResult::WrongKind => unsafe {
+                // SAFETY: a prepared target lease and typed migration node make
+                // rejection an internal invariant, not a recoverable fallback.
+                let retained = Arc::from_raw(pointer);
+                retained.cancel_scheduler_inbox_delivery();
+                drop(retained);
+                task_runtime::fatal_invariant(0x4d49_4701, thread.as_u64() as usize);
+            },
+        }
+    }
+}
+
+impl Drop for PreparedMigrationDelivery {
+    fn drop(&mut self) {
+        if let Some(core) = self.core.take() {
+            core.cancel_scheduler_inbox_delivery();
+        }
+    }
+}
+
 impl RemoteDeliveryState {
     pub(super) const fn new() -> Self {
         Self {

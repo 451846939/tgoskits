@@ -341,11 +341,6 @@ impl FairEntity {
     }
 
     #[cfg(test)]
-    pub(crate) const fn migration_pending(self) -> bool {
-        matches!(self.placement, FairPlacement::Migrating { .. })
-    }
-
-    #[cfg(test)]
     pub(crate) const fn saved_migration(self) -> Option<(i64, u64)> {
         match self.placement {
             FairPlacement::Migrating {

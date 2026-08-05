@@ -963,7 +963,7 @@ mod tests {
         else {
             panic!("round-robin constructor returned another policy class");
         };
-        assert_eq!(quantum_ns, 5_000_000);
+        assert_eq!(quantum_ns, 100_000_000);
     }
 
     #[test]

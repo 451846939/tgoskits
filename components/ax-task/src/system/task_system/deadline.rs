@@ -2,6 +2,12 @@
 
 use super::*;
 
+enum OwnerDeadlineTimerPlan {
+    Unchanged,
+    Cancel,
+    Arm(TaskDeadlineArmPlan),
+}
+
 impl TaskSystem {
     pub(super) fn publish_deadline_overrun_work(&self, core: Arc<ThreadCore>) {
         let core_ptr = Arc::into_raw(core);
@@ -43,42 +49,58 @@ impl TaskSystem {
         }
     }
 
-    fn replace_owner_deadline_timer(
-        mut cpu: Pin<&mut CpuLocal>,
+    fn prepare_owner_deadline_timer(
+        queue: &TaskDeadlineQueue,
         node: &TaskDeadlineNode,
-        registration: &mut Option<TaskDeadlineRegistration>,
+        registration: Option<&TaskDeadlineRegistration>,
         deadline_ns: Option<u64>,
         kind: TaskDeadlineKind,
-    ) -> Result<(), TaskError> {
+    ) -> Result<OwnerDeadlineTimerPlan, TaskError> {
         let deadline_ns = deadline_ns.filter(|deadline| *deadline != 0 && *deadline != u64::MAX);
-        if registration.as_ref().is_some_and(|registration| {
+        if registration.is_some_and(|registration| {
             Some(registration.deadline_ns()) == deadline_ns && registration.kind() == kind
         }) {
-            return Ok(());
-        }
-        if let Some(previous) = registration.take() {
-            // Expiration may already have moved the value-owned entry into the
-            // safe-point buffer. A later token makes that buffered copy stale;
-            // physical cancellation is required only while it remains queued.
-            let _removed = cpu.as_mut().task_deadlines().cancel(&previous);
+            return Ok(OwnerDeadlineTimerPlan::Unchanged);
         }
         let Some(deadline_ns) = deadline_ns else {
-            return Ok(());
+            return Ok(if registration.is_some() {
+                OwnerDeadlineTimerPlan::Cancel
+            } else {
+                OwnerDeadlineTimerPlan::Unchanged
+            });
         };
-        *registration = Some(
-            cpu.as_mut()
-                .task_deadlines()
-                .arm(node, deadline_ns, kind)
-                .map_err(Self::task_deadline_error)?,
-        );
-        Ok(())
+        queue
+            .prepare_arm(node, deadline_ns, kind)
+            .map(OwnerDeadlineTimerPlan::Arm)
+            .map_err(Self::task_deadline_error)
+    }
+
+    fn commit_owner_deadline_timer(
+        queue: &mut TaskDeadlineQueue,
+        registration: &mut Option<TaskDeadlineRegistration>,
+        plan: OwnerDeadlineTimerPlan,
+    ) {
+        match plan {
+            OwnerDeadlineTimerPlan::Unchanged => {}
+            OwnerDeadlineTimerPlan::Cancel => {
+                if let Some(previous) = registration.take() {
+                    // Expiration may already have moved the entry into the
+                    // safe-point buffer. The registration is terminal either
+                    // way; a later token makes the buffered copy stale.
+                    let _removed = queue.cancel(&previous);
+                }
+            }
+            OwnerDeadlineTimerPlan::Arm(plan) => {
+                *registration = Some(queue.commit_arm(plan));
+            }
+        }
     }
 
     pub(super) fn refresh_owner_deadline_timers_locked(
         core: &Arc<ThreadCore>,
         sched: &mut ThreadSchedState,
         mut cpu: Pin<&mut CpuLocal>,
-    ) -> Result<(), TaskError> {
+    ) {
         let owner = cpu.owner();
         let owns_bandwidth = sched.deadline.bandwidth_cpu == Some(owner);
         let cbs_deadline_ns = owns_bandwidth
@@ -86,45 +108,62 @@ impl TaskSystem {
             .filter(|_| sched.pi.deadline_cbs_borrower.is_none())
             .and(sched.policy.base_entity.deadline())
             .map(DeadlineEntity::next_scheduler_event_ns);
-        Self::replace_owner_deadline_timer(
-            cpu.as_mut(),
-            core.deadline_cbs_timer(),
-            &mut sched.deadline.cbs_timer,
-            cbs_deadline_ns,
-            TaskDeadlineKind::DeadlineCbs,
-        )?;
-
         let zero_lag_ns = (owns_bandwidth
             && sched.deadline.activity == DeadlineActivity::ActiveNonContending)
             .then_some(sched.deadline.zero_lag_ns);
-        Self::replace_owner_deadline_timer(
-            cpu,
+        let cbs_plan = Self::prepare_owner_deadline_timer(
+            cpu.as_mut().task_deadlines(),
+            core.deadline_cbs_timer(),
+            sched.deadline.cbs_timer.as_ref(),
+            cbs_deadline_ns,
+            TaskDeadlineKind::DeadlineCbs,
+        )
+        .unwrap_or_else(|_| {
+            task_runtime::fatal_invariant(0x444c_0006, core.id().as_u64() as usize)
+        });
+        let zero_lag_plan = Self::prepare_owner_deadline_timer(
+            cpu.as_mut().task_deadlines(),
             core.deadline_zero_lag_timer(),
-            &mut sched.deadline.zero_lag_timer,
+            sched.deadline.zero_lag_timer.as_ref(),
             zero_lag_ns,
             TaskDeadlineKind::DeadlineZeroLag,
         )
+        .unwrap_or_else(|_| {
+            task_runtime::fatal_invariant(0x444c_0007, core.id().as_u64() as usize)
+        });
+        let queue = cpu.task_deadlines();
+        Self::commit_owner_deadline_timer(queue, &mut sched.deadline.cbs_timer, cbs_plan);
+        Self::commit_owner_deadline_timer(queue, &mut sched.deadline.zero_lag_timer, zero_lag_plan);
     }
 
     pub(super) fn cancel_owner_deadline_timers_locked(
         core: &Arc<ThreadCore>,
         sched: &mut ThreadSchedState,
         mut cpu: Pin<&mut CpuLocal>,
-    ) -> Result<(), TaskError> {
-        Self::replace_owner_deadline_timer(
-            cpu.as_mut(),
+    ) {
+        let cbs_plan = Self::prepare_owner_deadline_timer(
+            cpu.as_mut().task_deadlines(),
             core.deadline_cbs_timer(),
-            &mut sched.deadline.cbs_timer,
+            sched.deadline.cbs_timer.as_ref(),
             None,
             TaskDeadlineKind::DeadlineCbs,
-        )?;
-        Self::replace_owner_deadline_timer(
-            cpu,
+        )
+        .unwrap_or_else(|_| {
+            task_runtime::fatal_invariant(0x444c_0008, core.id().as_u64() as usize)
+        });
+        let zero_lag_plan = Self::prepare_owner_deadline_timer(
+            cpu.as_mut().task_deadlines(),
             core.deadline_zero_lag_timer(),
-            &mut sched.deadline.zero_lag_timer,
+            sched.deadline.zero_lag_timer.as_ref(),
             None,
             TaskDeadlineKind::DeadlineZeroLag,
         )
+        .unwrap_or_else(|_| {
+            task_runtime::fatal_invariant(0x444c_0009, core.id().as_u64() as usize)
+        });
+        let queue = cpu.task_deadlines();
+        Self::commit_owner_deadline_timer(queue, &mut sched.deadline.cbs_timer, cbs_plan);
+        Self::commit_owner_deadline_timer(queue, &mut sched.deadline.zero_lag_timer, zero_lag_plan);
     }
 
     fn registration_matches(
@@ -416,7 +455,7 @@ impl TaskSystem {
                     }
                 }
             }
-            Self::refresh_owner_deadline_timers_locked(&core, &mut sched, cpu.as_mut())?;
+            Self::refresh_owner_deadline_timers_locked(&core, &mut sched, cpu.as_mut());
         }
         if let Some(entity) = update_queued
             && !cpu
@@ -451,11 +490,12 @@ impl TaskSystem {
             && event.deadline_ns() >= sched.deadline.zero_lag_ns
         {
             cpu.lock_run_queue()
-                .deactivate_deadline_bandwidth(sched.deadline.bandwidth_scaled)?;
+                .deactivate_deadline_bandwidth(sched.deadline.bandwidth_scaled);
             sched.deadline.activity = DeadlineActivity::Inactive;
             sched.deadline.zero_lag_ns = 0;
         }
-        Self::refresh_owner_deadline_timers_locked(&core, &mut sched, cpu)
+        Self::refresh_owner_deadline_timers_locked(&core, &mut sched, cpu);
+        Ok(())
     }
 
     /// Returns a monotonic sample suitable for work scheduled after this

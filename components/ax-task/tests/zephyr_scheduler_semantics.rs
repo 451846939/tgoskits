@@ -310,6 +310,7 @@ fn repeated_smp_wake_distributes_rt_threads_without_duplicate_entries() {
     assert_eq!(first_wake.wake(), WakeResult::Notified);
     assert_eq!(support::ipi_count(1), 1);
     assert!(support::consume_ipi(1));
+    system.complete_context_switch(cpu1.as_mut()).unwrap();
     assert_eq!(first.state(), ThreadState::Ready);
     assert_eq!(second.state(), ThreadState::Ready);
     assert_eq!(cpu0.try_runnable_summary(), Some(1));

@@ -1,14 +1,35 @@
-//! Single-owner scheduler placement state machine.
+//! Linux-style scheduler placement facts.
 
-use crate::{CpuId, CpuSet, TaskError};
+use crate::{CpuId, CpuSet, runtime::task_runtime};
 
-/// CPU eligibility and physical scheduler ownership for one thread.
+/// Linux-compatible runqueue ownership state.
+///
+/// `Queued` means `TASK_ON_RQ_QUEUED`: the task is runnable and owned by the
+/// runqueue named by `task_cpu`, even while it is the current task. Whether a
+/// scheduling-class node remains linked is owned by that class (Fair removes
+/// current; RT and Deadline retain it). `Migrating` is the transient
+/// `TASK_ON_RQ_MIGRATING` handoff between two runqueues.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TaskOnRunQueue {
+    None,
+    Queued,
+    Migrating,
+}
+
+/// CPU eligibility, runqueue ownership, and execution ownership for one task.
+///
+/// These facts intentionally remain orthogonal, matching Linux `task_cpu()`,
+/// `p->on_rq`, and `p->on_cpu`. In particular, switch-out may change `on_rq`
+/// while `on_cpu` continues to name the old CPU until switch tail publishes
+/// the release.
 #[derive(Debug)]
 pub(in crate::system) struct ThreadPlacementState {
     pub(in crate::system) affinity: CpuSet,
     pub(in crate::system) affinity_generation: u64,
-    physical: SchedulerPlacement,
+    task_cpu: Option<CpuId>,
+    on_rq: TaskOnRunQueue,
     on_cpu: Option<CpuId>,
+    migration_request: Option<CpuId>,
 }
 
 impl ThreadPlacementState {
@@ -16,102 +37,183 @@ impl ThreadPlacementState {
         Self {
             affinity,
             affinity_generation: 1,
-            physical: SchedulerPlacement::detached(),
+            task_cpu: None,
+            on_rq: TaskOnRunQueue::None,
             on_cpu: None,
+            migration_request: None,
         }
     }
 
+    /// Returns the CPU whose runqueue owns this runnable task.
+    ///
+    /// Like Linux `task_on_rq_queued()`, this remains `Some` for the current
+    /// task; callers that need a pushable candidate must also require
+    /// `on_cpu() == None`.
     pub(in crate::system) const fn queued_cpu(&self) -> Option<CpuId> {
-        self.physical.queued_cpu()
+        match self.on_rq {
+            TaskOnRunQueue::Queued => self.task_cpu,
+            TaskOnRunQueue::None | TaskOnRunQueue::Migrating => None,
+        }
     }
 
-    pub(in crate::system) const fn running_cpu(&self) -> Option<CpuId> {
-        self.physical.running_cpu()
+    /// Returns the CPU with the live execution claim.
+    pub(in crate::system) fn execution_cpu(&self) -> Option<CpuId> {
+        match (self.on_rq, self.task_cpu, self.on_cpu) {
+            (TaskOnRunQueue::Queued, Some(task_cpu), Some(on_cpu)) if task_cpu == on_cpu => {
+                Some(on_cpu)
+            }
+            _ => None,
+        }
     }
 
     pub(in crate::system) const fn on_cpu(&self) -> Option<CpuId> {
         self.on_cpu
     }
 
-    pub(in crate::system) const fn migration_target(&self) -> Option<CpuId> {
-        self.physical.migration_target()
+    #[cfg(test)]
+    pub(in crate::system) const fn task_cpu(&self) -> Option<CpuId> {
+        self.task_cpu
     }
 
-    /// Returns whether the current physical owner may keep executing without
-    /// first committing a placement transition.
+    /// Returns the immutable destination of a committed rq-to-rq handoff.
+    pub(in crate::system) const fn committed_migration_target(&self) -> Option<CpuId> {
+        match self.on_rq {
+            TaskOnRunQueue::Migrating => self.task_cpu,
+            TaskOnRunQueue::None | TaskOnRunQueue::Queued => None,
+        }
+    }
+
+    /// Returns whether either a committed handoff or a newer request remains.
+    pub(in crate::system) const fn has_pending_migration(&self) -> bool {
+        self.committed_migration_target().is_some() || self.migration_request.is_some()
+    }
+
     pub(in crate::system) fn can_continue_running_on(&self, cpu: CpuId) -> bool {
-        self.physical.running_cpu() == Some(cpu)
-            && self.on_cpu == Some(cpu)
-            && self.physical.migration_target().is_none()
+        self.execution_cpu() == Some(cpu)
+            && self.migration_request.is_none()
             && self.affinity.contains(cpu)
     }
 
-    pub(in crate::system) fn assigned_cpu(&self) -> Option<CpuId> {
-        self.physical
-            .running_cpu()
-            .or_else(|| self.physical.queued_cpu())
-            .or(self.on_cpu)
-            .or_else(|| self.physical.migration_target())
+    /// Linux `task_cpu()`: the last committed runqueue assignment.
+    pub(in crate::system) const fn assigned_cpu(&self) -> Option<CpuId> {
+        self.task_cpu
     }
 
-    pub(in crate::system) fn set_queued_cpu(
-        &mut self,
-        cpu: Option<CpuId>,
-    ) -> Result<(), TaskError> {
-        self.physical.set_queued_cpu(cpu)
-    }
-
-    pub(in crate::system) fn set_running_cpu(
-        &mut self,
-        cpu: Option<CpuId>,
-    ) -> Result<(), TaskError> {
-        self.physical.set_running_cpu(cpu)
-    }
-
-    pub(in crate::system) fn set_on_cpu(&mut self, cpu: Option<CpuId>) -> Result<(), TaskError> {
-        match (self.on_cpu, cpu) {
-            (None, Some(cpu)) if self.physical.running_cpu() == Some(cpu) => {
-                self.on_cpu = Some(cpu);
-                Ok(())
-            }
-            (Some(current), Some(cpu)) if current == cpu => Ok(()),
-            (Some(_), None) if self.physical.running_cpu().is_none() => {
-                self.on_cpu = None;
-                Ok(())
-            }
-            _ => Err(TaskError::InvalidConfiguration),
+    /// Linux `activate_task()`: publish runnable ownership on one runqueue.
+    pub(in crate::system) fn activate(&mut self, cpu: CpuId) {
+        let valid = self.on_cpu.is_none()
+            && match self.on_rq {
+                TaskOnRunQueue::None => true,
+                TaskOnRunQueue::Migrating => self.task_cpu == Some(cpu),
+                TaskOnRunQueue::Queued => false,
+            };
+        placement_invariant(valid, 0x504c_0001, cpu.as_u32() as usize);
+        self.task_cpu = Some(cpu);
+        self.on_rq = TaskOnRunQueue::Queued;
+        if self.migration_request == Some(cpu) {
+            self.migration_request = None;
         }
     }
 
-    pub(in crate::system) fn set_migration_target(
-        &mut self,
-        target: Option<CpuId>,
-    ) -> Result<(), TaskError> {
-        self.physical.set_migration_target(target)
+    /// Linux `block_task()`: remove a non-running runnable task from its rq.
+    pub(in crate::system) fn deactivate(&mut self, cpu: CpuId) {
+        let valid = self.on_rq == TaskOnRunQueue::Queued
+            && self.task_cpu == Some(cpu)
+            && self.on_cpu.is_none();
+        placement_invariant(valid, 0x504c_0002, cpu.as_u32() as usize);
+        self.on_rq = TaskOnRunQueue::None;
+        self.migration_request = None;
     }
 
-    pub(in crate::system) fn begin_queued_migration(
-        &mut self,
-        source: CpuId,
-        target: CpuId,
-    ) -> Result<(), TaskError> {
-        self.physical.begin_queued_migration(source, target)
+    /// Reserves the fixed destination of an off-rq remote wake publication.
+    pub(in crate::system) fn begin_remote_wakeup(&mut self, target: CpuId) {
+        let valid = self.on_rq == TaskOnRunQueue::None && self.on_cpu.is_none();
+        placement_invariant(valid, 0x504c_0003, target.as_u32() as usize);
+        self.task_cpu = Some(target);
+        self.on_rq = TaskOnRunQueue::Migrating;
+        self.migration_request = None;
     }
 
-    pub(in crate::system) fn rollback_queued_migration(
-        &mut self,
-        source: CpuId,
-        target: CpuId,
-    ) -> Result<(), TaskError> {
-        self.physical.rollback_queued_migration(source, target)
-    }
-
-    pub(in crate::system) fn detach_exiting(&mut self, cpu: CpuId) -> Result<(), TaskError> {
-        if self.on_cpu != Some(cpu) || self.physical.running_cpu() != Some(cpu) {
-            return Err(TaskError::InvalidConfiguration);
+    /// Records the newest affinity request without retargeting committed work.
+    pub(in crate::system) fn request_migration(&mut self, target: Option<CpuId>) {
+        match self.on_rq {
+            TaskOnRunQueue::Queued | TaskOnRunQueue::Migrating => {
+                self.migration_request = target.filter(|target| Some(*target) != self.task_cpu);
+            }
+            TaskOnRunQueue::None => {
+                placement_invariant(
+                    self.on_cpu.is_none(),
+                    0x504c_0004,
+                    target.map_or(usize::MAX, |cpu| cpu.as_u32() as usize),
+                );
+                // Linux leaves task_cpu() unchanged for blocked tasks. The next
+                // wakeup selects from the current affinity mask.
+                self.migration_request = None;
+            }
         }
-        self.physical = SchedulerPlacement::Detached;
-        Ok(())
+    }
+
+    pub(in crate::system) fn requested_migration(&self) -> Option<CpuId> {
+        self.migration_request
+    }
+
+    /// Linux `put_prev_task()`: runnable and execution ownership stay intact.
+    pub(in crate::system) fn put_prev(&self, cpu: CpuId) {
+        let valid = self.on_rq == TaskOnRunQueue::Queued
+            && self.task_cpu == Some(cpu)
+            && self.on_cpu == Some(cpu)
+            && self.migration_request.is_none();
+        placement_invariant(valid, 0x504c_0005, cpu.as_u32() as usize);
+    }
+
+    /// Commits `TASK_ON_RQ_MIGRATING` and the new `task_cpu()` together.
+    pub(in crate::system) fn begin_migration(&mut self, source: CpuId, target: CpuId) {
+        let valid = source != target
+            && self.on_rq == TaskOnRunQueue::Queued
+            && self.task_cpu == Some(source)
+            && self.on_cpu.is_none_or(|owner| owner == source);
+        placement_invariant(valid, 0x504c_0006, source.as_u32() as usize);
+        self.task_cpu = Some(target);
+        self.on_rq = TaskOnRunQueue::Migrating;
+        self.migration_request = None;
+    }
+
+    /// Removes current from the runqueue while switch tail retains `on_cpu`.
+    pub(in crate::system) fn block_current(&mut self, cpu: CpuId) {
+        let valid = self.on_rq == TaskOnRunQueue::Queued
+            && self.task_cpu == Some(cpu)
+            && self.on_cpu == Some(cpu);
+        placement_invariant(valid, 0x504c_0007, cpu.as_u32() as usize);
+        self.on_rq = TaskOnRunQueue::None;
+        self.migration_request = None;
+    }
+
+    /// Linux `set_next_task()`: publish execution for the selected task.
+    pub(in crate::system) fn set_next_task(&mut self, cpu: CpuId) {
+        let valid = self.on_rq == TaskOnRunQueue::Queued
+            && self.task_cpu == Some(cpu)
+            && self.on_cpu.is_none_or(|owner| owner == cpu);
+        placement_invariant(valid, 0x504c_0008, cpu.as_u32() as usize);
+        self.on_cpu = Some(cpu);
+    }
+
+    /// Linux `finish_task()`: switch tail releases the old execution claim.
+    pub(in crate::system) fn finish_task(&mut self, cpu: CpuId) {
+        placement_invariant(self.on_cpu == Some(cpu), 0x504c_0009, cpu.as_u32() as usize);
+        self.on_cpu = None;
+    }
+
+    /// Cancels an unconsumed remote handoff when an external owner exits a task.
+    pub(in crate::system) fn cancel_remote_handoff_for_exit(&mut self) {
+        let valid = self.on_cpu.is_none() && self.on_rq != TaskOnRunQueue::Queued;
+        placement_invariant(
+            valid,
+            0x504c_000a,
+            self.task_cpu
+                .map_or(usize::MAX, |cpu| cpu.as_u32() as usize),
+        );
+        self.on_rq = TaskOnRunQueue::None;
+        self.migration_request = None;
     }
 
     #[cfg(test)]
@@ -121,194 +223,16 @@ impl ThreadPlacementState {
 
     #[cfg(test)]
     pub(in crate::system) fn inject_exiting_on_cpu(&mut self, cpu: CpuId) {
-        self.physical = SchedulerPlacement::Detached;
+        self.task_cpu = Some(cpu);
+        self.on_rq = TaskOnRunQueue::None;
         self.on_cpu = Some(cpu);
+        self.migration_request = None;
     }
 }
 
-/// One thread's complete physical runqueue/CPU ownership.
-///
-/// The runqueue-side destination of one thread.
-///
-/// Linux keeps `on_rq`/task CPU placement separate from the `on_cpu` release
-/// completed by `finish_task_switch()`. This enum likewise records only the
-/// final runqueue or migration owner. [`ThreadPlacementState::on_cpu`] retains
-/// the outgoing physical CPU until the CPU-owned switch handoff is consumed;
-/// no `SwitchingOut` mirror is stored on the thread.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SchedulerPlacement {
-    /// Not queued, executing, or in flight between owners.
-    Detached,
-    /// Physically linked on one owner runqueue.
-    Queued {
-        cpu: CpuId,
-        migration_target: Option<CpuId>,
-    },
-    /// Current on one CPU, optionally with a pending affinity migration.
-    Running {
-        cpu: CpuId,
-        migration_target: Option<CpuId>,
-    },
-    /// Detached from the source and owned by a generation-checked inbox transfer.
-    Migrating { target: CpuId },
-}
-
-impl SchedulerPlacement {
-    const fn detached() -> Self {
-        Self::Detached
-    }
-
-    const fn queued_cpu(self) -> Option<CpuId> {
-        match self {
-            Self::Queued { cpu, .. } => Some(cpu),
-            Self::Detached | Self::Running { .. } | Self::Migrating { .. } => None,
-        }
-    }
-
-    const fn running_cpu(self) -> Option<CpuId> {
-        match self {
-            Self::Running { cpu, .. } => Some(cpu),
-            Self::Detached | Self::Queued { .. } | Self::Migrating { .. } => None,
-        }
-    }
-
-    const fn migration_target(self) -> Option<CpuId> {
-        match self {
-            Self::Queued {
-                migration_target, ..
-            }
-            | Self::Running {
-                migration_target, ..
-            } => migration_target,
-            Self::Migrating { target } => Some(target),
-            Self::Detached => None,
-        }
-    }
-
-    fn set_queued_cpu(&mut self, cpu: Option<CpuId>) -> Result<(), TaskError> {
-        let current = *self;
-        *self = match (current, cpu) {
-            (Self::Detached, Some(cpu)) => Self::Queued {
-                cpu,
-                migration_target: None,
-            },
-            (Self::Migrating { target }, Some(cpu)) if target == cpu => Self::Queued {
-                cpu,
-                migration_target: None,
-            },
-            (
-                Self::Queued {
-                    migration_target, ..
-                },
-                None,
-            ) => migration_target.map_or(Self::Detached, |target| Self::Migrating { target }),
-            _ => return Err(TaskError::InvalidConfiguration),
-        };
-        Ok(())
-    }
-
-    fn set_running_cpu(&mut self, cpu: Option<CpuId>) -> Result<(), TaskError> {
-        let current = *self;
-        *self = match (current, cpu) {
-            (Self::Detached, Some(cpu)) => Self::Running {
-                cpu,
-                migration_target: None,
-            },
-            (
-                Self::Queued {
-                    cpu: queued_cpu,
-                    migration_target,
-                },
-                Some(cpu),
-            ) if queued_cpu == cpu => Self::Running {
-                cpu,
-                migration_target,
-            },
-            (Self::Migrating { target }, Some(cpu)) if target == cpu => Self::Running {
-                cpu,
-                migration_target: None,
-            },
-            (
-                Self::Running {
-                    cpu: running_cpu, ..
-                },
-                Some(cpu),
-            ) if running_cpu == cpu => current,
-            (
-                Self::Running {
-                    migration_target, ..
-                },
-                None,
-            ) => migration_target.map_or(Self::Detached, |target| Self::Migrating { target }),
-            _ => return Err(TaskError::InvalidConfiguration),
-        };
-        Ok(())
-    }
-
-    fn set_migration_target(&mut self, target: Option<CpuId>) -> Result<(), TaskError> {
-        let current = *self;
-        *self = match (current, target) {
-            (Self::Detached, Some(target)) => Self::Migrating { target },
-            (
-                Self::Queued {
-                    cpu,
-                    migration_target: _,
-                },
-                target,
-            ) => Self::Queued {
-                cpu,
-                migration_target: target,
-            },
-            (
-                Self::Running {
-                    cpu,
-                    migration_target: _,
-                },
-                target,
-            ) => Self::Running {
-                cpu,
-                migration_target: target,
-            },
-            (Self::Migrating { .. }, Some(target)) => Self::Migrating { target },
-            (Self::Migrating { .. }, None) => Self::Detached,
-            (Self::Detached, None) => current,
-        };
-        Ok(())
-    }
-
-    /// Atomically transfers logical ownership from the source runqueue to a
-    /// not-yet-consumed migration carrier.
-    fn begin_queued_migration(&mut self, source: CpuId, target: CpuId) -> Result<(), TaskError> {
-        match *self {
-            Self::Queued {
-                cpu,
-                migration_target: None,
-            } if cpu == source => {
-                *self = Self::Migrating { target };
-                Ok(())
-            }
-            _ => Err(TaskError::InvalidConfiguration),
-        }
-    }
-
-    /// Restores source ownership when the migration carrier was not published.
-    fn rollback_queued_migration(&mut self, source: CpuId, target: CpuId) -> Result<(), TaskError> {
-        match *self {
-            Self::Queued {
-                cpu,
-                migration_target: None,
-            } if cpu == source => Ok(()),
-            Self::Migrating {
-                target: migration_target,
-            } if migration_target == target => {
-                *self = Self::Queued {
-                    cpu: source,
-                    migration_target: None,
-                };
-                Ok(())
-            }
-            _ => Err(TaskError::InvalidConfiguration),
-        }
+fn placement_invariant(valid: bool, code: u32, detail: usize) {
+    if !valid {
+        task_runtime::fatal_invariant(code, detail);
     }
 }
 
@@ -319,82 +243,100 @@ mod tests {
     const CPU0: CpuId = CpuId::new(0);
     const CPU1: CpuId = CpuId::new(1);
 
-    #[test]
-    fn switching_out_keeps_physical_cpu_until_tail() {
+    fn running_placement() -> ThreadPlacementState {
         let mut placement = ThreadPlacementState::new(CpuSet::all(2));
-        placement.set_running_cpu(Some(CPU0)).unwrap();
-        placement.set_on_cpu(Some(CPU0)).unwrap();
-        placement.set_running_cpu(None).unwrap();
-        placement.set_queued_cpu(Some(CPU0)).unwrap();
+        placement.activate(CPU0);
+        placement.set_next_task(CPU0);
+        placement
+    }
 
+    #[test]
+    fn current_remains_on_rq_across_put_prev() {
+        let mut placement = running_placement();
         assert_eq!(placement.queued_cpu(), Some(CPU0));
-        assert_eq!(placement.running_cpu(), None);
+        assert_eq!(placement.execution_cpu(), Some(CPU0));
+
+        placement.put_prev(CPU0);
+        assert_eq!(placement.queued_cpu(), Some(CPU0));
         assert_eq!(placement.on_cpu(), Some(CPU0));
 
-        placement.set_on_cpu(None).unwrap();
+        placement.finish_task(CPU0);
         assert_eq!(placement.queued_cpu(), Some(CPU0));
+        assert_eq!(placement.execution_cpu(), None);
+    }
+
+    #[test]
+    fn migration_changes_on_rq_before_switch_tail_releases_on_cpu() {
+        let mut placement = running_placement();
+        placement.begin_migration(CPU0, CPU1);
+
+        assert_eq!(placement.queued_cpu(), None);
+        assert_eq!(placement.task_cpu(), Some(CPU1));
+        assert_eq!(placement.committed_migration_target(), Some(CPU1));
+        assert_eq!(placement.on_cpu(), Some(CPU0));
+
+        placement.finish_task(CPU0);
         assert_eq!(placement.on_cpu(), None);
     }
 
     #[test]
-    fn migration_becomes_transfer_owned_only_after_tail() {
+    fn later_affinity_request_does_not_retarget_committed_migration() {
         let mut placement = ThreadPlacementState::new(CpuSet::all(2));
-        placement.set_running_cpu(Some(CPU0)).unwrap();
-        placement.set_on_cpu(Some(CPU0)).unwrap();
-        placement.set_migration_target(Some(CPU1)).unwrap();
-        placement.set_running_cpu(None).unwrap();
+        placement.begin_remote_wakeup(CPU1);
 
-        assert_eq!(placement.on_cpu(), Some(CPU0));
-        assert_eq!(placement.migration_target(), Some(CPU1));
+        placement.request_migration(Some(CPU0));
 
-        placement.set_on_cpu(None).unwrap();
-        assert_eq!(placement.on_cpu(), None);
-        assert_eq!(placement.migration_target(), Some(CPU1));
+        assert_eq!(placement.committed_migration_target(), Some(CPU1));
+        assert_eq!(placement.requested_migration(), Some(CPU0));
+        assert_eq!(placement.assigned_cpu(), Some(CPU1));
+
+        placement.activate(CPU1);
+        placement.begin_migration(CPU1, CPU0);
+        assert_eq!(placement.committed_migration_target(), Some(CPU0));
+        assert_eq!(placement.requested_migration(), None);
     }
 
     #[test]
-    fn outgoing_reselection_cancels_switch_tail_ownership() {
+    fn selecting_a_runnable_task_changes_only_on_cpu() {
         let mut placement = ThreadPlacementState::new(CpuSet::all(2));
-        placement.set_running_cpu(Some(CPU0)).unwrap();
-        placement.set_on_cpu(Some(CPU0)).unwrap();
-        placement.set_running_cpu(None).unwrap();
-        placement.set_queued_cpu(Some(CPU0)).unwrap();
-        placement.set_queued_cpu(None).unwrap();
-        placement.set_running_cpu(Some(CPU0)).unwrap();
+        placement.activate(CPU0);
+        placement.set_next_task(CPU0);
 
-        assert_eq!(placement.running_cpu(), Some(CPU0));
-        assert_eq!(placement.on_cpu(), Some(CPU0));
-    }
-
-    #[test]
-    fn unrelated_cpu_cannot_claim_a_queued_thread() {
-        let mut placement = SchedulerPlacement::detached();
-        placement.set_queued_cpu(Some(CPU0)).unwrap();
-
-        assert_eq!(
-            placement.set_running_cpu(Some(CPU1)),
-            Err(TaskError::InvalidConfiguration)
-        );
         assert_eq!(placement.queued_cpu(), Some(CPU0));
-        assert_eq!(placement.running_cpu(), None);
+        assert_eq!(placement.execution_cpu(), Some(CPU0));
+        assert_eq!(placement.on_cpu(), Some(CPU0));
     }
 
     #[test]
-    fn switch_destination_is_not_mirrored_in_thread_placement() {
+    #[should_panic(expected = "scheduler invariant reported by unit test")]
+    fn unrelated_cpu_cannot_claim_a_runnable_task() {
         let mut placement = ThreadPlacementState::new(CpuSet::all(2));
-        placement.set_running_cpu(Some(CPU0)).unwrap();
-        placement.set_on_cpu(Some(CPU0)).unwrap();
-        placement.set_running_cpu(None).unwrap();
-        placement.set_queued_cpu(Some(CPU0)).unwrap();
+        placement.activate(CPU0);
+        placement.set_next_task(CPU1);
+    }
 
-        assert_eq!(
-            placement.physical,
-            SchedulerPlacement::Queued {
-                cpu: CPU0,
-                migration_target: None,
-            },
-            "the CPU switch handoff, not the thread placement, must own the outgoing-stack phase"
-        );
-        assert_eq!(placement.on_cpu(), Some(CPU0));
+    #[test]
+    fn blocked_task_retains_task_cpu_without_runqueue_ownership() {
+        let mut placement = running_placement();
+        placement.block_current(CPU0);
+        placement.finish_task(CPU0);
+
+        assert_eq!(placement.task_cpu(), Some(CPU0));
+        assert_eq!(placement.queued_cpu(), None);
+        assert_eq!(placement.on_cpu(), None);
+        assert_eq!(placement.assigned_cpu(), Some(CPU0));
+    }
+
+    #[test]
+    fn exit_cancels_only_the_unconsumed_remote_handoff() {
+        let mut placement = ThreadPlacementState::new(CpuSet::all(2));
+        placement.begin_remote_wakeup(CPU1);
+        placement.request_migration(Some(CPU0));
+
+        placement.cancel_remote_handoff_for_exit();
+
+        assert_eq!(placement.committed_migration_target(), None);
+        assert_eq!(placement.requested_migration(), None);
+        assert_eq!(placement.assigned_cpu(), Some(CPU1));
     }
 }

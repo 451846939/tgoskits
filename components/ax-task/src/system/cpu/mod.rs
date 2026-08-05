@@ -29,7 +29,9 @@ use local::{earliest, nonzero_deadline};
 #[cfg(feature = "qperf-metrics")]
 pub(crate) use remote::WakePreemptionDecision;
 pub use remote::{CpuLifecycleState, CpuLocalOwnerBorrow, CpuRemote};
-pub(crate) use remote::{CpuRemotePublication, CpuRunQueueState, IdlePullReservation};
+pub(crate) use remote::{
+    CpuRemotePublication, CpuRunQueueState, IdlePullReservation, PreparedMigrationDelivery,
+};
 pub use snapshot::CpuSnapshot;
 
 use crate::{

@@ -1,6 +1,7 @@
 use ax_task::{
-    CpuId, DeadlineFlags, DeadlinePolicy, FairMode, NORMALIZED_FAIR_SLICE_NS, Nice, RtPriority,
-    SchedulePolicy, TaskSystem, TaskSystemConfig, ThreadSpec,
+    CpuId, DEFAULT_RR_QUANTUM_NS, DeadlineFlags, DeadlinePolicy, FairMode,
+    NORMALIZED_FAIR_SLICE_NS, Nice, RtPriority, SchedulePolicy, TaskSystem, TaskSystemConfig,
+    ThreadSpec,
 };
 
 mod support;
@@ -50,7 +51,7 @@ fn round_robin_dispatch_programs_its_remaining_quantum() {
     system.enqueue(cpu.as_mut(), rr.id(), 100).unwrap();
 
     assert_eq!(system.schedule(cpu.as_mut(), 100).unwrap().next(), rr.id());
-    assert_eq!(support::last_oneshot_ns(), 5_000_100);
+    assert_eq!(support::last_oneshot_ns(), 100 + DEFAULT_RR_QUANTUM_NS);
 }
 
 #[test]

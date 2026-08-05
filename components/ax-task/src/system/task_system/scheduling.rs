@@ -293,9 +293,9 @@ impl TaskSystem {
         cpu.as_mut().scheduler_enter();
         let previous = cpu.current();
         let previous_core = cpu.current_core().cloned();
-        let mut migration_target = None;
+        let mut migration = None;
         if let Some(core) = previous_core.as_ref() {
-            migration_target = self.schedule_out_owner_running(
+            migration = self.schedule_out_owner_running(
                 cpu.as_mut(),
                 Arc::clone(core),
                 now_ns,
@@ -303,18 +303,19 @@ impl TaskSystem {
             )?;
         }
         let next = self.pick_owner_next(cpu.as_mut(), now_ns, previous)?;
-        if let Some(target) = next.outgoing_migration_target {
-            migration_target = Some(target);
+        if next.outgoing_migration.is_some() {
+            migration = next.outgoing_migration;
         }
         let next_core = next.core;
+        let migrated = migration.is_some();
         Self::stage_switch_handoff(
             cpu.as_mut(),
             previous,
             previous_core.as_ref().map(Arc::clone),
             next_core.id(),
-            migration_target,
+            migration,
         )?;
-        let reason = if migration_target.is_some() {
+        let reason = if migrated {
             SwitchReason::Migrated
         } else {
             SwitchReason::Preempted
@@ -396,9 +397,9 @@ impl TaskSystem {
             });
         }
         self.commit_owner_current_dispatch(cpu.as_mut(), now_ns)?;
-        let mut migration_target = None;
+        let mut migration = None;
         if let Some(core) = previous_core.as_ref() {
-            migration_target = self.schedule_out_owner_running(
+            migration = self.schedule_out_owner_running(
                 cpu.as_mut(),
                 Arc::clone(core),
                 now_ns,
@@ -406,18 +407,19 @@ impl TaskSystem {
             )?;
         }
         let next = self.pick_owner_next(cpu.as_mut(), now_ns, previous)?;
-        if let Some(target) = next.outgoing_migration_target {
-            migration_target = Some(target);
+        if next.outgoing_migration.is_some() {
+            migration = next.outgoing_migration;
         }
         let next_core = next.core;
+        let migrated = migration.is_some();
         Self::stage_switch_handoff(
             cpu.as_mut(),
             previous,
             previous_core.as_ref().map(Arc::clone),
             next_core.id(),
-            migration_target,
+            migration,
         )?;
-        let reason = if migration_target.is_some() {
+        let reason = if migrated {
             SwitchReason::Migrated
         } else {
             SwitchReason::Preempted
@@ -467,33 +469,49 @@ impl TaskSystem {
                 return Ok(self.finish_owner_selection(cpu, decision, now_ns));
             }
         }
-        let mut migration_target = None;
+        let mut migration = None;
         if let Some(core) = previous_core.as_ref() {
             let deadline_job_ended = {
                 let mut sched = core.sched().lock();
                 if matches!(sched.policy.applied, SchedulePolicy::Deadline(_))
                     && !sched.is_pi_boosted()
                 {
+                    if sched.lifecycle.state() != ThreadState::Running
+                        || sched.placement.execution_cpu() != Some(cpu.owner())
+                        || sched.placement.on_cpu() != Some(cpu.owner())
+                    {
+                        return Err(TaskError::InvalidConfiguration);
+                    }
                     if !sched.policy.effective_entity.yield_deadline_job() {
                         return Err(TaskError::InvalidConfiguration);
                     }
                     if let SchedulingEntity::Deadline(_) = sched.policy.effective_entity {
                         sched.policy.base_entity = sched.policy.effective_entity;
                     }
-                    sched.placement.set_running_cpu(None)?;
                     sched.deadline.replenish_pending = true;
+                    Self::mark_owner_deadline_non_contending_locked(
+                        core,
+                        &mut sched,
+                        cpu.as_mut(),
+                        now_ns,
+                    );
                     sched.transition(core, ThreadState::Blocked)?;
-                    Self::refresh_owner_deadline_timers_locked(core, &mut sched, cpu.as_mut())?;
+                    let mut run_queue = cpu.lock_run_queue();
+                    if run_queue.is_linked_current(core.id()) {
+                        run_queue
+                            .dequeue(core.id())
+                            .expect("validated retained current must remain linked");
+                    }
+                    sched.placement.block_current(cpu.owner());
                     true
                 } else {
                     false
                 }
             };
             if deadline_job_ended {
-                Self::mark_owner_deadline_non_contending(core, cpu.as_mut(), now_ns)?;
                 cpu.as_mut().clear_current();
             } else {
-                migration_target = self.schedule_out_owner_running(
+                migration = self.schedule_out_owner_running(
                     cpu.as_mut(),
                     Arc::clone(core),
                     now_ns,
@@ -502,18 +520,19 @@ impl TaskSystem {
             }
         }
         let next = self.pick_owner_next(cpu.as_mut(), now_ns, previous)?;
-        if let Some(target) = next.outgoing_migration_target {
-            migration_target = Some(target);
+        if next.outgoing_migration.is_some() {
+            migration = next.outgoing_migration;
         }
         let next_core = next.core;
+        let migrated = migration.is_some();
         Self::stage_switch_handoff(
             cpu.as_mut(),
             previous,
             previous_core.as_ref().map(Arc::clone),
             next_core.id(),
-            migration_target,
+            migration,
         )?;
-        let reason = if migration_target.is_some() {
+        let reason = if migrated {
             SwitchReason::Migrated
         } else {
             SwitchReason::Yield

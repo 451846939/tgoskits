@@ -232,6 +232,8 @@ cfg_task! {
             | TaskError::DeadlineAffinity
             | TaskError::ActiveTimerAffinity
             | TaskError::ThreadBusy => crate::AxError::ResourceBusy,
+            // Linux copy_process() reports the global thread limit as EAGAIN.
+            TaskError::ThreadCapacity => crate::AxError::WouldBlock,
             TaskError::TimerCapacity => crate::AxError::NoMemory,
             TaskError::UnsafeContext => crate::AxError::OperationNotPermitted,
             TaskError::StaleThreadId => crate::AxError::NotFound,
@@ -303,6 +305,14 @@ cfg_task! {
             assert_eq!(
                 map_task_error(ax_runtime::task::TaskError::PiChainLimit { limit: 8 }),
                 crate::AxError::BadState
+            );
+        }
+
+        #[test]
+        fn thread_capacity_maps_to_linux_eagain() {
+            assert_eq!(
+                map_task_error(ax_runtime::task::TaskError::ThreadCapacity),
+                crate::AxError::WouldBlock
             );
         }
     }

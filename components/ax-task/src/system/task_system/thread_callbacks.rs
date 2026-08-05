@@ -31,15 +31,21 @@ impl ThreadCallbackState {
     }
 
     pub(super) fn prepare_exit(&mut self, has_callback: bool) -> Result<(), TaskError> {
-        if self.exit != ExitCallbackState::Absent {
-            return Err(TaskError::InvalidConfiguration);
-        }
+        self.validate_prepare_exit()?;
         self.exit = if has_callback {
             ExitCallbackState::Pending
         } else {
             ExitCallbackState::Absent
         };
         Ok(())
+    }
+
+    pub(super) fn validate_prepare_exit(&self) -> Result<(), TaskError> {
+        if self.exit == ExitCallbackState::Absent {
+            Ok(())
+        } else {
+            Err(TaskError::InvalidConfiguration)
+        }
     }
 
     pub(super) const fn exit_is_pending(&self) -> bool {

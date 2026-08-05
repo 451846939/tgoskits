@@ -173,7 +173,7 @@ USB/vsock 控制器协议属于外围驱动；除非它们违反上述调度交�
 | placement | `try_to_wake_up()`、rq locking | rq 独占 queued/running，CPU switch baton 独占 outgoing stack | 已删除 `target_cpu` CPU 身份双真相和 task 级 `SwitchingOut/ExitedAwaitingTail`；线程只保存最终 rq/migration placement 与独立 `on_cpu` 发布位，outgoing stack 生命周期唯一归 per-CPU `SwitchHandoff` |
 | Fair/EEVDF | `avg_vruntime()`、`place_entity()`、`pick_eevdf()` | 唯一加权平均 V；sleep/migration 保存 `vlag`；eligible current 保留请求保护 | 已删除旧 wakeup granularity 与重复单调 V，迁移使用 detach 事务 |
 | RT/DL 选核 | `cpupri`、`cpudl`、`RT_PUSH_IPI` | 优先级与 load 正交；DL runnable CPU 属于 cpupri HIGHER；只有可迁移候选才能发布 overload | root-domain cpupri/cpudl 已接入 wake placement；cpupri 包含 101 个桶，DL current/queued 发布 HIGHER；pushable summary 随 affinity generation 更新，不可迁移 RT/DL 不触发 owner balance doorbell |
-| 远程投递 | `try_to_wake_up()`、`ttwu_queue()`、`resched_curr()`、`irq_work_claim()` | PREEMPT_RT 关闭 `TTWU_QUEUE`，waker 直接锁目标 rq 激活；仅实际需要抢占时发送 reschedule IPI；IPI claim 必须先于 callback/drain | 已删除 remote-wake inbox；runtime 门铃改为 generation + physical edge ownership，coalescing 只返回成功，不再把 `Busy` 暴露为模糊的 transport 状态 |
+| 远程投递 | `try_to_wake_up()`、`ttwu_queue()`、`resched_curr()`、`irq_work_claim()` | PREEMPT_RT 关闭 `TTWU_QUEUE`，waker 直接锁目标 rq 激活；仅实际需要抢占时发送 reschedule IPI；IPI claim 必须先于 callback/drain | 已删除 task-level remote-wake inbox；migration/control 继续使用 typed owner inbox；runtime 门铃改为 generation + physical edge ownership，coalescing 只返回成功，不再把 `Busy` 暴露为模糊的 transport 状态 |
 | CPU 生命周期 | `sched_cpu_deactivate()`、`sched_cpu_dying()` | 先关 placement，再 drain producer，最后 offline | `Online/Inactive/Draining/Offline` 已实现 |
 | active mm | `exit_mm()`、`context_switch()`、`enter_lazy_tlb()`、`finish_task_switch()` | task-mm 所有权在 zombie 前解除；lazy CPU carrier 与页表根存储保留到最后 CPU lease | move-only token + task detach + per-CPU active lease 已实现 |
 | 用户 TLB 回收 | `mmu_gather`、`mm_cpumask()`、各架构 `flush_tlb_mm_range()` | 先改 PTE，再同步 active-mm CPU，最后释放物理所有权 | 共享 mm CPU tracker + typed gather 已实现；调度 token 不再各自维护错误的 CPU footprint |
@@ -333,10 +333,10 @@ Migrating(target)
 `SwitchingOut/ExitedAwaitingTail` 由 per-CPU `SwitchHandoff` 表示。enqueue、dequeue、wake、
 migration、switch-tail 和回收只能通过 rq 事务与 handoff 方法。blocked thread 的
 `wake_cpu_hint` 只承担 Linux `wake_cpu` 式的直接唤醒偏好，不再作为公共 CPU 身份。
-`ThreadHandle::assigned_cpu()` 优先从 placement 推导物理 owner，只有完全 detached 时
-才回退到 wake hint；CPU offline 关闭新 runqueue publication 后，将该提示重定向到
-仍 online 且满足 affinity 的 CPU。这样 affinity 的未来目标不会在 switch-tail 前
-冒充当前 CPU。
+`ThreadHandle::assigned_cpu()` 只返回 Linux `task_cpu()` 对应的最后一次 rq assignment，
+不再用 wake hint 补值。blocked task 保留旧 `task_cpu()`；CPU offline 只把独立的
+`wake_cpu_hint` 重定向到仍 online 且满足 affinity 的 CPU。物理执行 owner 由
+`scheduler_fence_cpu()`/`on_cpu` 单独报告，下一次唤醒偏好不能冒充 rq 或执行所有权。
 
 ### owner-CPU 与 runqueue
 
@@ -385,7 +385,9 @@ consumer 观察”。
 
 idle polling 与 work pending 共用原子状态，确保“观察到 polling 就省略 IPI”和“退出 polling 后新工作一定有物理边”之间没有丢唤醒窗口。
 
-普通 remote wake 不再进入这个门铃。waker 已在 target rq 内完成 activate 后，只有
+普通 remote wake 不再进入这个门铃。这里删除的是旧 task-level `RemoteWake` inbox；
+migration、affinity reconciliation 等 owner-only 控制仍使用 typed `owner_control_inbox`，
+不能把二者混写成“所有 inbox 已删除”。waker 已在 target rq 内完成 activate 后，只有
 `wakeup_preempt()` 等价判断确认新实体应抢占目标 current，才发布 target
 `need_resched` 并发送 reschedule IPI；目标处于 polling idle 时只发布状态，不发送
 物理 IPI。旧 `RemoteWake` inbox、嵌入线程的 wake node 和 drain batch 在切换完成后
@@ -1884,11 +1886,72 @@ cpupri/cpudl 作为 `TaskSystem` 的第三个平级字段。GRUB 热路径只能
   `max{u, Umax - Uinactive - Uextra}`，没有增加第二份 per-rq admission 镜像。
 
 确定性红测使用单 CPU、`U=0.5` 的唯一 RECLAIM Deadline 任务。旧实现忽略
-`Uextra=0.45`，100 ns 墙钟后预算从 500 降到 400；新实现按 `ceil(100 * 0.5 / 0.95)`
-只扣 53，剩余 447。同一测试先稳定失败，再由上述 owner 重构转绿；ax-task 的 306 个
-unit、21 个 loom、全部 integration 与 doctest 随后通过。这一阶段补齐 A4，但尚未把
+`Uextra=0.45`，100 ns 墙钟后预算从 500 降到 400；新实现与 Linux `grub_reclaim()` 一样
+按固定点乘法向下截断，`floor(100 * 0.5 / 0.95)` 只扣 52，剩余 448。换算、带宽相减和
+runtime charge 都以 admission/runqueue 不变量为前提；不再用 `unwrap_or(u64::MAX)`、
+`saturating_sub()` 或向上取整把异常吞成保守计费。同一测试先稳定失败，再由上述 owner
+重构转绿。这一阶段补齐 A4，但尚未把
 blocked Deadline reservation 从原 rq 的 zero-lag/CBS 生命周期中拆出；跨 CPU runtime
 borrowing 与 running-in-rq 仍需在下一阶段分别处理。
+
+### 2026-08-05 RT/DL running-in-rq 与独立 pushable 所有权
+
+review 提出的 A5 方向有效，但不能把“running 留队”机械套到所有调度类。Linux v7.1 的
+`set_next_entity()` 会把 Fair current 从 EEVDF 红黑树摘除，`put_prev_entity()` 再插回；
+`set_next_task_rt()` 与 `set_next_task_dl()` 则保留 current 在各自 active array/tree 中，
+只从 pushable 索引删除，`put_prev_task_*()` 再恢复 pushable。ax-task 现在按 class 保留这项
+差异，不建立统一但错误的兼容模型。
+
+重构后的 rq 所有权如下：
+
+- RT/DL 的 generation-bearing intrusive node 在 dispatch 期间继续属于 active 结构；pick 只
+  把它标记为 `linked_current`，不再归还 node storage、注销 membership、重新分配 sequence；
+- `len`、placement demand 与 remote runnable summary 表示 queued work，不把 physically-linked
+  current 重复计数；current 的优先级仍由同一 rq 锁内的 `CurrentSchedule` 发布；
+- migration eligibility 由独立、预分配的 generation-bearing `PushableIndex` 拥有。它使用固定
+  二叉堆和 slot-to-index 反向表，线程创建阶段准备容量，rq 热路径 O(log n) 且零分配；
+  `set_next` 只删除 pushable key，`put_prev` 只恢复 key。active ownership 与可迁移性不再共用
+  一次全量 class scan；
+- Deadline current 的 CBS accounting 在一个 dispatch interval 内保持 queue key 稳定，只在
+  rq 锁内替换 active node 的 augmented payload，不执行 remove/insert；absolute deadline
+  的变化由 `put_prev` 在 current 离开 dispatch 时统一 remove/reinsert 并 rekey；
+- RR yield/quantum expiry 只把原 intrusive node 移到同优先级尾部，普通 FIFO/未耗尽 RR
+  preemption 保持原位置；Fair 继续沿用原 EEVDF remove/insert 语义。
+
+两项最低层红测在旧实现稳定证明 RT 与 Deadline pick 后 membership 已消失；新实现要求
+active membership 保留、queued count 为零、pushable key 为空。确定性 reference model 也改为
+Linux 语义：未耗尽 RT/DL 的 scheduler entry 不产生新 arrival sequence，耗尽 CBS 才退出 active
+集合。不是放宽输出断言。当前检查点执行 `cargo test -p ax-task --quiet`，313 个 unit、
+21 个 loom 以及全部 integration/doctest 通过。后续仍需拆分 `CurrentDispatch`
+快照/记账；task 级 `SwitchingOut/ExitedAwaitingTail` 已删除，不能重新引入与 per-CPU
+`SwitchHandoff` 并行的兼容状态。
+
+### 2026-08-05 Linux `task_cpu/on_rq/on_cpu` 与 `TASK_WAKING`
+
+placement 现在直接采用 Linux v7.1 的三组正交事实，而不是一个可被 hint 覆盖的综合状态：
+
+- `task_cpu` 是最后提交的 rq assignment；`on_rq` 只有 `None / Queued / Migrating`；
+- `on_cpu` 是物理执行 claim，只允许 switch tail 的 `finish_task()` 清除；
+- `migration_request` 只是尚未提交的 affinity 目标，不能重定向已经携带目标 rq publication
+  lease 与 thread inbox reservation 的 `PreparedMigrationDelivery`；
+- `wake_cpu_hint` 只参与 `select_task_rq` 等价决策，不属于 placement，也不通过
+  `ThreadHandle::assigned_cpu()` 暴露。
+
+这消除了两个旧问题。其一，新的 affinity request 不能在 carrier 已经离开源 rq 后偷偷改写
+目标；exit 只能显式取消尚未消费的 remote handoff，目标仍负责 drain carrier 并释放 publication
+lease。其二，blocked task 可能在 outgoing context 尚未完成 switch tail 时被唤醒。此时线程先
+进入 `Waking`，但不得 activate 到任何 rq；`finish_task()` 以 Release 清除 `on_cpu` 后，
+`finish_switch_tail_wake()` 才选目标并提交 `Waking -> Ready`。这对应 Linux
+`try_to_wake_up()` 等待/观察 `p->on_cpu` 与 `finish_task()` 的 release/acquire 边界。
+
+Idle 也按 Linux 特殊调度类处理：运行中的 idle 始终保持 `on_rq=Queued`，schedule-out 只执行
+`put_prev`，不会借普通 block 路径把它变成 detached。确定性回归分别覆盖 wake-before-tail、
+后续 affinity request 不改写 committed target、exit 取消未消费 carrier、连续 idle 选择和
+blocked task 在 CPU offline 后保留旧 `task_cpu` 但更新 wake hint。
+
+检查点验证还包括 `cargo xtask clippy --package ax-task` 的 base/qperf 两项，以及
+`cargo xtask clippy --package starry-kernel` 的 26 项 feature/configuration matrix，全部通过。
+本检查点没有启动 QEMU，不能把编译与最低层行为测试描述为四架构运行结果。
 
 ## 模块化结果
 

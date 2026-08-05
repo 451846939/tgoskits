@@ -3,15 +3,20 @@
 use super::*;
 
 /// State committed before an architecture switch and consumed by switch tail.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct SwitchHandoff {
     pub(crate) previous: Arc<ThreadCore>,
-    pub(crate) migration_target: Option<CpuId>,
+    pub(crate) migration: Option<PreparedMigrationDelivery>,
     /// The architecture tail has irrevocably left `previous`'s context.
-    ///
-    /// Scheduler state may still reject a later, retryable bookkeeping step.
-    /// Such a retry must not execute the architecture tail twice.
     pub(crate) runtime_tail_finished: bool,
+}
+
+impl SwitchHandoff {
+    pub(crate) fn migration_target(&self) -> Option<CpuId> {
+        self.migration
+            .as_ref()
+            .map(PreparedMigrationDelivery::target)
+    }
 }
 /// Owner-CPU copy of the running thread's mutable dispatch accounting.
 ///
@@ -76,6 +81,10 @@ impl CurrentSchedule {
 
     pub(crate) const fn schedule_policy(self) -> SchedulePolicy {
         self.policy
+    }
+
+    pub(crate) const fn scheduling_entity(self) -> SchedulingEntity {
+        self.entity
     }
 
     pub(crate) const fn absolute_deadline_ns(self) -> Option<u64> {
@@ -286,19 +295,21 @@ impl CurrentDispatch {
         if !policy.flags().contains(crate::DeadlineFlags::RECLAIM) || max_bw_scaled == 0 {
             return 0;
         }
-        let own_bw_scaled = u64::try_from(DeadlineAdmission::utilization(policy))
-            .unwrap_or(u64::MAX)
-            .min(max_bw_scaled);
-        let reclaimable_bw_scaled = inactive_bw_scaled
-            .saturating_add(extra_bw_scaled)
-            .min(max_bw_scaled);
-        let charge_rate_scaled =
-            own_bw_scaled.max(max_bw_scaled.saturating_sub(reclaimable_bw_scaled));
-        let charged_ns = (runtime_ns as u128)
-            .saturating_mul(charge_rate_scaled as u128)
-            .saturating_add(max_bw_scaled as u128 - 1)
-            / max_bw_scaled as u128;
-        runtime_ns.saturating_sub(u64::try_from(charged_ns).unwrap_or(u64::MAX))
+        let utilization = DeadlineAdmission::utilization(policy);
+        let Ok(own_bw_scaled) = u64::try_from(utilization) else {
+            task_runtime::fatal_invariant(0x444c_1010, self.thread.as_u64() as usize);
+        };
+        if own_bw_scaled > max_bw_scaled {
+            task_runtime::fatal_invariant(0x444c_1011, self.thread.as_u64() as usize);
+        }
+        let charged_ns = grub_charge_ns(
+            runtime_ns,
+            own_bw_scaled,
+            inactive_bw_scaled,
+            extra_bw_scaled,
+            max_bw_scaled,
+        );
+        runtime_ns - charged_ns
     }
 
     pub(super) fn is_rt(&self) -> bool {
@@ -341,6 +352,28 @@ impl CurrentDispatch {
     }
 }
 
+fn grub_charge_ns(
+    runtime_ns: u64,
+    own_bw_scaled: u64,
+    inactive_bw_scaled: u64,
+    extra_bw_scaled: u64,
+    max_bw_scaled: u64,
+) -> u64 {
+    assert!(max_bw_scaled > 0);
+    assert!(own_bw_scaled <= max_bw_scaled);
+
+    // Linux compares Uinact + Uextra against Umax - u instead of
+    // subtracting first: the reclaimable sum may legitimately exceed Umax.
+    let reclaimable_bw_scaled = inactive_bw_scaled as u128 + extra_bw_scaled as u128;
+    let charge_rate_scaled = if reclaimable_bw_scaled > (max_bw_scaled - own_bw_scaled) as u128 {
+        own_bw_scaled
+    } else {
+        max_bw_scaled - reclaimable_bw_scaled as u64
+    };
+    let charged_ns = runtime_ns as u128 * charge_rate_scaled as u128 / max_bw_scaled as u128;
+    u64::try_from(charged_ns).expect("GRUB charge cannot exceed the supplied runtime")
+}
+
 fn deadline_key(entity: SchedulingEntity) -> u64 {
     entity
         .deadline()
@@ -352,4 +385,14 @@ fn deadline_key(entity: SchedulingEntity) -> u64 {
 pub(crate) struct DispatchCharge {
     pub(crate) slice_expired: bool,
     pub(crate) deadline_overrun: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::grub_charge_ns;
+
+    #[test]
+    fn grub_charge_uses_linux_fixed_point_truncation() {
+        assert_eq!(grub_charge_ns(1, 1, 1, 0, 2), 0);
+    }
 }

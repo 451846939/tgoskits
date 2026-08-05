@@ -114,7 +114,13 @@ fn compare_scenario(seed: u64, scenario: Scenario) {
             }
             _ => {
                 let charge = system.charge_current(cpu.as_mut(), now_ns, 1, 0).unwrap();
-                assert_eq!(charge.slice_expired(), reference.charge(now_ns, 1));
+                assert_eq!(
+                    charge.slice_expired(),
+                    reference.charge(now_ns, 1),
+                    "scenario={scenario:?} seed={seed:#x} event={event_index} \
+                     reference={reference:?} production_deadline={:?}",
+                    system.deadline_runtime(reference.current.id)
+                );
                 assert!(!charge.deadline_overrun());
             }
         }
@@ -295,18 +301,37 @@ impl ReferenceScheduler {
 
     fn enqueue_current(&mut self, reason: ReferenceEnqueue) {
         let mut current = self.current;
-        current.sequence = self.next_sequence;
-        self.next_sequence = self.next_sequence.wrapping_add(1);
-        let preserve_head = matches!(reason, ReferenceEnqueue::Preempted)
-            && match current.entity {
-                ReferenceEntity::Fifo => true,
-                ReferenceEntity::RoundRobin {
-                    remaining_quantum_ns,
-                } => remaining_quantum_ns != 0,
-                _ => false,
-            };
+        if matches!(
+            current.entity,
+            ReferenceEntity::Deadline {
+                remaining_runtime_ns: 0,
+                ..
+            }
+        ) {
+            // An exhausted CBS leaves the active EDF tree and stays
+            // throttled until a later replenishment event, which this bounded
+            // reference stream does not reach.
+            return;
+        }
+        let keeps_active_position = match current.entity {
+            // Linux keeps RT/DL current linked in their active structures.
+            // A scheduler entry alone therefore cannot assign a fresh FIFO or
+            // EDF tie-break sequence.
+            ReferenceEntity::Fifo => {
+                matches!(reason, ReferenceEnqueue::Preempted)
+            }
+            ReferenceEntity::Deadline { .. } => matches!(reason, ReferenceEnqueue::Preempted),
+            ReferenceEntity::RoundRobin {
+                remaining_quantum_ns,
+            } => matches!(reason, ReferenceEnqueue::Preempted) && remaining_quantum_ns != 0,
+            ReferenceEntity::Fair { .. } => false,
+        };
+        if !keeps_active_position {
+            current.sequence = self.next_sequence;
+            self.next_sequence = self.next_sequence.wrapping_add(1);
+        }
         current.entity.prepare_enqueue(reason, self.virtual_time);
-        if preserve_head {
+        if keeps_active_position && self.scenario != Scenario::Deadline {
             self.ready.insert(0, current);
         } else {
             self.ready.push(current);
@@ -386,9 +411,8 @@ impl ReferenceEntity {
                 remaining_runtime_ns,
                 ..
             } => {
-                let had_budget = *remaining_runtime_ns != 0;
                 *remaining_runtime_ns = remaining_runtime_ns.saturating_sub(runtime_ns);
-                had_budget && *remaining_runtime_ns == 0
+                *remaining_runtime_ns == 0
             }
         }
     }

@@ -54,9 +54,8 @@ impl TaskSystem {
         let record = state.thread_record_mut(current)?;
         let mut sched = record.sched.lock();
         if sched.lifecycle.state() != ThreadState::Running
-            || sched.placement.running_cpu() != Some(owner)
+            || sched.placement.execution_cpu() != Some(owner)
             || sched.placement.on_cpu() != Some(owner)
-            || sched.placement.queued_cpu().is_some()
         {
             return Err(TaskError::InvalidConfiguration);
         }
@@ -83,9 +82,8 @@ impl TaskSystem {
         let record = state.thread_record_mut(current)?;
         let mut sched = record.sched.lock();
         if sched.lifecycle.state() != ThreadState::Running
-            || sched.placement.running_cpu() != Some(owner)
+            || sched.placement.execution_cpu() != Some(owner)
             || sched.placement.on_cpu() != Some(owner)
-            || sched.placement.queued_cpu().is_some()
             || record.resources.address_space().is_none()
         {
             return Err(TaskError::InvalidConfiguration);
@@ -173,7 +171,7 @@ impl TaskSystem {
             let desired_reservation = u128::from(sched.deadline.desired_reservation);
             let owner = sched
                 .placement
-                .running_cpu()
+                .execution_cpu()
                 .or(sched.placement.queued_cpu())
                 .or(sched.deadline.bandwidth_cpu);
             let generation = sched

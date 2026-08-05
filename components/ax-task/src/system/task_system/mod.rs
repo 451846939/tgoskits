@@ -58,12 +58,12 @@ use crate::runtime::ExecutionContextHandle;
 use crate::system::cpu::WakePreemptionDecision;
 use crate::{
     CpuId, CpuLocal, CpuRemote, CpuRemotePublication, CpuSet, CpuSnapshot, DeadlineAdmission,
-    DeadlineBandwidthSnapshot, DeadlineEntity, DetachedQueueEntry, EnqueueReason, FairMode,
-    OwnedThreadSchedulerExit, ParkCommit, ParkPrepare, ParkTicket, PiMutexRaw, PiWaitKey,
-    PiWaitToken, PiWaitTree, QueuedThread, SchedulePolicy, SchedulingClass, SchedulingEntity,
-    SwitchReason, TaskError, TaskSystemConfig, ThreadAffinityChange, ThreadCore, ThreadExtension,
-    ThreadExtensionBorrow, ThreadExtensionLease, ThreadExtensionView, ThreadHandle, ThreadId,
-    ThreadResources, ThreadRuntimeSnapshot, ThreadSpec, ThreadState, WakeResult,
+    DeadlineBandwidthSnapshot, DeadlineEntity, EnqueueReason, FairMode, OwnedThreadSchedulerExit,
+    ParkCommit, ParkPrepare, ParkTicket, PiMutexRaw, PiWaitKey, PiWaitToken, PiWaitTree,
+    QueuedThread, SchedulePolicy, SchedulingClass, SchedulingEntity, SwitchReason, TaskError,
+    TaskSystemConfig, ThreadAffinityChange, ThreadCore, ThreadExtension, ThreadExtensionBorrow,
+    ThreadExtensionLease, ThreadExtensionView, ThreadHandle, ThreadId, ThreadResources,
+    ThreadRuntimeSnapshot, ThreadSpec, ThreadState, WakeResult,
     executor::CoroutineHeader,
     inbox::{InboxKind, InboxMessage, InboxOperation, PublishResult, SchedulerInbox},
     lock::{IrqScope, IrqTicketLock, PreemptTicketLock, SequenceCounter},
@@ -73,12 +73,12 @@ use crate::{
     },
     system::cpu::{
         CpuRunQueueState, CurrentDispatch, CurrentDispatchState, CurrentSchedule,
-        IdlePullReservation,
+        IdlePullReservation, PreparedMigrationDelivery,
     },
     task_work::{TaskWorkConsumerGuard, TaskWorkDoorbell},
     timer::{
-        ExpiredTaskDeadline, TaskDeadlineError, TaskDeadlineKind, TaskDeadlineNode,
-        TaskDeadlineRegistration,
+        ExpiredTaskDeadline, TaskDeadlineArmPlan, TaskDeadlineError, TaskDeadlineKind,
+        TaskDeadlineNode, TaskDeadlineQueue, TaskDeadlineRegistration,
     },
 };
 
@@ -89,7 +89,7 @@ struct UnpublishedThreadGuard<'system> {
 
 struct OwnerNext {
     core: Arc<ThreadCore>,
-    outgoing_migration_target: Option<CpuId>,
+    outgoing_migration: Option<PreparedMigrationDelivery>,
 }
 
 impl<'system> UnpublishedThreadGuard<'system> {
@@ -185,7 +185,8 @@ fn validate_config(config: TaskSystemConfig) -> Result<(), TaskError> {
         || config.rt_period_ns() == 0
         || config.rt_runtime_ns() > config.rt_period_ns()
         || config.balance_interval_ns() == 0
-        || config.timer_capacity() == 0
+        || config.thread_capacity() == 0
+        || config.thread_capacity() > u32::MAX as usize
         || config.batch_limit() == 0
         || config.batch_limit() > crate::DEFAULT_BATCH_LIMIT
         || config.pi_chain_limit() == 0

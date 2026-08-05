@@ -32,7 +32,7 @@ fn reclaim_includes_unreserved_root_domain_bandwidth() {
             .deadline_runtime(reclaimer.id())
             .unwrap()
             .remaining_runtime_ns(),
-        447,
+        448,
         "GRUB must include the root domain's unreserved capacity in Uextra"
     );
 }
@@ -79,7 +79,7 @@ fn reclaim_starts_only_after_the_blocked_reservation_zero_lag_time() {
             .deadline_runtime(reclaimer.id())
             .unwrap()
             .remaining_runtime_ns(),
-        2
+        3
     );
 
     assert!(
@@ -92,14 +92,14 @@ fn reclaim_starts_only_after_the_blocked_reservation_zero_lag_time() {
         system.schedule(cpu.as_mut(), 6).unwrap().next(),
         reclaimer.id()
     );
-    // Umax=.95, Uinactive=.5 and Ui=.25: two wall-time units consume one
-    // budget unit after integer rounding, rather than the full two units.
+    // Umax=.95, Uinactive=.5 and Ui=.25: Linux's fixed-point GRUB rule
+    // truncates this two-nanosecond charge to zero.
     assert_eq!(
         system
             .deadline_runtime(reclaimer.id())
             .unwrap()
             .remaining_runtime_ns(),
-        1
+        3
     );
 }
 
@@ -123,11 +123,23 @@ fn deadline_yield_does_not_publish_immediate_reclaimable_runtime() {
     assert_eq!(activity.zero_lag_ns(), 8);
     assert_eq!(cpu.deadline_bandwidth().inactive_bw_scaled(), 0);
     assert!(
-        system
+        !system
             .charge_current(cpu.as_mut(), 6, 4, 0)
             .unwrap()
             .slice_expired(),
-        "yielded bandwidth must not become reclaimable before zero-lag"
+        "root-domain Uextra remains reclaimable before zero-lag"
+    );
+    assert_eq!(
+        system.schedule(cpu.as_mut(), 6).unwrap().next(),
+        reclaimer.id()
+    );
+    assert_eq!(
+        system
+            .deadline_runtime(reclaimer.id())
+            .unwrap()
+            .remaining_runtime_ns(),
+        1,
+        "the yielded donor must not contribute Uinactive before zero-lag"
     );
 }
 
@@ -303,9 +315,9 @@ fn queued_policy_change_replaces_the_deadline_reservation_accounting() {
 }
 
 #[test]
-fn deadline_member_capacity_failure_rolls_back_bandwidth_accounting() {
+fn scheduler_capacity_is_rejected_before_deadline_runqueue_publication() {
     support::clear_handles();
-    let system = TaskSystem::new(TaskSystemConfig::new(1).with_timer_capacity(1)).unwrap();
+    let system = TaskSystem::new(TaskSystemConfig::new(1).with_thread_capacity(2)).unwrap();
     let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
     system
         .register_idle_thread(
@@ -315,22 +327,15 @@ fn deadline_member_capacity_failure_rolls_back_bandwidth_accounting() {
         .unwrap();
     system.bring_cpu_online(cpu.as_mut()).unwrap();
     let first = ready_deadline(&system, 1, 10, 10, DeadlineFlags::NONE);
-    let second = ready_deadline(&system, 1, 10, 10, DeadlineFlags::NONE);
-
     system.enqueue(cpu.as_mut(), first.id(), 0).unwrap();
+    let second_policy =
+        SchedulePolicy::deadline(DeadlinePolicy::new(1, 10, 10, DeadlineFlags::NONE).unwrap());
     assert_eq!(
-        system.enqueue(cpu.as_mut(), second.id(), 0),
-        Err(TaskError::TimerCapacity)
+        system.create_thread(ThreadSpec::new(second_policy)),
+        Err(TaskError::ThreadCapacity)
     );
 
     assert_eq!(cpu.deadline_bandwidth().this_bw_scaled(), 100_000_000);
-    assert_eq!(
-        system
-            .deadline_activity(second.id())
-            .unwrap()
-            .bandwidth_cpu(),
-        None
-    );
 }
 
 #[test]

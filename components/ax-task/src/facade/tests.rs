@@ -514,6 +514,99 @@ mod tests {
     }
 
     #[test]
+    fn clockevent_buffer_preserves_unconsumed_expirations() {
+        let system = Box::pin(
+            TaskSystem::new(
+                crate::TaskSystemConfig::new(1)
+                    .with_thread_capacity(3)
+                    .with_batch_limit(2),
+            )
+            .unwrap(),
+        );
+        let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
+        system
+            .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
+            .unwrap();
+        system.bring_cpu_online(cpu.as_mut()).unwrap();
+        let _runtime_handles = InstalledTaskHandles::new(system.as_ref(), cpu.as_mut());
+        let first = system
+            .create_thread(ThreadSpec::new(SchedulePolicy::default()))
+            .unwrap();
+        let second = system
+            .create_thread(ThreadSpec::new(SchedulePolicy::default()))
+            .unwrap();
+        let _first_registration = cpu
+            .as_mut()
+            .task_deadlines()
+            .arm(first.sleep_timer(), 10, TaskDeadlineKind::park_timeout(1))
+            .unwrap();
+        let _second_registration = cpu
+            .as_mut()
+            .task_deadlines()
+            .arm(second.sleep_timer(), 10, TaskDeadlineKind::park_timeout(1))
+            .unwrap();
+
+        assert_eq!(on_clock_event(10, 2).unwrap().expired(), 2);
+        let mut first_event = [ExpiredTaskDeadline::EMPTY; 1];
+        assert_eq!(
+            take_current_expired_task_deadlines(&mut first_event).unwrap(),
+            1
+        );
+        let mut second_event = [ExpiredTaskDeadline::EMPTY; 1];
+        assert_eq!(
+            take_current_expired_task_deadlines(&mut second_event).unwrap(),
+            1
+        );
+        assert_ne!(first_event[0].thread(), second_event[0].thread());
+        assert_eq!(
+            take_current_expired_task_deadlines(&mut second_event).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn scheduler_safe_points_finish_clockevent_backlog_without_another_irq() {
+        let system = Box::pin(
+            TaskSystem::new(
+                crate::TaskSystemConfig::new(1)
+                    .with_thread_capacity(4)
+                    .with_batch_limit(1),
+            )
+            .unwrap(),
+        );
+        let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
+        system
+            .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
+            .unwrap();
+        system.bring_cpu_online(cpu.as_mut()).unwrap();
+        let _runtime_handles = InstalledTaskHandles::new(system.as_ref(), cpu.as_mut());
+        let threads: [ThreadHandle; 3] = core::array::from_fn(|_| {
+            system
+                .create_thread(ThreadSpec::new(SchedulePolicy::default()))
+                .unwrap()
+        });
+        let _registrations = threads
+            .iter()
+            .map(|thread| {
+                cpu.as_mut()
+                    .task_deadlines()
+                    .arm(thread.sleep_timer(), 10, TaskDeadlineKind::park_timeout(1))
+                    .unwrap()
+            })
+            .collect::<alloc::vec::Vec<_>>();
+
+        test_runtime::set_monotonic_ns(10);
+        let irq = on_clock_event(10, 1).unwrap();
+        assert_eq!(irq.expired(), 1);
+        assert!(irq.pending());
+        assert!(schedule_current_cpu().is_ok());
+        assert!(current_cpu_needs_resched().unwrap());
+        assert!(schedule_current_cpu().is_ok());
+        assert!(cpu.as_mut().task_deadlines().is_empty());
+        assert!(!current_cpu_needs_resched().unwrap());
+    }
+
+    #[test]
     fn park_deadline_owner_mismatch_preserves_ticket_for_retry() {
         let system = Box::pin(TaskSystem::new(crate::TaskSystemConfig::new(1)).unwrap());
         let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();

@@ -20,7 +20,7 @@ pub(crate) struct LocalTaskDeadlineState {
 impl LocalTaskDeadlineState {
     pub(crate) fn new(config: TaskSystemConfig) -> Self {
         Self {
-            queue: TaskDeadlineQueue::new(config.timer_capacity()),
+            queue: TaskDeadlineQueue::new(config.thread_capacity()),
             expired_buffer: vec![ExpiredTaskDeadline::EMPTY; config.batch_limit()],
             expired_count: 0,
             generation: 0,

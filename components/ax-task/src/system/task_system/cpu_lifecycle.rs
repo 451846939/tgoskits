@@ -266,18 +266,18 @@ impl TaskSystem {
                 return false;
             }
             let physically_owned = sched.placement.queued_cpu() == Some(cpu)
-                || sched.placement.running_cpu() == Some(cpu)
+                || sched.placement.execution_cpu() == Some(cpu)
                 || sched.placement.on_cpu() == Some(cpu)
-                || sched.placement.migration_target() == Some(cpu)
+                || sched.placement.committed_migration_target() == Some(cpu)
                 || sched.deadline.bandwidth_cpu == Some(cpu)
                 || record.core.sleep_timer_cpu() == Some(cpu);
             if physically_owned {
                 return false;
             }
             let has_other_placement = sched.placement.queued_cpu().is_some()
-                || sched.placement.running_cpu().is_some()
+                || sched.placement.execution_cpu().is_some()
                 || sched.placement.on_cpu().is_some()
-                || sched.placement.migration_target().is_some()
+                || sched.placement.has_pending_migration()
                 || sched.deadline.bandwidth_cpu.is_some()
                 || record.core.sleep_timer_cpu().is_some();
             if record.core.wake_cpu_hint() == Some(cpu) && has_other_placement {
@@ -296,6 +296,8 @@ impl TaskSystem {
             let Some(fallback) = fallback_for(&sched.placement.affinity) else {
                 return false;
             };
+            // Linux deliberately leaves task_cpu() unchanged for blocked
+            // tasks; the next wakeup selects from the then-current active mask.
             record.core.set_wake_cpu_hint(fallback);
         }
         true
@@ -331,9 +333,9 @@ impl TaskSystem {
                         && sched.placement.affinity.contains(candidate)
                 });
                 let owned_by_cpu = sched.placement.queued_cpu() == Some(cpu)
-                    || sched.placement.running_cpu() == Some(cpu)
+                    || sched.placement.execution_cpu() == Some(cpu)
                     || sched.placement.on_cpu() == Some(cpu)
-                    || sched.placement.migration_target() == Some(cpu)
+                    || sched.placement.committed_migration_target() == Some(cpu)
                     || sched.deadline.bandwidth_cpu == Some(cpu)
                     || record.core.sleep_timer_cpu() == Some(cpu)
                     || record.core.wake_cpu_hint() == Some(cpu);
@@ -402,7 +404,7 @@ mod tests {
     }
 
     #[test]
-    fn blocked_thread_target_is_redirected_before_cpu_offline() {
+    fn blocked_thread_keeps_task_cpu_but_publishes_an_online_wake_hint() {
         let (system, _cpu0, mut cpu1, sleeper) = blocked_thread_fixture();
         assert_eq!(sleeper.assigned_cpu(), Some(CpuId::new(1)));
 
@@ -410,9 +412,10 @@ mod tests {
 
         assert_eq!(
             sleeper.assigned_cpu(),
-            Some(CpuId::new(0)),
-            "hotplug preparation must publish an online target before closing the old CPU"
+            Some(CpuId::new(1)),
+            "Linux leaves task_cpu unchanged while a task is blocked"
         );
+        assert_eq!(sleeper.core.wake_cpu_hint(), Some(CpuId::new(0)));
     }
 
     #[test]

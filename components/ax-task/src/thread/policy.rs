@@ -248,7 +248,7 @@ impl SchedulePolicy {
         Self::Fifo { priority }
     }
 
-    /// Creates a round-robin policy with the default 5 ms quantum.
+    /// Creates a round-robin policy with the Linux default 100 ms quantum.
     pub const fn round_robin(priority: RtPriority) -> Self {
         Self::RoundRobin {
             priority,

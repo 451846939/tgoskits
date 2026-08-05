@@ -123,6 +123,18 @@ pub(crate) struct TaskDeadlineCancelTxn {
     entry: TimerEntry,
 }
 
+/// Fully validated arm operation whose queue commit cannot fail.
+///
+/// Owner code may prepare every timer affected by one scheduler transition
+/// before changing any queue entry. This is the task-deadline equivalent of
+/// Linux hrtimer's prepare/enqueue split: capacity and generation failures stay
+/// on the recoverable side of the scheduler commit boundary.
+#[must_use = "a prepared task deadline must be committed or discarded"]
+pub(crate) struct TaskDeadlineArmPlan {
+    entry: TimerEntry,
+    replacing: bool,
+}
+
 impl TaskDeadlineCancelTxn {
     pub(crate) const fn commit(self) {}
 
@@ -169,6 +181,16 @@ impl TaskDeadlineQueue {
         deadline_ns: u64,
         kind: TaskDeadlineKind,
     ) -> Result<TaskDeadlineRegistration, TaskDeadlineError> {
+        let plan = self.prepare_arm(node, deadline_ns, kind)?;
+        Ok(self.commit_arm(plan))
+    }
+
+    pub(crate) fn prepare_arm(
+        &self,
+        node: &TaskDeadlineNode,
+        deadline_ns: u64,
+        kind: TaskDeadlineKind,
+    ) -> Result<TaskDeadlineArmPlan, TaskDeadlineError> {
         let deadline = FiniteTaskDeadline::from_nanos(deadline_ns)
             .ok_or(TaskDeadlineError::InvalidDeadline)?;
         let thread = node.thread();
@@ -182,23 +204,36 @@ impl TaskDeadlineQueue {
             return Err(TaskDeadlineError::Capacity);
         }
         let token = node.next_token(identity)?;
+        Ok(TaskDeadlineArmPlan {
+            entry: TimerEntry::new(deadline, thread, token, kind),
+            replacing,
+        })
+    }
+
+    pub(crate) fn commit_arm(&mut self, plan: TaskDeadlineArmPlan) -> TaskDeadlineRegistration {
+        let TaskDeadlineArmPlan { entry, replacing } = plan;
+        let identity = entry.token().node();
         if replacing {
             let removed = self.heap.remove_node(identity);
-            debug_assert!(
+            assert!(
                 removed.is_some(),
-                "contains_node proved the physical task deadline entry exists"
+                "prepared replacement must retain its physical task deadline entry"
             );
         } else {
+            let class = entry.kind().class();
+            assert!(
+                self.class_counts[class.index()] < self.capacity_per_class,
+                "prepared task deadline must retain its reserved class capacity"
+            );
             self.class_counts[class.index()] += 1;
         }
-        let entry = TimerEntry::new(deadline, thread, token, kind);
         self.heap.push(entry);
-        Ok(TaskDeadlineRegistration::new(
-            thread,
-            token,
-            deadline_ns,
-            kind,
-        ))
+        TaskDeadlineRegistration::new(
+            entry.thread(),
+            entry.token(),
+            entry.deadline_ns(),
+            entry.kind(),
+        )
     }
 
     /// Cancels one matching arm operation and immediately releases its heap slot.

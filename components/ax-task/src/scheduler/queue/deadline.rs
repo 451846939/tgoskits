@@ -174,11 +174,38 @@ impl DeadlineRunQueue {
         find_node_mut(self.root.as_deref_mut(), key).and_then(|node| node.thread.as_mut())
     }
 
-    pub(super) fn pick_first(&mut self) -> Option<QueuedThread> {
+    pub(super) fn select_first(&self) -> Option<QueuedThread> {
         #[cfg(test)]
         super::record_deadline_runqueue_visit();
-        let key = self.first().map(DeadlineQueueKey::for_thread)?;
-        self.remove(key)
+        self.first().cloned()
+    }
+
+    pub(super) fn put_prev(
+        &mut self,
+        key: DeadlineQueueKey,
+        thread: QueuedThread,
+    ) -> Option<DeadlineQueueKey> {
+        let new_key = DeadlineQueueKey::for_thread(&thread);
+        if new_key == key {
+            replace_thread(self.root.as_deref_mut(), key, thread)?;
+            return Some(key);
+        }
+        self.remove(key)?;
+        Some(self.insert(thread))
+    }
+
+    pub(super) fn update_linked_entity(
+        &mut self,
+        key: DeadlineQueueKey,
+        entity: SchedulingEntity,
+    ) -> Option<()> {
+        let current = self.get(key)?;
+        let mut updated = current.clone();
+        updated.entity = entity;
+        if DeadlineQueueKey::for_thread(&updated) != key {
+            return None;
+        }
+        replace_thread(self.root.as_deref_mut(), key, updated)
     }
 
     pub(super) fn find_first_matching(
@@ -392,6 +419,21 @@ fn find_node_mut(
         Ordering::Greater => find_node_mut(node.right.as_deref_mut(), key),
         Ordering::Equal => Some(node),
     }
+}
+
+fn replace_thread(
+    node: Option<&mut DeadlineNode>,
+    key: DeadlineQueueKey,
+    thread: QueuedThread,
+) -> Option<()> {
+    let node = node?;
+    match key.cmp(&node.key) {
+        Ordering::Less => replace_thread(node.left.as_deref_mut(), key, thread)?,
+        Ordering::Greater => replace_thread(node.right.as_deref_mut(), key, thread)?,
+        Ordering::Equal => node.thread = Some(thread),
+    }
+    node.refresh();
+    Some(())
 }
 
 fn find_first_matching<'queue>(

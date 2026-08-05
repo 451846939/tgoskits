@@ -63,7 +63,8 @@ impl DeadlineBandwidthSnapshot {
 
     /// Returns utilization currently eligible for GRUB reclaim.
     pub const fn inactive_bw_scaled(self) -> u64 {
-        self.this_bw_scaled.saturating_sub(self.running_bw_scaled)
+        assert!(self.running_bw_scaled <= self.this_bw_scaled);
+        self.this_bw_scaled - self.running_bw_scaled
     }
 
     /// Returns the per-CPU reclaim capacity.

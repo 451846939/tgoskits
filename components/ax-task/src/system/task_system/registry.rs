@@ -108,10 +108,16 @@ impl TaskSystemState {
         }
     }
 
-    pub(super) fn allocate_thread_slot(&mut self) -> Result<(u32, u32), TaskError> {
+    pub(super) fn allocate_thread_slot(
+        &mut self,
+        thread_capacity: usize,
+    ) -> Result<(u32, u32), TaskError> {
         if let Some(slot) = self.free_slots.pop() {
             Ok((slot, self.slots[slot as usize].generation))
         } else {
+            if self.slots.len() == thread_capacity {
+                return Err(TaskError::ThreadCapacity);
+            }
             let slot =
                 u32::try_from(self.slots.len()).map_err(|_| TaskError::InvalidConfiguration)?;
             let required_capacity = self.slots.len().saturating_add(1);
@@ -226,9 +232,9 @@ impl TaskSystemState {
             let sched = record.sched.lock();
             if sched.lifecycle.state() == ThreadState::Exited
                 || sched.placement.queued_cpu().is_some()
-                || sched.placement.running_cpu().is_some()
+                || sched.placement.execution_cpu().is_some()
                 || sched.placement.on_cpu().is_some()
-                || sched.placement.migration_target().is_some()
+                || sched.placement.has_pending_migration()
                 || sched.deadline.bandwidth_cpu.is_some()
                 || sched.deadline.cleanup_pending
                 || sched.pi.deadline_cbs_borrower.is_some()
@@ -282,7 +288,7 @@ impl TaskSystemState {
             // the Acquire observation of zero. A non-zero count owns both one
             // raw inbox Arc and access to scheduler-owned thread state.
             if sched.placement.on_cpu().is_some()
-                || sched.placement.migration_target().is_some()
+                || sched.placement.has_pending_migration()
                 || sched.deadline.bandwidth_cpu.is_some()
                 || sched.deadline.cleanup_pending
                 || sched.pi.deadline_cbs_borrower.is_some()
@@ -544,7 +550,7 @@ impl TaskSystemState {
                 (
                     sched
                         .placement
-                        .running_cpu()
+                        .execution_cpu()
                         .or(sched.placement.queued_cpu())
                         .or(sched.deadline.bandwidth_cpu),
                     sched.policy.generation,

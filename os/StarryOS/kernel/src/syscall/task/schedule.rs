@@ -554,7 +554,8 @@ fn map_task_error(error: scheduler::TaskError) -> AxError {
         TaskError::StaleThreadId => AxError::NoSuchProcess,
         TaskError::NotInitialized
         | TaskError::InvalidRuntimeHandle
-        | TaskError::CpuOwnerBorrowed => AxError::BadState,
+        | TaskError::CpuOwnerBorrowed
+        | TaskError::ThreadCapacity => AxError::BadState,
         TaskError::UnsafeContext => AxError::OperationNotPermitted,
         TaskError::TimerCapacity => AxError::NoMemory,
         TaskError::CpuOwnerMismatch { .. }

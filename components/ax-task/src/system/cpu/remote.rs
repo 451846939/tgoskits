@@ -8,9 +8,10 @@ mod owner;
 mod run_queue;
 mod scheduler;
 
+pub(crate) use delivery::PreparedMigrationDelivery;
 pub(crate) use idle_pull::IdlePullReservation;
 pub use lifecycle::CpuLifecycleState;
-pub(crate) use lifecycle::CpuRemotePublication;
+pub(crate) use lifecycle::{CpuRemotePublication, OwnedCpuRemotePublication};
 pub use owner::CpuLocalOwnerBorrow;
 pub(crate) use run_queue::CpuRunQueueState;
 #[cfg(feature = "qperf-metrics")]

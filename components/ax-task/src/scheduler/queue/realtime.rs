@@ -4,7 +4,7 @@ use alloc::{boxed::Box, sync::Arc};
 use core::ptr::NonNull;
 
 use super::{EnqueueReason, QueuedThread};
-use crate::ThreadId;
+use crate::{SchedulingEntity, ThreadId};
 
 const RT_PRIORITY_LEVELS: usize = 99;
 const FIXED_PRIORITY_LEVELS: usize = RT_PRIORITY_LEVELS;
@@ -86,16 +86,6 @@ impl RealtimeLevel {
         self.len += 1;
     }
 
-    fn pop_front(&mut self) -> Option<Box<RealtimeNode>> {
-        let mut removed = self.head.take()?;
-        self.head = removed.next.take();
-        self.len -= 1;
-        if self.head.is_none() {
-            self.tail = None;
-        }
-        Some(removed)
-    }
-
     fn remove_at(&mut self, position: usize) -> Option<Box<RealtimeNode>> {
         if position >= self.len {
             return None;
@@ -119,29 +109,16 @@ impl RealtimeLevel {
         Some(removed)
     }
 
-    fn insert_at(&mut self, position: usize, mut node: Box<RealtimeNode>) {
-        if position == 0 {
-            self.push_front(node);
-            return;
-        }
-        if position >= self.len {
-            self.push_back(node);
-            return;
-        }
-        let mut link = &mut self.head;
-        for _ in 0..position {
-            link = &mut link
-                .as_mut()
-                .expect("RT restore position must remain within the level")
-                .next;
-        }
-        node.next = link.take();
-        *link = Some(node);
-        self.len += 1;
-    }
-
     fn position(&self, id: ThreadId) -> Option<usize> {
         self.iter().position(|thread| thread.id == id)
+    }
+
+    fn get_mut_by_position(&mut self, position: usize) -> Option<&mut QueuedThread> {
+        let mut node = self.head.as_deref_mut();
+        for _ in 0..position {
+            node = node?.next.as_deref_mut();
+        }
+        node.map(RealtimeNode::thread_mut)
     }
 
     fn iter(&self) -> RealtimeIter<'_> {
@@ -245,30 +222,6 @@ impl RealtimeRunQueue {
         Some(self.after_remove(index, node))
     }
 
-    pub(super) fn detach(&mut self, priority: u8, id: ThreadId) -> Option<(QueuedThread, usize)> {
-        let index = (priority - 1) as usize;
-        let position = self.active[index].position(id)?;
-        let node = self.active[index].remove_at(position)?;
-        Some((self.after_remove(index, node), position))
-    }
-
-    pub(super) fn restore(&mut self, priority: u8, position: usize, thread: QueuedThread) {
-        let index = (priority - 1) as usize;
-        if thread.rt_quota_exempt {
-            self.exempt_count[index] = self.exempt_count[index].saturating_add(1);
-            self.exempt_bitmap |= 1_u128 << index;
-        }
-        let core = Arc::clone(&thread.core);
-        let mut node = unsafe {
-            // SAFETY: a detached transfer retains exclusive placement of this
-            // thread until either restore or target publication commits.
-            core.runqueue_nodes().take_realtime()
-        };
-        node.reset(thread);
-        self.active[index].insert_at(position, node);
-        self.active_bitmap |= 1_u128 << index;
-    }
-
     pub(super) fn get(&self, priority: u8, id: ThreadId) -> Option<&QueuedThread> {
         self.active[(priority - 1) as usize]
             .iter()
@@ -286,11 +239,6 @@ impl RealtimeRunQueue {
         None
     }
 
-    pub(super) fn first(&self) -> Option<&QueuedThread> {
-        let priority = self.highest_rt_priority()?;
-        self.active[(priority - 1) as usize].iter().next()
-    }
-
     pub(super) fn find_first_matching(
         &self,
         predicate: &mut impl FnMut(&QueuedThread) -> bool,
@@ -302,24 +250,79 @@ impl RealtimeRunQueue {
             .find_map(|level| level.iter().find(|thread| predicate(thread)).cloned())
     }
 
-    pub(super) fn pick(&mut self, ordinary_may_run: bool) -> Option<QueuedThread> {
+    pub(super) fn select(&self, ordinary_may_run: bool) -> Option<QueuedThread> {
         let priority = if ordinary_may_run {
             self.highest_rt_priority()?
         } else {
             bitmap_highest_priority(self.exempt_bitmap)?
         };
         let index = (priority - 1) as usize;
-        let node = if ordinary_may_run {
-            self.active[index].pop_front()
+        if ordinary_may_run {
+            self.active[index].iter().next().cloned()
         } else {
-            let position = self.active[index]
+            self.active[index]
                 .iter()
-                .position(|thread| thread.rt_quota_exempt)
-                .expect("RT exempt bitmap must identify an exempt entry");
-            self.active[index].remove_at(position)
+                .find(|thread| thread.rt_quota_exempt)
+                .cloned()
         }
-        .expect("RT bitmap must identify a non-empty priority queue");
-        Some(self.after_remove(index, node))
+    }
+
+    pub(super) fn put_prev(
+        &mut self,
+        priority: u8,
+        mut thread: QueuedThread,
+        reason: EnqueueReason,
+    ) -> Option<SchedulingEntity> {
+        if thread.policy.rt_priority()?.get() != priority {
+            return None;
+        }
+        let index = (priority - 1) as usize;
+        let position = self.active[index].position(thread.id)?;
+        let previous = self.active[index].iter().nth(position)?.clone();
+        thread.sequence = previous.sequence;
+        thread.balance_scan_epoch = previous.balance_scan_epoch;
+        let move_to_tail = matches!(reason, EnqueueReason::Yield)
+            || (matches!(reason, EnqueueReason::Preempted)
+                && thread.entity.round_robin_quantum_expired());
+        if move_to_tail {
+            thread.entity.reset_round_robin_quantum(thread.policy);
+        }
+        self.update_exempt(index, previous.rt_quota_exempt, thread.rt_quota_exempt);
+        let entity = thread.entity;
+        if move_to_tail {
+            let mut node = self.active[index].remove_at(position)?;
+            node.thread = Some(thread);
+            self.active[index].push_back(node);
+        } else {
+            *self.active[index].get_mut_by_position(position)? = thread;
+        }
+        Some(entity)
+    }
+
+    pub(super) fn update_linked_entity(
+        &mut self,
+        priority: u8,
+        id: ThreadId,
+        entity: SchedulingEntity,
+    ) -> Option<()> {
+        self.get_mut(priority, id)?.entity = entity;
+        Some(())
+    }
+
+    fn update_exempt(&mut self, index: usize, previous: bool, next: bool) {
+        match (previous, next) {
+            (false, true) => {
+                self.exempt_count[index] = self.exempt_count[index].saturating_add(1);
+                self.exempt_bitmap |= 1_u128 << index;
+            }
+            (true, false) => {
+                self.exempt_count[index] -= 1;
+                if self.exempt_count[index] == 0 {
+                    self.exempt_bitmap &= !(1_u128 << index);
+                }
+            }
+            _ => {}
+        }
     }
 
     fn after_remove(&mut self, index: usize, mut node: Box<RealtimeNode>) -> QueuedThread {

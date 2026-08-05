@@ -20,7 +20,8 @@ impl TaskSystem {
             let mut state = self.state.lock();
             let mut root_domain = self.root_domain.lock();
             let reservation = root_domain.reserve_deadline(policy, &affinity)?;
-            let (slot, generation) = match state.allocate_thread_slot() {
+            let (slot, generation) = match state.allocate_thread_slot(self.config.thread_capacity())
+            {
                 Ok(identity) => identity,
                 Err(error) => {
                     root_domain.deadline_admission.release(reservation);
@@ -179,8 +180,8 @@ impl TaskSystem {
                 sched.transition(&core, ThreadState::Ready)?;
                 sched.transition(&core, ThreadState::Running)?;
                 let dispatch = Self::owner_dispatch(&core, &sched, task_runtime::monotonic_ns())?;
-                sched.placement.set_running_cpu(Some(cpu.owner()))?;
-                sched.placement.set_on_cpu(Some(cpu.owner()))?;
+                sched.placement.activate(cpu.owner());
+                sched.placement.set_next_task(cpu.owner());
                 core.set_wake_cpu_hint(cpu.owner());
                 dispatch
             };

@@ -32,29 +32,73 @@ pub(super) fn owner_dispatch_constructions() -> usize {
     OWNER_DISPATCH_CONSTRUCTIONS.get()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WakeTransition {
+    Notified,
+    Activate,
+    DeferredUntilSwitchTail,
+}
+
 impl TaskSystem {
     fn consume_wake_locked(
         core: &Arc<ThreadCore>,
         sched: &mut ThreadSchedState,
-    ) -> Result<bool, TaskError> {
+    ) -> Result<WakeTransition, TaskError> {
         let lifecycle = sched.lifecycle.state();
         if !core.consume_wake(lifecycle == ThreadState::Parking) || lifecycle == ThreadState::Exited
         {
-            return Ok(false);
+            return Ok(WakeTransition::Notified);
         }
         if sched.deadline.replenish_pending {
-            return Ok(false);
+            return Ok(WakeTransition::Notified);
         }
         match lifecycle {
-            ThreadState::Parking => Ok(false),
+            ThreadState::Parking => Ok(WakeTransition::Notified),
             ThreadState::Blocked => {
                 sched.transition(core, ThreadState::Waking)?;
-                sched.transition(core, ThreadState::Ready)?;
-                Ok(true)
+                Ok(if sched.placement.on_cpu().is_some() {
+                    WakeTransition::DeferredUntilSwitchTail
+                } else {
+                    WakeTransition::Activate
+                })
             }
-            ThreadState::Ready | ThreadState::Running | ThreadState::Waking => Ok(false),
-            ThreadState::New | ThreadState::Exited => Ok(false),
+            ThreadState::Ready | ThreadState::Running | ThreadState::Waking => {
+                Ok(WakeTransition::Notified)
+            }
+            ThreadState::New | ThreadState::Exited => Ok(WakeTransition::Notified),
         }
+    }
+
+    fn select_wake_target(
+        &self,
+        sched: &ThreadSchedState,
+        policy: SchedulePolicy,
+        entity: SchedulingEntity,
+        preferred: Option<CpuId>,
+        now_ns: u64,
+    ) -> Option<CpuId> {
+        #[cfg(test)]
+        WAKE_TARGET_SELECTIONS.set(WAKE_TARGET_SELECTIONS.get().saturating_add(1));
+        sched
+            .deadline
+            .bandwidth_cpu
+            .filter(|_| matches!(policy, SchedulePolicy::Deadline(_)))
+            .filter(|cpu| sched.placement.affinity.contains(*cpu))
+            .filter(|cpu| {
+                self.cpu_remotes
+                    .get(cpu.as_usize())
+                    .is_some_and(|remote| remote.accepts_placement())
+            })
+            .or_else(|| {
+                self.select_priority_cpu(
+                    policy,
+                    entity,
+                    &sched.placement.affinity,
+                    preferred,
+                    None,
+                    now_ns,
+                )
+            })
     }
 
     /// Activates a blocked thread directly under its target runqueue lock.
@@ -97,30 +141,17 @@ impl TaskSystem {
         let preferred = preferred
             .or_else(|| sched.placement.assigned_cpu())
             .or_else(|| core.wake_cpu_hint());
+        if sched.lifecycle.state() == ThreadState::Blocked && sched.placement.on_cpu().is_some() {
+            match Self::consume_wake_locked(&core, &mut sched) {
+                Ok(WakeTransition::DeferredUntilSwitchTail) => return WakeResult::Notified,
+                Ok(WakeTransition::Notified | WakeTransition::Activate) | Err(_) => {
+                    task_runtime::fatal_invariant(0x574b_0003, core.id().as_u64() as usize)
+                }
+            }
+        }
         let policy = sched.policy.effective;
-        let mut queued_entity = sched.policy.effective_entity;
-        #[cfg(test)]
-        WAKE_TARGET_SELECTIONS.set(WAKE_TARGET_SELECTIONS.get().saturating_add(1));
-        let target = sched
-            .deadline
-            .bandwidth_cpu
-            .filter(|_| matches!(policy, SchedulePolicy::Deadline(_)))
-            .filter(|cpu| sched.placement.affinity.contains(*cpu))
-            .filter(|cpu| {
-                self.cpu_remotes
-                    .get(cpu.as_usize())
-                    .is_some_and(|remote| remote.accepts_placement())
-            })
-            .or_else(|| {
-                self.select_priority_cpu(
-                    policy,
-                    queued_entity,
-                    &sched.placement.affinity,
-                    preferred,
-                    None,
-                    now_ns,
-                )
-            });
+        let queued_entity = sched.policy.effective_entity;
+        let target = self.select_wake_target(&sched, policy, queued_entity, preferred, now_ns);
         let Some(target) = target else {
             core.discard_failed_wake();
             return WakeResult::Unavailable;
@@ -129,16 +160,40 @@ impl TaskSystem {
             core.discard_failed_wake();
             return WakeResult::Unavailable;
         };
-        let activated = match Self::consume_wake_locked(&core, &mut sched) {
-            Ok(activated) => activated,
+        let transition = match Self::consume_wake_locked(&core, &mut sched) {
+            Ok(transition) => transition,
             Err(_) => task_runtime::fatal_invariant(0x574b_0002, core.id().as_u64() as usize),
         };
-        if !activated {
-            return WakeResult::Notified;
+        match transition {
+            WakeTransition::Notified => WakeResult::Notified,
+            WakeTransition::Activate => {
+                self.activate_waking_thread_locked(&core, sched, target, publication, now_ns)
+            }
+            WakeTransition::DeferredUntilSwitchTail => {
+                task_runtime::fatal_invariant(0x574b_0004, core.id().as_u64() as usize)
+            }
+        }
+    }
+
+    fn activate_waking_thread_locked(
+        &self,
+        core: &Arc<ThreadCore>,
+        mut sched: crate::lock::IrqTicketGuard<'_, ThreadSchedState>,
+        target: CpuId,
+        publication: CpuRemotePublication<'_>,
+        now_ns: u64,
+    ) -> WakeResult {
+        if sched.lifecycle.state() != ThreadState::Waking || sched.placement.on_cpu().is_some() {
+            task_runtime::fatal_invariant(0x574b_0005, core.id().as_u64() as usize);
+        }
+        if sched.transition(core, ThreadState::Ready).is_err() {
+            task_runtime::fatal_invariant(0x574b_0006, core.id().as_u64() as usize);
         }
         #[cfg(feature = "qperf-metrics")]
         crate::metrics::record_direct_wake_activation();
 
+        let policy = sched.policy.effective;
+        let mut queued_entity = sched.policy.effective_entity;
         let deadline_wake = matches!(policy, SchedulePolicy::Deadline(_)) && !sched.is_pi_boosted();
         if deadline_wake {
             queued_entity.activate_deadline(now_ns);
@@ -150,18 +205,14 @@ impl TaskSystem {
         let remote = &self.cpu_remotes[target.as_usize()];
         remote.cancel_idle_pull_if_uncommitted();
         let mut run_queue = remote.lock_run_queue();
-        if Self::activate_deadline_bandwidth_locked(&core, &mut sched, &mut run_queue, target)
-            .is_err()
-        {
-            task_runtime::fatal_invariant(0x574b_0101, core.id().as_u64() as usize);
-        }
+        Self::activate_deadline_bandwidth_locked(core, &mut sched, &mut run_queue, target);
         if deadline_wake
             && queued_entity
                 .deadline()
                 .is_some_and(DeadlineEntity::is_throttled)
         {
             sched.deadline.replenish_pending = true;
-            if sched.throttle_ready_deadline(&core).is_err() {
+            if sched.throttle_ready_deadline(core).is_err() {
                 task_runtime::fatal_invariant(0x574b_0102, core.id().as_u64() as usize);
             }
             core.publish_effective_schedule(policy, queued_entity);
@@ -170,7 +221,7 @@ impl TaskSystem {
             drop(run_queue);
             drop(sched);
             self.publish_owner_deadline_refresh_reserved(
-                &core,
+                core,
                 target,
                 deadline_generation,
                 publication,
@@ -184,7 +235,7 @@ impl TaskSystem {
                 core.id(),
                 policy,
                 queued_entity,
-                Arc::clone(&core),
+                Arc::clone(core),
                 sched.is_pi_boosted_rt_owner(),
                 sched.placement.affinity.is_migration_capable(),
             ),
@@ -206,9 +257,7 @@ impl TaskSystem {
             sched.policy.base_entity = queued_entity;
         }
         core.publish_effective_schedule(policy, queued_entity);
-        if sched.placement.set_queued_cpu(Some(target)).is_err() {
-            task_runtime::fatal_invariant(0x574b_0200, core.id().as_u64() as usize);
-        }
+        sched.placement.activate(target);
         core.set_wake_cpu_hint(target);
         self.publish_run_queue_summary(remote, &run_queue);
         let rt_deadline_push_pending = self.rt_deadline_push_pending(remote);
@@ -237,7 +286,7 @@ impl TaskSystem {
                 remote.request_reschedule();
             }
             self.publish_owner_deadline_refresh_reserved(
-                &core,
+                core,
                 target,
                 deadline_generation,
                 publication,
@@ -255,6 +304,37 @@ impl TaskSystem {
             remote.kick_scheduler_work();
         }
         WakeResult::Notified
+    }
+
+    /// Completes Linux's `TASK_WAKING` handoff after `finish_task()`.
+    pub(super) fn finish_switch_tail_wake(&self, core: &Arc<ThreadCore>, now_ns: u64) {
+        let sched = core.sched().lock();
+        if sched.lifecycle.state() != ThreadState::Waking {
+            return;
+        }
+        if sched.placement.on_cpu().is_some()
+            || sched.placement.queued_cpu().is_some()
+            || sched.placement.committed_migration_target().is_some()
+        {
+            task_runtime::fatal_invariant(0x574b_0007, core.id().as_u64() as usize);
+        }
+        let policy = sched.policy.effective;
+        let entity = sched.policy.effective_entity;
+        let preferred = sched
+            .placement
+            .assigned_cpu()
+            .or_else(|| core.wake_cpu_hint());
+        let target = self
+            .select_wake_target(&sched, policy, entity, preferred, now_ns)
+            .unwrap_or_else(|| {
+                task_runtime::fatal_invariant(0x574b_0008, core.id().as_u64() as usize)
+            });
+        let publication = self.cpu_remotes[target.as_usize()]
+            .begin_publication()
+            .unwrap_or_else(|| {
+                task_runtime::fatal_invariant(0x574b_0009, core.id().as_u64() as usize)
+            });
+        let _result = self.activate_waking_thread_locked(core, sched, target, publication, now_ns);
     }
 
     pub(super) fn enqueue_owner_thread(
@@ -289,7 +369,7 @@ impl TaskSystem {
         if sched.lifecycle.state() != ThreadState::Ready {
             return Err(TaskError::NotReady);
         }
-        if !sched.placement.affinity.contains(owner) {
+        if !sched.placement.affinity.contains(owner) && !matches!(reason, EnqueueReason::Migrated) {
             return Err(TaskError::InvalidCpu(owner.as_u32()));
         }
         cpu.as_ref()
@@ -311,14 +391,14 @@ impl TaskSystem {
             }
         }
         let mut run_queue = cpu.lock_run_queue();
-        Self::activate_deadline_bandwidth_locked(core, sched, &mut run_queue, owner)?;
+        Self::activate_deadline_bandwidth_locked(core, sched, &mut run_queue, owner);
         if deadline_wake_throttled {
             sched.deadline.replenish_pending = true;
             sched.throttle_ready_deadline(core)?;
             core.publish_effective_schedule(policy, queued_entity);
             core.set_wake_cpu_hint(owner);
             drop(run_queue);
-            Self::refresh_owner_deadline_timers_locked(core, sched, cpu.as_mut())?;
+            Self::refresh_owner_deadline_timers_locked(core, sched, cpu.as_mut());
             return Ok(false);
         }
         let current_fair = cpu
@@ -351,10 +431,16 @@ impl TaskSystem {
             sched.policy.base_entity = queued_entity;
         }
         core.publish_effective_schedule(policy, queued_entity);
-        sched.placement.set_queued_cpu(Some(owner))?;
+        if sched.placement.on_cpu() == Some(owner) {
+            // Fair removes current from its class tree while Linux keeps the
+            // task logically on_rq. Re-linking it is put_prev, not activation.
+            sched.placement.put_prev(owner);
+        } else {
+            sched.placement.activate(owner);
+        }
         core.set_wake_cpu_hint(owner);
         drop(run_queue);
-        Self::refresh_owner_deadline_timers_locked(core, sched, cpu.as_mut())?;
+        Self::refresh_owner_deadline_timers_locked(core, sched, cpu.as_mut());
         Ok(preempts_current)
     }
 
@@ -382,7 +468,7 @@ impl TaskSystem {
         sched: &mut ThreadSchedState,
         cpu: Pin<&mut CpuLocal>,
         owner: CpuId,
-    ) -> Result<(), TaskError> {
+    ) {
         let mut run_queue = cpu.lock_run_queue();
         Self::activate_deadline_bandwidth_locked(core, sched, &mut run_queue, owner)
     }
@@ -392,38 +478,27 @@ impl TaskSystem {
         sched: &mut ThreadSchedState,
         run_queue: &mut CpuRunQueueState,
         owner: CpuId,
-    ) -> Result<(), TaskError> {
+    ) {
         if !matches!(sched.policy.applied, SchedulePolicy::Deadline(_)) {
-            return Ok(());
+            return;
         }
-        let member_registered = run_queue.register_deadline_member(core)?;
-        let bandwidth_result = match sched.deadline.bandwidth_cpu {
+        run_queue.register_deadline_member(core);
+        match sched.deadline.bandwidth_cpu {
             None => run_queue.add_deadline_bandwidth(sched.deadline.bandwidth_scaled, true),
-            Some(assigned) if assigned != owner => Err(TaskError::CpuOwnerMismatch {
-                expected: assigned.as_u32(),
-                actual: owner.as_u32(),
-            }),
+            Some(assigned) if assigned != owner => {
+                task_runtime::fatal_invariant(0x444c_000a, core.id().as_u64() as usize)
+            }
             Some(_) if sched.deadline.activity == DeadlineActivity::Inactive => {
                 run_queue.activate_deadline_bandwidth(sched.deadline.bandwidth_scaled)
             }
-            Some(_) => Ok(()),
-        };
-        if let Err(error) = bandwidth_result {
-            if member_registered {
-                run_queue.unregister_deadline_member(core);
-            }
-            return Err(error);
+            Some(_) => {}
         }
         sched.deadline.activity = DeadlineActivity::ActiveContending;
         sched.deadline.bandwidth_cpu = Some(owner);
         sched.deadline.zero_lag_ns = 0;
-        Ok(())
     }
 
-    pub(super) fn detach_owner_deadline_bandwidth(
-        core: &Arc<ThreadCore>,
-        cpu: Pin<&mut CpuLocal>,
-    ) -> Result<(), TaskError> {
+    pub(super) fn detach_owner_deadline_bandwidth(core: &Arc<ThreadCore>, cpu: Pin<&mut CpuLocal>) {
         let mut sched = core.sched().lock();
         Self::detach_owner_deadline_bandwidth_locked(core, &mut sched, cpu)
     }
@@ -432,90 +507,98 @@ impl TaskSystem {
         core: &Arc<ThreadCore>,
         sched: &mut ThreadSchedState,
         mut cpu: Pin<&mut CpuLocal>,
-    ) -> Result<(), TaskError> {
+    ) {
         let owner = cpu.owner();
         let Some(assigned_cpu) = sched.deadline.bandwidth_cpu else {
-            return Ok(());
+            return;
         };
         if assigned_cpu != owner {
-            return Err(TaskError::CpuOwnerMismatch {
-                expected: assigned_cpu.as_u32(),
-                actual: owner.as_u32(),
-            });
+            task_runtime::fatal_invariant(0x444c_000b, core.id().as_u64() as usize);
         }
-        Self::cancel_owner_deadline_timers_locked(core, sched, cpu.as_mut())?;
+        let bandwidth = cpu.lock_run_queue().deadline_bandwidth();
+        if bandwidth.this_bw_scaled() < sched.deadline.bandwidth_scaled
+            || (sched.deadline.activity != DeadlineActivity::Inactive
+                && bandwidth.running_bw_scaled() < sched.deadline.bandwidth_scaled)
+        {
+            task_runtime::fatal_invariant(0x444c_000c, core.id().as_u64() as usize);
+        }
+        Self::cancel_owner_deadline_timers_locked(core, sched, cpu.as_mut());
         let mut run_queue = cpu.lock_run_queue();
         run_queue.remove_deadline_bandwidth(
             sched.deadline.bandwidth_scaled,
             sched.deadline.activity != DeadlineActivity::Inactive,
-        )?;
+        );
         sched.deadline.bandwidth_cpu = None;
         run_queue.unregister_deadline_member(core);
-        Ok(())
     }
 
     pub(super) fn assign_owner_inactive_deadline_bandwidth(
         core: &Arc<ThreadCore>,
         cpu: Pin<&mut CpuLocal>,
-    ) -> Result<(), TaskError> {
+    ) {
         let owner = cpu.owner();
         let mut sched = core.sched().lock();
         if !matches!(sched.policy.applied, SchedulePolicy::Deadline(_)) {
-            return Ok(());
+            return;
         }
         let mut run_queue = cpu.lock_run_queue();
-        let member_registered = run_queue.register_deadline_member(core)?;
-        let bandwidth_result = match sched.deadline.bandwidth_cpu {
+        run_queue.register_deadline_member(core);
+        match sched.deadline.bandwidth_cpu {
             None => run_queue.add_deadline_bandwidth(sched.deadline.bandwidth_scaled, false),
-            Some(assigned) if assigned != owner => Err(TaskError::CpuOwnerMismatch {
-                expected: assigned.as_u32(),
-                actual: owner.as_u32(),
-            }),
-            Some(_) => Ok(()),
-        };
-        if let Err(error) = bandwidth_result {
-            if member_registered {
-                run_queue.unregister_deadline_member(core);
+            Some(assigned) if assigned != owner => {
+                task_runtime::fatal_invariant(0x444c_000d, core.id().as_u64() as usize)
             }
-            return Err(error);
+            Some(_) => {}
         }
         if sched.deadline.bandwidth_cpu.is_some() {
-            return Ok(());
+            return;
         }
         sched.deadline.activity = DeadlineActivity::Inactive;
         sched.deadline.bandwidth_cpu = Some(owner);
         sched.deadline.zero_lag_ns = 0;
         drop(run_queue);
-        Self::refresh_owner_deadline_timers_locked(core, &mut sched, cpu)
+        Self::refresh_owner_deadline_timers_locked(core, &mut sched, cpu);
     }
 
-    pub(super) fn mark_owner_deadline_non_contending(
+    pub(super) fn mark_owner_deadline_non_contending_locked(
         core: &Arc<ThreadCore>,
-        cpu: Pin<&mut CpuLocal>,
+        sched: &mut ThreadSchedState,
+        mut cpu: Pin<&mut CpuLocal>,
         now_ns: u64,
-    ) -> Result<(), TaskError> {
+    ) {
         let owner = cpu.owner();
-        let mut sched = core.sched().lock();
         let (Some(assigned_cpu), Some(deadline)) = (
             sched.deadline.bandwidth_cpu,
             sched.policy.base_entity.deadline(),
         ) else {
-            return Ok(());
+            return;
         };
         if assigned_cpu != owner || sched.deadline.activity != DeadlineActivity::ActiveContending {
-            return Ok(());
+            return;
         }
         let zero_lag_ns = deadline_zero_lag_ns(deadline);
-        if zero_lag_ns <= now_ns {
-            cpu.lock_run_queue()
-                .deactivate_deadline_bandwidth(sched.deadline.bandwidth_scaled)?;
+        let deactivate_now = zero_lag_ns <= now_ns;
+        if deactivate_now
+            && cpu
+                .lock_run_queue()
+                .deadline_bandwidth()
+                .running_bw_scaled()
+                < sched.deadline.bandwidth_scaled
+        {
+            task_runtime::fatal_invariant(0x444c_000e, core.id().as_u64() as usize);
+        }
+        if deactivate_now {
             sched.deadline.activity = DeadlineActivity::Inactive;
             sched.deadline.zero_lag_ns = 0;
         } else {
             sched.deadline.activity = DeadlineActivity::ActiveNonContending;
             sched.deadline.zero_lag_ns = zero_lag_ns;
         }
-        Self::refresh_owner_deadline_timers_locked(core, &mut sched, cpu)
+        Self::refresh_owner_deadline_timers_locked(core, sched, cpu.as_mut());
+        if deactivate_now {
+            cpu.lock_run_queue()
+                .deactivate_deadline_bandwidth(sched.deadline.bandwidth_scaled);
+        }
     }
 
     pub(super) fn owner_fair_policy_placement(
@@ -576,7 +659,7 @@ impl TaskSystem {
                 // is available as soon as the donor is neither the runnable
                 // owner dispatch nor a queued candidate; timer servicing is
                 // excluded by the borrower baton below.
-                let cbs_available = donor_sched.placement.running_cpu().is_none()
+                let cbs_available = donor_sched.placement.execution_cpu().is_none()
                     && donor_sched.placement.queued_cpu().is_none();
                 let cbs_generation =
                     if cbs_available && donor_sched.pi.deadline_cbs_borrower.is_none() {
@@ -698,7 +781,7 @@ impl TaskSystem {
         if let Some((donor_core, owner, generation)) = deadline_owner_reconcile {
             if owner == cpu.owner() {
                 let mut donor = donor_core.sched().lock();
-                Self::refresh_owner_deadline_timers_locked(&donor_core, &mut donor, cpu.as_mut())?;
+                Self::refresh_owner_deadline_timers_locked(&donor_core, &mut donor, cpu.as_mut());
                 cpu.request_scheduler_work();
             } else {
                 // The retained, generation-bearing donor identity replaces
@@ -784,6 +867,7 @@ impl TaskSystem {
         activate_deadline: bool,
     ) -> Result<bool, TaskError> {
         let mut sched = core.sched().lock();
+        Self::validate_owner_policy_generation(&sched, generation)?;
         if generation > sched.policy.generation {
             return Ok(false);
         }
@@ -819,6 +903,11 @@ impl TaskSystem {
             .deadline
             .active_reservation
             .max(sched.deadline.desired_reservation);
+        let next_dispatch_generation = sched
+            .policy
+            .dispatch_generation
+            .checked_add(1)
+            .ok_or(TaskError::InvalidConfiguration)?;
         sched.policy.applied = base_policy;
         sched.policy.base_entity = base_entity;
         if !sched.is_pi_boosted() {
@@ -832,15 +921,11 @@ impl TaskSystem {
         }
         sched.deadline.active_reservation = sched.deadline.desired_reservation;
         sched.policy.applied_generation = sched.policy.generation;
-        sched.policy.dispatch_generation = sched
-            .policy
-            .dispatch_generation
-            .checked_add(1)
-            .ok_or(TaskError::InvalidConfiguration)?;
+        sched.policy.dispatch_generation = next_dispatch_generation;
         let released = previous_held.saturating_sub(sched.deadline.desired_reservation);
         let effective_policy = sched.policy.effective;
         let effective_entity = sched.policy.effective_entity;
-        let running_policy_changed = sched.placement.running_cpu().is_some();
+        let running_policy_changed = sched.placement.execution_cpu().is_some();
         core.publish_effective_schedule(effective_policy, effective_entity);
         drop(sched);
         if running_policy_changed && let Some(extension) = core.extension_view() {
@@ -850,8 +935,26 @@ impl TaskSystem {
             // valid for this retained ThreadCore.
             unsafe { extension.notify_running_policy_applied(core.id(), base_policy, now_ns) };
         }
-        self.defer_deadline_admission_release(released)?;
+        if self.defer_deadline_admission_release(released).is_err() {
+            task_runtime::fatal_invariant(0x504f_0001, core.id().as_u64() as usize);
+        }
         Ok(true)
+    }
+
+    pub(super) fn validate_owner_policy_generation(
+        sched: &ThreadSchedState,
+        generation: u64,
+    ) -> Result<(), TaskError> {
+        if generation <= sched.policy.generation
+            && sched.policy.applied_generation != sched.policy.generation
+        {
+            sched
+                .policy
+                .dispatch_generation
+                .checked_add(1)
+                .ok_or(TaskError::InvalidConfiguration)?;
+        }
+        Ok(())
     }
 
     pub(super) fn recompute_pi_after_policy_update(

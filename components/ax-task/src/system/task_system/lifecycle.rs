@@ -19,7 +19,7 @@ impl TaskSystem {
                 return Err(TaskError::StaleThreadId);
             }
             let mut sched = record.sched.lock();
-            if sched.placement.queued_cpu().is_some() || sched.placement.running_cpu().is_some() {
+            if sched.placement.queued_cpu().is_some() || sched.placement.execution_cpu().is_some() {
                 return Err(TaskError::AlreadyQueued);
             }
             if sched.placement.on_cpu().is_some() || sched.pi.deadline_cbs_borrower.is_some() {
@@ -43,7 +43,7 @@ impl TaskSystem {
                 self.state.lock().request_owner_reschedule(thread);
                 return Err(TaskError::ThreadBusy);
             }
-            sched.placement.set_migration_target(None)?;
+            sched.placement.cancel_remote_handoff_for_exit();
             sched.transition(&record.core, ThreadState::Exited)?;
             scheduler_exit.seal();
             record.callbacks.prepare_exit(record.extension.is_some())?;

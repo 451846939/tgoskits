@@ -10,6 +10,100 @@ pub(crate) enum WakePreemptionDecision {
     QueuedCandidateSelected,
 }
 
+/// Linux `dl_rq` bandwidth ledger owned by one runqueue lock.
+#[derive(Debug)]
+struct DeadlineRunQueueBandwidth {
+    this_bw_scaled: u64,
+    running_bw_scaled: u64,
+    max_bw_scaled: u64,
+}
+
+impl DeadlineRunQueueBandwidth {
+    const fn new(max_bw_scaled: u64) -> Self {
+        Self {
+            this_bw_scaled: 0,
+            running_bw_scaled: 0,
+            max_bw_scaled,
+        }
+    }
+
+    fn add(&mut self, utilization_scaled: u64, active: bool) {
+        let this_bw_scaled = self
+            .this_bw_scaled
+            .checked_add(utilization_scaled)
+            .unwrap_or_else(|| {
+                task_runtime::fatal_invariant(0x444c_1001, utilization_scaled as usize)
+            });
+        let running_bw_scaled = if active {
+            self.running_bw_scaled
+                .checked_add(utilization_scaled)
+                .unwrap_or_else(|| {
+                    task_runtime::fatal_invariant(0x444c_1002, utilization_scaled as usize)
+                })
+        } else {
+            self.running_bw_scaled
+        };
+        if running_bw_scaled > this_bw_scaled {
+            task_runtime::fatal_invariant(0x444c_1003, utilization_scaled as usize);
+        }
+        self.this_bw_scaled = this_bw_scaled;
+        self.running_bw_scaled = running_bw_scaled;
+    }
+
+    fn remove(&mut self, utilization_scaled: u64, active: bool) {
+        let this_bw_scaled = self
+            .this_bw_scaled
+            .checked_sub(utilization_scaled)
+            .unwrap_or_else(|| {
+                task_runtime::fatal_invariant(0x444c_1004, utilization_scaled as usize)
+            });
+        let running_bw_scaled = if active {
+            self.running_bw_scaled
+                .checked_sub(utilization_scaled)
+                .unwrap_or_else(|| {
+                    task_runtime::fatal_invariant(0x444c_1005, utilization_scaled as usize)
+                })
+        } else {
+            self.running_bw_scaled
+        };
+        if running_bw_scaled > this_bw_scaled {
+            task_runtime::fatal_invariant(0x444c_1006, utilization_scaled as usize);
+        }
+        self.this_bw_scaled = this_bw_scaled;
+        self.running_bw_scaled = running_bw_scaled;
+    }
+
+    fn activate(&mut self, utilization_scaled: u64) {
+        let running_bw_scaled = self
+            .running_bw_scaled
+            .checked_add(utilization_scaled)
+            .unwrap_or_else(|| {
+                task_runtime::fatal_invariant(0x444c_1007, utilization_scaled as usize)
+            });
+        if running_bw_scaled > self.this_bw_scaled {
+            task_runtime::fatal_invariant(0x444c_1008, utilization_scaled as usize);
+        }
+        self.running_bw_scaled = running_bw_scaled;
+    }
+
+    fn deactivate(&mut self, utilization_scaled: u64) {
+        self.running_bw_scaled = self
+            .running_bw_scaled
+            .checked_sub(utilization_scaled)
+            .unwrap_or_else(|| {
+                task_runtime::fatal_invariant(0x444c_1009, utilization_scaled as usize)
+            });
+    }
+
+    const fn snapshot(&self) -> DeadlineBandwidthSnapshot {
+        DeadlineBandwidthSnapshot {
+            this_bw_scaled: self.this_bw_scaled,
+            running_bw_scaled: self.running_bw_scaled,
+            max_bw_scaled: self.max_bw_scaled,
+        }
+    }
+}
+
 impl WakePreemptionDecision {
     pub(crate) const fn requests_reschedule(self) -> bool {
         matches!(self, Self::WakeeSelected)
@@ -29,9 +123,7 @@ pub(crate) struct CpuRunQueueState {
     /// physical runqueue membership. Remote wakeups therefore cannot expose a
     /// runnable Deadline entity before its CBS reservation is accounted.
     deadline_members: Vec<Arc<ThreadCore>>,
-    deadline_admitted_bw_scaled: u64,
-    deadline_running_bw_scaled: u64,
-    deadline_max_bw_scaled: u64,
+    deadline_bandwidth: DeadlineRunQueueBandwidth,
 }
 
 impl CpuRunQueueState {
@@ -39,10 +131,10 @@ impl CpuRunQueueState {
         Self {
             queue: RunQueue::new(),
             current: None,
-            deadline_members: Vec::with_capacity(config.timer_capacity()),
-            deadline_admitted_bw_scaled: 0,
-            deadline_running_bw_scaled: 0,
-            deadline_max_bw_scaled: u64::from(config.deadline_cap_percent()) * 10_000_000,
+            deadline_members: Vec::with_capacity(config.thread_capacity()),
+            deadline_bandwidth: DeadlineRunQueueBandwidth::new(
+                u64::from(config.deadline_cap_percent()) * 10_000_000,
+            ),
         }
     }
 
@@ -51,6 +143,15 @@ impl CpuRunQueueState {
     }
 
     pub(crate) fn set_current(&mut self, current: Option<CurrentSchedule>) {
+        if let Some(current) = current {
+            self.queue
+                .update_linked_current(
+                    current.thread(),
+                    current.schedule_policy(),
+                    current.scheduling_entity(),
+                )
+                .expect("running RT/DL linkage must match the dispatch snapshot");
+        }
         self.current = current;
     }
 
@@ -79,22 +180,20 @@ impl CpuRunQueueState {
         self.deadline_members.is_empty()
     }
 
-    pub(crate) fn register_deadline_member(
-        &mut self,
-        core: &Arc<ThreadCore>,
-    ) -> Result<bool, TaskError> {
+    pub(crate) fn register_deadline_member(&mut self, core: &Arc<ThreadCore>) -> bool {
         if self
             .deadline_members
             .iter()
             .any(|member| Arc::ptr_eq(member, core))
         {
-            return Ok(false);
+            return false;
         }
-        if self.deadline_members.len() == self.deadline_members.capacity() {
-            return Err(TaskError::TimerCapacity);
-        }
+        assert!(
+            self.deadline_members.len() < self.deadline_members.capacity(),
+            "thread construction must reserve every Deadline member slot"
+        );
         self.deadline_members.push(Arc::clone(core));
-        Ok(true)
+        true
     }
 
     pub(crate) fn unregister_deadline_member(&mut self, core: &Arc<ThreadCore>) {
@@ -107,80 +206,24 @@ impl CpuRunQueueState {
         }
     }
 
-    pub(crate) fn add_deadline_bandwidth(
-        &mut self,
-        utilization_scaled: u64,
-        active: bool,
-    ) -> Result<(), TaskError> {
-        let admitted = self
-            .deadline_admitted_bw_scaled
-            .checked_add(utilization_scaled)
-            .ok_or(TaskError::InvalidConfiguration)?;
-        let running = if active {
-            self.deadline_running_bw_scaled
-                .checked_add(utilization_scaled)
-                .ok_or(TaskError::InvalidConfiguration)?
-        } else {
-            self.deadline_running_bw_scaled
-        };
-        self.deadline_admitted_bw_scaled = admitted;
-        self.deadline_running_bw_scaled = running;
-        Ok(())
+    pub(crate) fn add_deadline_bandwidth(&mut self, utilization_scaled: u64, active: bool) {
+        self.deadline_bandwidth.add(utilization_scaled, active);
     }
 
-    pub(crate) fn remove_deadline_bandwidth(
-        &mut self,
-        utilization_scaled: u64,
-        active: bool,
-    ) -> Result<(), TaskError> {
-        let admitted = self
-            .deadline_admitted_bw_scaled
-            .checked_sub(utilization_scaled)
-            .ok_or(TaskError::InvalidConfiguration)?;
-        let running = if active {
-            self.deadline_running_bw_scaled
-                .checked_sub(utilization_scaled)
-                .ok_or(TaskError::InvalidConfiguration)?
-        } else {
-            self.deadline_running_bw_scaled
-        };
-        self.deadline_admitted_bw_scaled = admitted;
-        self.deadline_running_bw_scaled = running;
-        Ok(())
+    pub(crate) fn remove_deadline_bandwidth(&mut self, utilization_scaled: u64, active: bool) {
+        self.deadline_bandwidth.remove(utilization_scaled, active);
     }
 
-    pub(crate) fn activate_deadline_bandwidth(
-        &mut self,
-        utilization_scaled: u64,
-    ) -> Result<(), TaskError> {
-        let running = self
-            .deadline_running_bw_scaled
-            .checked_add(utilization_scaled)
-            .ok_or(TaskError::InvalidConfiguration)?;
-        if running > self.deadline_admitted_bw_scaled {
-            return Err(TaskError::InvalidConfiguration);
-        }
-        self.deadline_running_bw_scaled = running;
-        Ok(())
+    pub(crate) fn activate_deadline_bandwidth(&mut self, utilization_scaled: u64) {
+        self.deadline_bandwidth.activate(utilization_scaled);
     }
 
-    pub(crate) fn deactivate_deadline_bandwidth(
-        &mut self,
-        utilization_scaled: u64,
-    ) -> Result<(), TaskError> {
-        self.deadline_running_bw_scaled = self
-            .deadline_running_bw_scaled
-            .checked_sub(utilization_scaled)
-            .ok_or(TaskError::InvalidConfiguration)?;
-        Ok(())
+    pub(crate) fn deactivate_deadline_bandwidth(&mut self, utilization_scaled: u64) {
+        self.deadline_bandwidth.deactivate(utilization_scaled);
     }
 
     pub(crate) const fn deadline_bandwidth(&self) -> DeadlineBandwidthSnapshot {
-        DeadlineBandwidthSnapshot {
-            this_bw_scaled: self.deadline_admitted_bw_scaled,
-            running_bw_scaled: self.deadline_running_bw_scaled,
-            max_bw_scaled: self.deadline_max_bw_scaled,
-        }
+        self.deadline_bandwidth.snapshot()
     }
 
     /// Applies Linux EEVDF wakeup preemption to the complete owner runqueue.

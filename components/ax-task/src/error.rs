@@ -123,6 +123,9 @@ pub enum TaskError {
     /// A configured fixed-capacity resource is exhausted.
     #[error("timer capacity is exhausted")]
     TimerCapacity,
+    /// The cold-path scheduler thread reservation is exhausted.
+    #[error("scheduler thread capacity is exhausted")]
+    ThreadCapacity,
     /// An affinity update would move a thread away from its owner-CPU sleep timer.
     #[error("thread affinity excludes the CPU owning an active sleep timer")]
     ActiveTimerAffinity,

@@ -208,7 +208,9 @@ fn map_task_error(error: TaskError) -> ax_errno::AxError {
         | TaskError::InvalidRoundRobinQuantum
         | TaskError::InvalidDeadline { .. }
         | TaskError::UnsupportedDeadlineFlags(_) => ax_errno::AxError::InvalidInput,
-        TaskError::TimerCapacity => ax_errno::AxError::NoMemory,
+        // Linux kthread_create_on_node() reports task-object allocation and
+        // kernel-thread capacity failures as ENOMEM to kernel worker callers.
+        TaskError::TimerCapacity | TaskError::ThreadCapacity => ax_errno::AxError::NoMemory,
         TaskError::RuntimeFailure(status) if status == RuntimeStatus::NoMemory as u32 => {
             ax_errno::AxError::NoMemory
         }
@@ -418,5 +420,13 @@ mod tests {
     #[test]
     fn runtime_task_ops_is_available() {
         let _ = &TASK_OPS;
+    }
+
+    #[test]
+    fn block_worker_thread_capacity_matches_linux_kthread_enomem() {
+        assert_eq!(
+            map_task_error(TaskError::ThreadCapacity),
+            ax_errno::AxError::NoMemory
+        );
     }
 }
