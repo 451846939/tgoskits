@@ -270,6 +270,7 @@ impl CurrentDispatch {
         &self,
         runtime_ns: u64,
         inactive_bw_scaled: u64,
+        extra_bw_scaled: u64,
         max_bw_scaled: u64,
     ) -> u64 {
         // A PI owner may execute on a different CPU from the Deadline donor.
@@ -288,8 +289,11 @@ impl CurrentDispatch {
         let own_bw_scaled = u64::try_from(DeadlineAdmission::utilization(policy))
             .unwrap_or(u64::MAX)
             .min(max_bw_scaled);
+        let reclaimable_bw_scaled = inactive_bw_scaled
+            .saturating_add(extra_bw_scaled)
+            .min(max_bw_scaled);
         let charge_rate_scaled =
-            own_bw_scaled.max(max_bw_scaled.saturating_sub(inactive_bw_scaled.min(max_bw_scaled)));
+            own_bw_scaled.max(max_bw_scaled.saturating_sub(reclaimable_bw_scaled));
         let charged_ns = (runtime_ns as u128)
             .saturating_mul(charge_rate_scaled as u128)
             .saturating_add(max_bw_scaled as u128 - 1)

@@ -15,6 +15,7 @@ mod pi;
 mod placement;
 mod priority_index;
 mod registry;
+mod root_domain;
 mod scheduling;
 mod switch;
 mod thread_api;
@@ -25,14 +26,14 @@ use alloc::{sync::Arc, vec::Vec};
 use core::{
     pin::Pin,
     ptr,
-    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
 use exited_work::ExitedThreadWork;
 use model::{
     BalanceReason, BalanceTransferOutcome, DeferredTaskWorkClass, DetachedOwnerMessageBatch,
     FAIR_BALANCE_BALANCED_BACKOFF_FACTOR, FAIR_BALANCE_CONSTRAINED_BACKOFF_FACTOR,
-    FairBalanceResult, FairPolicyPlacement, RootDomainState,
+    FairBalanceResult, FairPolicyPlacement,
 };
 pub use model::{DeferredTaskWorkBatch, OwnedThreadReapError, TaskSystem};
 pub(crate) use outcome::SwitchEndpoint;
@@ -47,6 +48,7 @@ use registry::{
     CpuRegistration, DeadlineCallbackClaim, DetachedThreadRecord, PiWaitRegistration,
     TaskSystemState, ThreadRecord, ThreadSlot,
 };
+use root_domain::{RootDomain, RootDomainState};
 use thread_callbacks::ThreadCallbackState;
 
 use super::thread_sched::{DeadlineActivity, ThreadSchedCell, ThreadSchedState};
@@ -129,20 +131,8 @@ impl Drop for UnpublishedThreadGuard<'_> {
 }
 
 impl TaskSystem {
-    fn drain_pending_deadline_admission(&self, state: &mut TaskSystemState) {
-        let released = self
-            .pending_deadline_admission_release
-            .swap(0, Ordering::AcqRel);
-        state.deadline_admission.release(u128::from(released));
-    }
-
     fn defer_deadline_admission_release(&self, released: u64) -> Result<(), TaskError> {
-        self.pending_deadline_admission_release
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
-                pending.checked_add(released)
-            })
-            .map(|_| ())
-            .map_err(|_| TaskError::InvalidConfiguration)
+        self.root_domain.defer_deadline_release(released)
     }
 
     /// Creates an empty scheduler instance for a fixed topology.
@@ -174,19 +164,14 @@ impl TaskSystem {
                 task_work_class_cursor: DeferredTaskWorkClass::Deadline,
                 address_space_reclaim_first: true,
                 exited_work: ExitedThreadWork::new(),
-                deadline_admission: DeadlineAdmission::new(config.deadline_cap_percent()),
             }),
-            root_domain: PreemptTicketLock::new(RootDomainState {
-                online: CpuSet::empty(config.cpu_count()),
-            }),
-            priority_index: RootDomainPriorityIndex::new(config.cpu_count()),
+            root_domain: RootDomain::new(config),
             deferred_coroutine_reclaims: SchedulerInbox::new(InboxKind::Reclaim),
             deferred_deadline_callbacks: SchedulerInbox::new(InboxKind::TaskWork),
             deferred_scheduler_ticks: SchedulerInbox::new(InboxKind::TaskWork),
             task_work,
             topology_sequence: SequenceCounter::default(),
             online_count: AtomicUsize::new(0),
-            pending_deadline_admission_release: AtomicU64::new(0),
         })
     }
 }

@@ -543,7 +543,11 @@ impl TaskSystem {
             }
             if queued_cpu == Some(owner) {
                 if cpu.dispatch_state().current_dispatch.is_some() {
-                    cpu.as_mut().settle_current_dispatch(now_ns, 0)?;
+                    cpu.as_mut().settle_current_dispatch(
+                        now_ns,
+                        0,
+                        self.root_domain.deadline_extra_bw_scaled(),
+                    )?;
                 } else {
                     cpu.lock_run_queue().update_fair_virtual_time(None);
                 }

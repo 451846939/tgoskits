@@ -109,7 +109,7 @@ impl TaskSystem {
         let _irq = IrqScope::enter();
         self.ensure_owner_cpu_context(&cpu)?;
         let id = cpu.owner();
-        let mut state = self.state.lock();
+        let state = self.state.lock();
         let mut root_domain = self.root_domain.lock();
         let registration = state.cpu_registration(id)?;
         if registration.remote.lifecycle_state() != crate::CpuLifecycleState::Offline {
@@ -148,11 +148,10 @@ impl TaskSystem {
             root_domain.online.insert(id),
             "validated offline CPU must be absent from the root domain"
         );
-        state.deadline_admission.set_online_cpus(online_count);
         self.online_count.store(online_count, Ordering::Release);
         {
             let run_queue = cpu.lock_run_queue();
-            self.priority_index.publish_run_queue(id, &run_queue, true);
+            self.root_domain.publish_run_queue(id, &run_queue, true);
         }
         assert!(
             cpu.as_ref().get_ref().remote().mark_online(),
@@ -173,7 +172,7 @@ impl TaskSystem {
         self.ensure_owner_cpu_context(&cpu)?;
         let _irq = IrqScope::enter();
         let id = cpu.owner();
-        let mut state = self.state.lock();
+        let state = self.state.lock();
         let mut root_domain = self.root_domain.lock();
         let remote = Arc::clone(&state.cpu_registration(id)?.remote);
         if !Arc::ptr_eq(&remote, cpu.remote()) {
@@ -213,10 +212,9 @@ impl TaskSystem {
             Err(TaskError::InvalidConfiguration)
         } else {
             let online_count = state.online_cpu_count();
-            state.deadline_admission.set_online_cpus(online_count);
             self.online_count.store(online_count, Ordering::Release);
             remote.finish_offline();
-            self.priority_index.publish_offline(id);
+            self.root_domain.publish_offline(id);
             Ok(())
         };
         self.topology_sequence.write_end();

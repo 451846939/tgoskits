@@ -198,7 +198,7 @@ impl TaskSystem {
         let indexed = match policy {
             SchedulePolicy::KernelStop => None,
             SchedulePolicy::Fifo { priority } | SchedulePolicy::RoundRobin { priority, .. } => self
-                .priority_index
+                .root_domain
                 .find_lowest_rt_cpu(priority, affinity, preferred, accepts),
             SchedulePolicy::Deadline(deadline_policy) => {
                 let absolute_deadline_ns = entity
@@ -206,7 +206,7 @@ impl TaskSystem {
                     .map(DeadlineEntity::absolute_deadline_ns)
                     .filter(|deadline| *deadline != 0)
                     .unwrap_or_else(|| now_ns.saturating_add(deadline_policy.deadline_ns()));
-                self.priority_index.find_later_deadline_cpu(
+                self.root_domain.find_later_deadline_cpu(
                     absolute_deadline_ns,
                     affinity,
                     preferred,

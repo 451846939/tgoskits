@@ -107,24 +107,13 @@ pub struct TaskSystem {
     // Cold-path order is registry/PI/admission -> root domain -> thread cell.
     // Wake and placement hot paths lock thread state before the target runqueue.
     pub(super) state: PreemptTicketLock<TaskSystemState>,
-    pub(super) root_domain: PreemptTicketLock<RootDomainState>,
-    /// Lockless RT cpupri buckets plus the serialized Deadline cpudl heap.
-    ///
-    /// Runqueues remain authoritative. This is a root-domain derived index
-    /// published in the same transaction as each remotely visible rq summary.
-    pub(super) priority_index: RootDomainPriorityIndex,
+    pub(super) root_domain: RootDomain,
     pub(super) deferred_coroutine_reclaims: SchedulerInbox,
     pub(super) deferred_deadline_callbacks: SchedulerInbox,
     pub(super) deferred_scheduler_ticks: SchedulerInbox,
     pub(super) task_work: Arc<TaskWorkDoorbell>,
     pub(super) topology_sequence: SequenceCounter,
     pub(super) online_count: AtomicUsize,
-    pub(super) pending_deadline_admission_release: AtomicU64,
-}
-
-#[derive(Debug)]
-pub(super) struct RootDomainState {
-    pub(super) online: CpuSet,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

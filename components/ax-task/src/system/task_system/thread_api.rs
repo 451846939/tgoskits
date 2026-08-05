@@ -158,9 +158,8 @@ impl TaskSystem {
         // domains. Copying into this fixed-topology buffer is allocation-free.
         let mut affinity = CpuSet::empty(self.config.cpu_count());
         let (core, owner, generation, owner_publication) = {
-            let mut state = self.state.lock();
-            self.drain_pending_deadline_admission(&mut state);
-            let root_domain = self.root_domain.lock();
+            let state = self.state.lock();
+            let mut root_domain = self.root_domain.lock();
             let (core, sched_cell) = {
                 let record = state.thread_record(thread)?;
                 (Arc::clone(&record.core), Arc::clone(&record.sched))
@@ -191,16 +190,15 @@ impl TaskSystem {
                         .ok_or(TaskError::CpuOffline(owner.as_u32()))
                 })
                 .transpose()?;
-            let reservation =
-                state.deadline_reservation_for(policy, &affinity, &root_domain.online)?;
+            let reservation = root_domain.deadline_reservation_for(policy, &affinity)?;
             let old_held = active_reservation.max(desired_reservation);
             let new_held = active_reservation.max(reservation);
             if new_held > old_held {
-                state
+                root_domain
                     .deadline_admission
                     .reserve_utilization(new_held - old_held)?;
             } else {
-                state.deadline_admission.release(old_held - new_held);
+                root_domain.deadline_admission.release(old_held - new_held);
             }
             sched.deadline.desired_reservation = u64::try_from(reservation).unwrap_or(u64::MAX);
             sched.policy.requested = policy;

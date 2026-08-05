@@ -133,11 +133,8 @@ impl TaskSystem {
         run_queue: &CpuRunQueueState,
     ) {
         remote.publish_run_queue_load_summary(run_queue);
-        self.priority_index.publish_run_queue(
-            remote.owner(),
-            run_queue,
-            remote.accepts_placement(),
-        );
+        self.root_domain
+            .publish_run_queue(remote.owner(), run_queue, remote.accepts_placement());
     }
 
     pub(super) fn rt_deadline_push_pending(&self, remote: &CpuRemote) -> bool {

@@ -397,7 +397,11 @@ impl TaskSystem {
                 record.callbacks.prepare_exit(record.extension.is_some())?;
             }
             state.queue_exited_thread(previous);
-            state.release_deadline_reservation_on_exit(previous)?;
+            let mut root_domain = self.root_domain.lock();
+            state.release_deadline_reservation_on_exit(
+                &mut root_domain.deadline_admission,
+                previous,
+            )?;
             cpu.as_mut().clear_current();
             let next = self.pick_owner_next(cpu.as_mut(), now_ns, Some(previous))?;
             if next.outgoing_migration_target.is_some() {

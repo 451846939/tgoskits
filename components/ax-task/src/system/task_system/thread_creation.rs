@@ -18,13 +18,12 @@ impl TaskSystem {
         validate_affinity(&affinity, self.config.cpu_count())?;
         let (slot, generation, reservation) = {
             let mut state = self.state.lock();
-            self.drain_pending_deadline_admission(&mut state);
-            let root_domain = self.root_domain.lock();
-            let reservation = state.reserve_deadline(policy, &affinity, &root_domain.online)?;
+            let mut root_domain = self.root_domain.lock();
+            let reservation = root_domain.reserve_deadline(policy, &affinity)?;
             let (slot, generation) = match state.allocate_thread_slot() {
                 Ok(identity) => identity,
                 Err(error) => {
-                    state.deadline_admission.release(reservation);
+                    root_domain.deadline_admission.release(reservation);
                     return Err(error);
                 }
             };
@@ -86,13 +85,14 @@ impl TaskSystem {
             if status != RuntimeStatus::Success {
                 {
                     let mut state = self.state.lock();
+                    let mut root_domain = self.root_domain.lock();
                     let failed_slot = &mut state.slots[slot as usize];
                     debug_assert_eq!(failed_slot.generation, generation);
                     debug_assert!(failed_slot.record.is_none());
                     if advance_thread_slot_generation(failed_slot) {
                         state.free_slots.push(slot);
                     }
-                    state.deadline_admission.release(reservation);
+                    root_domain.deadline_admission.release(reservation);
                 }
                 drop(core);
                 self.release_thread_record(record);
@@ -103,13 +103,10 @@ impl TaskSystem {
         let mut record = Some(record);
         let commit_error = {
             let mut state = self.state.lock();
-            self.drain_pending_deadline_admission(&mut state);
-            let root_domain = self.root_domain.lock();
+            let mut root_domain = self.root_domain.lock();
             let is_deadline = matches!(policy, SchedulePolicy::Deadline(_));
             let topology_rejects_deadline = is_deadline && !affinity.covers(&root_domain.online);
-            let admission_overcommitted = is_deadline
-                && state.deadline_admission.reserved_scaled()
-                    > state.deadline_admission.capacity_scaled();
+            let admission_overcommitted = is_deadline && root_domain.admission_overcommitted();
             if topology_rejects_deadline || admission_overcommitted {
                 let failed_slot = &mut state.slots[slot as usize];
                 debug_assert_eq!(failed_slot.generation, generation);
@@ -117,7 +114,7 @@ impl TaskSystem {
                 if advance_thread_slot_generation(failed_slot) {
                     state.free_slots.push(slot);
                 }
-                state.deadline_admission.release(reservation);
+                root_domain.deadline_admission.release(reservation);
                 Some(if topology_rejects_deadline {
                     TaskError::DeadlineAffinity
                 } else {
@@ -247,10 +244,14 @@ impl TaskSystem {
     }
 
     fn discard_unpublished_thread(&self, handle: ThreadHandle) -> Result<(), TaskError> {
-        let record = self
-            .state
-            .lock()
-            .remove_unpublished_thread_with_handle(&handle)?;
+        let record = {
+            let mut state = self.state.lock();
+            let mut root_domain = self.root_domain.lock();
+            state.remove_unpublished_thread_with_handle(
+                &mut root_domain.deadline_admission,
+                &handle,
+            )?
+        };
         drop(handle);
         self.release_thread_record(record);
         Ok(())

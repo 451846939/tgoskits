@@ -176,6 +176,7 @@ impl CpuLocal {
         now_ns: u64,
         runtime_ns: u64,
         reclaimed_ns: u64,
+        deadline_extra_bw_scaled: u64,
     ) -> Result<DispatchCharge, TaskError> {
         // SAFETY: the owner scheduler serializes this pinned runqueue state.
         // These disjoint projections avoid reference-count traffic on every
@@ -197,6 +198,7 @@ impl CpuLocal {
                 dispatch.grub_reclaimed_ns(
                     runtime_ns,
                     admitted_bw_scaled.saturating_sub(running_bw_scaled),
+                    deadline_extra_bw_scaled,
                     max_bw_scaled,
                 )
             });
@@ -238,6 +240,7 @@ impl CpuLocal {
         mut self: Pin<&mut Self>,
         now_ns: u64,
         reclaimed_ns: u64,
+        deadline_extra_bw_scaled: u64,
     ) -> Result<DispatchCharge, TaskError> {
         let runtime_ns = self
             .as_ref()
@@ -247,8 +250,12 @@ impl CpuLocal {
             .as_ref()
             .ok_or(TaskError::NoRunnableThread)?
             .unaccounted_runtime(now_ns);
-        self.as_mut()
-            .charge_current_dispatch(now_ns, runtime_ns, reclaimed_ns)
+        self.as_mut().charge_current_dispatch(
+            now_ns,
+            runtime_ns,
+            reclaimed_ns,
+            deadline_extra_bw_scaled,
+        )
     }
 
     pub(crate) fn set_idle(self: Pin<&mut Self>, idle: ThreadId, core: Arc<ThreadCore>) {

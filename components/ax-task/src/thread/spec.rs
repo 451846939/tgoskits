@@ -182,6 +182,11 @@ impl CpuSet {
         self.allowed.len()
     }
 
+    /// Returns the number of CPUs selected by this set.
+    pub(crate) fn count(&self) -> usize {
+        self.allowed.iter().filter(|allowed| **allowed).count()
+    }
+
     /// Returns whether a runnable thread can leave its current allowed CPU.
     pub(crate) fn is_migration_capable(&self) -> bool {
         self.allowed

@@ -54,7 +54,6 @@ pub(super) struct TaskSystemState {
     pub(super) task_work_class_cursor: DeferredTaskWorkClass,
     pub(super) address_space_reclaim_first: bool,
     pub(super) exited_work: ExitedThreadWork,
-    pub(super) deadline_admission: DeadlineAdmission,
 }
 
 pub(super) enum DeadlineCallbackClaim {
@@ -106,40 +105,6 @@ impl TaskSystemState {
             Ok(DeadlineCallbackClaim::Callback { extension, thread })
         } else {
             Ok(DeadlineCallbackClaim::NoCallback { has_more })
-        }
-    }
-
-    pub(super) fn reserve_deadline(
-        &mut self,
-        policy: SchedulePolicy,
-        affinity: &CpuSet,
-        online: &CpuSet,
-    ) -> Result<u128, TaskError> {
-        match policy {
-            SchedulePolicy::Deadline(deadline) => {
-                if !affinity.covers(online) {
-                    return Err(TaskError::DeadlineAffinity);
-                }
-                self.deadline_admission.reserve(deadline)
-            }
-            _ => Ok(0),
-        }
-    }
-
-    pub(super) fn deadline_reservation_for(
-        &self,
-        policy: SchedulePolicy,
-        affinity: &CpuSet,
-        online: &CpuSet,
-    ) -> Result<u128, TaskError> {
-        match policy {
-            SchedulePolicy::Deadline(deadline) => {
-                if !affinity.covers(online) {
-                    return Err(TaskError::DeadlineAffinity);
-                }
-                Ok(DeadlineAdmission::utilization(deadline))
-            }
-            _ => Ok(0),
         }
     }
 
@@ -213,6 +178,7 @@ impl TaskSystemState {
 
     pub(super) fn release_deadline_reservation_on_exit(
         &mut self,
+        deadline_admission: &mut DeadlineAdmission,
         thread: ThreadId,
     ) -> Result<(), TaskError> {
         let held = {
@@ -226,19 +192,21 @@ impl TaskSystemState {
             sched.deadline.desired_reservation = 0;
             held
         };
-        self.deadline_admission.release(u128::from(held));
+        deadline_admission.release(u128::from(held));
         Ok(())
     }
 
     pub(super) fn remove_exited_thread(
         &mut self,
+        deadline_admission: &mut DeadlineAdmission,
         thread: ThreadId,
     ) -> Result<ThreadRecord, TaskError> {
-        self.remove_exited_thread_with_lease_count(thread, 0, None)
+        self.remove_exited_thread_with_lease_count(deadline_admission, thread, 0, None)
     }
 
     pub(super) fn remove_unpublished_thread_with_handle(
         &mut self,
+        deadline_admission: &mut DeadlineAdmission,
         handle: &ThreadHandle,
     ) -> Result<ThreadRecord, TaskError> {
         let thread = handle.id();
@@ -278,7 +246,7 @@ impl TaskSystemState {
                 .max(sched.deadline.desired_reservation)
         };
         let record = slot.record.take().ok_or(TaskError::StaleThreadId)?;
-        self.deadline_admission.release(u128::from(held));
+        deadline_admission.release(u128::from(held));
         if advance_thread_slot_generation(slot) {
             self.free_slots.push(thread.slot());
         }
@@ -287,6 +255,7 @@ impl TaskSystemState {
 
     pub(super) fn remove_exited_thread_with_lease_count(
         &mut self,
+        deadline_admission: &mut DeadlineAdmission,
         thread: ThreadId,
         expected_external_leases: usize,
         expected_core: Option<*const ThreadCore>,
@@ -349,7 +318,7 @@ impl TaskSystemState {
                 .active_reservation
                 .max(sched.deadline.desired_reservation)
         };
-        self.deadline_admission.release(u128::from(held));
+        deadline_admission.release(u128::from(held));
         if advance_thread_slot_generation(slot) {
             self.free_slots.push(thread.slot());
         }
@@ -359,12 +328,21 @@ impl TaskSystemState {
 
     pub(super) fn remove_exited_thread_with_handle(
         &mut self,
+        deadline_admission: &mut DeadlineAdmission,
         handle: &ThreadHandle,
     ) -> Result<ThreadRecord, TaskError> {
-        self.remove_exited_thread_with_lease_count(handle.id(), 1, Some(Arc::as_ptr(&handle.core)))
+        self.remove_exited_thread_with_lease_count(
+            deadline_admission,
+            handle.id(),
+            1,
+            Some(Arc::as_ptr(&handle.core)),
+        )
     }
 
-    pub(super) fn take_unreferenced_exited(&mut self) -> Result<Option<ThreadRecord>, TaskError> {
+    pub(super) fn take_unreferenced_exited(
+        &mut self,
+        deadline_admission: &mut DeadlineAdmission,
+    ) -> Result<Option<ThreadRecord>, TaskError> {
         let candidate_count = self.exited_work.candidate_count();
         for _ in 0..candidate_count {
             let thread = self
@@ -373,7 +351,7 @@ impl TaskSystemState {
                 .expect("exit candidate count must match the queue");
             #[cfg(test)]
             REAPER_RECORD_VISITS.set(REAPER_RECORD_VISITS.get().saturating_add(1));
-            match self.remove_exited_thread_with_lease_count(thread, 0, None) {
+            match self.remove_exited_thread_with_lease_count(deadline_admission, thread, 0, None) {
                 Ok(record) => return Ok(Some(record)),
                 Err(TaskError::ThreadBusy) => {}
                 Err(TaskError::StaleThreadId) => self.exited_work.remove(thread),

@@ -1862,6 +1862,34 @@ POSIX RT 兼容实现；Starry 调度 ABI 也不得暴露该内部策略。
 独立 topology read-side lease：撤销 online 前禁用 stopper endpoint，并等待已提交命令、
 hard-call 和 scheduler doorbell 全部 quiesce；不能只在 wait predicate 中重复读取布尔值。
 
+### 2026-08-05 root-domain Deadline 带宽与 GRUB `extra_bw`
+
+Linux v7.1 的 `struct root_domain` 同时拥有 online span、cpupri/cpudl 与 `dl_bw`；各 CPU
+`dl_rq` 只拥有本地 `this_bw`、`running_bw`、`extra_bw` 和 `max_bw`。旧实现却把 Deadline
+admission 放在通用线程 registry，把 online mask 放在另一把 root-domain 锁，再把
+cpupri/cpudl 作为 `TaskSystem` 的第三个平级字段。GRUB 热路径只能看到本地
+`this_bw - running_bw`，完全不知道 root domain 尚未预留的容量。
+
+当前实现把这些事实收敛到唯一 `RootDomain`：
+
+- topology 与 `DeadlineAdmission` 在同一 root-domain 状态事务中更新；
+- cpupri/cpudl 继续由目标 rq 锁串行发布，并作为 root-domain 的派生索引存在。没有为每次
+  wake 增加全局 root-domain 锁；同一 CPU 的两个 publisher 已由该 CPU 的 raw rq lock
+  排除，不能把并不存在的双写竞态当作理由退化热路径；
+- admission 变更按在线 CPU 数发布 `Uextra = Umax - Ureserved / nr_online`。普通 runtime
+  charge 只 Acquire 读取这个值，不进入 root-domain 锁；owner policy apply 不能取得冷域锁
+  时，release 先进入单调 pending counter，读取侧只会增加已确认释放的 spare bandwidth，
+  下一次 root-domain 事务再合并精确值；
+- runqueue 仍是本地 `this_bw/running_bw` 的唯一 owner。GRUB 按 Linux 公式使用
+  `max{u, Umax - Uinactive - Uextra}`，没有增加第二份 per-rq admission 镜像。
+
+确定性红测使用单 CPU、`U=0.5` 的唯一 RECLAIM Deadline 任务。旧实现忽略
+`Uextra=0.45`，100 ns 墙钟后预算从 500 降到 400；新实现按 `ceil(100 * 0.5 / 0.95)`
+只扣 53，剩余 447。同一测试先稳定失败，再由上述 owner 重构转绿；ax-task 的 306 个
+unit、21 个 loom、全部 integration 与 doctest 随后通过。这一阶段补齐 A4，但尚未把
+blocked Deadline reservation 从原 rq 的 zero-lag/CBS 生命周期中拆出；跨 CPU runtime
+borrowing 与 running-in-rq 仍需在下一阶段分别处理。
+
 ## 模块化结果
 
 - `TaskSystem` orchestration 只负责编排，registry/reap、placement、owner scheduling、deadline、PI、balance、deferred work 分模块；

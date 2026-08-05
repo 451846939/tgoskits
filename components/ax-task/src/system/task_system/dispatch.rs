@@ -628,7 +628,11 @@ impl TaskSystem {
         if cpu.dispatch_state().current_dispatch.is_none() {
             return Ok(());
         }
-        let _charge = cpu.as_mut().settle_current_dispatch(now_ns, 0)?;
+        let _charge = cpu.as_mut().settle_current_dispatch(
+            now_ns,
+            0,
+            self.root_domain.deadline_extra_bw_scaled(),
+        )?;
         let Some(mut dispatch) = cpu.as_mut().take_dispatch() else {
             return Ok(());
         };

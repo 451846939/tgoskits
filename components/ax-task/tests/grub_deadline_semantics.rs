@@ -8,6 +8,36 @@ use ax_task::{
 mod support;
 
 #[test]
+fn reclaim_includes_unreserved_root_domain_bandwidth() {
+    let (system, mut cpu) = online_system();
+    let reclaimer = ready_deadline(&system, 500, 1_000, 1_000, DeadlineFlags::RECLAIM);
+    system.enqueue(cpu.as_mut(), reclaimer.id(), 0).unwrap();
+    assert_eq!(
+        system.schedule(cpu.as_mut(), 0).unwrap().next(),
+        reclaimer.id()
+    );
+
+    assert!(
+        !system
+            .charge_current(cpu.as_mut(), 100, 100, 0)
+            .unwrap()
+            .slice_expired()
+    );
+    assert_eq!(
+        system.schedule(cpu.as_mut(), 100).unwrap().next(),
+        reclaimer.id()
+    );
+    assert_eq!(
+        system
+            .deadline_runtime(reclaimer.id())
+            .unwrap()
+            .remaining_runtime_ns(),
+        447,
+        "GRUB must include the root domain's unreserved capacity in Uextra"
+    );
+}
+
+#[test]
 fn reclaim_starts_only_after_the_blocked_reservation_zero_lag_time() {
     let (system, mut cpu) = online_system();
     let donor = ready_deadline(&system, 4, 8, 8, DeadlineFlags::NONE);

@@ -50,7 +50,11 @@ impl TaskSystem {
             let exited_core = Arc::clone(&record.core);
             drop(sched);
             state.queue_exited_thread(thread);
-            state.release_deadline_reservation_on_exit(thread)?;
+            let mut root_domain = self.root_domain.lock();
+            state.release_deadline_reservation_on_exit(
+                &mut root_domain.deadline_admission,
+                thread,
+            )?;
             exited_core
         };
         exited_core.notify_affinity_waiters();
@@ -100,7 +104,8 @@ impl TaskSystem {
         }
         let record = {
             let mut state = self.state.lock();
-            state.remove_exited_thread(thread)?
+            let mut root_domain = self.root_domain.lock();
+            state.remove_exited_thread(&mut root_domain.deadline_admission, thread)?
         };
         self.release_thread_record(record);
         Ok(())
@@ -117,7 +122,10 @@ impl TaskSystem {
         }
         let record = {
             let mut state = self.state.lock();
-            match state.remove_exited_thread_with_handle(&handle) {
+            let mut root_domain = self.root_domain.lock();
+            match state
+                .remove_exited_thread_with_handle(&mut root_domain.deadline_admission, &handle)
+            {
                 Ok(record) => record,
                 Err(error) => return Err(OwnedThreadReapError::new(error, handle)),
             }
@@ -146,7 +154,8 @@ impl TaskSystem {
         while reaped < limit {
             let record = {
                 let mut state = self.state.lock();
-                state.take_unreferenced_exited()?
+                let mut root_domain = self.root_domain.lock();
+                state.take_unreferenced_exited(&mut root_domain.deadline_admission)?
             };
             let Some(record) = record else {
                 break;
