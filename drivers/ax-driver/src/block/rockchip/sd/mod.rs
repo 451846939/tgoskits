@@ -29,12 +29,12 @@ use sdmmc_protocol::{
     sdio::{card::SdioSdmmc, init::CardInitPreference},
 };
 
-use super::clock::enable_node_clocks;
+use super::clock::{ScmiClockOps, enable_node_clocks};
 use crate::{block::ProbeFdtBlock, mmio::iomap, soc::RockchipFdtPinctrlParser};
 
 const DWMMC_STABLE_REFERENCE_CLOCK: u32 = 50_000_000;
 const ROCKCHIP_DWMMC_CLKGEN_DIV: u32 = 2;
-const ENABLE_SD_SPEED_SELECTION: bool = true;
+const ENABLE_SD_SPEED_SELECTION: bool = false;
 const RK3588_CRU_BASE: usize = 0xfd7c_0000;
 const RK3588_CRU_SIZE: usize = 0x5c000;
 const RK3588_SDMMC_CON0: usize = 0x0c30;
@@ -43,8 +43,9 @@ const RK3588_SDMMC_PHASE_SHIFT: u32 = 1;
 const RK3588_SDMMC_DRV_PHASE_DEG: u32 = 90;
 const RK3588_SDMMC_SAMPLE_PHASE_DEG: u32 = 0;
 
-struct RockchipDwMmcClock {
-    clock: ClockLine,
+enum RockchipDwMmcClock {
+    Rdrive(ClockLine),
+    Scmi(ScmiClockOps),
 }
 
 struct DwMmcClockSetup {
@@ -58,13 +59,24 @@ impl HostClock for RockchipDwMmcClock {
             return Err(Error::InvalidArgument);
         }
         let cclkin = u64::from(target_hz) * u64::from(ROCKCHIP_DWMMC_CLKGEN_DIV);
-        self.clock
-            .set_rate(cclkin)
-            .map_err(|_| Error::BadResponse(ErrorContext::new(Phase::Init)))?;
-        let rate = self
-            .clock
-            .rate()
-            .map_err(|_| Error::BadResponse(ErrorContext::new(Phase::Init)))?;
+        let rate = match self {
+            Self::Rdrive(clock) => {
+                clock
+                    .set_rate(cclkin)
+                    .map_err(|_| Error::BadResponse(ErrorContext::new(Phase::Init)))?;
+                clock
+                    .rate()
+                    .map_err(|_| Error::BadResponse(ErrorContext::new(Phase::Init)))?
+            }
+            Self::Scmi(clock) => {
+                clock
+                    .set_rate(cclkin)
+                    .ok_or_else(|| Error::BadResponse(ErrorContext::new(Phase::Init)))?;
+                clock
+                    .rate()
+                    .ok_or_else(|| Error::BadResponse(ErrorContext::new(Phase::Init)))?
+            }
+        };
         let bus_hz = rate / u64::from(ROCKCHIP_DWMMC_CLKGEN_DIV);
         let bus_hz = validate_bus_clock(bus_hz)?;
         info!(
@@ -269,12 +281,40 @@ fn card_init_preference(info: &FdtInfo<'_>) -> CardInitPreference {
 }
 
 fn dwmmc_clock_setup(info: &FdtInfo<'_>) -> Result<Option<DwMmcClockSetup>, OnProbeError> {
-    let Some(clock) = info.find_clock_line_by_name("ciu")? else {
-        warn!("[{}] ciu clock provider is not available", info.node.name());
+    let Some(clock_ref) = info.find_clk_by_name("ciu") else {
+        warn!(
+            "[{}] ciu clock provider is not available through CRU or SCMI",
+            info.node.name()
+        );
         return Ok(None);
     };
-    clock.set_rate(DWMMC_STABLE_REFERENCE_CLOCK as u64)?;
-    let rate = clock.rate()?;
+    let clock = match ScmiClockOps::from_ref(info, &clock_ref) {
+        Some(clock) => RockchipDwMmcClock::Scmi(clock),
+        None => RockchipDwMmcClock::Rdrive(info.clock_line(&clock_ref)?),
+    };
+    let rate = match &clock {
+        RockchipDwMmcClock::Rdrive(clock) => {
+            clock.set_rate(DWMMC_STABLE_REFERENCE_CLOCK as u64)?;
+            clock.rate()?
+        }
+        RockchipDwMmcClock::Scmi(clock) => {
+            clock
+                .set_rate(DWMMC_STABLE_REFERENCE_CLOCK as u64)
+                .ok_or_else(|| {
+                    OnProbeError::other(format!(
+                        "[{}] failed to set SCMI ciu clock to {} Hz",
+                        info.node.name(),
+                        DWMMC_STABLE_REFERENCE_CLOCK
+                    ))
+                })?;
+            clock.rate().ok_or_else(|| {
+                OnProbeError::other(format!(
+                    "[{}] failed to read SCMI ciu clock rate",
+                    info.node.name()
+                ))
+            })?
+        }
+    };
     let reference_clock = validate_reference_clock(info, rate).ok_or_else(|| {
         OnProbeError::other(format!(
             "[{}] invalid ciu clock rate {rate} Hz",
@@ -283,7 +323,7 @@ fn dwmmc_clock_setup(info: &FdtInfo<'_>) -> Result<Option<DwMmcClockSetup>, OnPr
     })?;
     Ok(Some(DwMmcClockSetup {
         reference_clock,
-        clock: RockchipDwMmcClock { clock },
+        clock,
     }))
 }
 
