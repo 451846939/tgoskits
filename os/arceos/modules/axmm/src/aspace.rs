@@ -3,7 +3,7 @@ use core::fmt;
 use ax_errno::{AxError, AxResult, ax_err};
 use ax_hal::{
     mem::phys_to_virt,
-    paging::{MappingFlags, PageTable},
+    paging::{MappingFlags, PageTable, PagingAllocator},
     trap::PageFaultFlags,
 };
 use ax_memory_addr::{
@@ -12,6 +12,23 @@ use ax_memory_addr::{
 use ax_memory_set::{MemoryArea, MemorySet};
 
 use crate::backend::Backend;
+
+fn mapping_flags_from_fault(access_flags: PageFaultFlags) -> MappingFlags {
+    let mut flags = MappingFlags::empty();
+    if access_flags.contains(PageFaultFlags::READ) {
+        flags |= MappingFlags::READ;
+    }
+    if access_flags.contains(PageFaultFlags::WRITE) {
+        flags |= MappingFlags::WRITE;
+    }
+    if access_flags.contains(PageFaultFlags::EXECUTE) {
+        flags |= MappingFlags::EXECUTE;
+    }
+    if access_flags.contains(PageFaultFlags::USER) {
+        flags |= MappingFlags::USER;
+    }
+    flags
+}
 
 /// The virtual memory address space.
 pub struct AddrSpace {
@@ -57,7 +74,7 @@ impl AddrSpace {
         Ok(Self {
             va_range: VirtAddrRange::from_start_size(base, size),
             areas: MemorySet::new(),
-            pt: PageTable::try_new().map_err(|_| AxError::NoMemory)?,
+            pt: PageTable::new(PagingAllocator).map_err(|_| AxError::NoMemory)?,
         })
     }
 
@@ -74,8 +91,8 @@ impl AddrSpace {
             return ax_err!(InvalidInput, "address space overlap");
         }
         self.pt
-            .cursor()
-            .copy_from(&other.pt, other.base(), other.size());
+            .copy_from(&other.pt, other.base(), other.size())
+            .map_err(|_| AxError::BadState)?;
         Ok(())
     }
 
@@ -261,7 +278,6 @@ impl AddrSpace {
 
         // TODO
         self.pt
-            .cursor()
             .protect_region(start, size, flags)
             .map_err(|_| AxError::BadState)?;
         Ok(())
@@ -315,6 +331,7 @@ impl AddrSpace {
         if !self.va_range.contains(vaddr) {
             return false;
         }
+        let access_flags = mapping_flags_from_fault(access_flags);
         if let Some(area) = self.areas.find(vaddr) {
             let orig_flags = area.flags();
             if orig_flags.contains(access_flags) {

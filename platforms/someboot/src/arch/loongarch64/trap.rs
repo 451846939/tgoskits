@@ -118,21 +118,21 @@ impl IrqId {
 
     /// 获取中断类型及硬件中断号
     pub fn kind(&self) -> IrqKind {
-        if self.raw() < EXCCODE_INT_NUM {
-            IrqKind::Private(self.raw())
+        if self.as_usize() < EXCCODE_INT_NUM {
+            IrqKind::Private(self.as_usize())
         } else {
-            IrqKind::External(self.raw() - EXCCODE_INT_NUM)
+            IrqKind::External(self.as_usize() - EXCCODE_INT_NUM)
         }
     }
 
     /// 检查是否为定时器中断
     pub fn is_timer(&self) -> bool {
-        self.raw() == cpuintc::TI as usize
+        self.as_usize() == cpuintc::TI as usize
     }
 
     /// 检查是否为 IPI 中断
     pub fn is_ipi(&self) -> bool {
-        self.raw() == cpuintc::IPI as usize
+        self.as_usize() == cpuintc::IPI as usize
     }
 }
 

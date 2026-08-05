@@ -1,6 +1,6 @@
 use crate::{
-    FrameAllocator, PageTableEntry, PagingError, PagingResult, PhysAddr, PteConfig, TableMeta,
-    VirtAddr,
+    FrameAllocator, MappingFlags, PageSize, PageTableEntry, PagingError, PagingResult, PhysAddr,
+    PteConfig, TableMeta, VirtAddr,
 };
 
 /// 页表帧，代表一个物理页面上的页表
@@ -15,7 +15,7 @@ pub struct Frame<T: TableMeta, A: FrameAllocator> {
 impl<T: TableMeta, A: FrameAllocator> core::fmt::Debug for Frame<T, A> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Frame")
-            .field("paddr", &format_args!("{:#x}", self.paddr.raw()))
+            .field("paddr", &format_args!("{:#x}", self.paddr.as_usize()))
             .finish()
     }
 }
@@ -165,7 +165,63 @@ where
         let level_index_bits = T::LEVEL_BITS[total_levels - level];
         let mask = (1 << level_index_bits) - 1;
 
-        (vaddr.raw() >> shift) & mask
+        (vaddr.as_usize() >> shift) & mask
+    }
+
+    pub fn page_size_from_level(level: usize) -> PageSize {
+        match Self::level_size(level) {
+            0x1000 => PageSize::Size4K,
+            0x10_0000 => PageSize::Size1M,
+            0x20_0000 => PageSize::Size2M,
+            0x4000_0000 => PageSize::Size1G,
+            _ => PageSize::Size4K,
+        }
+    }
+
+    pub fn protect_recursive(
+        &mut self,
+        vaddr: VirtAddr,
+        flags: MappingFlags,
+        level: usize,
+    ) -> PagingResult<PageSize> {
+        let index = Self::virt_to_index(vaddr, level);
+        let config = self.as_slice()[index].to_config(level > 1);
+        if !config.valid {
+            return Err(PagingError::not_mapped());
+        }
+        if config.huge || level == 1 {
+            self.as_slice_mut()[index] =
+                T::P::from_config(PteConfig::page(config.paddr, flags, config.huge));
+            return Ok(Self::page_size_from_level(level));
+        }
+
+        let mut child = Self::from_paddr(config.paddr, self.allocator.clone());
+        child.protect_recursive(vaddr, flags, level - 1)
+    }
+
+    pub fn remap_recursive(
+        &mut self,
+        vaddr: VirtAddr,
+        paddr: PhysAddr,
+        flags: MappingFlags,
+        level: usize,
+    ) -> PagingResult<PageSize> {
+        let index = Self::virt_to_index(vaddr, level);
+        let config = self.as_slice()[index].to_config(level > 1);
+        if !config.valid {
+            return Err(PagingError::not_mapped());
+        }
+        if config.huge || level == 1 {
+            let page_size = Self::page_size_from_level(level);
+            let aligned_paddr =
+                PhysAddr::from_usize(paddr.as_usize() & !(usize::from(page_size) - 1));
+            self.as_slice_mut()[index] =
+                T::P::from_config(PteConfig::page(aligned_paddr, flags, config.huge));
+            return Ok(page_size);
+        }
+
+        let mut child = Self::from_paddr(config.paddr, self.allocator.clone());
+        child.remap_recursive(vaddr, paddr, flags, level - 1)
     }
 
     /// 重建完整的虚拟地址
@@ -218,7 +274,7 @@ where
                     let config = entries[i].to_config(level > 1);
                     (config.valid, config.huge, config.paddr)
                 } else {
-                    (false, false, crate::PhysAddr::new(0))
+                    (false, false, crate::PhysAddr::from_usize(0))
                 }
             };
 

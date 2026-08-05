@@ -63,7 +63,7 @@ impl<'a, T: TableMeta, A: FrameAllocator> PageTableWalker<'a, T, A> {
                 frame: page_table.root.clone(),
                 level: Frame::<T, A>::PT_LEVEL,
                 index: 0,
-                base_vaddr: VirtAddr::new(0),
+                base_vaddr: VirtAddr::from_usize(0),
             };
             walker.stack.push(root_state).ok(); // 栈容量足够时一定成功
         } else {

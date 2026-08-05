@@ -16,6 +16,16 @@ pub use walk::*;
 
 pub type PagingResult<T = ()> = Result<T, PagingError>;
 
+#[cfg(feature = "ax-errno")]
+impl From<PagingError> for ax_errno::AxErrorKind {
+    fn from(value: PagingError) -> Self {
+        match value {
+            PagingError::NoMemory => ax_errno::AxErrorKind::NoMemory,
+            _ => ax_errno::AxErrorKind::InvalidInput,
+        }
+    }
+}
+
 pub trait FrameAllocator: Clone + Sync + Send + 'static {
     fn alloc_frame(&self) -> Option<PhysAddr>;
 
@@ -37,7 +47,7 @@ pub trait FrameAllocator: Clone + Sync + Send + 'static {
             return;
         }
         for i in 0..frames {
-            self.dealloc_frame(PhysAddr::new(start.raw() + i * frame_size));
+            self.dealloc_frame(PhysAddr::from_usize(start.as_usize() + i * frame_size));
         }
     }
 }
