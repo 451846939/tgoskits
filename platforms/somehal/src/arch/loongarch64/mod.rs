@@ -13,6 +13,8 @@ mod liointc;
 mod liointc_cpu_interface;
 mod pch_pic;
 
+use ipi_command::runtime_ipi_send_value;
+
 use crate::irq_routing::{RawIrq, classify_cpu_irq, cpu_local_hwirq_is_runtime_irq};
 
 pub struct Plat;
@@ -24,7 +26,6 @@ const IOCSR_IPI_SEND: usize = 0x1040;
 
 const EIOINTC_IRQ: usize = 3;
 const IPI_IRQ: usize = 12;
-const IPI_VECTOR: u32 = 0;
 
 fn cpu_local_irq(raw: usize) -> IrqId {
     IrqId::new(CPU_LOCAL_IRQ_DOMAIN, HwIrq(raw as u32))

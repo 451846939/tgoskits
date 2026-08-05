@@ -1815,6 +1815,21 @@ root-domain bandwidth owner，再调整 rq class 生命周期。owner-side RT pu
 generation-bearing doorbell；Linux `RT_PUSH_IPI` 同样以 root-domain irq-work 避免 wake 路径
 同步持有任意两个 rq 锁，因此不采纳“waker 无条件同步双 rq push”的建议。
 
+### 2026-08-05 LoongArch IPI 提交语义
+
+远端 CI 在 LoongArch ArceOS `task-ipi` callback burst 中超时，而当前 head 的单例通常通过。
+对照 Linux v7.1 `arch/loongarch/kernel/smp.c::ipi_write_action()` 后确认，Linux 每次写
+`IOCSR_IPI_SEND` 都设置 `IOCSR_IPI_SEND_BLOCKING`；该位只等待共享 send transport 接受命令，
+不等待目标 CPU 执行 handler。somehal 原实现明确用非 blocking command，在多个 producer
+快速写同一发送寄存器时可能丢掉软件队列发布后的最后一个物理边沿，因此恢复 IPI 能让队列
+突然继续推进。
+
+LoongArch command 编码现已拆为可在 host 运行的纯值模型。确定性旧红测精确断言 runtime
+command 的 blocking 位原为 0，修复后为 1；目标 `task-ipi` 随后在 4 vCPU LoongArch QEMU
+连续 10/10 正式通过。该修复不改变 scheduler doorbell 的 generation/claim/drain 协议，也
+不把远程 wake 改成同步回调。现有 `ax-ipi` safe boxed callback 仍会在 hard IRQ 执行和析构，
+其 typed hard-IPI 与 task-deferred endpoint 拆分作为独立下一阶段，不能用本次寄存器修复掩盖。
+
 ## 模块化结果
 
 - `TaskSystem` orchestration 只负责编排，registry/reap、placement、owner scheduling、deadline、PI、balance、deferred work 分模块；
