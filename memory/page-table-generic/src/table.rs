@@ -10,6 +10,8 @@ use crate::{
     walk::{PageTableWalker, WalkConfig},
 };
 
+const TARGETED_FLUSH_LIMIT: usize = 32;
+
 pub struct PageTable<T: TableMeta, A: FrameAllocator> {
     inner: PageTableRef<T, A>,
     #[cfg(feature = "copy-from")]
@@ -190,6 +192,7 @@ impl<T: TableMeta, A: FrameAllocator> PageTableRef<T, A> {
     }
 
     /// Maps a contiguous virtual region, choosing large pages when possible.
+    /// TLB invalidation is deferred and batched until the region has been updated.
     pub fn map_region(
         &mut self,
         start_vaddr: VirtAddr,
@@ -210,15 +213,46 @@ impl<T: TableMeta, A: FrameAllocator> PageTableRef<T, A> {
         }
 
         let mut offset = 0;
-        while offset < size {
+        let mut flush_addrs = heapless::Vec::<VirtAddr, TARGETED_FLUSH_LIMIT>::new();
+        let mut full_flush = false;
+        let result = loop {
+            if offset >= size {
+                break Ok(());
+            }
             let vaddr = start_vaddr + offset;
             let paddr = get_paddr(vaddr);
             let remaining = size - offset;
             let page_size = largest_page_size::<T, A>(vaddr, paddr, remaining, allow_huge);
-            self.map_page(vaddr, paddr, page_size, flags)?;
-            offset += usize::from(page_size);
+            let page_bytes = usize::from(page_size);
+            if let Err(err) = self.map(&MapConfig {
+                vaddr: align_vaddr_down(vaddr, page_bytes),
+                paddr: align_paddr_down(paddr, page_bytes),
+                size: page_bytes,
+                pte: PteConfig::page(
+                    align_paddr_down(paddr, page_bytes),
+                    flags,
+                    page_size.is_huge(),
+                ),
+                allow_huge: page_size.is_huge(),
+                flush: false,
+            }) {
+                break Err(err);
+            }
+            if !full_flush && flush_addrs.push(vaddr).is_err() {
+                full_flush = true;
+                flush_addrs.clear();
+            }
+            offset += page_bytes;
+        };
+
+        if full_flush {
+            T::flush(None);
+        } else {
+            for vaddr in flush_addrs {
+                T::flush(Some(vaddr));
+            }
         }
-        Ok(())
+        result
     }
 
     /// Unmaps one page and returns its physical address, flags, and page size.
