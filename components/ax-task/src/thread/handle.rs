@@ -887,7 +887,7 @@ impl ThreadCore {
         }
     }
 
-    fn effective_scheduling_urgency(&self) -> SchedulingUrgency {
+    pub(crate) fn effective_scheduling_urgency(&self) -> SchedulingUrgency {
         let key = self.effective_scheduling_key();
         SchedulingUrgency::new(key.class_rank(), key.primary())
     }

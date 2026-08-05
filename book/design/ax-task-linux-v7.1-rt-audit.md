@@ -172,7 +172,7 @@ USB/vsock 控制器协议属于外围驱动；除非它们违反上述调度交�
 | --- | --- | --- | --- |
 | placement | `try_to_wake_up()`、rq locking | rq 独占 queued/running，CPU switch baton 独占 outgoing stack | 已删除 `target_cpu` CPU 身份双真相和 task 级 `SwitchingOut/ExitedAwaitingTail`；线程只保存最终 rq/migration placement 与独立 `on_cpu` 发布位，outgoing stack 生命周期唯一归 per-CPU `SwitchHandoff` |
 | Fair/EEVDF | `avg_vruntime()`、`place_entity()`、`pick_eevdf()` | 唯一加权平均 V；sleep/migration 保存 `vlag`；eligible current 保留请求保护 | 已删除旧 wakeup granularity 与重复单调 V，迁移使用 detach 事务 |
-| RT/DL 选核 | `cpupri`、`cpudl`、`RT_PUSH_IPI` | 优先级与 load 正交；DL runnable CPU 属于 cpupri HIGHER；只有可迁移候选才能发布 overload | root-domain cpupri/cpudl 已接入 wake placement；cpupri 包含 101 个桶，DL current/queued 发布 HIGHER；pushable summary 随 affinity generation 更新，不可迁移 RT/DL 不触发 owner balance doorbell |
+| RT/DL 选核 | `cpupri`、`cpudl`、`rto_mask/rto_count`、`dlo_mask/dlo_count`、`RT_PUSH_IPI` | 优先级与 load 正交；DL runnable CPU 属于 cpupri HIGHER；只有可迁移候选才能发布 overload；优先级下降启动单一 root-domain push iterator | root-domain cpupri/cpudl 已接入 wake placement；cpupri 包含 101 个桶，DL current/queued 发布 HIGHER；pushable membership 在 rq 事务内直接发布 RT/DL overload mask/count；priority-drop 通过 generation-bearing root-domain iterator 串行通知 owner，不广播 IPI |
 | 远程投递 | `try_to_wake_up()`、`ttwu_queue()`、`resched_curr()`、`irq_work_claim()` | PREEMPT_RT 关闭 `TTWU_QUEUE`，waker 直接锁目标 rq 激活；仅实际需要抢占时发送 reschedule IPI；IPI claim 必须先于 callback/drain | 已删除 task-level remote-wake inbox；migration/control 继续使用 typed owner inbox；runtime 门铃改为 generation + physical edge ownership，coalescing 只返回成功，不再把 `Busy` 暴露为模糊的 transport 状态 |
 | CPU 生命周期 | `sched_cpu_deactivate()`、`dl_bw_deactivate()`、`sched_cpu_dying()` | 先验证剩余 Deadline capacity，再关 placement、drain producer，最后 offline | `Online/Inactive/Draining/Offline` 已实现；Deadline 过量预留会在 topology mutation 前拒绝 CPU down |
 | active mm | `exit_mm()`、`context_switch()`、`enter_lazy_tlb()`、`finish_task_switch()` | task-mm 所有权在 zombie 前解除；lazy CPU carrier 与页表根存储保留到最后 CPU lease | move-only token + task detach + per-CPU active lease 已实现 |
@@ -1831,10 +1831,10 @@ review 中其余建议按所有权依赖处理：GRUB `extra_bw` 与跨 CPU runt
 独立 root-domain bandwidth owner，不能只加一个永远为零的 per-rq 字段；blocked DL 在
 zero-lag 前保留 `bandwidth_cpu` 与 Linux non-contending 语义一致，不是现有正确性缺陷。
 RT/DL push 继续使用 generation-bearing owner doorbell，不改成 waker 同时持两个 rq lock；
-Linux 的 `RT_PUSH_IPI` 同样通过 root-domain IRQ work 避免跨 rq 锁风暴。后续若延迟仍不达标，
-应在该 owner 模型上补 `need_pull_rt_task`、equal-priority preemption 与 topology/capacity 选择，
-而不是恢复旧 wake inbox 或同步双 rq 兼容路径。本节尚无新的端到端性能数据，不据此声称已经
-达到 Linux PREEMPT_RT 水平。
+Linux 的 `RT_PUSH_IPI` 同样通过 root-domain IRQ work 避免跨 rq 锁风暴。后续检查点已经补齐
+`need_pull_rt_task()` 等价的 priority-drop 触发、`rto/dlo` overload 索引和单一 root-domain
+push iterator；不能恢复旧 wake inbox、同步双 rq 或逐 overload CPU 广播的兼容路径。本节尚无
+新的端到端性能数据，不据此声称已经达到 Linux PREEMPT_RT 水平。
 
 ### 2026-08-05 逻辑期限、物理 clockevent 与绝对睡眠
 
@@ -1871,9 +1871,10 @@ timer 组合，未以放宽 ABI 断言换取通过。
 本轮 review 的 N1(cpupri HIGHER)、C5(不可迁移 overload) 与 running dispatch 已由上一检查点
 完成。GRUB `extra_bw`、root-domain runtime borrowing 和 running 留队模型仍是下一阶段的调度
 架构工作；它们不会通过在现有 per-rq 字段旁增加兼容镜像来实现，而会先建立唯一
-root-domain bandwidth owner，再调整 rq class 生命周期。owner-side RT push 保留
-generation-bearing doorbell；Linux `RT_PUSH_IPI` 同样以 root-domain irq-work 避免 wake 路径
-同步持有任意两个 rq 锁，因此不采纳“waker 无条件同步双 rq push”的建议。
+root-domain bandwidth owner，再调整 rq class 生命周期。owner-side RT/DL push 保留
+generation-bearing doorbell；后续检查点已按 Linux `RT_PUSH_IPI` 增加单一 root-domain
+iterator，避免 wake 路径同步持有任意两个 rq 锁，也避免逐 overload CPU 广播，因此不采纳
+“waker 无条件同步双 rq push”的建议。
 
 ### 2026-08-05 LoongArch IPI 提交语义
 
@@ -2037,6 +2038,53 @@ blocked task 在 CPU offline 后保留旧 `task_cpu` 但更新 wake hint。
 检查点验证还包括 `cargo xtask clippy --package ax-task` 的 base/qperf 两项，以及
 `cargo xtask clippy --package starry-kernel` 的 26 项 feature/configuration matrix，全部通过。
 本检查点没有启动 QEMU，不能把编译与最低层行为测试描述为四架构运行结果。
+
+### 2026-08-05 root-domain overload 与串行 push iterator
+
+再次完整对照 Linux v7.1 `kernel/sched/rt.c::rt_set_overload()`、
+`rt_clear_overload()`、`need_pull_rt_task()`、`tell_cpu_to_push()`、
+`rto_push_irq_work_func()`，以及 `kernel/sched/deadline.c::dl_set_overload()`、
+`dl_clear_overload()`、`deadline_queue_push_tasks()` 后，确认上一实现虽然已经有 cpupri/cpudl，
+但仍缺少 Linux 决定“哪些源 rq 需要 push”的另一组 root-domain 权威事实。旧代码从
+`CpuLoadSummary::{workload, pushable_class}` 重新推导 overload；当目标 CPU 从高优先级 RT/DL
+任务切换到较低优先级任务时，也没有 `need_pull_*` 等价触发。结果是源 rq 上已经排队的
+RT/DL 任务只能等待下一次偶然 enqueue、tick 或 idle pull。
+
+当前实现直接采用 Linux 的所有权划分：
+
+- 每个 rq 的 `PushableIndex` 在同一 rq 锁事务内维护 Deadline、RT class membership count；
+  running entity 不在 pushable index，单 CPU affinity entity 也不会进入。root-domain 由此发布
+  独立的 `dlo_mask/dlo_count` 与 `rto_mask/rto_count`，不再从 load summary 建立第二真相；
+- set 路径先 Release 发布 mask bit，再发布 count；clear 路径先减少 count，再清 bit。读取者只有
+  观察到非零 count 才扫描 mask，对应 Linux `smp_wmb()` 与 pull-side `smp_rmb()` 的可见性契约；
+- owner selection 同时保存 previous/next 的 `SchedulingUrgency`，只比较 class 与 class-local
+  priority/deadline，不把 ThreadId、arrival sequence 等队列 tie-break 误判成优先级下降；
+- 真正发生 RT/DL priority drop 时只增加 root-domain `requested_generation`。一个
+  `Idle / Published(cpu) / Claimed(cpu)` iterator 保存 `scan_generation` 与 cursor，同一时刻只给
+  一个 overload owner 发布 scheduler doorbell；owner claim 后在自己的 rq/safe point 内 push，
+  完成再交给下一 owner。扫描期间的新请求只推进 generation，本轮结束后重扫，等价于 Linux
+  `rto_loop_next/rto_loop/rto_cpu`，不会形成逐 CPU IPI storm；
+- ax-task 的迁移事务要求源 rq owner 独占 intrusive node 与 publication lease，所以 RT 和 DL
+  共用这条 root-domain owner iterator。它对应 Linux RT 的 irq-work 扫描所有权，并保留 Linux
+  DL 的独立 `dlo` membership；没有退回 target CPU 同步锁多个 rq 的第二迁移协议；
+- 每个 safe point 最多提交一次跨 rq 迁移。若迁移成功且源仍 overload，iterator 保留该 source
+  并重新发布本地 owner work；若没有可迁移目标则交给下一 source。这样保持 owner callback 有界，
+  同时具备 Linux `push_rt_tasks()/push_dl_tasks()` 的“只要持续取得进展就继续”语义。
+
+审计还发现 scheduler doorbell 原先只设置通用 work bit；若当前任务无需被抢占，
+`schedule_if_requested()` 会直接返回，根本不执行 rq balance callback。新实现把 callback service
+放入无切换 safe point：先同步 running dispatch 和 root-domain publication，再 claim iterator，
+最后决定是否需要下一 generation。调度选择和资源 switch tail 仍不因 balance callback 被伪造为
+一次上下文切换。
+
+两个确定性红测分别固定旧失败：CPU1 从 RT50 降到 Fair 后，CPU0 的 RT10 永远没有 owner
+doorbell；两个 overload source 同时存在时，旧 fan-out 一次发送 2 个 IPI。新实现前一测先观察
+到 1 个 serialized owner edge，并在 CPU0 无切换 safe point 提交到 CPU1 的 migration；后一测
+首次只发送 1 个 IPI，CPU0 完成后才把下一 generation 交给 CPU2。该检查点尚未重跑 x86_64
+完整 Starry QEMU 或 Linux RT wake-latency 对比，不能据最低层红绿测试声称端到端性能已经对齐。
+当前 `cargo test -p ax-task --quiet` 的 336 个 unit、21 个 loom 及全部 integration/doc test，
+`cargo xtask clippy --package ax-task` 的 2 项和 `cargo xtask clippy --package ax-runtime` 的
+27 项 feature/configuration matrix 均通过。
 
 ## 模块化结果
 

@@ -375,6 +375,10 @@ impl TaskSystem {
         if previous_core.is_some() && !switch_requested {
             self.sync_owner_current_dispatch(cpu.as_mut())?;
             self.publish_owner_cpu_load_summary(cpu.as_mut());
+            let current = previous.expect("a current core must retain its thread identity");
+            if self.owner_balance_work_pending(cpu.as_ref().get_ref(), current) {
+                self.service_owner_balance(cpu.as_mut(), current)?;
+            }
             // `scheduler_enter` consumed the sticky entry request, but a
             // bounded inbox drain may have left another batch behind. Preserve
             // that work (and any request produced by Deadline servicing) for

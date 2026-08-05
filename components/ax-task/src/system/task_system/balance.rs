@@ -137,13 +137,32 @@ impl TaskSystem {
         // the owner-side balance pass revalidates the topology before moving a
         // thread.
         self.online_count.load(Ordering::Acquire) > 1
-            && remote.try_load_summary().is_some_and(|summary| {
-                summary.is_overloaded()
-                    && matches!(
-                        summary.pushable_class(),
-                        Some(SchedulingClass::Deadline | SchedulingClass::Realtime)
-                    )
-            })
+            && self
+                .root_domain
+                .cpu_has_rt_deadline_overload(remote.owner())
+    }
+
+    /// Mirrors Linux `need_pull_rt_task()`/`need_pull_dl_task()` followed by
+    /// `tell_cpu_to_push()`: when this rq installs a less urgent task, start
+    /// the root-domain push iterator. The iterator serializes delivery across
+    /// overloaded rq owners instead of broadcasting one IPI per source.
+    pub(super) fn notify_overloaded_owners_after_priority_drop(
+        &self,
+        owner: CpuId,
+        previous: Option<SchedulingUrgency>,
+        next: SchedulingUrgency,
+    ) {
+        let Some(previous) = previous else {
+            return;
+        };
+        if !matches!(
+            previous.class_rank(),
+            DEADLINE_CLASS_RANK | REALTIME_CLASS_RANK
+        ) || next <= previous
+        {
+            return;
+        }
+        self.root_domain.request_rt_deadline_push(owner);
     }
 
     fn select_owner_balance_transfer_by(
@@ -422,13 +441,8 @@ impl TaskSystem {
         if cpu.idle() == Some(next) || cpu.fair_balance_pending() {
             return true;
         }
-        cpu.try_load_summary().is_some_and(|summary| {
-            summary.is_overloaded()
-                && matches!(
-                    summary.pushable_class(),
-                    Some(SchedulingClass::Deadline | SchedulingClass::Realtime)
-                )
-        })
+        self.root_domain.cpu_has_rt_deadline_overload(cpu.owner())
+            || self.root_domain.push_target_pending(cpu.owner())
     }
 
     pub(super) fn service_owner_balance(
@@ -438,12 +452,36 @@ impl TaskSystem {
     ) -> Result<(), TaskError> {
         #[cfg(test)]
         OWNER_BALANCE_PASSES.set(OWNER_BALANCE_PASSES.get().saturating_add(1));
-        if cpu.idle() == Some(next) {
-            let _requested = self.request_idle_pull(cpu.as_ref())?;
-            let _fair = self.balance_fair(cpu.as_mut())?;
-        } else {
-            let _pushed = self.push_overloaded_from_published_summary(cpu.as_mut())?;
-            let _fair = self.balance_fair(cpu.as_mut())?;
+        let push_claim = self.root_domain.claim_rt_deadline_push(cpu.owner());
+        let balance = (|| -> Result<Option<ThreadId>, TaskError> {
+            if cpu.idle() == Some(next) {
+                let _requested = self.request_idle_pull(cpu.as_ref())?;
+                let _fair = self.balance_fair(cpu.as_mut())?;
+                Ok(None)
+            } else {
+                let pushed = self.push_overloaded_from_published_summary(cpu.as_mut())?;
+                let _fair = self.balance_fair(cpu.as_mut())?;
+                Ok(pushed)
+            }
+        })();
+        let pushed = match balance {
+            Ok(pushed) => pushed,
+            Err(error) => {
+                if let Some(claim) = push_claim {
+                    self.root_domain.finish_rt_deadline_push(claim, false);
+                }
+                return Err(error);
+            }
+        };
+        if let Some(claim) = push_claim {
+            self.root_domain
+                .finish_rt_deadline_push(claim, pushed.is_some());
+        } else if pushed.is_some() && self.root_domain.cpu_has_rt_deadline_overload(cpu.owner()) {
+            // Linux `push_rt_tasks()`/`push_dl_tasks()` keep running the
+            // callback while a migration makes progress. Preserve that loop
+            // as another bounded owner safe point instead of monopolizing one
+            // scheduler entry.
+            cpu.request_scheduler_work();
         }
         Ok(())
     }

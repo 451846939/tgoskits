@@ -57,13 +57,14 @@ use crate::runtime::ExecutionContextHandle;
 #[cfg(feature = "qperf-metrics")]
 use crate::system::cpu::WakePreemptionDecision;
 use crate::{
-    CpuId, CpuLocal, CpuRemote, CpuRemotePublication, CpuSet, CpuSnapshot, DeadlineAdmission,
-    DeadlineBandwidthSnapshot, DeadlineEntity, EnqueueReason, FairMode, OwnedThreadSchedulerExit,
-    ParkCommit, ParkPrepare, ParkTicket, PiMutexRaw, PiWaitKey, PiWaitToken, PiWaitTree,
-    QueuedThread, SchedulePolicy, SchedulingClass, SchedulingEntity, SwitchReason, TaskError,
-    TaskSystemConfig, ThreadAffinityChange, ThreadCore, ThreadExtension, ThreadExtensionBorrow,
-    ThreadExtensionLease, ThreadExtensionView, ThreadHandle, ThreadId, ThreadResources,
-    ThreadRuntimeSnapshot, ThreadSpec, ThreadState, WakeResult,
+    CpuId, CpuLocal, CpuRemote, CpuRemotePublication, CpuSet, CpuSnapshot, DEADLINE_CLASS_RANK,
+    DeadlineAdmission, DeadlineBandwidthSnapshot, DeadlineEntity, EnqueueReason, FairMode,
+    OwnedThreadSchedulerExit, ParkCommit, ParkPrepare, ParkTicket, PiMutexRaw, PiWaitKey,
+    PiWaitToken, PiWaitTree, QueuedThread, REALTIME_CLASS_RANK, SchedulePolicy, SchedulingClass,
+    SchedulingEntity, SchedulingUrgency, SwitchReason, TaskError, TaskSystemConfig,
+    ThreadAffinityChange, ThreadCore, ThreadExtension, ThreadExtensionBorrow, ThreadExtensionLease,
+    ThreadExtensionView, ThreadHandle, ThreadId, ThreadResources, ThreadRuntimeSnapshot,
+    ThreadSpec, ThreadState, WakeResult,
     executor::CoroutineHeader,
     inbox::{InboxKind, InboxMessage, InboxOperation, PublishResult, SchedulerInbox},
     lock::{IrqScope, IrqTicketLock, PreemptTicketLock, SequenceCounter},

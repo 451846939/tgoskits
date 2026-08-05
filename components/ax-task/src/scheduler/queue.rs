@@ -11,8 +11,8 @@ use realtime::RealtimeRunQueue;
 
 use super::{fair_queue::FairRunQueue, virtual_before};
 use crate::{
-    FairEntity, FairMode, SchedulePolicy, SchedulingEntity, SchedulingKey, TaskError, ThreadCore,
-    ThreadId,
+    DEADLINE_CLASS_RANK, FairEntity, FairMode, REALTIME_CLASS_RANK, SchedulePolicy,
+    SchedulingEntity, SchedulingKey, TaskError, ThreadCore, ThreadId,
 };
 
 /// Scheduling-class linkage prepared with each thread, like Linux embedding
@@ -249,6 +249,7 @@ impl PushableSummary {
 struct PushableIndex {
     heap: Vec<Option<PushableSummary>>,
     positions: Vec<Option<(u32, usize)>>,
+    class_counts: [usize; 5],
     len: usize,
 }
 
@@ -257,8 +258,15 @@ impl PushableIndex {
         Self {
             heap: Vec::new(),
             positions: Vec::new(),
+            class_counts: [0; 5],
             len: 0,
         }
+    }
+
+    fn has_class(&self, class_rank: u8) -> bool {
+        self.class_counts
+            .get(class_rank as usize)
+            .is_some_and(|count| *count != 0)
     }
 
     fn prepare_thread_slot(&mut self, slot: usize) {
@@ -275,8 +283,11 @@ impl PushableIndex {
 
     fn insert(&mut self, summary: PushableSummary) {
         let slot = summary.thread.slot() as usize;
+        let class = summary.key.class_rank() as usize;
         assert!(
-            slot < self.positions.len() && self.len < self.heap.len(),
+            slot < self.positions.len()
+                && self.len < self.heap.len()
+                && class < self.class_counts.len(),
             "thread construction must prepare pushable index storage"
         );
         assert!(
@@ -286,6 +297,9 @@ impl PushableIndex {
             "one thread cannot own two pushable keys"
         );
         assert!(self.heap[self.len].replace(summary).is_none());
+        self.class_counts[class] = self.class_counts[class]
+            .checked_add(1)
+            .expect("pushable scheduler-class count must fit usize");
         self.len += 1;
         self.sift_up(self.len - 1);
     }
@@ -302,6 +316,10 @@ impl PushableIndex {
         let removed = self.heap[self.len]
             .take()
             .expect("pushable position must identify a heap entry");
+        let class = removed.key.class_rank() as usize;
+        self.class_counts[class] = self.class_counts[class]
+            .checked_sub(1)
+            .expect("pushable scheduler-class count must match heap membership");
         self.positions[removed.thread.slot() as usize] = None;
         if index < self.len {
             let parent = index.saturating_sub(1) / 2;
@@ -523,6 +541,14 @@ impl RunQueue {
 
     pub(crate) fn pushable_key(&self) -> Option<SchedulingKey> {
         self.pushable.first().map(|summary| summary.key)
+    }
+
+    pub(crate) fn has_pushable_deadline(&self) -> bool {
+        self.pushable.has_class(DEADLINE_CLASS_RANK)
+    }
+
+    pub(crate) fn has_pushable_realtime(&self) -> bool {
+        self.pushable.has_class(REALTIME_CLASS_RANK)
     }
 
     pub(crate) fn update_deadline_entity(

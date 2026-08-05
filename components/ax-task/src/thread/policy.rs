@@ -7,7 +7,8 @@ use crate::{
     scheduler_time_cmp,
 };
 
-const DEADLINE_CLASS_RANK: u8 = 1;
+pub(crate) const DEADLINE_CLASS_RANK: u8 = 1;
+pub(crate) const REALTIME_CLASS_RANK: u8 = 2;
 
 /// Linux-compatible nice value in the inclusive range `-20..=19`.
 #[repr(transparent)]
@@ -289,8 +290,8 @@ impl SchedulePolicy {
     pub const fn class_rank(self) -> u8 {
         match self {
             Self::KernelStop => 0,
-            Self::Deadline(_) => 1,
-            Self::Fifo { .. } | Self::RoundRobin { .. } => 2,
+            Self::Deadline(_) => DEADLINE_CLASS_RANK,
+            Self::Fifo { .. } | Self::RoundRobin { .. } => REALTIME_CLASS_RANK,
             Self::Fair {
                 mode: FairMode::Normal | FairMode::Batch,
                 ..

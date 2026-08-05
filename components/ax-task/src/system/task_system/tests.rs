@@ -1224,6 +1224,149 @@ fn nonpreempting_rt_wake_kicks_overloaded_owner_balance() {
 }
 
 #[test]
+fn lowering_rt_priority_notifies_overloaded_root_domain_owner() {
+    crate::test_runtime::reset_irq_state();
+    let system = Box::pin(TaskSystem::new(TaskSystemConfig::new(2)).unwrap());
+    let mut cpu0 = system.create_cpu_local(CpuId::new(0)).unwrap();
+    let mut cpu1 = system.create_cpu_local(CpuId::new(1)).unwrap();
+    for cpu in [&mut cpu0, &mut cpu1] {
+        system
+            .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
+            .unwrap();
+        system.bring_cpu_online(cpu.as_mut()).unwrap();
+    }
+
+    let cpu0_current = install_running_fifo(&system, cpu0.as_mut(), 90, 1);
+    assert_eq!(
+        system.schedule_at(cpu0.as_mut(), 1).unwrap().next(),
+        cpu0_current.id()
+    );
+    system.complete_context_switch(cpu0.as_mut()).unwrap();
+    let pushable = system
+        .create_thread(ThreadSpec::new(SchedulePolicy::fifo(
+            RtPriority::new(10).unwrap(),
+        )))
+        .unwrap();
+    system.make_ready(pushable.id()).unwrap();
+    system.enqueue_at(cpu0.as_mut(), pushable.id(), 2).unwrap();
+    cpu0.remote().scheduler_enter();
+
+    let cpu1_current = install_running_fifo(&system, cpu1.as_mut(), 50, 3);
+    assert_eq!(
+        system.schedule_at(cpu1.as_mut(), 3).unwrap().next(),
+        cpu1_current.id()
+    );
+    system.complete_context_switch(cpu1.as_mut()).unwrap();
+    cpu1.remote().scheduler_enter();
+
+    let runtime_handles = InstalledTaskHandles::new(system.as_ref(), cpu1.as_mut());
+    crate::test_runtime::configure_scheduler_ipi(RuntimeStatus::Success);
+    let decision = system.block_current_at(cpu1.as_mut(), 4).unwrap();
+    assert_ne!(
+        Some(decision.next()),
+        cpu1.idle(),
+        "the regression requires a priority drop to a non-idle task"
+    );
+    assert_eq!(
+        crate::test_runtime::scheduler_ipi_send_count(),
+        1,
+        "when a CPU lowers its RT priority, Linux RT notifies an overloaded root-domain owner so \
+         its queued RT task can be pushed immediately"
+    );
+    drop(runtime_handles);
+
+    let _source_handles = InstalledTaskHandles::new(system.as_ref(), cpu0.as_mut());
+    let _outcome = system.schedule_if_requested_at(cpu0.as_mut(), 5).unwrap();
+    assert_eq!(
+        pushable
+            .core
+            .sched()
+            .lock()
+            .placement
+            .committed_migration_target(),
+        Some(CpuId::new(1)),
+        "the overloaded owner must execute its queued balance callback even when its current RT \
+         task keeps running"
+    );
+}
+
+#[test]
+fn priority_drop_serializes_root_domain_push_delivery() {
+    crate::test_runtime::reset_irq_state();
+    let system = Box::pin(TaskSystem::new(TaskSystemConfig::new(4)).unwrap());
+    let mut cpus = (0..4)
+        .map(|id| system.create_cpu_local(CpuId::new(id)).unwrap())
+        .collect::<Vec<_>>();
+    for cpu in &mut cpus {
+        system
+            .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
+            .unwrap();
+        system.bring_cpu_online(cpu.as_mut()).unwrap();
+    }
+
+    for (source, running_priority, queued_priority, now) in
+        [(0usize, 90, 10, 1), (2usize, 80, 20, 3)]
+    {
+        let running = install_running_fifo(&system, cpus[source].as_mut(), running_priority, now);
+        assert_eq!(
+            system
+                .schedule_at(cpus[source].as_mut(), now)
+                .unwrap()
+                .next(),
+            running.id()
+        );
+        system
+            .complete_context_switch(cpus[source].as_mut())
+            .unwrap();
+        let pushable = system
+            .create_thread(ThreadSpec::new(SchedulePolicy::fifo(
+                RtPriority::new(queued_priority).unwrap(),
+            )))
+            .unwrap();
+        system.make_ready(pushable.id()).unwrap();
+        system
+            .enqueue_at(cpus[source].as_mut(), pushable.id(), now + 1)
+            .unwrap();
+        cpus[source].remote().scheduler_enter();
+    }
+
+    let lowering = install_running_fifo(&system, cpus[1].as_mut(), 50, 5);
+    assert_eq!(
+        system.schedule_at(cpus[1].as_mut(), 5).unwrap().next(),
+        lowering.id()
+    );
+    system.complete_context_switch(cpus[1].as_mut()).unwrap();
+    cpus[1].remote().scheduler_enter();
+
+    let lowering_handles = InstalledTaskHandles::new(system.as_ref(), cpus[1].as_mut());
+    crate::test_runtime::configure_scheduler_ipi(RuntimeStatus::Success);
+    let decision = system.block_current_at(cpus[1].as_mut(), 6).unwrap();
+    assert_ne!(Some(decision.next()), cpus[1].idle());
+    assert_eq!(
+        crate::test_runtime::scheduler_ipi_send_count(),
+        1,
+        "Linux RT starts one root-domain push iterator instead of broadcasting an IPI to every \
+         overloaded rq"
+    );
+    drop(lowering_handles);
+
+    let _first_source_handles = InstalledTaskHandles::new(system.as_ref(), cpus[0].as_mut());
+    let _outcome = system
+        .schedule_if_requested_at(cpus[0].as_mut(), 7)
+        .unwrap();
+    assert_eq!(
+        crate::test_runtime::scheduler_ipi_send_count(),
+        3,
+        "the first source emits one migration reschedule and then hands the serialized scan to \
+         the next source"
+    );
+    assert!(
+        cpus[2].remote().needs_reschedule(),
+        "the second overload owner must hold the next root-domain push generation"
+    );
+}
+
+#[test]
 fn pinned_rt_work_does_not_kick_owner_push() {
     crate::test_runtime::reset_irq_state();
     let system = Box::pin(TaskSystem::new(TaskSystemConfig::new(2)).unwrap());

@@ -1,6 +1,9 @@
 //! Root-domain topology, priority indexes, and Deadline bandwidth ownership.
 
-use core::ops::Deref;
+use core::{
+    ops::Deref,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use super::*;
 use crate::{DEADLINE_UTILIZATION_SCALE, RtPriority, lock::PreemptTicketGuard};
@@ -17,8 +20,61 @@ use crate::{DEADLINE_UTILIZATION_SCALE, RtPriority, lock::PreemptTicketGuard};
 pub(super) struct RootDomain {
     state: PreemptTicketLock<RootDomainState>,
     priority: RootDomainPriorityIndex,
+    overload: RootDomainOverloadIndex,
+    push: RootDomainPushIterator,
     runqueues: Vec<Arc<CpuRemote>>,
     deadline_max_bw_scaled: u64,
+}
+
+/// Linux `rto_mask`/`dlo_mask` and their publication counts.
+///
+/// Each bit is published while its CPU owns the corresponding rq lock. A set
+/// transition publishes the mask before the count; a clear transition removes
+/// the count before the mask. Readers may therefore use the count as the fast
+/// path and then scan a mask without observing an increment whose bit is still
+/// absent.
+#[derive(Debug)]
+struct RootDomainOverloadIndex {
+    realtime: RootDomainOverloadMask,
+    deadline: RootDomainOverloadMask,
+}
+
+#[derive(Debug)]
+struct RootDomainOverloadMask {
+    count: AtomicUsize,
+    words: Vec<AtomicUsize>,
+}
+
+/// The single root-domain push iterator corresponding to Linux
+/// `rto_push_work`.
+///
+/// A priority drop starts one serialized scan instead of broadcasting an IPI
+/// to every overloaded rq. The target owner claims the published generation,
+/// performs its rq-local push callback, then hands the scan to the next owner.
+#[derive(Debug)]
+struct RootDomainPushIterator {
+    state: PreemptTicketLock<RootDomainPushState>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RootDomainPushPhase {
+    Idle,
+    Published(CpuId),
+    Claimed(CpuId),
+}
+
+#[derive(Debug)]
+struct RootDomainPushState {
+    requested_generation: u64,
+    scan_generation: u64,
+    cursor: Option<CpuId>,
+    phase: RootDomainPushPhase,
+}
+
+#[derive(Debug)]
+pub(super) struct RootDomainPushClaim {
+    source: CpuId,
+    generation: u64,
 }
 
 #[derive(Debug)]
@@ -50,6 +106,8 @@ impl RootDomain {
                 deadline_admission: DeadlineAdmission::new(config.deadline_cap_percent()),
             }),
             priority: RootDomainPriorityIndex::new(config.cpu_count()),
+            overload: RootDomainOverloadIndex::new(config.cpu_count()),
+            push: RootDomainPushIterator::new(),
             runqueues,
             deadline_max_bw_scaled,
         }
@@ -64,10 +122,83 @@ impl RootDomain {
 
     pub(super) fn publish_run_queue(&self, cpu: CpuId, run_queue: &CpuRunQueueState, online: bool) {
         self.priority.publish_run_queue(cpu, run_queue, online);
+        self.overload.publish(
+            cpu,
+            online && run_queue.has_pushable_realtime(),
+            online && run_queue.has_pushable_deadline(),
+        );
     }
 
     pub(super) fn publish_offline(&self, cpu: CpuId) {
         self.priority.publish_offline(cpu);
+        self.overload.publish(cpu, false, false);
+    }
+
+    pub(super) fn cpu_has_rt_deadline_overload(&self, cpu: CpuId) -> bool {
+        self.overload.contains(cpu)
+    }
+
+    pub(super) fn request_rt_deadline_push(&self, requester: CpuId) {
+        let target = {
+            let mut state = self.push.state.lock();
+            state.requested_generation = state.requested_generation.wrapping_add(1);
+            if state.phase != RootDomainPushPhase::Idle {
+                None
+            } else {
+                state.scan_generation = state.requested_generation;
+                state.cursor = None;
+                self.publish_next_push_target(&mut state, requester)
+            }
+        };
+        self.deliver_push_target(target);
+    }
+
+    pub(super) fn push_target_pending(&self, source: CpuId) -> bool {
+        matches!(
+            self.push.state.lock().phase,
+            RootDomainPushPhase::Published(target) if target == source
+        )
+    }
+
+    pub(super) fn claim_rt_deadline_push(&self, source: CpuId) -> Option<RootDomainPushClaim> {
+        let mut state = self.push.state.lock();
+        if state.phase != RootDomainPushPhase::Published(source) {
+            return None;
+        }
+        state.phase = RootDomainPushPhase::Claimed(source);
+        Some(RootDomainPushClaim {
+            source,
+            generation: state.scan_generation,
+        })
+    }
+
+    pub(super) fn finish_rt_deadline_push(&self, claim: RootDomainPushClaim, made_progress: bool) {
+        let target = {
+            let mut state = self.push.state.lock();
+            assert_eq!(
+                state.phase,
+                RootDomainPushPhase::Claimed(claim.source),
+                "root-domain push completion must match the claimed owner"
+            );
+            assert_eq!(
+                state.scan_generation, claim.generation,
+                "root-domain push completion must match the claimed scan generation"
+            );
+            if made_progress
+                && self.overload.contains(claim.source)
+                && self
+                    .runqueues
+                    .get(claim.source.as_usize())
+                    .is_some_and(|remote| remote.is_online())
+            {
+                state.phase = RootDomainPushPhase::Published(claim.source);
+                Some(claim.source)
+            } else {
+                state.cursor = Some(claim.source);
+                self.advance_push_scan(&mut state, claim.source)
+            }
+        };
+        self.deliver_push_target(target);
     }
 
     pub(super) fn find_lowest_rt_cpu(
@@ -152,6 +283,167 @@ impl RootDomain {
                     "Deadline replacement must match a previously published reservation"
                 );
                 remote.publish_deadline_extra_bw(extra);
+            }
+        }
+    }
+
+    fn advance_push_scan(&self, state: &mut RootDomainPushState, current: CpuId) -> Option<CpuId> {
+        if let Some(target) = self.publish_next_push_target(state, current) {
+            return Some(target);
+        }
+        if state.scan_generation != state.requested_generation {
+            state.scan_generation = state.requested_generation;
+            state.cursor = None;
+            return self.publish_next_push_target(state, current);
+        }
+        state.phase = RootDomainPushPhase::Idle;
+        None
+    }
+
+    fn publish_next_push_target(
+        &self,
+        state: &mut RootDomainPushState,
+        excluded: CpuId,
+    ) -> Option<CpuId> {
+        if !self.overload.any() {
+            state.phase = RootDomainPushPhase::Idle;
+            return None;
+        }
+        let first = state
+            .cursor
+            .map_or(0, |cpu| cpu.as_usize().saturating_add(1));
+        let target = (first..self.runqueues.len())
+            .map(|index| CpuId::new(index as u32))
+            .find(|cpu| {
+                *cpu != excluded
+                    && self.overload.contains(*cpu)
+                    && self.runqueues[cpu.as_usize()].is_online()
+            });
+        state.phase = target.map_or(RootDomainPushPhase::Idle, RootDomainPushPhase::Published);
+        target
+    }
+
+    fn deliver_push_target(&self, mut target: Option<CpuId>) {
+        while let Some(source) = target {
+            let Some(remote) = self.runqueues.get(source.as_usize()) else {
+                return;
+            };
+            if remote.kick_scheduler_work() {
+                return;
+            }
+            target = {
+                let mut state = self.push.state.lock();
+                if state.phase != RootDomainPushPhase::Published(source) {
+                    return;
+                }
+                state.cursor = Some(source);
+                self.advance_push_scan(&mut state, source)
+            };
+        }
+    }
+}
+
+impl RootDomainOverloadIndex {
+    fn new(cpu_count: usize) -> Self {
+        Self {
+            realtime: RootDomainOverloadMask::new(cpu_count),
+            deadline: RootDomainOverloadMask::new(cpu_count),
+        }
+    }
+
+    fn publish(&self, cpu: CpuId, realtime: bool, deadline: bool) {
+        self.realtime.publish(cpu, realtime);
+        self.deadline.publish(cpu, deadline);
+    }
+
+    fn contains(&self, cpu: CpuId) -> bool {
+        self.deadline.contains(cpu) || self.realtime.contains(cpu)
+    }
+
+    fn any(&self) -> bool {
+        self.deadline.count.load(Ordering::Acquire) != 0
+            || self.realtime.count.load(Ordering::Acquire) != 0
+    }
+
+    #[cfg(test)]
+    fn for_each_source(&self, excluded: CpuId, mut visit: impl FnMut(CpuId)) {
+        self.deadline.for_each(|cpu| {
+            if cpu != excluded {
+                visit(cpu);
+            }
+        });
+        self.realtime.for_each(|cpu| {
+            if cpu != excluded && !self.deadline.contains(cpu) {
+                visit(cpu);
+            }
+        });
+    }
+}
+
+impl RootDomainPushIterator {
+    const fn new() -> Self {
+        Self {
+            state: PreemptTicketLock::new(RootDomainPushState {
+                requested_generation: 0,
+                scan_generation: 0,
+                cursor: None,
+                phase: RootDomainPushPhase::Idle,
+            }),
+        }
+    }
+}
+
+impl RootDomainOverloadMask {
+    fn new(cpu_count: usize) -> Self {
+        let word_count = cpu_count.div_ceil(usize::BITS as usize);
+        Self {
+            count: AtomicUsize::new(0),
+            words: (0..word_count).map(|_| AtomicUsize::new(0)).collect(),
+        }
+    }
+
+    fn publish(&self, cpu: CpuId, present: bool) {
+        let word_index = cpu.as_usize() / usize::BITS as usize;
+        let bit = 1usize << (cpu.as_usize() % usize::BITS as usize);
+        let Some(word) = self.words.get(word_index) else {
+            return;
+        };
+        let already_present = word.load(Ordering::Acquire) & bit != 0;
+        if already_present == present {
+            return;
+        }
+        if present {
+            word.fetch_or(bit, Ordering::Release);
+            self.count.fetch_add(1, Ordering::Release);
+        } else {
+            let previous = self.count.fetch_sub(1, Ordering::AcqRel);
+            assert_ne!(previous, 0, "root-domain overload count underflowed");
+            word.fetch_and(!bit, Ordering::Release);
+        }
+    }
+
+    fn contains(&self, cpu: CpuId) -> bool {
+        let word_index = cpu.as_usize() / usize::BITS as usize;
+        let bit = 1usize << (cpu.as_usize() % usize::BITS as usize);
+        self.words
+            .get(word_index)
+            .is_some_and(|word| word.load(Ordering::Acquire) & bit != 0)
+    }
+
+    #[cfg(test)]
+    fn for_each(&self, mut visit: impl FnMut(CpuId)) {
+        if self.count.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        for (word_index, word) in self.words.iter().enumerate() {
+            let mut members = word.load(Ordering::Acquire);
+            while members != 0 {
+                let bit = members.trailing_zeros() as usize;
+                members &= members - 1;
+                let index = word_index
+                    .saturating_mul(usize::BITS as usize)
+                    .saturating_add(bit);
+                visit(CpuId::new(index as u32));
             }
         }
     }
@@ -254,5 +546,81 @@ impl Deref for RootDomainGuard<'_> {
 
     fn deref(&self) -> &Self::Target {
         &self.state
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec::Vec;
+
+    use super::*;
+
+    #[test]
+    fn overload_masks_track_rt_and_deadline_independently() {
+        let overload = RootDomainOverloadIndex::new(4);
+        let cpu0 = CpuId::new(0);
+        let cpu1 = CpuId::new(1);
+        let cpu2 = CpuId::new(2);
+
+        overload.publish(cpu0, true, false);
+        overload.publish(cpu1, false, true);
+        overload.publish(cpu2, true, true);
+        assert_eq!(overload.realtime.count.load(Ordering::Acquire), 2);
+        assert_eq!(overload.deadline.count.load(Ordering::Acquire), 2);
+
+        let mut sources = Vec::new();
+        overload.for_each_source(cpu1, |cpu| sources.push(cpu));
+        sources.sort_by_key(|cpu| cpu.as_u32());
+        assert_eq!(sources, [cpu0, cpu2]);
+
+        overload.publish(cpu2, false, true);
+        assert_eq!(overload.realtime.count.load(Ordering::Acquire), 1);
+        assert_eq!(overload.deadline.count.load(Ordering::Acquire), 2);
+        overload.publish(cpu2, false, false);
+        assert_eq!(overload.deadline.count.load(Ordering::Acquire), 1);
+        assert!(!overload.contains(cpu2));
+    }
+
+    #[test]
+    fn push_iterator_restarts_after_a_concurrent_priority_drop() {
+        crate::test_runtime::reset_irq_state();
+        crate::test_runtime::configure_scheduler_ipi(RuntimeStatus::Success);
+        let config = TaskSystemConfig::new(3);
+        let runqueues = (0..3)
+            .map(|index| CpuRemote::create(CpuId::new(index), config))
+            .collect::<Vec<_>>();
+        for remote in &runqueues {
+            assert!(remote.mark_online());
+        }
+        let root = RootDomain::new(config, runqueues);
+        let cpu0 = CpuId::new(0);
+        let cpu1 = CpuId::new(1);
+        let cpu2 = CpuId::new(2);
+        root.overload.publish(cpu0, true, false);
+        root.overload.publish(cpu1, true, false);
+
+        root.request_rt_deadline_push(cpu2);
+        root.request_rt_deadline_push(cpu2);
+        {
+            let state = root.push.state.lock();
+            assert_eq!(state.requested_generation, 2);
+            assert_eq!(state.scan_generation, 1);
+            assert_eq!(state.phase, RootDomainPushPhase::Published(cpu0));
+        }
+
+        let first = root.claim_rt_deadline_push(cpu0).unwrap();
+        root.overload.publish(cpu0, false, false);
+        root.finish_rt_deadline_push(first, false);
+        assert_eq!(
+            root.push.state.lock().phase,
+            RootDomainPushPhase::Published(cpu1)
+        );
+
+        let second = root.claim_rt_deadline_push(cpu1).unwrap();
+        root.overload.publish(cpu1, false, false);
+        root.finish_rt_deadline_push(second, false);
+        let state = root.push.state.lock();
+        assert_eq!(state.phase, RootDomainPushPhase::Idle);
+        assert_eq!(state.scan_generation, state.requested_generation);
     }
 }

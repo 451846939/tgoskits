@@ -45,6 +45,11 @@ impl TaskSystem {
         // before this tail. Reporting a recoverable error would let block or
         // yield callers attempt to resume an outgoing thread that is no longer
         // current, so runtime failures beyond this boundary are fatal.
+        self.notify_overloaded_owners_after_priority_drop(
+            cpu.owner(),
+            decision.previous_urgency,
+            decision.next_urgency,
+        );
         if self.owner_balance_work_pending(cpu.as_ref().get_ref(), decision.next())
             && self
                 .service_owner_balance(cpu.as_mut(), decision.next())
@@ -463,6 +468,8 @@ impl TaskSystem {
             next: next.id(),
             previous_endpoint: previous.map(|core| SwitchEndpoint::from_core(core)),
             next_endpoint: SwitchEndpoint::from_core(next),
+            previous_urgency: previous.map(|core| core.effective_scheduling_urgency()),
+            next_urgency: next.effective_scheduling_urgency(),
             switch_reason,
             timestamp_ns,
         }

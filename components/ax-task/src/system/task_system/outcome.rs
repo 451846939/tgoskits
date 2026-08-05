@@ -13,6 +13,8 @@ pub struct ScheduleDecision {
     pub(super) next: ThreadId,
     pub(super) previous_endpoint: Option<SwitchEndpoint>,
     pub(super) next_endpoint: SwitchEndpoint,
+    pub(super) previous_urgency: Option<crate::SchedulingUrgency>,
+    pub(super) next_urgency: crate::SchedulingUrgency,
     pub(super) switch_reason: SwitchReason,
     pub(super) timestamp_ns: u64,
 }
