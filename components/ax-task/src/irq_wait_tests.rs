@@ -1,9 +1,5 @@
-use alloc::boxed::Box;
-use core::{
-    mem::ManuallyDrop,
-    ptr::{NonNull, with_exposed_provenance},
-    sync::atomic::{AtomicUsize, Ordering},
-};
+use alloc::sync::Arc;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use super::*;
 
@@ -70,14 +66,33 @@ fn detaching_a_waiter_enters_a_distinct_drain_lifetime() {
 }
 
 #[test]
-#[should_panic(expected = "dropped before token quiescence")]
-fn dropping_an_attached_registration_is_rejected() {
+fn cell_owns_a_published_node_after_its_token_is_abandoned() {
     let cell = IrqWaitCell::new();
     let registration = TestRegistration::new();
     let token = expect_registered(cell.register(registration.registration()));
 
     core::mem::forget(token);
     drop(registration);
+
+    assert_eq!(
+        cell.notify(),
+        IrqNotifyResult::Notified,
+        "the cell must retain an owning reference until it revokes the published node",
+    );
+}
+
+#[test]
+fn cell_teardown_revokes_a_published_node_before_reuse() {
+    let registration = TestRegistration::new();
+    let cell = IrqWaitCell::new();
+    let token = expect_registered(cell.register(registration.registration()));
+
+    drop(token);
+    drop(cell);
+
+    let next_cell = IrqWaitCell::new();
+    let next = expect_registered(next_cell.register(registration.registration()));
+    next.detach().try_finish().unwrap();
 }
 
 #[test]
@@ -88,27 +103,20 @@ fn detached_registration_is_not_quiescent_until_irq_wake_returns() {
         completed: AtomicUsize,
     }
 
-    unsafe fn blocking_wake(data: usize) {
-        let state = unsafe { &*with_exposed_provenance::<BlockingWake>(data) };
-        state.entered.store(1, Ordering::Release);
-        while state.release.load(Ordering::Acquire) == 0 {
-            core::hint::spin_loop();
-        }
-        state.completed.store(1, Ordering::Release);
-    }
-
     let cell = IrqWaitCell::new();
-    let state = Box::leak(Box::new(BlockingWake {
+    let state = Arc::new(BlockingWake {
         entered: AtomicUsize::new(0),
         release: AtomicUsize::new(0),
         completed: AtomicUsize::new(0),
-    }));
-    let wake = unsafe {
-        IrqWakeHandle::from_raw(
-            (state as *mut BlockingWake).expose_provenance(),
-            blocking_wake,
-        )
-    };
+    });
+    let wake_state = Arc::clone(&state);
+    let wake = IrqWakeHandle::from_fn(move || {
+        wake_state.entered.store(1, Ordering::Release);
+        while wake_state.release.load(Ordering::Acquire) == 0 {
+            core::hint::spin_loop();
+        }
+        wake_state.completed.store(1, Ordering::Release);
+    });
     let registration = IrqWaitRegistration::new_test(wake);
     let token = expect_registered(cell.register(&registration));
 
@@ -121,6 +129,7 @@ fn detached_registration_is_not_quiescent_until_irq_wake_returns() {
         assert!(!token.is_attached());
         let drain = token.detach();
         let quiescent_while_wake_uses_payload = drain.is_quiescent();
+        drop(registration);
 
         state.release.store(1, Ordering::Release);
         assert_eq!(notifier.join().unwrap(), IrqNotifyResult::Notified);
@@ -141,25 +150,18 @@ fn second_irq_during_registration_wake_remains_pending() {
         release: AtomicUsize,
     }
 
-    unsafe fn blocking_wake(data: usize) {
-        let state = unsafe { &*with_exposed_provenance::<BlockingWake>(data) };
-        state.entered.store(1, Ordering::Release);
-        while state.release.load(Ordering::Acquire) == 0 {
-            core::hint::spin_loop();
-        }
-    }
-
     let cell = IrqWaitCell::new();
-    let state = Box::leak(Box::new(BlockingWake {
+    let state = Arc::new(BlockingWake {
         entered: AtomicUsize::new(0),
         release: AtomicUsize::new(0),
-    }));
-    let wake = unsafe {
-        IrqWakeHandle::from_raw(
-            (state as *mut BlockingWake).expose_provenance(),
-            blocking_wake,
-        )
-    };
+    });
+    let wake_state = Arc::clone(&state);
+    let wake = IrqWakeHandle::from_fn(move || {
+        wake_state.entered.store(1, Ordering::Release);
+        while wake_state.release.load(Ordering::Acquire) == 0 {
+            core::hint::spin_loop();
+        }
+    });
     let registration = IrqWaitRegistration::new_test(wake);
     cell.pause_after_register_publish
         .store(true, Ordering::Release);
@@ -248,9 +250,7 @@ fn old_detach_cannot_remove_a_rearmed_registration_with_the_same_node_address() 
     });
 }
 
-fn expect_registered<'cell, 'registration>(
-    result: IrqRegisterResult<'cell, 'registration>,
-) -> IrqWaitToken<'cell, 'registration> {
+fn expect_registered(result: IrqRegisterResult<'_>) -> IrqWaitToken<'_> {
     match result {
         IrqRegisterResult::Registered(token) => token,
         other => panic!("expected a registered IRQ waiter, got {other:?}"),
@@ -258,20 +258,19 @@ fn expect_registered<'cell, 'registration>(
 }
 
 struct TestRegistration {
-    registration: ManuallyDrop<IrqWaitRegistration>,
-    wakes: NonNull<AtomicUsize>,
+    registration: IrqWaitRegistration,
+    wakes: Arc<AtomicUsize>,
 }
 
 impl TestRegistration {
     fn new() -> Self {
-        let wakes = NonNull::new(Box::into_raw(Box::new(AtomicUsize::new(0))))
-            .expect("Box never yields a null pointer");
-        let wake = unsafe {
-            // The raw allocation has a stable address and outlives the registration.
-            IrqWakeHandle::from_raw(wakes.as_ptr().expose_provenance(), count_wake)
-        };
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let wake_counter = Arc::clone(&wakes);
+        let wake = IrqWakeHandle::from_fn(move || {
+            wake_counter.fetch_add(1, Ordering::Relaxed);
+        });
         Self {
-            registration: ManuallyDrop::new(IrqWaitRegistration::new_test(wake)),
+            registration: IrqWaitRegistration::new_test(wake),
             wakes,
         }
     }
@@ -281,33 +280,6 @@ impl TestRegistration {
     }
 
     fn wake_count(&self) -> usize {
-        unsafe {
-            // The fixture exclusively owns the allocation; atomic callbacks may
-            // access it concurrently through the same exposed provenance.
-            self.wakes.as_ref().load(Ordering::Relaxed)
-        }
+        self.wakes.load(Ordering::Relaxed)
     }
-}
-
-impl Drop for TestRegistration {
-    fn drop(&mut self) {
-        unsafe {
-            // Drop the registration before reclaiming the callback payload.
-            ManuallyDrop::drop(&mut self.registration);
-            drop(Box::from_raw(self.wakes.as_ptr()));
-        }
-    }
-}
-
-/// Counts one direct IRQ wake.
-///
-/// # Safety
-///
-/// `data` must point to the boxed atomic owned by the matching test fixture.
-unsafe fn count_wake(data: usize) {
-    let wakes = unsafe {
-        // The fixture preserves this exposed allocation until unregister/wake.
-        &*with_exposed_provenance::<AtomicUsize>(data)
-    };
-    wakes.fetch_add(1, Ordering::Relaxed);
 }

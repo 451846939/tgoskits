@@ -10,7 +10,8 @@ use std::{
 };
 
 use ax_task::{
-    CpuId, RtPriority, SchedulePolicy, TaskSystem, TaskSystemConfig, ThreadId, ThreadSpec,
+    CpuId, IrqNotifyResult, IrqRegisterResult, IrqWaitCell, IrqWaitRegistration, RtPriority,
+    SchedulePolicy, TaskSystem, TaskSystemConfig, ThreadId, ThreadSpec,
     executor::LocalExecutor,
     timer::{
         ExpiredTaskDeadline, TaskDeadlineExpireRequest, TaskDeadlineKind, TaskDeadlineNode,
@@ -120,8 +121,17 @@ fn hard_irq_contract_is_zero_alloc_zero_free_and_zero_poll() {
         .complete_context_switch(cpu.as_mut())
         .expect("blocked thread must leave the physical CPU");
     let wake = thread.wake_handle();
+    let irq_wait = IrqWaitCell::new();
+    let irq_registration = IrqWaitRegistration::new(thread.wake_handle());
+    let irq_token = match irq_wait.register(&irq_registration) {
+        IrqRegisterResult::Registered(token) => token,
+        other => panic!("IRQ allocation fixture failed to register: {other:?}"),
+    };
 
     support::set_hard_irq(true);
+    let irq_wait_audit = audit(|| irq_wait.notify());
+    assert_eq!(irq_wait_audit.value, IrqNotifyResult::Notified);
+    assert_zero_allocator_activity(irq_wait_audit);
     let thread_wake_audit = audit(|| wake.wake());
     assert_zero_allocator_activity(thread_wake_audit);
     assert_eq!(
@@ -156,6 +166,10 @@ fn hard_irq_contract_is_zero_alloc_zero_free_and_zero_poll() {
     assert_eq!(timer_audit.value.expired(), 1);
     assert_zero_allocator_activity(timer_audit);
     support::set_hard_irq(false);
+    irq_token
+        .detach()
+        .try_finish()
+        .expect("completed hard-IRQ wake must be quiescent");
     assert_eq!(
         system
             .snapshot(cpu.as_ref())

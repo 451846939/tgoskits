@@ -191,7 +191,41 @@ Unpublished -> Published -> Draining -> Dead
 - UART 已拆成 control、IRQ、emergency-TX 三端点；
 - Starry perf overflow 使用 owner-CPU registry、generation 和本地 IRQ grace，不获取上层睡眠锁；
 - timer IRQ 仍直接调用 ax-task 的 owner-CPU deadline 服务，但该接口被限制为有界、无分配、无任意 callback；
-- `IrqWaitCell` 已将任务侧 publication token 与 grace-period drain 拆成不同 move-only 类型。IRQ 完成只进入 `Draining`，任务侧 `try_finish()` 后才重新进入可复用的 `Detached`；正常生命周期不再依赖永久泄漏，也不会在 hard IRQ 中等待或析构。
+- `IrqWaitCell` 已将任务侧 publication token 与 grace-period drain 拆成不同 move-only 类型。cell、token、drain 分别持有真实 owning reference；IRQ 完成只进入 `Draining`，任务侧 `try_finish()` 后才重新进入可复用的 `Detached`。正常生命周期不再依赖 destructor leak，hard IRQ 的 notify 路径保持零分配、零释放。
+
+### IrqWaitCell publication owner 与 grace period
+
+Linux v7.1 的 `__free_irq()` 先在 `desc->lock` 下从 action chain 撤销 handler，并在最后一个
+action 时 shutdown IRQ；随后释放 handler 可能需要的 bus/raw lock，再经
+`__synchronize_irq()` 等待 `IRQD_IRQ_INPROGRESS` 与 `threads_active` 清零，最后停止 threaded
+handler、deactivate irq domain 并释放 action。`synchronize_irq()` 明确只能从可抢占任务上下文
+调用，且调用方不能持有 handler 需要的资源。这一顺序把“关闭新 reader”“等待已有 reader”
+和“释放 payload”分成三个 owner 清晰的阶段。
+
+旧 `IrqWaitRegistration` 只拥有一个 `Pin<Box<_>>`，cell 的原子槽保存不计所有权的裸地址。
+registration 在 token 未完成时析构只能 debug panic，并在 release build 永久泄漏 allocation；
+这不是 grace-period owner，而是依赖析构分支阻止 UAF。当前实现改为：
+
+1. `register()` 在任务上下文预先创建 cell-owned `Arc` reference，再以 raw Arc 地址发布；
+2. token 独立持有同一 node，保证 notifier 执行期间 wake payload 仍有任务侧 owner；
+3. notify 成功 claim 后一次性收回 cell reference，执行固定 `ThreadWakeHandle`，将 generation
+   从 `Notifying` 发布到 `Draining`；正常 typed 路径中 token/registration 仍持有 reference，
+   因而 hard IRQ 只做 refcount decrement，不触发 allocation 析构；
+4. `detach()` 撤销尚未 claim 的 publication，或让 drain 等待已 claim reader；`try_finish()`
+   只在观察到 `Draining` 后推进到可复用的 `Detached`；
+5. cell 自身在任务上下文销毁时，以独占访问撤销仍 attached 的 generation，再释放 cell owner。
+
+公开 API 不再把 registration 借用期当作唯一内存安全条件：即使任务态 handle 在 notifier
+完成前释放，token/drain 与 cell 的 owning reference 仍保持 node 和 wake payload 有效。显式
+`mem::forget(token)` 会像所有 Rust owning token 一样泄漏它自己的 reference，但代码不再有
+“检测未 quiesce 后主动泄漏 Box”的 fallback 分支。
+
+确定性红测 `cell_owns_a_published_node_after_its_token_is_abandoned` 在旧实现稳定命中
+`dropped before token quiescence`；新实现中 registration 正常析构后，cell 仍能安全完成已
+发布 wake。补充行为测试覆盖 cell teardown 后同一 registration rearm，以及 registration 在
+direct wake 阻塞期间释放、drain 必须等 wake 返回。`hard_irq_contract_is_zero_alloc_zero_free_and_zero_poll`
+现已把 `IrqWaitCell::notify()` 纳入 allocator audit，要求 hard IRQ 中 allocation/deallocation
+均为零。
 
 USB/vsock 控制器协议属于外围驱动；除非它们违反上述调度交接契约，否则单独登记 issue。
 
@@ -212,7 +246,7 @@ USB/vsock 控制器协议属于外围驱动；除非它们违反上述调度交�
 | 架构 current/preempt | `current.h`、`preempt.h`、`cpu_switch_to`、`finish_task_switch()` | current 与普通 preempt 状态必须由架构唯一来源取得；TLS 只在物理寄存器确实重叠时改变 current 读取路径；裸切换尾不可失败 | AArch64 始终以 `SP_EL0` 为 current、`TPIDR_EL0` 为 TLS；x86 以 GS/FS 分离；RISC-V/LoongArch TLS 模式才从 CPU anchor 取得 current；删除全局 TLS current 模式选择 |
 | PI/锁 | `rtmutex`、`spinlock_rt.c`、`wake_q` | raw rq/IRQ gate、sleeping PI、task-local pin 四层分离；每把锁拥有有序 waiter tree，owner 只接收各锁 top waiter；解锁核心在同一 preempt-disabled 事务内选择 waiter、deboost、发布 ownerless 状态并加入 wake_q，释放元数据锁后由核心完成 wake | `PiMutexCore` 唯一拥有 generation-bearing owner word 与 allocation-free AVL waiter tree；线程预备 lock/owner 两套 linkage，owner donor tree 只保存每把已持有锁的 top waiter；ax-sync 不再保存第二份 owner、selected、waiter 容器或可丢弃 wake handle；registration、release、claim 与 release 后 wake 均由 ax-task 持有完整事务，外层不能遗漏 handoff wake |
 | 阻塞等待 | `do_lock_file_wait()`、`wait_event_interruptible()`、`locks_delete_block()` | wake 只是重试提示；条件与临时阻塞关系由领域层拥有，返回前必须先注销 | scheduler notification 与 nofault access retry 已类型化分离，fcntl/futex 外层负责重试 |
-| IRQ waiter | `__free_irq()`、`synchronize_irq()` | 撤销后 grace，再释放 | token/drain 类型状态与同地址 ABA 防护已实现 |
+| IRQ waiter | `__free_irq()`、`__synchronize_irq()`、`synchronize_irq()` | 先关闭新 reader，再等待 hard/threaded reader grace，最后在任务上下文释放；hard IRQ 不析构 payload | cell/token/drain 持有真实 owning reference；发布槽的 raw Arc reference 只在原子 claim 后回收；registration 可独立释放；generation 防 ABA；删除 destructor-leak fallback，并以 allocator audit 证明正常 notify 零分配零释放 |
 | signal | `recalc_sigpending_tsk()` | scan 后只能确认已观察 generation | 单调 interruption generation 已实现 |
 | process | `exit_notify()`、`__do_wait()`、`do_wait_thread()`、`ptrace_do_wait()` | 单一 PID generation 与关系锁序；每次 wake 后重扫 children/ptrace/zombie 权威关系，禁止跨阻塞保存候选快照 | 采用 dev `ProcessIdentity`；waitpid/waitid 共用 refreshable scan，初次无候选返回 `ECHILD`，阻塞后的每次 poll 重新采集 |
 | perf | `perf_install_in_context()` | task 与 CPU target 分离；owner CPU teardown | 已类型化并有 IRQ grace |

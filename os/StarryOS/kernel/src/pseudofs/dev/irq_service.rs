@@ -8,13 +8,13 @@ use ax_std::os::arceos::task::{self as scheduler, IrqRegisterResult, IrqWaitToke
 /// A notification consumed during registration is already detached and runs
 /// the task-context fan-out immediately. A published token remains alive until
 /// both cell ownership and any in-flight hard-IRQ wake have ended.
-pub(super) fn complete_irq_service_cycle<'cell, 'registration, P, F>(
-    registration: IrqRegisterResult<'cell, 'registration>,
+pub(super) fn complete_irq_service_cycle<'cell, P, F>(
+    registration: IrqRegisterResult<'cell>,
     park: P,
     fanout: F,
 ) -> Result<bool, TaskError>
 where
-    P: FnOnce(&IrqWaitToken<'cell, 'registration>),
+    P: FnOnce(&IrqWaitToken<'cell>),
     F: FnOnce(),
 {
     match registration {

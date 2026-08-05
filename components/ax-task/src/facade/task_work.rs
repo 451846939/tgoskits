@@ -149,7 +149,7 @@ fn wait_for_task_work(
 /// releasing storage reachable through the matching
 /// [`IrqWaitRegistration`]. Hard-IRQ teardown must instead move the token or its
 /// drain state to a task-context worker.
-pub fn quiesce_irq_wait(token: IrqWaitToken<'_, '_>) -> Result<(), TaskError> {
+pub fn quiesce_irq_wait(token: IrqWaitToken<'_>) -> Result<(), TaskError> {
     let mut drain = token.detach();
     loop {
         match drain.try_finish() {
