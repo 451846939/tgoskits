@@ -82,7 +82,7 @@ mod scheduler_ipi_tests {
     }
 
     #[test]
-    fn sticky_scheduler_work_coalesces_until_owner_claims_it() {
+    fn logical_scheduler_work_does_not_claim_runtime_doorbell_ownership() {
         let remote = CpuRemote::create(CpuId::new(1), TaskSystemConfig::new(2));
         assert!(remote.mark_online());
         crate::test_runtime::configure_scheduler_ipi(RuntimeStatus::Success);
@@ -91,16 +91,16 @@ mod scheduler_ipi_tests {
         assert!(remote.kick_scheduler_work());
         assert_eq!(
             crate::test_runtime::scheduler_ipi_send_count(),
-            1,
-            "one sticky pending interval may publish only one physical scheduler IPI"
+            2,
+            "ax-task must forward every non-polling remote publication so the runtime doorbell can own physical-edge coalescing"
         );
 
         remote.scheduler_enter();
         assert!(remote.kick_scheduler_work());
         assert_eq!(
             crate::test_runtime::scheduler_ipi_send_count(),
-            2,
-            "a publication after owner claim must be allowed to ring a fresh doorbell"
+            3,
+            "claiming logical scheduler work must remain independent of physical delivery state"
         );
     }
 

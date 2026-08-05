@@ -6,8 +6,15 @@ const DEFERRED_SCHEDULER_WORK_OFFLINE_INVARIANT: u32 = 0x4453_574f;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SchedulerWorkPublication {
+    /// The owner is in the IRQ-disabled idle polling region and will observe
+    /// the sticky work bit before committing to sleep.
     PollingOwner,
-    AlreadyPending,
+    /// The runtime must publish a physical-delivery generation.
+    ///
+    /// This is deliberately independent of `SCHEDULER_WORK_PENDING`: that bit
+    /// is the logical scheduling fact and may have been set by owner-local
+    /// work which never armed a remote doorbell. Physical edge coalescing is
+    /// owned by the runtime's per-CPU generation transport.
     DoorbellRequired,
 }
 
@@ -79,9 +86,7 @@ impl CpuRemote {
             .scheduler
             .flags
             .fetch_or(SCHEDULER_WORK_PENDING, Ordering::AcqRel);
-        if previous & SCHEDULER_WORK_PENDING != 0 {
-            SchedulerWorkPublication::AlreadyPending
-        } else if previous & SCHEDULER_IDLE_POLLING != 0 {
+        if previous & SCHEDULER_IDLE_POLLING != 0 {
             SchedulerWorkPublication::PollingOwner
         } else {
             SchedulerWorkPublication::DoorbellRequired
@@ -153,7 +158,7 @@ impl CpuRemote {
         &self,
         publication: SchedulerWorkPublication,
     ) -> bool {
-        if publication != SchedulerWorkPublication::DoorbellRequired
+        if publication == SchedulerWorkPublication::PollingOwner
             || self.current_cpu_will_service_local_work()
         {
             return true;
