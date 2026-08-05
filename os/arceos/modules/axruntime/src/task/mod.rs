@@ -111,7 +111,7 @@ pub use spawn::{
     prepare_raw, prepare_raw_with_extension_in_address_space_and_policy, spawn_raw,
     spawn_raw_with_affinity, spawn_raw_with_extension, spawn_raw_with_extension_and_affinity,
     spawn_raw_with_extension_in_address_space,
-    spawn_raw_with_extension_in_address_space_and_policy,
+    spawn_raw_with_extension_in_address_space_and_policy, spawn_raw_with_policy_and_affinity,
 };
 #[cfg(all(target_arch = "riscv64", feature = "fp-simd"))]
 pub use spawn::{

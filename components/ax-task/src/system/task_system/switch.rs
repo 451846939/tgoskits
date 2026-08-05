@@ -196,6 +196,7 @@ impl TaskSystem {
                     .is_some_and(|remote| remote.accepts_placement())
         };
         let indexed = match policy {
+            SchedulePolicy::KernelStop => None,
             SchedulePolicy::Fifo { priority } | SchedulePolicy::RoundRobin { priority, .. } => self
                 .priority_index
                 .find_lowest_rt_cpu(priority, affinity, preferred, accepts),

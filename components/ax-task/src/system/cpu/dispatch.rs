@@ -117,7 +117,9 @@ impl CurrentSchedule {
         fair_virtual_time: u64,
     ) -> bool {
         match woken_policy {
+            SchedulePolicy::KernelStop => !matches!(self.policy, SchedulePolicy::KernelStop),
             SchedulePolicy::Deadline(_) => match self.policy {
+                SchedulePolicy::KernelStop => false,
                 SchedulePolicy::Deadline(_) => {
                     deadline_key(woken_entity) < deadline_key(self.entity)
                 }
@@ -125,7 +127,7 @@ impl CurrentSchedule {
             },
             SchedulePolicy::Fifo { priority } | SchedulePolicy::RoundRobin { priority, .. } => {
                 match self.policy {
-                    SchedulePolicy::Deadline(_) => false,
+                    SchedulePolicy::KernelStop | SchedulePolicy::Deadline(_) => false,
                     SchedulePolicy::Fifo { priority: current }
                     | SchedulePolicy::RoundRobin {
                         priority: current, ..
@@ -136,7 +138,8 @@ impl CurrentSchedule {
             SchedulePolicy::Fair {
                 mode: woken_mode, ..
             } => match self.policy {
-                SchedulePolicy::Deadline(_)
+                SchedulePolicy::KernelStop
+                | SchedulePolicy::Deadline(_)
                 | SchedulePolicy::Fifo { .. }
                 | SchedulePolicy::RoundRobin { .. } => false,
                 SchedulePolicy::Fair {
@@ -315,6 +318,7 @@ impl CurrentDispatch {
 
     pub(super) fn next_scheduler_event_ns(&self, now_ns: u64) -> Option<u64> {
         match self.entity {
+            SchedulingEntity::KernelStop => None,
             SchedulingEntity::Fair(fair) => {
                 Some(now_ns.saturating_add(fair.remaining_request_ns()))
             }

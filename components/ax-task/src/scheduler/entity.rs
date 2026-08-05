@@ -5,6 +5,8 @@ use crate::{DeadlineEntity, FairEntity, SchedulePolicy, SchedulingKey, Schedulin
 /// Mutable scheduler accounting owned by one thread record.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SchedulingEntity {
+    /// Runtime-owned CPU-stopper work has no budget accounting.
+    KernelStop,
     /// EEVDF fair accounting.
     Fair(FairEntity),
     /// FIFO needs only queue ordering state.
@@ -22,6 +24,7 @@ impl SchedulingEntity {
     /// Creates class-specific state for a base policy.
     pub fn new(policy: SchedulePolicy, fair_slice_ns: u64, virtual_time: u64) -> Self {
         match policy {
+            SchedulePolicy::KernelStop => Self::KernelStop,
             SchedulePolicy::Fair { nice, mode } => {
                 Self::Fair(FairEntity::new(nice, mode, fair_slice_ns, virtual_time))
             }
@@ -54,6 +57,7 @@ impl SchedulingEntity {
     /// Charges one dispatch and reports whether its class slice expired.
     pub fn charge(&mut self, runtime_ns: u64, virtual_time: u64, reclaimed_ns: u64) -> bool {
         match self {
+            Self::KernelStop => false,
             Self::Fair(entity) => entity.charge(runtime_ns, virtual_time),
             Self::Fifo => false,
             Self::RoundRobin {
@@ -97,7 +101,8 @@ impl SchedulingEntity {
     pub const fn matches_policy(self, policy: SchedulePolicy) -> bool {
         matches!(
             (self, policy),
-            (Self::Fair(_), SchedulePolicy::Fair { .. })
+            (Self::KernelStop, SchedulePolicy::KernelStop)
+                | (Self::Fair(_), SchedulePolicy::Fair { .. })
                 | (Self::Fifo, SchedulePolicy::Fifo { .. })
                 | (Self::RoundRobin { .. }, SchedulePolicy::RoundRobin { .. })
                 | (Self::Deadline(_), SchedulePolicy::Deadline(_))

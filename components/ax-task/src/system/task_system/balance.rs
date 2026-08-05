@@ -306,9 +306,10 @@ impl TaskSystem {
                         }
                         let target_summary = remote.try_load_summary()?;
                         if target_summary.runnable_count() >= source_load
-                            || target_summary
-                                .current_key()
-                                .is_some_and(|current| current <= key && current.class_rank() != 3)
+                            || target_summary.current_key().is_some_and(|current| {
+                                current <= key
+                                    && current.class_rank() != SchedulingClass::Idle as u8
+                            })
                         {
                             return None;
                         }

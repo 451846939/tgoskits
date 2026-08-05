@@ -168,6 +168,11 @@ impl DeadlinePolicy {
 /// Base scheduling policy of a thread.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SchedulePolicy {
+    /// Per-CPU kernel stopper work, above Deadline and POSIX RT classes.
+    ///
+    /// This class is reserved for runtime-owned workers that implement Linux
+    /// CPU-stopper semantics. User-facing policy adapters must not construct it.
+    KernelStop,
     /// EEVDF fair scheduling.
     Fair {
         /// Nice-derived weight.
@@ -199,6 +204,7 @@ impl SchedulePolicy {
     /// utilization tracker can provide a stronger class-specific estimate.
     pub(crate) const fn placement_demand(self) -> u64 {
         match self {
+            Self::KernelStop => 0,
             Self::Fair {
                 mode: FairMode::Idle,
                 ..
@@ -214,7 +220,7 @@ impl SchedulePolicy {
     pub(crate) const fn fair_demand(self) -> u64 {
         match self {
             Self::Fair { .. } => self.placement_demand(),
-            Self::Fifo { .. } | Self::RoundRobin { .. } | Self::Deadline(_) => 0,
+            Self::KernelStop | Self::Fifo { .. } | Self::RoundRobin { .. } | Self::Deadline(_) => 0,
         }
     }
 
@@ -229,6 +235,12 @@ impl SchedulePolicy {
     /// Creates a fair policy.
     pub const fn fair(nice: Nice, mode: FairMode) -> Self {
         Self::Fair { nice, mode }
+    }
+
+    /// Creates the runtime-only per-CPU stopper policy.
+    #[doc(hidden)]
+    pub const fn kernel_stop() -> Self {
+        Self::KernelStop
     }
 
     /// Creates a FIFO policy.
@@ -267,16 +279,17 @@ impl SchedulePolicy {
     /// Returns the strict scheduler class rank, where smaller values run first.
     pub const fn class_rank(self) -> u8 {
         match self {
-            Self::Deadline(_) => 0,
-            Self::Fifo { .. } | Self::RoundRobin { .. } => 1,
+            Self::KernelStop => 0,
+            Self::Deadline(_) => 1,
+            Self::Fifo { .. } | Self::RoundRobin { .. } => 2,
             Self::Fair {
                 mode: FairMode::Normal | FairMode::Batch,
                 ..
-            } => 2,
+            } => 3,
             Self::Fair {
                 mode: FairMode::Idle,
                 ..
-            } => 3,
+            } => 4,
         }
     }
 
@@ -284,7 +297,7 @@ impl SchedulePolicy {
     pub(crate) const fn rt_priority(self) -> Option<RtPriority> {
         match self {
             Self::Fifo { priority } | Self::RoundRobin { priority, .. } => Some(priority),
-            Self::Fair { .. } | Self::Deadline(_) => None,
+            Self::KernelStop | Self::Fair { .. } | Self::Deadline(_) => None,
         }
     }
 
@@ -297,6 +310,7 @@ impl SchedulePolicy {
     /// Returns scheduler urgency without an identity or arrival tie-break.
     pub const fn scheduling_urgency(self) -> SchedulingUrgency {
         let primary = match self {
+            Self::KernelStop => 0,
             Self::Deadline(policy) => policy.deadline_ns(),
             Self::Fifo { priority } | Self::RoundRobin { priority, .. } => {
                 99 - priority.get() as u64
@@ -712,6 +726,19 @@ mod tests {
         assert_eq!(Nice::new(-20).unwrap().weight(), 88_761);
         assert_eq!(Nice::ZERO.weight(), 1_024);
         assert_eq!(Nice::new(19).unwrap().weight(), 15);
+    }
+
+    #[test]
+    fn kernel_stopper_outranks_deadline_rt_and_fair_work() {
+        let stopper = SchedulePolicy::kernel_stop();
+        let deadline =
+            SchedulePolicy::deadline(DeadlinePolicy::new(1, 2, 3, DeadlineFlags::NONE).unwrap());
+        let realtime = SchedulePolicy::fifo(RtPriority::new(99).unwrap());
+        let fair = SchedulePolicy::default();
+
+        assert!(stopper.scheduling_key(0) < deadline.scheduling_key(0));
+        assert!(deadline.scheduling_key(0) < realtime.scheduling_key(0));
+        assert!(realtime.scheduling_key(0) < fair.scheduling_key(0));
     }
 
     #[test]

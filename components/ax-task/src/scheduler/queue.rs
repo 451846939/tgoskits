@@ -11,8 +11,8 @@ use realtime::RealtimeRunQueue;
 
 use super::fair_queue::FairRunQueue;
 use crate::{
-    FairEntity, FairMode, Nice, SchedulePolicy, SchedulingEntity, SchedulingKey, TaskError,
-    ThreadCore, ThreadId,
+    FairEntity, FairMode, SchedulePolicy, SchedulingEntity, SchedulingKey, TaskError, ThreadCore,
+    ThreadId,
 };
 
 /// Scheduling-class linkage prepared with each thread, like Linux embedding
@@ -228,6 +228,7 @@ struct PushableSummary {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum QueueMembershipClass {
+    Stop,
     Deadline(DeadlineQueueKey),
     Realtime(u8),
     Fair,
@@ -261,12 +262,14 @@ pub(crate) struct DetachedQueueEntry {
 
 #[derive(Debug)]
 pub(crate) struct RunQueue {
+    stop: Option<QueuedThread>,
     deadline: DeadlineRunQueue,
     rt: RealtimeRunQueue,
     fair: FairRunQueue,
     idle_fair: FairRunQueue,
     membership: Vec<Option<QueueMembership>>,
     pushable_summary: Option<PushableSummary>,
+    fixed_placement_demand: u64,
     balance_scan_epoch: u64,
     next_sequence: u64,
     len: usize,
@@ -275,12 +278,14 @@ pub(crate) struct RunQueue {
 impl RunQueue {
     pub(crate) fn new() -> Self {
         Self {
+            stop: None,
             deadline: DeadlineRunQueue::new(),
             rt: RealtimeRunQueue::new(),
             fair: FairRunQueue::new(),
             idle_fair: FairRunQueue::new(),
             membership: Vec::new(),
             pushable_summary: None,
+            fixed_placement_demand: 0,
             balance_scan_epoch: 0,
             next_sequence: 0,
             len: 0,
@@ -310,10 +315,8 @@ impl RunQueue {
     }
 
     pub(crate) fn placement_demand(&self) -> u64 {
-        let fair_count = self.fair.len().saturating_add(self.idle_fair.len());
-        let non_fair_count = self.len.saturating_sub(fair_count);
         self.fair_demand()
-            .saturating_add((non_fair_count as u64).saturating_mul(u64::from(Nice::ZERO.weight())))
+            .saturating_add(self.fixed_placement_demand)
     }
 
     #[cfg(test)]
@@ -348,11 +351,11 @@ impl RunQueue {
     }
 
     pub(crate) fn has_rt(&self) -> bool {
-        self.rt.has_any()
+        self.rt.has_any_rt()
     }
 
     pub(crate) fn highest_rt_priority(&self) -> Option<u8> {
-        self.rt.highest_priority()
+        self.rt.highest_rt_priority()
     }
 
     pub(crate) fn rt_count_at_priority(&self, priority: u8) -> usize {
@@ -421,6 +424,12 @@ impl RunQueue {
             return false;
         };
         match class {
+            QueueMembershipClass::Stop => {
+                self.stop
+                    .as_mut()
+                    .expect("stop membership must retain the stopper task")
+                    .migration_capable = false;
+            }
             QueueMembershipClass::Deadline(key) => {
                 self.deadline
                     .get_mut(key)
@@ -488,6 +497,7 @@ impl RunQueue {
 
     pub(crate) fn queued_thread(&self, id: ThreadId) -> Option<QueuedThread> {
         match self.membership_class(id)? {
+            QueueMembershipClass::Stop => self.stop.clone(),
             QueueMembershipClass::Deadline(key) => self.deadline.get(key).cloned(),
             QueueMembershipClass::Realtime(priority) => self.rt.get(priority, id).cloned(),
             QueueMembershipClass::Fair => {
@@ -562,6 +572,14 @@ impl RunQueue {
         };
         let queued_entity = entry.entity;
         let (pushable_summary, membership_class) = match policy {
+            SchedulePolicy::KernelStop => {
+                entry.migration_capable = false;
+                assert!(
+                    self.stop.replace(entry).is_none(),
+                    "one CPU runqueue can own only one stopper task"
+                );
+                (None, QueueMembershipClass::Stop)
+            }
             SchedulePolicy::Deadline(_) => {
                 if entry.entity.deadline().is_none_or(|deadline| {
                     deadline.absolute_deadline_ns() == 0 || deadline.is_throttled()
@@ -592,6 +610,9 @@ impl RunQueue {
             }
         };
         self.len += 1;
+        self.fixed_placement_demand = self
+            .fixed_placement_demand
+            .saturating_add(fixed_placement_demand(policy));
         self.register_membership(id, membership_class);
         if matches!(membership_class, QueueMembershipClass::Fair)
             && self
@@ -626,6 +647,9 @@ impl RunQueue {
             .membership_class(id)
             .expect("a selected balance candidate must remain queued")
         {
+            QueueMembershipClass::Stop => {
+                unreachable!("the per-CPU stopper must never be a balance candidate")
+            }
             QueueMembershipClass::Deadline(key) => {
                 self.deadline
                     .get_mut(key)
@@ -703,6 +727,7 @@ impl RunQueue {
     pub(crate) fn dequeue(&mut self, id: ThreadId) -> Option<QueuedThread> {
         let class = self.membership_class(id)?;
         let removed = match class {
+            QueueMembershipClass::Stop => self.stop.take(),
             QueueMembershipClass::Deadline(key) => self.deadline.remove(key),
             QueueMembershipClass::Realtime(priority) => self.rt.remove(priority, id),
             QueueMembershipClass::Fair => self.fair.remove(id),
@@ -710,6 +735,9 @@ impl RunQueue {
         }
         .expect("runqueue membership must identify a linked scheduling entity");
         self.len -= 1;
+        self.fixed_placement_demand = self
+            .fixed_placement_demand
+            .saturating_sub(fixed_placement_demand(removed.policy));
         self.unregister_membership(removed.id);
         if self
             .pushable_summary
@@ -729,6 +757,7 @@ impl RunQueue {
         self.update_fair_virtual_time(current_fair);
         let class = self.membership_class(id)?;
         let (mut thread, restore_point) = match class {
+            QueueMembershipClass::Stop => return None,
             QueueMembershipClass::Deadline(key) => {
                 (self.deadline.remove(key)?, QueueRestorePoint::Deadline(key))
             }
@@ -748,6 +777,9 @@ impl RunQueue {
             );
         }
         self.len -= 1;
+        self.fixed_placement_demand = self
+            .fixed_placement_demand
+            .saturating_sub(fixed_placement_demand(thread.policy));
         self.unregister_membership(thread.id);
         if self
             .pushable_summary
@@ -769,6 +801,7 @@ impl RunQueue {
         } = detached;
         thread.entity.cancel_fair_migration();
         let id = thread.id;
+        let policy = thread.policy;
         assert!(
             !self.contains(id),
             "a detached transfer entry must not already be queued"
@@ -793,18 +826,25 @@ impl RunQueue {
             }
         };
         self.len += 1;
+        self.fixed_placement_demand = self
+            .fixed_placement_demand
+            .saturating_add(fixed_placement_demand(policy));
         self.register_membership(id, membership_class);
         self.recompute_pushable_summary();
     }
 
     pub(crate) fn pick_next(&mut self, rt_eligibility: RtEligibility) -> Option<QueuedThread> {
         let picked = self
-            .pick_deadline()
+            .pick_stop()
+            .or_else(|| self.pick_deadline())
             .or_else(|| self.pick_rt(rt_eligibility))
             .or_else(|| self.pick_fair(false))
             .or_else(|| self.pick_fair(true));
         if let Some(picked_entry) = &picked {
             self.len -= 1;
+            self.fixed_placement_demand = self
+                .fixed_placement_demand
+                .saturating_sub(fixed_placement_demand(picked_entry.policy));
             self.unregister_membership(picked_entry.id);
             if self
                 .pushable_summary
@@ -818,6 +858,10 @@ impl RunQueue {
 
     fn pick_deadline(&mut self) -> Option<QueuedThread> {
         self.deadline.pick_first()
+    }
+
+    fn pick_stop(&mut self) -> Option<QueuedThread> {
+        self.stop.take()
     }
 
     fn pick_rt(&mut self, eligibility: RtEligibility) -> Option<QueuedThread> {
@@ -842,10 +886,11 @@ impl RunQueue {
         (thread.migration_capable
             && !matches!(
                 thread.policy,
-                SchedulePolicy::Fair {
-                    mode: FairMode::Idle,
-                    ..
-                }
+                SchedulePolicy::KernelStop
+                    | SchedulePolicy::Fair {
+                        mode: FairMode::Idle,
+                        ..
+                    }
             ))
         .then(|| PushableSummary {
             thread: thread.id,
@@ -926,6 +971,12 @@ impl RunQueue {
         self.next_sequence = self.next_sequence.wrapping_add(1);
         sequence
     }
+}
+
+const fn fixed_placement_demand(policy: SchedulePolicy) -> u64 {
+    policy
+        .placement_demand()
+        .saturating_sub(policy.fair_demand())
 }
 
 #[cfg(test)]
@@ -1023,6 +1074,82 @@ mod tests {
             queue.pick_next(RtEligibility::Ordinary).unwrap().id,
             ThreadId::from_parts(2, 1)
         );
+    }
+
+    #[test]
+    fn kernel_stopper_runs_before_deadline_even_when_rt_is_throttled() {
+        let mut queue = RunQueue::new();
+        let stopper = SchedulePolicy::kernel_stop();
+        let deadline =
+            SchedulePolicy::deadline(DeadlinePolicy::new(1, 2, 3, DeadlineFlags::NONE).unwrap());
+        let mut deadline_entity = SchedulingEntity::new(deadline, 1, 0);
+        deadline_entity.activate_deadline(0);
+        queue
+            .enqueue_test(
+                ThreadId::from_parts(0, 1),
+                deadline,
+                deadline_entity,
+                0,
+                EnqueueReason::Wake,
+            )
+            .unwrap();
+        queue
+            .enqueue_test(
+                ThreadId::from_parts(1, 1),
+                stopper,
+                SchedulingEntity::new(stopper, 1, 0),
+                0,
+                EnqueueReason::Wake,
+            )
+            .unwrap();
+
+        assert_eq!(
+            queue.pick_next(RtEligibility::PiOwnerOnly).unwrap().id,
+            ThreadId::from_parts(1, 1),
+            "stopper work must bypass ordinary RT bandwidth throttling"
+        );
+    }
+
+    #[test]
+    fn kernel_stopper_does_not_enter_the_realtime_priority_array() {
+        let mut queue = RunQueue::new();
+        let stopper = SchedulePolicy::kernel_stop();
+        queue
+            .enqueue_test(
+                ThreadId::from_parts(1, 1),
+                stopper,
+                SchedulingEntity::new(stopper, 1, 0),
+                0,
+                EnqueueReason::Wake,
+            )
+            .unwrap();
+
+        assert_eq!(queue.rt.count_at_priority(100), 0);
+        assert_eq!(queue.placement_demand(), 0);
+    }
+
+    #[test]
+    fn kernel_stopper_preempts_all_user_sched_classes() {
+        let stopper = SchedulePolicy::kernel_stop();
+        let stopper_entity = SchedulingEntity::new(stopper, 1, 0);
+        for policy in [
+            SchedulePolicy::default(),
+            SchedulePolicy::fifo(RtPriority::new(99).unwrap()),
+            SchedulePolicy::deadline(DeadlinePolicy::new(1, 2, 3, DeadlineFlags::NONE).unwrap()),
+        ] {
+            let mut entity = SchedulingEntity::new(policy, 1, 0);
+            entity.activate_deadline(0);
+            let current = CurrentSchedule::test_state(ThreadId::from_parts(0, 1), policy, entity);
+            assert!(current.should_preempt(stopper, stopper_entity, 0));
+        }
+
+        let current =
+            CurrentSchedule::test_state(ThreadId::from_parts(0, 1), stopper, stopper_entity);
+        assert!(!current.should_preempt(
+            SchedulePolicy::default(),
+            SchedulingEntity::new(SchedulePolicy::default(), 1, 0),
+            0
+        ));
     }
 
     #[test]
@@ -1435,12 +1562,12 @@ mod tests {
                 .enqueue_test(id, policy, entity, 0, EnqueueReason::Wake)
                 .unwrap();
         }
-        assert_eq!(queue.pushable_key().unwrap().class_rank(), 0);
+        assert_eq!(queue.pushable_key().unwrap().class_rank(), 1);
 
         queue.dequeue(deadline_id).unwrap();
-        assert_eq!(queue.pushable_key().unwrap().class_rank(), 1);
-        assert_eq!(queue.pick_next(RtEligibility::Ordinary).unwrap().id, rt_id);
         assert_eq!(queue.pushable_key().unwrap().class_rank(), 2);
+        assert_eq!(queue.pick_next(RtEligibility::Ordinary).unwrap().id, rt_id);
+        assert_eq!(queue.pushable_key().unwrap().class_rank(), 3);
         queue.dequeue(fair_id).unwrap();
         assert_eq!(queue.pushable_key(), None);
         assert_eq!(queue.dequeue(idle_id).unwrap().id, idle_id);

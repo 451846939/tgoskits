@@ -12,7 +12,7 @@ use core::{
     ops::Deref,
     pin::Pin,
     ptr::NonNull,
-    sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, AtomicUsize, Ordering},
 };
 
 pub(crate) use dispatch::{

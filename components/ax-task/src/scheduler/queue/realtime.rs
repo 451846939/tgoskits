@@ -7,6 +7,8 @@ use super::{EnqueueReason, QueuedThread};
 use crate::ThreadId;
 
 const RT_PRIORITY_LEVELS: usize = 99;
+const FIXED_PRIORITY_LEVELS: usize = RT_PRIORITY_LEVELS;
+const RT_PRIORITY_BITMAP: u128 = (1_u128 << RT_PRIORITY_LEVELS) - 1;
 
 /// Per-thread RT linkage prepared during thread construction.
 #[derive(Debug)]
@@ -178,10 +180,10 @@ impl<'queue> Iterator for RealtimeIter<'queue> {
 /// allocate or free memory while the rq lock is held.
 #[derive(Debug)]
 pub(super) struct RealtimeRunQueue {
-    active: [RealtimeLevel; RT_PRIORITY_LEVELS],
+    active: [RealtimeLevel; FIXED_PRIORITY_LEVELS],
     active_bitmap: u128,
     exempt_bitmap: u128,
-    exempt_count: [usize; RT_PRIORITY_LEVELS],
+    exempt_count: [usize; FIXED_PRIORITY_LEVELS],
 }
 
 impl RealtimeRunQueue {
@@ -190,16 +192,16 @@ impl RealtimeRunQueue {
             active: core::array::from_fn(|_| RealtimeLevel::new()),
             active_bitmap: 0,
             exempt_bitmap: 0,
-            exempt_count: [0; RT_PRIORITY_LEVELS],
+            exempt_count: [0; FIXED_PRIORITY_LEVELS],
         }
     }
 
-    pub(super) const fn has_any(&self) -> bool {
-        self.active_bitmap != 0
+    pub(super) const fn has_any_rt(&self) -> bool {
+        self.active_bitmap & RT_PRIORITY_BITMAP != 0
     }
 
-    pub(super) fn highest_priority(&self) -> Option<u8> {
-        bitmap_highest_priority(self.active_bitmap)
+    pub(super) fn highest_rt_priority(&self) -> Option<u8> {
+        bitmap_highest_priority(self.active_bitmap & RT_PRIORITY_BITMAP)
     }
 
     pub(super) fn count_at_priority(&self, priority: u8) -> usize {
@@ -213,7 +215,7 @@ impl RealtimeRunQueue {
         let priority = thread
             .policy
             .rt_priority()
-            .expect("RT queue requires RT policy")
+            .expect("RT priority array requires FIFO or RR policy")
             .get();
         let index = (priority - 1) as usize;
         if thread.rt_quota_exempt {
@@ -285,7 +287,7 @@ impl RealtimeRunQueue {
     }
 
     pub(super) fn first(&self) -> Option<&QueuedThread> {
-        let priority = self.highest_priority()?;
+        let priority = self.highest_rt_priority()?;
         self.active[(priority - 1) as usize].iter().next()
     }
 
@@ -295,13 +297,14 @@ impl RealtimeRunQueue {
     ) -> Option<QueuedThread> {
         self.active
             .iter()
+            .take(RT_PRIORITY_LEVELS)
             .rev()
             .find_map(|level| level.iter().find(|thread| predicate(thread)).cloned())
     }
 
     pub(super) fn pick(&mut self, ordinary_may_run: bool) -> Option<QueuedThread> {
         let priority = if ordinary_may_run {
-            self.highest_priority()?
+            self.highest_rt_priority()?
         } else {
             bitmap_highest_priority(self.exempt_bitmap)?
         };

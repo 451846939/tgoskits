@@ -21,7 +21,7 @@ pub(super) struct RemoteLoadState {
     fair_demand: AtomicU64,
     workload_demand: AtomicU64,
     incoming_migration_demand: AtomicU64,
-    flags: AtomicU8,
+    flags: AtomicU16,
     current_primary: AtomicU64,
     current_sequence: AtomicU64,
     pushable_primary: AtomicU64,
@@ -38,7 +38,7 @@ impl RemoteLoadState {
             fair_demand: AtomicU64::new(0),
             workload_demand: AtomicU64::new(0),
             incoming_migration_demand: AtomicU64::new(0),
-            flags: AtomicU8::new(0),
+            flags: AtomicU16::new(0),
             current_primary: AtomicU64::new(0),
             current_sequence: AtomicU64::new(0),
             pushable_primary: AtomicU64::new(0),
@@ -74,7 +74,8 @@ impl CpuRemote {
         let mut flags = 0;
         if let Some(key) = current_key {
             flags |= SUMMARY_CURRENT_PRESENT;
-            flags |= (key.class_rank() & SUMMARY_CLASS_MASK) << SUMMARY_CURRENT_CLASS_SHIFT;
+            flags |=
+                (u16::from(key.class_rank()) & SUMMARY_CLASS_MASK) << SUMMARY_CURRENT_CLASS_SHIFT;
             self.load
                 .current_primary
                 .store(key.primary(), Ordering::Relaxed);
@@ -84,7 +85,8 @@ impl CpuRemote {
         }
         if let Some(key) = pushable_key {
             flags |= SUMMARY_PUSHABLE_PRESENT;
-            flags |= (key.class_rank() & SUMMARY_CLASS_MASK) << SUMMARY_PUSHABLE_CLASS_SHIFT;
+            flags |=
+                (u16::from(key.class_rank()) & SUMMARY_CLASS_MASK) << SUMMARY_PUSHABLE_CLASS_SHIFT;
             self.load
                 .pushable_primary
                 .store(key.primary(), Ordering::Relaxed);
@@ -161,8 +163,9 @@ impl CpuRemote {
             if self.load.sequence.load(Ordering::Acquire) != epoch {
                 continue;
             }
-            let current_rank = (flags >> SUMMARY_CURRENT_CLASS_SHIFT) & SUMMARY_CLASS_MASK;
-            let pushable_rank = (flags >> SUMMARY_PUSHABLE_CLASS_SHIFT) & SUMMARY_CLASS_MASK;
+            let current_rank = ((flags >> SUMMARY_CURRENT_CLASS_SHIFT) & SUMMARY_CLASS_MASK) as u8;
+            let pushable_rank =
+                ((flags >> SUMMARY_PUSHABLE_CLASS_SHIFT) & SUMMARY_CLASS_MASK) as u8;
             return Some(CpuLoadSummary {
                 epoch,
                 runnable_count,

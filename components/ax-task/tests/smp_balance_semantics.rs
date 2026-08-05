@@ -158,7 +158,7 @@ fn load_summary_publishes_effective_current_and_top_pushable_keys() {
     let summary = cpu0.try_load_summary().unwrap();
     assert!(summary.epoch() > before);
     assert_eq!(summary.runnable_count(), 1);
-    assert_eq!(summary.current_key().unwrap().class_rank(), 1);
+    assert_eq!(summary.current_key().unwrap().class_rank(), 2);
     assert_eq!(summary.current_key().unwrap().primary(), 9);
     assert_eq!(summary.pushable_class(), Some(SchedulingClass::Realtime));
     assert_eq!(summary.pushable_key().unwrap().primary(), 19);

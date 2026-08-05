@@ -1112,6 +1112,7 @@ impl AtomicPolicy {
 
 fn encode_policy(policy: SchedulePolicy) -> (u8, u64, u64, u64, u32) {
     match policy {
+        SchedulePolicy::KernelStop => (6, 0, 0, 0, 0),
         SchedulePolicy::Fair { nice, mode } => {
             let kind = match mode {
                 FairMode::Normal => 0,
@@ -1162,6 +1163,7 @@ fn decode_policy(encoded: (u8, u64, u64, u64, u32)) -> SchedulePolicy {
                 .map(SchedulePolicy::deadline)
                 .unwrap_or_default()
         }
+        6 => SchedulePolicy::kernel_stop(),
         _ => SchedulePolicy::default(),
     }
 }

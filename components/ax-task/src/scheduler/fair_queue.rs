@@ -138,10 +138,6 @@ impl FairRunQueue {
         self.len == 0
     }
 
-    pub(super) const fn len(&self) -> usize {
-        self.len
-    }
-
     pub(super) fn total_weight(&self) -> u64 {
         u64::try_from(self.total_weight).expect("fair runqueue weight must remain non-negative")
     }

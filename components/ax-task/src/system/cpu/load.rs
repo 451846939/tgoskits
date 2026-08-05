@@ -4,22 +4,25 @@ use super::*;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum SchedulingClass {
+    /// Runtime-owned per-CPU stopper work.
+    Stop     = 0,
     /// Absolute-deadline EDF work.
-    Deadline = 0,
+    Deadline = 1,
     /// Fixed-priority FIFO or round-robin work.
-    Realtime = 1,
+    Realtime = 2,
     /// Normal or batch EEVDF work.
-    Fair     = 2,
+    Fair     = 3,
     /// Lowest-priority fair idle work.
-    Idle     = 3,
+    Idle     = 4,
 }
 
 impl SchedulingClass {
     pub(super) const fn from_rank(rank: u8) -> Self {
         match rank {
-            0 => Self::Deadline,
-            1 => Self::Realtime,
-            2 => Self::Fair,
+            0 => Self::Stop,
+            1 => Self::Deadline,
+            2 => Self::Realtime,
+            3 => Self::Fair,
             _ => Self::Idle,
         }
     }
@@ -120,10 +123,10 @@ impl CpuLoadSummary {
     }
 }
 
-pub(super) const SUMMARY_CURRENT_PRESENT: u8 = 1 << 0;
-pub(super) const SUMMARY_PUSHABLE_PRESENT: u8 = 1 << 1;
-pub(super) const SUMMARY_OVERLOADED: u8 = 1 << 2;
+pub(super) const SUMMARY_CURRENT_PRESENT: u16 = 1 << 0;
+pub(super) const SUMMARY_PUSHABLE_PRESENT: u16 = 1 << 1;
+pub(super) const SUMMARY_OVERLOADED: u16 = 1 << 2;
 pub(super) const SUMMARY_CURRENT_CLASS_SHIFT: u32 = 3;
-pub(super) const SUMMARY_PUSHABLE_CLASS_SHIFT: u32 = 5;
-pub(super) const SUMMARY_CLASS_MASK: u8 = 0b11;
+pub(super) const SUMMARY_PUSHABLE_CLASS_SHIFT: u32 = 6;
+pub(super) const SUMMARY_CLASS_MASK: u16 = 0b111;
 pub(super) const LOAD_SUMMARY_READ_RETRIES: usize = 8;

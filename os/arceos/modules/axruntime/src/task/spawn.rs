@@ -52,6 +52,33 @@ where
     unsafe { spawn_raw_with_extension_and_affinity(entry, name, stack_size, None, Some(affinity)) }
 }
 
+/// Creates a scheduler-owned kernel service thread with policy and affinity
+/// installed before run-queue publication.
+pub fn spawn_raw_with_policy_and_affinity<F>(
+    entry: F,
+    name: String,
+    stack_size: usize,
+    policy: SchedulePolicy,
+    affinity: CpuSet,
+) -> Result<ThreadHandle, TaskError>
+where
+    F: FnOnce() + Send + 'static,
+{
+    // SAFETY: `None` carries no external callback ownership. Both scheduler
+    // attributes are committed before the thread can execute.
+    unsafe {
+        spawn_raw_with_options(
+            entry,
+            name,
+            stack_size,
+            None,
+            Some(affinity),
+            policy,
+            InitialContextState::kernel(),
+        )
+    }
+}
+
 /// Creates a kernel thread while retaining one OS-specific extension.
 ///
 /// The runtime owns an outer extension for the closure and join metadata. It
