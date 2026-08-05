@@ -25,10 +25,7 @@ use crate::{
     config::USER_HEAP_BASE,
     file::{ResolveAtResult, current_fd_table, memfd::Memfd, resolve_at},
     mm::{copy_from_kernel, load_user_app, new_user_aspace_empty, vm_load_string},
-    task::{
-        current_user_task, future::block_on, rebind_task_tid, release_thread_pid, yield_now,
-        zap_thread,
-    },
+    task::{future::block_on, rebind_task_tid, release_thread_pid, yield_now, zap_thread},
 };
 
 fn commit_address_space_handoff<OldAddressSpace>(
@@ -42,6 +39,7 @@ fn commit_address_space_handoff<OldAddressSpace>(
 }
 
 pub fn sys_execve(
+    current: &crate::task::UserTaskRef,
     uctx: &mut UserContext,
     path: *const c_char,
     argv: *const *const c_char,
@@ -49,13 +47,14 @@ pub fn sys_execve(
 ) -> AxResult<isize> {
     let path = vm_load_string(path)?;
     let loc = current_fs_context().lock().resolve(&path)?;
-    do_execve(uctx, loc, path, argv, envp)
+    do_execve(current, uctx, loc, path, argv, envp)
 }
 
 /// execveat(2) — like execve, but the program is identified by `dirfd` plus
 /// `path` (resolved relative to `dirfd`), or by `dirfd` alone when
 /// `AT_EMPTY_PATH` is set and `path` is empty.
 pub fn sys_execveat(
+    current: &crate::task::UserTaskRef,
     uctx: &mut UserContext,
     dirfd: c_int,
     path: *const c_char,
@@ -90,7 +89,7 @@ pub fn sys_execveat(
         }
     };
 
-    do_execve(uctx, loc, disp_path, argv, envp)
+    do_execve(current, uctx, loc, disp_path, argv, envp)
 }
 
 /// Shared execve core (Linux's `do_execveat_common` equivalent): both
@@ -99,6 +98,7 @@ pub fn sys_execveat(
 /// `path` is the display name (used for argv0-independent `comm`/`exe_path` and
 /// the loader's `.sh`/shebang handling), not re-resolved against the FS.
 fn do_execve(
+    current: &crate::task::UserTaskRef,
     uctx: &mut UserContext,
     loc: Location,
     path: String,
@@ -135,7 +135,7 @@ fn do_execve(
 
     debug!("do_execve <= path: {path:?}, args: {args:?}, envs: {envs:?}");
 
-    let curr = current_user_task();
+    let curr = current;
     let thr = curr.as_thread();
     let proc_data = &thr.proc_data;
     let my_tid = thr.tid();
@@ -395,7 +395,7 @@ fn do_execve(
     if my_tid != tgid {
         release_thread_pid(&proc_data.identity(), my_tid as u64);
         thr.set_tid(tgid);
-        rebind_task_tid(&curr, my_tid, tgid);
+        rebind_task_tid(curr, my_tid, tgid);
         proc_data.clear_retired_leader_nice();
         proc_data.signal.rename_child(my_tid, tgid);
         proc_data.proc.rename_thread(my_tid, tgid);

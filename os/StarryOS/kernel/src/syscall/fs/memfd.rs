@@ -21,7 +21,6 @@ use crate::{
     },
     mm::vm_load_string,
     pseudofs,
-    task::current_user_task,
 };
 
 /// `MFD_ALLOW_SEALING` — bit 1. `linux-raw-sys` does not export it on every
@@ -41,7 +40,11 @@ const MFD_EXEC: u32 = 0x0010;
 /// Linux enforces `NAME_MAX - strlen("memfd:")` = 249 bytes for the name.
 const MEMFD_NAME_MAX: usize = 249;
 
-pub fn sys_memfd_create(name: *const c_char, flags: u32) -> AxResult<isize> {
+pub fn sys_memfd_create(
+    current: &crate::task::UserTaskRef,
+    name: *const c_char,
+    flags: u32,
+) -> AxResult<isize> {
     let valid_flags = MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_NOEXEC_SEAL | MFD_EXEC;
     if flags & !valid_flags != 0 || flags & MFD_HUGETLB != 0 {
         return Err(AxError::InvalidInput);
@@ -66,7 +69,7 @@ pub fn sys_memfd_create(name: *const c_char, flags: u32) -> AxResult<isize> {
     let fs_context = current_fs_context();
     let fs = fs_context.lock();
     let mountpoint = fs.resolve(mount_path)?.mountpoint().clone();
-    let cred = current_user_task().as_thread().cred();
+    let cred = current.as_thread().cred();
     let entry = tmpfs.create_anonymous_file(
         &name_str,
         axfs_ng_vfs::NodePermission::from_bits_truncate(0o666),

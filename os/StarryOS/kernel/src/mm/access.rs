@@ -26,13 +26,13 @@ use starry_vm::{
 
 use crate::{
     config::{USER_SPACE_BASE, USER_SPACE_SIZE},
-    task::{UserTaskRef, current_user_task, might_sleep, try_current_user_task},
+    task::{UserTaskRef, might_sleep, try_current_user_task},
 };
 
 /// Enables scoped access into user memory, allowing page faults to occur inside
 /// kernel.
 #[track_caller]
-fn access_user_memory<R>(f: impl FnOnce() -> R) -> VmResult<R> {
+fn access_user_memory<R>(task: &UserTaskRef, f: impl FnOnce() -> R) -> VmResult<R> {
     if ax_runtime::hal::irq::in_irq_context() {
         return Err(VmError::AccessDenied);
     }
@@ -42,8 +42,7 @@ fn access_user_memory<R>(f: impl FnOnce() -> R) -> VmResult<R> {
     );
     might_sleep();
 
-    let curr = current_user_task();
-    let _scope = curr.as_thread().enter_user_memory_access();
+    let _scope = task.as_thread().enter_user_memory_access();
     Ok(f())
 }
 
@@ -235,6 +234,7 @@ fn fault_in_user_u32(address: usize, access: MappingFlags) -> AxResult<()> {
         return Err(AxError::BadAddress);
     }
     prepare_user_memory("fault in futex word", address, size_of::<u32>(), access)
+        .map(|_| ())
         .map_err(Into::into)
 }
 
@@ -336,6 +336,7 @@ impl<T> UserConstPtr<T> {
             .checked_mul(len)
             .ok_or(AxError::InvalidInput)?;
         prepare_user_memory("validate read", self.0.addr(), byte_len, MappingFlags::READ)
+            .map(|_| ())
             .map_err(Into::into)
     }
 }
@@ -353,6 +354,9 @@ static PAGE_FAULT_IDENTITY_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 /// Fixed, allocation-free diagnostic for malformed task identity during user-copy setup.
 static USER_MEMORY_IDENTITY_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "axtest")]
+const _: fn(&str, usize, usize, MappingFlags) -> VmResult<UserTaskRef> = prepare_user_memory;
 
 #[page_fault_handler]
 fn handle_page_fault(vaddr: VirtAddr, access_flags: MappingFlags) -> bool {
@@ -457,14 +461,17 @@ fn user_task_for_memory_access(op: &str, start: usize, len: usize) -> VmResult<U
     }
 }
 
-fn prepare_user_memory(op: &str, start: usize, len: usize, access_flags: MappingFlags) -> VmResult {
+fn prepare_user_memory(
+    op: &str,
+    start: usize,
+    len: usize,
+    access_flags: MappingFlags,
+) -> VmResult<UserTaskRef> {
     if ax_runtime::hal::irq::in_irq_context() {
         return Err(VmError::AccessDenied);
     }
     check_access(start, len)?;
-    if len == 0 {
-        return Ok(());
-    }
+    debug_assert_ne!(len, 0, "empty user-memory ranges require no preparation");
     let curr = user_task_for_memory_access(op, start, len)?;
 
     let start = VirtAddr::from(start);
@@ -485,7 +492,9 @@ fn prepare_user_memory(op: &str, start: usize, len: usize, access_flags: Mapping
 
     aspace
         .populate_area(page_start, page_end - page_start, access_flags)
-        .map_err(|_| VmError::AccessDenied)
+        .map_err(|_| VmError::AccessDenied)?;
+    drop(aspace);
+    Ok(curr)
 }
 
 #[extern_trait]
@@ -498,8 +507,8 @@ unsafe impl VmIo for Vm {
         if buf.is_empty() {
             return Ok(());
         }
-        prepare_user_memory("read", start, buf.len(), MappingFlags::READ)?;
-        let failed_at = access_user_memory(|| unsafe {
+        let task = prepare_user_memory("read", start, buf.len(), MappingFlags::READ)?;
+        let failed_at = access_user_memory(&task, || unsafe {
             user_copy(buf.as_mut_ptr() as *mut _, start as _, buf.len())
         })?;
         if unlikely(failed_at != 0) {
@@ -513,8 +522,8 @@ unsafe impl VmIo for Vm {
         if buf.is_empty() {
             return Ok(());
         }
-        prepare_user_memory("write", start, buf.len(), MappingFlags::WRITE)?;
-        let failed_at = access_user_memory(|| unsafe {
+        let task = prepare_user_memory("write", start, buf.len(), MappingFlags::WRITE)?;
+        let failed_at = access_user_memory(&task, || unsafe {
             user_copy(start as _, buf.as_ptr() as *const _, buf.len())
         })?;
         if unlikely(failed_at != 0) {

@@ -34,6 +34,9 @@ static TIMER_WORKER_STARTED: AtomicBool = AtomicBool::new(false);
 static TIMER_EPOCH: AtomicU64 = AtomicU64::new(0);
 static NEXT_TIMER_KEY: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(feature = "axtest")]
+const _: fn(&UserTaskRef) -> LocalExecutor = user_executor;
+
 /// Polls one future on the calling scheduler thread until completion.
 ///
 /// This generic executor has no Starry user-task semantics and is therefore
@@ -41,7 +44,11 @@ static NEXT_TIMER_KEY: AtomicU64 = AtomicU64::new(1);
 /// a signal arrives use [`block_on_user`].
 #[track_caller]
 pub fn block_on<F: IntoFuture>(future: F) -> F::Output {
-    block_on_with_abort(future, None, None, || false)
+    let scheduler_thread = scheduler::current_thread_handle()
+        .unwrap_or_else(|error| panic!("future polling requires a scheduler thread: {error}"));
+    let executor = LocalExecutor::new(scheduler_thread.wake_handle())
+        .unwrap_or_else(|error| panic!("future executor requires its owner thread: {error}"));
+    block_on_with_abort(future, executor, None, || false)
 }
 
 /// Polls a future for a proven Starry user task until completion.
@@ -72,9 +79,10 @@ pub fn block_on_user_until<F: IntoFuture>(
     deadline: Option<TimeValue>,
     future: F,
 ) -> UserWaitOutcome<F::Output> {
+    let executor = user_executor(task);
     block_on_with_abort(
         user_wait_future(task, deadline, future),
-        Some(task.id()),
+        executor,
         deadline,
         || task.interrupted(),
     )
@@ -109,7 +117,7 @@ async fn user_wait_future<F: IntoFuture>(
 
 fn block_on_with_abort<F, A>(
     future: F,
-    expected_owner: Option<scheduler::ThreadId>,
+    executor: LocalExecutor,
     deadline: Option<TimeValue>,
     should_abort: A,
 ) -> F::Output
@@ -117,18 +125,7 @@ where
     F: IntoFuture,
     A: Fn() -> bool,
 {
-    let scheduler_thread = scheduler::current_thread_handle()
-        .unwrap_or_else(|error| panic!("future polling requires a scheduler thread: {error}"));
-    if let Some(expected_owner) = expected_owner {
-        assert_eq!(
-            scheduler_thread.id(),
-            expected_owner,
-            "a user future must be polled by its owning scheduler thread"
-        );
-    }
     let wait = WaitQueue::new();
-    let executor = LocalExecutor::new(scheduler_thread.wake_handle())
-        .unwrap_or_else(|error| panic!("future executor requires its owner thread: {error}"));
     let output = executor.run(future.into_future(), |condition| {
         let ready = || condition.should_abort() || should_abort();
         if let Some(deadline) = deadline {
@@ -139,6 +136,12 @@ where
     });
     drop(executor);
     output
+}
+
+fn user_executor(task: &UserTaskRef) -> LocalExecutor {
+    LocalExecutor::new(task.wake_handle()).unwrap_or_else(|error| {
+        panic!("user future must run on its owning scheduler thread: {error}")
+    })
 }
 
 /// Coalesced hard-IRQ notification for one fixed service thread.

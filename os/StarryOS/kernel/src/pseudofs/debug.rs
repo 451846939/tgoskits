@@ -31,6 +31,12 @@ fn render_scheduler_metrics() -> alloc::string::String {
     let metrics = ax_runtime::task::qperf_runtime_scheduler_metrics_snapshot();
     let task = metrics.task;
     let mut output = alloc::string::String::new();
+    writeln!(
+        output,
+        "current_thread_handle_queries {}",
+        task.current_thread_handle_queries
+    )
+    .unwrap();
     writeln!(output, "direct_wake_attempts {}", task.direct_wake_attempts).unwrap();
     writeln!(
         output,
@@ -171,6 +177,7 @@ mod tests {
         assert_eq!(
             keys,
             [
+                "current_thread_handle_queries",
                 "direct_wake_attempts",
                 "direct_wake_activations",
                 "direct_wake_enqueues",

@@ -22,8 +22,8 @@ use crate::{
     file::{FD_TABLE, FileLike, PidFd, add_file_like, close_file_like_if},
     mm::copy_from_kernel,
     task::{
-        ProcessData, ProcessDataInit, ProcessImage, Thread, allocate_user_tid, current_user_task,
-        new_user_task, notify_members_changed, register_prepared_task,
+        ProcessData, ProcessDataInit, ProcessImage, Thread, allocate_user_tid, new_user_task,
+        notify_members_changed, register_prepared_task,
     },
 };
 
@@ -416,7 +416,11 @@ impl CloneArgs {
         Ok(())
     }
 
-    pub fn do_clone(self, uctx: &UserContext) -> AxResult<isize> {
+    pub fn do_clone(
+        self,
+        current: &crate::task::UserTaskRef,
+        uctx: &UserContext,
+    ) -> AxResult<isize> {
         self.validate()?;
 
         let Self {
@@ -469,7 +473,7 @@ impl CloneArgs {
             0
         };
 
-        let curr = current_user_task();
+        let curr = current;
         let curr_thread = curr.as_thread();
         let old_proc_data = &curr_thread.proc_data;
         if flags.contains(CloneFlags::NEWCGROUP) && !curr_thread.cred().has_cap_sys_admin() {
@@ -889,6 +893,7 @@ ktracepoint::define_event_trace!(
 );
 
 pub fn sys_clone(
+    current: &crate::task::UserTaskRef,
     uctx: &UserContext,
     flags: u32,
     stack: usize,
@@ -922,18 +927,18 @@ pub fn sys_clone(
         },
     };
 
-    args.do_clone(uctx)
+    args.do_clone(current, uctx)
 }
 
 #[cfg(target_arch = "x86_64")]
-pub fn sys_fork(uctx: &UserContext) -> AxResult<isize> {
-    sys_clone(uctx, SIGCHLD, 0, 0, 0, 0)
+pub fn sys_fork(current: &crate::task::UserTaskRef, uctx: &UserContext) -> AxResult<isize> {
+    sys_clone(current, uctx, SIGCHLD, 0, 0, 0, 0)
 }
 
 #[cfg(target_arch = "x86_64")]
-pub fn sys_vfork(uctx: &UserContext) -> AxResult<isize> {
+pub fn sys_vfork(current: &crate::task::UserTaskRef, uctx: &UserContext) -> AxResult<isize> {
     let flags = (CloneFlags::VFORK | CloneFlags::VM).bits() as u32 | SIGCHLD;
-    sys_clone(uctx, flags, 0, 0, 0, 0)
+    sys_clone(current, uctx, flags, 0, 0, 0, 0)
 }
 
 #[cfg(axtest)]

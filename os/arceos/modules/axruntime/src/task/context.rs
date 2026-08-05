@@ -13,8 +13,8 @@ use ax_hal::percpu::{
 use ax_task::{
     TaskError,
     runtime::{
-        ContextSwitch, ContextThreadBinding, ExecutionContextHandle, KernelContextRequest,
-        RuntimeHandleResult, RuntimeStatus, StackHandle, ThreadIdentityV1, UserContextRequest,
+        ContextSwitch, ContextThreadBinding, CurrentThreadPublication, ExecutionContextHandle,
+        KernelContextRequest, RuntimeHandleResult, RuntimeStatus, StackHandle, UserContextRequest,
     },
 };
 
@@ -84,6 +84,7 @@ struct RuntimeSwitchTail {
 #[repr(C)]
 struct RuntimeContext {
     header: CurrentThreadHeader,
+    publication: UnsafeCell<CurrentThreadPublication>,
     inner: Box<UnsafeCell<ax_hal::context::TaskContext>>,
     stack: StackHandle,
     switch_tail: UnsafeCell<Option<RuntimeSwitchTail>>,
@@ -98,6 +99,7 @@ impl RuntimeContext {
             .expect("an architecture context allocation must have a non-zero identity");
         Box::into_raw(Box::new(Self {
             header: CurrentThreadHeader::new(identity),
+            publication: UnsafeCell::new(CurrentThreadPublication::NONE),
             inner,
             stack,
             switch_tail: UnsafeCell::new(None),
@@ -306,23 +308,25 @@ pub(super) fn destroy_runtime_context(handle: ExecutionContextHandle) -> Runtime
 }
 
 pub(super) fn bind_runtime_context_thread(binding: ContextThreadBinding) -> RuntimeStatus {
-    if binding.identity.generation == 0 {
+    if !binding.publication.identity().is_bound() || binding.publication.owner().is_none() {
         return RuntimeStatus::InvalidArgument;
     }
-    let thread_identity =
-        ((binding.identity.generation as u64) << 32) | binding.identity.slot as u64;
-    let Ok(thread_identity) = usize::try_from(thread_identity) else {
-        return RuntimeStatus::InvalidArgument;
-    };
-    let Some(thread_identity) = RuntimeThreadCookie::new(thread_identity) else {
-        return RuntimeStatus::InvalidArgument;
-    };
     let Ok(context) = runtime_context(binding.context) else {
+        return RuntimeStatus::InvalidHandle;
+    };
+    if context.header.runtime_thread_cookie().is_some() {
+        return RuntimeStatus::InvalidArgument;
+    }
+    // Context binding runs exactly once before scheduler publication, so this
+    // is the sole write to the pinned current-thread publication.
+    unsafe { *context.publication.get() = binding.publication };
+    let publication = context.publication.get().expose_provenance();
+    let Some(publication) = RuntimeThreadCookie::new(publication) else {
         return RuntimeStatus::InvalidHandle;
     };
     if context
         .header
-        .bind_runtime_thread_cookie(thread_identity)
+        .bind_runtime_thread_cookie(publication)
         .is_err()
     {
         return RuntimeStatus::InvalidArgument;
@@ -334,25 +338,33 @@ pub(super) fn bind_runtime_context_thread(binding: ContextThreadBinding) -> Runt
     RuntimeStatus::Success
 }
 
-/// Reads the immutable scheduler identity owned by the current runtime context.
+/// Reads the immutable scheduler publication owned by the current runtime context.
 ///
 /// # Safety
 ///
 /// The caller must retain migration exclusion until the returned value has
 /// been copied. The architecture current-thread register must retain its live
 /// pinned [`CurrentThreadHeader`] publication for that complete interval.
-pub(super) unsafe fn scheduler_current_thread_identity() -> ThreadIdentityV1 {
+pub(super) unsafe fn scheduler_current_thread_publication() -> CurrentThreadPublication {
     let header = unsafe { ax_hal::percpu::current_thread_raw() };
     if header.is_null() {
-        return ThreadIdentityV1::NONE;
+        return CurrentThreadPublication::NONE;
     }
     // SAFETY: the current-thread register points to a live pinned header.
     let header = unsafe { &*header };
-    let Some(identity) = header.runtime_thread_cookie() else {
-        return ThreadIdentityV1::NONE;
+    let Some(publication) = header.runtime_thread_cookie() else {
+        return CurrentThreadPublication::NONE;
     };
-    let identity = identity.get() as u64;
-    ThreadIdentityV1::new(identity as u32, (identity >> 32) as u32)
+    let context = header as *const CurrentThreadHeader as *const RuntimeContext;
+    // SAFETY: `RuntimeContext::header` is at offset zero and the current header
+    // remains live under the caller's migration pin.
+    let expected = unsafe { (*context).publication.get() };
+    if publication.get() != expected.expose_provenance() {
+        return CurrentThreadPublication::NONE;
+    }
+    // SAFETY: binding initialized this immutable field before the context
+    // entered any run queue, and the cookie publication points to it exactly.
+    unsafe { *expected }
 }
 
 fn prepare_runtime_thread_switch<'switch>(

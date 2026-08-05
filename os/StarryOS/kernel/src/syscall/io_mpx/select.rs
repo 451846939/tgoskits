@@ -16,7 +16,6 @@ use crate::{
     mm::{UserConstPtr, UserPtr},
     syscall::signal::check_sigset_size,
     task::{
-        current_user_task,
         future::{UserWaitOutcome, block_on_user_timeout, poll_io},
         with_blocked_signals,
     },
@@ -55,6 +54,7 @@ impl fmt::Debug for FdSet {
 }
 
 fn do_select(
+    current: &crate::task::UserTaskRef,
     nfds: u32,
     readfds: UserPtr<__kernel_fd_set>,
     writefds: UserPtr<__kernel_fd_set>,
@@ -134,10 +134,10 @@ fn do_select(
     drop(fd_table);
     let fds = FdPollSet(fds);
 
-    let task = current_user_task();
+    let task = current;
     let result = with_blocked_signals(sigmask, || {
         let result = block_on_user_timeout(
-            &task,
+            task,
             timeout,
             poll_io(&fds, IoEvents::empty(), false, || {
                 let mut res = 0usize;
@@ -204,6 +204,7 @@ fn do_select(
 
 #[cfg(target_arch = "x86_64")]
 pub fn sys_select(
+    current: &crate::task::UserTaskRef,
     nfds: u32,
     readfds: UserPtr<__kernel_fd_set>,
     writefds: UserPtr<__kernel_fd_set>,
@@ -211,6 +212,7 @@ pub fn sys_select(
     timeout: UserConstPtr<timeval>,
 ) -> AxResult<isize> {
     do_select(
+        current,
         nfds,
         readfds,
         writefds,
@@ -236,6 +238,7 @@ pub struct SignalSetWithSize {
 }
 
 pub fn sys_pselect6(
+    current: &crate::task::UserTaskRef,
     nfds: u32,
     readfds: UserPtr<__kernel_fd_set>,
     writefds: UserPtr<__kernel_fd_set>,
@@ -244,6 +247,7 @@ pub fn sys_pselect6(
     sigmask: UserConstPtr<SignalSetWithSize>,
 ) -> AxResult<isize> {
     do_select(
+        current,
         nfds,
         readfds,
         writefds,

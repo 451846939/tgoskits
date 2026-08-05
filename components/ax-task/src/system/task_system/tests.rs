@@ -1540,7 +1540,7 @@ fn context_is_bound_to_the_allocated_thread_before_new_is_published() {
         crate::test_runtime::last_context_binding(),
         Some(ContextThreadBinding {
             context,
-            identity: ThreadIdentityV1::new(thread.id().slot(), thread.id().generation()),
+            publication: thread.runtime_publication(),
         })
     );
 }
@@ -1614,8 +1614,11 @@ fn failed_context_binding_retires_the_allocated_generation() {
     let replacement = system
         .create_thread(ThreadSpec::new(Default::default()))
         .unwrap();
-    assert_eq!(replacement.id().slot(), failed.identity.slot);
-    assert_ne!(replacement.id().generation(), failed.identity.generation);
+    assert_eq!(replacement.id().slot(), failed.publication.identity().slot);
+    assert_ne!(
+        replacement.id().generation(),
+        failed.publication.identity().generation
+    );
     crate::test_runtime::configure_resource_release(RuntimeStatus::Unsupported);
 }
 

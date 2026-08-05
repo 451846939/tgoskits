@@ -12,7 +12,7 @@ use super::{
     IPC_CREAT, IPC_EXCL, IPC_INFO, IPC_PRIVATE, IPC_RMID, IPC_SET, IPC_STAT, IpcPerm, MSG_INFO,
     MSG_STAT, has_ipc_permission, next_ipc_id,
 };
-use crate::task::{WaitQueue as MsgWaitQueue, current_user_task};
+use crate::task::WaitQueue as MsgWaitQueue;
 
 /// Data structure describing a message queue.
 #[repr(C)]
@@ -387,8 +387,7 @@ pub struct UserMsgbuf {
     pub mtext: [u8; 0], // actual data, use zero-sized array to simulate flexible array
 }
 
-pub fn sys_msgget(key: i32, msgflg: i32) -> AxResult<isize> {
-    let current = current_user_task();
+pub fn sys_msgget(current: &crate::task::UserTaskRef, key: i32, msgflg: i32) -> AxResult<isize> {
     let thread = current.as_thread();
     let proc_data = &thread.proc_data;
     let cred = thread.cred();
@@ -473,6 +472,7 @@ pub fn sys_msgget(key: i32, msgflg: i32) -> AxResult<isize> {
 }
 
 pub fn sys_msgsnd(
+    current: &crate::task::UserTaskRef,
     msqid: i32,
     msgp: *const UserMsgbuf,
     msgsz: usize,
@@ -482,7 +482,6 @@ pub fn sys_msgsnd(
     if msgsz > MSGMAX {
         return Err(AxError::from(LinuxError::EINVAL)); // EINVAL
     }
-    let current = current_user_task();
     let thread = current.as_thread();
     let proc_data = &thread.proc_data;
     let cred = thread.cred();
@@ -550,7 +549,7 @@ pub fn sys_msgsnd(
 
         let send_wait_queue = msg_queue.send_wait_queue.clone();
         drop(msg_queue);
-        let _ = send_wait_queue.wait_if(u32::MAX, None, || {
+        let _ = send_wait_queue.wait_if(current, u32::MAX, None, || {
             let msg_queue = msg_queue_ref.lock();
             !msg_queue.mark_removed && queue_would_exceed(&msg_queue, data_len)
         })?;
@@ -558,6 +557,7 @@ pub fn sys_msgsnd(
 }
 
 pub fn sys_msgrcv(
+    current: &crate::task::UserTaskRef,
     msqid: i32,
     msgp: *mut UserMsgbuf,
     msgsz: usize,
@@ -580,7 +580,6 @@ pub fn sys_msgrcv(
     } else {
         flags.remove(MsgRcvFlags::MSG_EXCEPT);
     }
-    let current = current_user_task();
     let thread = current.as_thread();
     let proc_data = &thread.proc_data;
     let cred = thread.cred();
@@ -663,7 +662,7 @@ pub fn sys_msgrcv(
 
             let recv_wait_queue = msg_queue.recv_wait_queue.clone();
             drop(msg_queue);
-            let _ = recv_wait_queue.wait_if(u32::MAX, None, || {
+            let _ = recv_wait_queue.wait_if(current, u32::MAX, None, || {
                 let msg_queue = msg_queue_ref.lock();
                 !msg_queue.mark_removed
                     && find_matching_message(&msg_queue, msgtyp, &flags).is_none()
@@ -721,9 +720,13 @@ pub fn sys_msgrcv(
     Ok(copy_len as isize)
 }
 
-pub fn sys_msgctl(msqid: i32, cmd: i32, buf: usize) -> AxResult<isize> {
+pub fn sys_msgctl(
+    current: &crate::task::UserTaskRef,
+    msqid: i32,
+    cmd: i32,
+    buf: usize,
+) -> AxResult<isize> {
     //  Get current process information
-    let current = current_user_task();
     let thread = current.as_thread();
     let cred = thread.cred();
     let current_uid = cred.euid;

@@ -68,7 +68,12 @@ impl TryFrom<Clone3Args> for CloneArgs {
     }
 }
 
-pub fn sys_clone3(uctx: &UserContext, args: *const u8, size: usize) -> AxResult<isize> {
+pub fn sys_clone3(
+    current: &crate::task::UserTaskRef,
+    uctx: &UserContext,
+    args: *const u8,
+    size: usize,
+) -> AxResult<isize> {
     debug!("sys_clone3 <= args: {args:p}, size: {size}");
 
     if size < MIN_CLONE_ARGS_SIZE {
@@ -91,7 +96,7 @@ pub fn sys_clone3(uctx: &UserContext, args: *const u8, size: usize) -> AxResult<
         bytemuck::try_pod_read_unaligned(&buffer).map_err(|_| AxError::InvalidInput)?;
 
     let clone_args = CloneArgs::try_from(clone3_args)?;
-    clone_args.do_clone(uctx)
+    clone_args.do_clone(current, uctx)
 }
 
 #[cfg(axtest)]

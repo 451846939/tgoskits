@@ -74,7 +74,13 @@ pub use task_work::{
 /// [`TaskError::CpuOwnerBorrowed`] for a reentrant owner query, or
 /// [`TaskError::NoRunnableThread`] before a current thread is installed.
 pub fn current_thread_handle() -> Result<ThreadHandle, TaskError> {
-    runtime_current_cpu()?.current_thread_handle()
+    #[cfg(feature = "qperf-metrics")]
+    crate::metrics::record_current_thread_handle_query();
+    let _pin = RuntimePreemptGuard::enter();
+    // SAFETY: `_pin` prevents the architecture-selected current context from
+    // changing until `acquire_handle` has cloned its owner-side strong Arc.
+    let publication = unsafe { current_thread_publication_pinned()? };
+    unsafe { publication.acquire_handle() }
 }
 
 /// Returns the generation-bearing identity of the calling scheduler thread.
@@ -106,8 +112,18 @@ pub fn current_thread_token() -> Result<CurrentThreadToken, TaskError> {
 /// Task-context callers normally satisfy this with a preemption guard or an
 /// IRQ-aware metadata lock.
 pub unsafe fn current_thread_id_pinned() -> Result<ThreadId, TaskError> {
-    let identity = unsafe { task_runtime::current_thread_identity() };
+    let identity = unsafe { current_thread_publication_pinned()? }.identity();
+    Ok(ThreadId::from_parts(identity.slot, identity.generation))
+}
+
+unsafe fn current_thread_publication_pinned()
+-> Result<crate::runtime::CurrentThreadPublication, TaskError> {
+    let publication = unsafe { task_runtime::current_thread_publication() };
+    let identity = publication.identity();
     if !identity.is_bound() {
+        if !publication.owner().is_none() {
+            return Err(TaskError::InvalidRuntimeHandle);
+        }
         // Preserve the public distinction between a runtime that has not
         // installed its task system and an initialized bootstrap context that
         // has not published a scheduler thread. This cold error path does not
@@ -115,7 +131,10 @@ pub unsafe fn current_thread_id_pinned() -> Result<ThreadId, TaskError> {
         let _system = runtime_task_system()?;
         return Err(TaskError::NoRunnableThread);
     }
-    Ok(ThreadId::from_parts(identity.slot, identity.generation))
+    if publication.owner().is_none() {
+        return Err(TaskError::InvalidRuntimeHandle);
+    }
+    Ok(publication)
 }
 
 /// Tests the current CPU's sticky reschedule request while migration is pinned.

@@ -34,7 +34,6 @@ use starry_vm::{VmMutPtr, vm_read_slice, vm_write_slice};
 use super::{FileLike, Kstat};
 use crate::{
     file::{IoDst, IoSrc, get_file_like},
-    syscall::in_root_net_ns,
     task::current_user_task,
 };
 
@@ -133,6 +132,18 @@ fn allocate_socket_staging(len: usize) -> AxResult<Vec<u8>> {
         .map_err(|_| AxError::NoMemory)?;
     buffer.resize(len, 0);
     Ok(buffer)
+}
+
+/// Returns whether the calling task can observe the root network namespace.
+///
+/// This query remains at the file-object boundary because these methods are
+/// also invoked outside syscall dispatch. A future network-namespace ownership
+/// refactor should attach the namespace to each socket, as Linux does, instead
+/// of extending a syscall task capability into the portable socket layer.
+pub(super) fn in_root_net_ns() -> bool {
+    let current = current_user_task();
+    let namespace = current.as_thread().proc_data.namespace_snapshot();
+    namespace.net_ns.lock().ns_id == 0
 }
 
 pub(super) fn visible_interfaces() -> impl Iterator<Item = InterfaceInfo> {

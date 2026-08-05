@@ -14,7 +14,7 @@ use linux_raw_sys::general::{
 
 use crate::{
     file::{FD_TABLE, FileDescriptor, NsFd, PidFd, get_file_like},
-    task::{AX_FILE_LIMIT, ProcessNamespaceUpdate, Thread, current_user_task, get_task},
+    task::{AX_FILE_LIMIT, ProcessNamespaceUpdate, Thread, get_task},
 };
 
 const UNSHARE_NAMESPACE_FLAGS: u32 = CLONE_NEWUTS
@@ -120,13 +120,13 @@ impl PreparedUnshare {
 }
 
 /// unshare(2) — disassociate parts of the process execution context.
-pub fn sys_unshare(flags: u32) -> AxResult<isize> {
+pub fn sys_unshare(current: &crate::task::UserTaskRef, flags: u32) -> AxResult<isize> {
     if flags & !SUPPORTED_NS_FLAGS != 0 {
         warn!("sys_unshare: unsupported flags {:#x}", flags);
         return Err(AxError::InvalidInput);
     }
 
-    let curr = current_user_task();
+    let curr = current;
     let thread = curr.as_thread();
     let want_privileged_ns = flags & (CLONE_NEWNS | CLONE_NEWCGROUP) != 0;
 
@@ -157,7 +157,7 @@ pub fn sys_unshare(flags: u32) -> AxResult<isize> {
 /// * `EINVAL` — `nstype` does not match the namespace type, or multi-threaded
 ///   process attempts to change PID namespace
 /// * `EPERM` — insufficient privileges (e.g. user namespace restrictions)
-pub fn sys_setns(fd: u32, nstype: u32) -> AxResult<isize> {
+pub fn sys_setns(current: &crate::task::UserTaskRef, fd: u32, nstype: u32) -> AxResult<isize> {
     if nstype != 0 && nstype & !SUPPORTED_SETNS_FLAGS != 0 {
         warn!("sys_setns: unsupported nstype {:#x}", nstype);
         return Err(AxError::InvalidInput);
@@ -167,12 +167,12 @@ pub fn sys_setns(fd: u32, nstype: u32) -> AxResult<isize> {
 
     // ── 方式一: NsFd (from /proc/<pid>/ns/<type>) ────────────────────
     if let Some(nsfd) = file_like.downcast_ref::<NsFd>() {
-        return setns_via_nsfd(nsfd, nstype);
+        return setns_via_nsfd(current, nsfd, nstype);
     }
 
     // ── 方式二: PidFd (from pidfd_open) ─────────────────────────────
     if let Some(pidfd) = file_like.downcast_ref::<PidFd>() {
-        return setns_via_pidfd(pidfd, nstype);
+        return setns_via_pidfd(current, pidfd, nstype);
     }
 
     Err(AxError::BadFileDescriptor)
@@ -182,7 +182,7 @@ pub fn sys_setns(fd: u32, nstype: u32) -> AxResult<isize> {
 ///
 /// An NsFd always references exactly one namespace type, so `nstype`
 /// must either be `0` or match the fd's type.
-fn setns_via_nsfd(nsfd: &NsFd, nstype: u32) -> AxResult<isize> {
+fn setns_via_nsfd(current: &crate::task::UserTaskRef, nsfd: &NsFd, nstype: u32) -> AxResult<isize> {
     let fd_type = nsfd.ns_type();
 
     if nstype != 0 && nstype != fd_type {
@@ -193,7 +193,7 @@ fn setns_via_nsfd(nsfd: &NsFd, nstype: u32) -> AxResult<isize> {
         return Err(AxError::InvalidInput);
     }
 
-    let curr = current_user_task();
+    let curr = current;
     let thread = curr.as_thread();
     let proc_data = &thread.proc_data;
     if fd_type == CLONE_NEWCGROUP && !thread.cred().has_cap_sys_admin() {
@@ -255,7 +255,11 @@ fn setns_via_nsfd(nsfd: &NsFd, nstype: u32) -> AxResult<isize> {
 /// `nstype` is a bitmask of `CLONE_NEW*` flags specifying which
 /// namespaces to join from the target process.  Unlike the NsFd path,
 /// this can join multiple namespaces in a single call.
-fn setns_via_pidfd(pidfd: &PidFd, nstype: u32) -> AxResult<isize> {
+fn setns_via_pidfd(
+    current: &crate::task::UserTaskRef,
+    pidfd: &PidFd,
+    nstype: u32,
+) -> AxResult<isize> {
     if nstype == 0 {
         warn!("sys_setns: nstype must be non-zero for pidfd");
         return Err(AxError::InvalidInput);
@@ -275,7 +279,7 @@ fn setns_via_pidfd(pidfd: &PidFd, nstype: u32) -> AxResult<isize> {
     };
     let target_nsproxy = target_proc.namespace_snapshot();
 
-    let curr = current_user_task();
+    let curr = current;
     let thread = curr.as_thread();
     let proc_data = &thread.proc_data;
     if nstype & CLONE_NEWCGROUP != 0 && !thread.cred().has_cap_sys_admin() {

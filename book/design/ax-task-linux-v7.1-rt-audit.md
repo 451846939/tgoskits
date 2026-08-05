@@ -1532,6 +1532,93 @@ identity 的事实源。
 Starry `current_user_task()` 从 registry-backed `current_thread_handle()` 收敛为生命周期安全的
 本地 current extension capability，才会覆盖 futex、nanosleep 和大多数 syscall 热路径。
 
+### 2026-08-05 syscall current capability 的显式传播
+
+Linux v7.1 的 syscall 在当前 `task_struct` 的执行上下文中完成。四架构的 `current` 入口不同，
+但生命周期规则一致：同步 syscall 路径可直接借用当前任务；只有把任务发布到 wake queue、
+callback、异步 worker 或其他 CPU 时才通过 `get_task_struct()` 增加强引用。阻塞后返回并不要求
+重新查找 current，因为被调度回来的仍是发起 syscall 的同一个任务。
+
+Starry 用户线程入口原本已经在整个用户执行循环中持有强 `UserTaskRef`，其中
+`ThreadHandle` 同时固定 scheduler record 与 Starry extension 的生命周期；但旧
+`handle_syscall(&Thread, ...)` 丢弃了这项能力。syscall 子树中的 171 个调用点随后重新调用
+`current_user_task()`，每次都要取得可变 CPU owner、克隆当前 `ThreadHandle` 并重新校验
+extension。`poll`、`wait` 等路径甚至会在同一个 syscall 中重复该过程。
+
+本轮按 Linux current 的边界整体迁移，不保留隐藏 getter 兼容层：
+
+- 用户执行循环把同一个 `&UserTaskRef` 交给 `handle_syscall`；
+- 只有实际依赖当前任务的 syscall 和辅助函数才显式接收这项能力，不需要 current 的 syscall
+  保持原签名；
+- sleep、futex、poll、select、epoll、AIO、signal wait、waitpid 和 IPC 阻塞路径在调度前后都
+  借用同一个强 capability，不重新查询 runqueue owner；
+- 凭据、PID、namespace、地址空间和调度策略查询从该 capability 收窄到 `&Thread` 或
+  `ProcessData`，不得保存跨任务的裸 extension 指针；
+- syscall 目录内的 `current_user_task()` 调用从 171 降为 0。网络文件对象仍有独立于 syscall
+  dispatch 的 namespace 查询，本轮将该所有权留在 file/socket 边界，避免把 syscall
+  capability 错误扩散到可移植网络层；其最终方向应像 Linux 一样由 socket 持有 netns。
+
+确定性红测先把 `handle_syscall` 的类型约束为接收 `&UserTaskRef`，旧实现因仍接收
+`&Thread` 稳定编译失败；迁移后同一约束通过。`qperf-metrics` 新增
+`current_thread_handle_queries`，用于在相同启动和 workload 下直接比较 scheduler current
+强句柄查询次数，不用从 QEMU 总时间反推。该计数只在 qperf feature 下启用，普通内核热路径
+不增加原子操作。
+
+#### current 强句柄与四架构 publication
+
+显式传播消除了 syscall 子树的重复查询，但 Starry VM 指针、文件对象和内核辅助层仍需要在
+无法携带 syscall borrow 的边界取得强句柄。旧 `current_thread_handle()` 为此进入 IRQ guard，
+借用 `CpuLocal` 的可变 owner gate，再从 `dispatch.current_core` 克隆 `Arc`。这仍把 Linux 的
+本地 `current` 与 runqueue owner 混在一起：一轮 x86 wakeup workload 中即使 syscall 已显式
+传播任务，仍出现 1,900,741 次 owner-side handle 查询。
+
+Linux v7.1 的共同模型不是“四架构分别维护一套 scheduler current”，而是架构寄存器或
+per-CPU 固定槽选择当前 `task_struct`，`get_task_struct()` 只在需要跨当前执行区间持有任务时
+增加引用。TGOSKits 四架构已经统一由 `TaskContext.task_local.current_header` 在裸切换尾部恢复
+固定的 `CurrentThreadHeader`：x86 使用 GS CPU anchor，AArch64 使用 `sp_el0` 或 TLS anchor，
+RISC-V 使用 `tp` 或 `sscratch` anchor，LoongArch 使用 `tp` 或 `r21` anchor。因此强句柄也应
+从同一个 header 所属 runtime context 派生，而不是再访问 runqueue。
+
+本轮把该边界收敛为 `CurrentThreadPublication { identity, owner }`：
+
+- ax-task 在线程 ID 分配后、进入 runqueue 前一次性绑定 generation-bearing identity 与
+  `ThreadCore` 的 opaque owner 地址；ax-runtime 把 publication 保存在 pinned
+  `RuntimeContext`，header cookie 只指向这份不可变 publication；
+- `current_thread_id()` 与 `current_thread_handle()` 读取同一个 publication。后者只持有一次
+  preemption pin，在 `CpuLocal.current_core` 仍保留 owner-side `Arc` 的证明下增加 strong
+  count，再通过 `ThreadHandle::from_core` 获取正常 external reaper lease；
+- publication 的裸地址不能单独升级、不能跨 context switch 使用，也不能绕过
+  `ThreadHandle` 的 external lease。退出线程仍由 scheduler handoff 保留到 switch tail 清除
+  `on_cpu`；tail 前 reaper 不可能取得最后一个 strong owner；
+- 运行时同时校验 publication identity 与克隆后 `ThreadHandle::id()`，错误或半绑定的
+  publication 返回 `InvalidRuntimeHandle`，未绑定 bootstrap context 保持
+  `NoRunnableThread`/`NotInitialized` 的原错误区分；
+- 四架构汇编、`CurrentThreadHeader` 64B ABI 和 CPU-local register contract 不需要分叉，只有
+  runtime cookie 的解释从 packed identity 升级为 typed publication 指针。
+
+确定性红测在旧实现上观察到一次 `current_thread_handle()` 产生一个 CPU owner claim 且没有
+migration pin；新实现要求 owner claim 为 0、remote endpoint 读取为 0、migration pin 恰为 1。
+测试同时覆盖绑定 identity/owner 一致性、重复绑定、registry lock 持有期间的 current
+extension 取得，以及原有 exit/switch-tail/reap 顺序。
+
+Starry uaccess 也删除了同一次 copy 中的第二次任务查询：`prepare_user_memory()` 返回已经校验
+并固定的 `UserTaskRef`，随后 fault scope 直接借用它；独立 page-fault trap 仍按自己的异常入口
+解析 current。返回类型红测在旧 `VmResult<()>` 实现上稳定编译失败，新实现要求
+`VmResult<UserTaskRef>`。
+
+同一 x86_64 TCG、相同镜像和 workload 的前后结果如下（基线为 d69dba054）：
+
+- `current_thread_handle_queries`：2,743,554 → 948,430（-65.4%）；
+- 完整 QEMU：79.03s → 76.82s（-2.8%）；clock-pair：27.072 → 22.712 微秒（-16.1%）；
+- OTHER p50：同核 123.643 → 110.935（-10.3%）、跨核 113.317 → 108.520（-4.2%）、
+  跨进程 114.464 → 109.264（-4.5%）、timer 214.519 → 197.693 微秒（-7.8%）；
+- FIFO p50：三个 futex 场景分别改善 4.7%、3.6%、4.6%；timer 215.717 → 217.898 微秒
+  （+1.0%，保留为 TCG 波动/后续 timer 审计项，不能声称全部指标已对齐）。
+
+该结果证明本地 current 不再争用 scheduler owner，且显式 capability 能降低实际端到端开销；
+它仍不是“已达到 Linux RT 同一绝对水平”的证据。后续比较继续以 Linux RT 同机 workload、
+调用链和 tail latency 为准，而不是用查询次数下降替代最终性能验收。
+
 ## 模块化结果
 
 - `TaskSystem` orchestration 只负责编排，registry/reap、placement、owner scheduling、deadline、PI、balance、deferred work 分模块；

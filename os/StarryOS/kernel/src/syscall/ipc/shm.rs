@@ -20,10 +20,7 @@ use super::{
     IPC_CREAT, IPC_EXCL, IPC_INFO, IPC_PRIVATE, IPC_RMID, IPC_SET, IPC_STAT, IpcPerm, SHM_INFO,
     SHM_STAT, has_ipc_permission, next_ipc_id,
 };
-use crate::{
-    mm::{AddrSpace, Backend, SharedPages, UserPtr},
-    task::current_user_task,
-};
+use crate::mm::{AddrSpace, Backend, SharedPages, UserPtr};
 
 bitflags::bitflags! {
     /// flags for sys_shmat
@@ -517,8 +514,13 @@ pub fn clear_proc_shm(pid: Pid, aspace: &Arc<PiMutex<AddrSpace>>) {
     shm_manager.remove_pid(pid);
 }
 
-pub fn sys_shmget(key: i32, size: usize, shmflg: usize) -> AxResult<isize> {
-    let curr = current_user_task();
+pub fn sys_shmget(
+    current: &crate::task::UserTaskRef,
+    key: i32,
+    size: usize,
+    shmflg: usize,
+) -> AxResult<isize> {
+    let curr = current;
     let thread = curr.as_thread();
     let cur_pid = thread.proc_data.proc.pid();
     let cred = thread.cred();
@@ -564,10 +566,15 @@ pub fn sys_shmget(key: i32, size: usize, shmflg: usize) -> AxResult<isize> {
     Ok(shmid as isize)
 }
 
-pub fn sys_shmat(shmid: i32, addr: usize, shmflg: u32) -> AxResult<isize> {
+pub fn sys_shmat(
+    current: &crate::task::UserTaskRef,
+    shmid: i32,
+    addr: usize,
+    shmflg: u32,
+) -> AxResult<isize> {
     let shm_flg = ShmAtFlags::from_bits_truncate(shmflg);
 
-    let curr = current_user_task();
+    let curr = current;
     let proc_data = &curr.as_thread().proc_data;
     let pid = proc_data.proc.pid();
 
@@ -653,10 +660,15 @@ pub fn sys_shmat(shmid: i32, addr: usize, shmflg: u32) -> AxResult<isize> {
     Ok(start_addr.as_usize() as isize)
 }
 
-pub fn sys_shmctl(shmid: i32, cmd: u32, buf: UserPtr<ShmidDs>) -> AxResult<isize> {
+pub fn sys_shmctl(
+    current: &crate::task::UserTaskRef,
+    shmid: i32,
+    cmd: u32,
+    buf: UserPtr<ShmidDs>,
+) -> AxResult<isize> {
     let cmd = cmd as i32;
 
-    let curr = current_user_task();
+    let curr = current;
     let thread = curr.as_thread();
     let cred = thread.cred();
     let ns_id = thread.proc_data.namespace_snapshot().ipc_ns.lock().ns_id;
@@ -800,10 +812,10 @@ pub fn sys_shmctl(shmid: i32, cmd: u32, buf: UserPtr<ShmidDs>) -> AxResult<isize
 
 // Note: all the below delete functions only delete the mapping between the
 // shm_id and the shm_inner,   but the shm_inner is not deleted or modifyed!
-pub fn sys_shmdt(shmaddr: usize) -> AxResult<isize> {
+pub fn sys_shmdt(current: &crate::task::UserTaskRef, shmaddr: usize) -> AxResult<isize> {
     let shmaddr = VirtAddr::from(shmaddr);
 
-    let curr = current_user_task();
+    let curr = current;
     let proc_data = &curr.as_thread().proc_data;
     let pid = proc_data.proc.pid();
 

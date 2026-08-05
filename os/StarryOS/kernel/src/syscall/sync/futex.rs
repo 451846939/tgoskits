@@ -18,9 +18,7 @@ use crate::{
         atomic_update_user_u32_nofault, fault_in_user_u32_read, fault_in_user_u32_write,
         read_user_u32_nofault,
     },
-    task::{
-        FutexAccessError, FutexContext, FutexKeyMode, FutexWaitError, current_user_task, get_task,
-    },
+    task::{FutexAccessError, FutexContext, FutexKeyMode, FutexWaitError, UserTaskRef, get_task},
     time::TimeValueLike,
 };
 
@@ -249,6 +247,7 @@ fn complete_futex_wake(count: usize) -> AxResult<isize> {
 }
 
 pub fn sys_futex(
+    current: &UserTaskRef,
     uaddr: *const u32,
     futex_op: u32,
     value: u32,
@@ -287,7 +286,7 @@ pub fn sys_futex(
             } else {
                 u32::MAX
             };
-            let context = FutexContext::current();
+            let context = FutexContext::new(current);
 
             loop {
                 let futex = context.resolve(uaddr.addr(), op.key_mode);
@@ -316,7 +315,7 @@ pub fn sys_futex(
             let wake_count = assert_non_negative_i32(value)? as usize;
             validate_futex_word(uaddr)?;
 
-            let futex = FutexContext::current().resolve(uaddr.addr(), op.key_mode);
+            let futex = FutexContext::new(current).resolve(uaddr.addr(), op.key_mode);
             let bitset = if op.command == FutexCommand::WakeBitset {
                 value3
             } else {
@@ -332,7 +331,7 @@ pub fn sys_futex(
                 validate_futex_word(uaddr)?;
             }
             validate_futex_word(uaddr2)?;
-            let context = FutexContext::current();
+            let context = FutexContext::new(current);
 
             let count = loop {
                 let (source_futex, target_futex) =
@@ -379,7 +378,7 @@ pub fn sys_futex(
                 apply_wake_op_without_waiters(uaddr2, wake_operation)?;
                 0
             } else {
-                let context = FutexContext::current();
+                let context = FutexContext::new(current);
                 loop {
                     // Shared keys depend on the current VMA backing and must be
                     // recomputed after fault-in, matching Linux futex retry.
@@ -416,13 +415,15 @@ pub fn sys_get_robust_list(
     Ok(0)
 }
 
-pub fn sys_set_robust_list(head: *const robust_list_head, size: usize) -> AxResult<isize> {
+pub fn sys_set_robust_list(
+    current: &crate::task::UserTaskRef,
+    head: *const robust_list_head,
+    size: usize,
+) -> AxResult<isize> {
     if size != size_of::<robust_list_head>() {
         return Err(AxError::InvalidInput);
     }
-    current_user_task()
-        .as_thread()
-        .set_robust_list_head(head.addr());
+    current.as_thread().set_robust_list_head(head.addr());
 
     Ok(0)
 }

@@ -18,15 +18,14 @@ use crate::{
     mm::{UserConstPtr, UserPtr},
     syscall::signal::check_sigset_size,
     task::{
-        current_user_task,
         future::{UserWaitOutcome, block_on_user_timeout},
         with_blocked_signals,
     },
     time::TimeValueLike,
 };
 
-fn check_nfds_limit(nfds: usize) -> AxResult<()> {
-    let nofile = current_user_task().as_thread().proc_data.rlimits()[RLIMIT_NOFILE].current;
+fn check_nfds_limit(current: &crate::task::UserTaskRef, nfds: usize) -> AxResult<()> {
+    let nofile = current.as_thread().proc_data.rlimits()[RLIMIT_NOFILE].current;
     if nfds as u64 > nofile {
         Err(AxError::InvalidInput)
     } else {
@@ -34,8 +33,12 @@ fn check_nfds_limit(nfds: usize) -> AxResult<()> {
     }
 }
 
-fn read_poll_fds(fds: UserPtr<pollfd>, nfds: usize) -> AxResult<Vec<pollfd>> {
-    check_nfds_limit(nfds)?;
+fn read_poll_fds(
+    current: &crate::task::UserTaskRef,
+    fds: UserPtr<pollfd>,
+    nfds: usize,
+) -> AxResult<Vec<pollfd>> {
+    check_nfds_limit(current, nfds)?;
     if nfds == 0 {
         return Ok(Vec::new());
     }
@@ -93,6 +96,7 @@ fn collect_ready_poll_events(
 }
 
 fn do_poll(
+    current: &crate::task::UserTaskRef,
     poll_fds: &mut [pollfd],
     timeout: Option<TimeValue>,
     sigmask: Option<SignalSet>,
@@ -145,8 +149,8 @@ fn do_poll(
             Poll::Pending
         });
 
-        let task = current_user_task();
-        match block_on_user_timeout(&task, timeout, wait) {
+        let task = current;
+        match block_on_user_timeout(task, timeout, wait) {
             UserWaitOutcome::Ready(result) => result,
             UserWaitOutcome::TimedOut => Ok(0),
             UserWaitOutcome::Interrupted => Err(AxError::Interrupted),
@@ -155,15 +159,20 @@ fn do_poll(
 }
 
 #[cfg(target_arch = "x86_64")]
-pub fn sys_poll(fds: UserPtr<pollfd>, nfds: u32, timeout: i32) -> AxResult<isize> {
+pub fn sys_poll(
+    current: &crate::task::UserTaskRef,
+    fds: UserPtr<pollfd>,
+    nfds: u32,
+    timeout: i32,
+) -> AxResult<isize> {
     let nfds = nfds as usize;
-    let mut poll_fds = read_poll_fds(fds, nfds)?;
+    let mut poll_fds = read_poll_fds(current, fds, nfds)?;
     let timeout = if timeout < 0 {
         None
     } else {
         Some(TimeValue::from_millis(timeout as u64))
     };
-    let res = do_poll(&mut poll_fds, timeout, None)?;
+    let res = do_poll(current, &mut poll_fds, timeout, None)?;
     if nfds > 0 {
         write_poll_revents(fds, &poll_fds)?;
     }
@@ -171,6 +180,7 @@ pub fn sys_poll(fds: UserPtr<pollfd>, nfds: u32, timeout: i32) -> AxResult<isize
 }
 
 pub fn sys_ppoll(
+    current: &crate::task::UserTaskRef,
     fds: UserPtr<pollfd>,
     nfds: i32,
     timeout: UserConstPtr<timespec>,
@@ -181,7 +191,7 @@ pub fn sys_ppoll(
         check_sigset_size(sigsetsize)?;
     }
     let nfds = nfds.try_into().map_err(|_| AxError::InvalidInput)?;
-    let mut poll_fds = read_poll_fds(fds, nfds)?;
+    let mut poll_fds = read_poll_fds(current, fds, nfds)?;
     let timeout = (if timeout.is_null() {
         None
     } else {
@@ -198,7 +208,7 @@ pub fn sys_ppoll(
         // pattern is valid and unsupported bits are handled by signal logic.
         Some(unsafe { sigmask.read_abi()? })
     };
-    let res = do_poll(&mut poll_fds, timeout, sigmask)?;
+    let res = do_poll(current, &mut poll_fds, timeout, sigmask)?;
     if nfds > 0 {
         write_poll_revents(fds, &poll_fds)?;
     }

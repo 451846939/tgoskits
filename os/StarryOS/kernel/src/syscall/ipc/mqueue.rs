@@ -23,7 +23,6 @@ use crate::{
         queues_max, validate_name,
     },
     mm::vm_load_string,
-    task::current_user_task,
     time::TimeValueLike,
 };
 
@@ -45,6 +44,7 @@ fn load_deadline(abs_timeout: *const __kernel_timespec) -> AxResult<Option<core:
 /// `O_CREAT` supplies an `attr`, its `mq_maxmsg`/`mq_msgsize` seed the queue
 /// (bounded by the system limits), otherwise the Linux defaults apply.
 pub fn sys_mq_open(
+    current: &crate::task::UserTaskRef,
     name: *const core::ffi::c_char,
     oflag: i32,
     mode: __kernel_mode_t,
@@ -75,7 +75,7 @@ pub fn sys_mq_open(
     // queue and drive the access check on an existing one (Linux uses
     // current_fsuid()/current_fsgid()); the resource capability lifts the
     // unprivileged attribute ceilings and DAC-override bypasses the open check.
-    let curr = current_user_task();
+    let curr = current;
     let thr = curr.as_thread();
     let cred = thr.cred();
     let (fsuid, fsgid, can_sys_resource, can_dac_override) = (
@@ -216,7 +216,10 @@ pub fn sys_mq_open(
 /// dir (the mqueuefs root, created at mount as root, so fsuid == 0), or holds
 /// `CAP_FOWNER`; otherwise `-EPERM`. The dir is world-writable so no extra
 /// `MAY_WRITE`/`MAY_EXEC` gate applies. We enforce the same before removing.
-pub fn sys_mq_unlink(name: *const core::ffi::c_char) -> AxResult<isize> {
+pub fn sys_mq_unlink(
+    current: &crate::task::UserTaskRef,
+    name: *const core::ffi::c_char,
+) -> AxResult<isize> {
     let raw = vm_load_string(name)?;
     let short = validate_name(&raw)?;
     let key = {
@@ -226,7 +229,7 @@ pub fn sys_mq_unlink(name: *const core::ffi::c_char) -> AxResult<isize> {
         k
     };
 
-    let curr = current_user_task();
+    let curr = current;
     let cred = curr.as_thread().cred();
     let (fsuid, can_fowner) = (cred.fsuid, cred.has_cap_fowner());
 
@@ -311,9 +314,13 @@ pub fn sys_mq_timedreceive(
 /// `sigev_notify = SIGEV_THREAD`, `sigev_signo = <netlink fd>` and
 /// `sigev_value.sival_ptr = <cookie buffer>`; the kernel pushes the cookie over
 /// that socket on message arrival (ipc/mqueue.c:1287-1351, `netlink_sendskb`).
-pub fn sys_mq_notify(mqdes: i32, sevp: *const sigevent) -> AxResult<isize> {
+pub fn sys_mq_notify(
+    current: &crate::task::UserTaskRef,
+    mqdes: i32,
+    sevp: *const sigevent,
+) -> AxResult<isize> {
     let queue = queue_from_fd(mqdes)?;
-    let pid = current_user_task().as_thread().proc_data.proc.pid();
+    let pid = current.as_thread().proc_data.proc.pid();
 
     let req = if sevp.is_null() {
         NotifyRequest::Unregister

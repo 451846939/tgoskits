@@ -13,8 +13,6 @@ use ax_memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
 use ax_runtime::hal::paging::MappingFlags;
 use starry_vm::vm_write_slice;
 
-use crate::task::current_user_task;
-
 /// Check whether pages are resident in memory.
 ///
 /// The mincore() system call determines whether pages of the calling process's
@@ -42,7 +40,12 @@ use crate::task::current_user_task;
 /// - EFAULT: vec points to invalid address
 /// - EINVAL: addr not page-aligned
 /// - ENOMEM: length > (TASK_SIZE - addr), negative length, or unmapped memory
-pub fn sys_mincore(addr: usize, length: usize, vec: *mut u8) -> AxResult<isize> {
+pub fn sys_mincore(
+    current: &crate::task::UserTaskRef,
+    addr: usize,
+    length: usize,
+    vec: *mut u8,
+) -> AxResult<isize> {
     let start_addr = VirtAddr::from(addr);
 
     // EINVAL: addr must be a multiple of the page size
@@ -72,7 +75,7 @@ pub fn sys_mincore(addr: usize, length: usize, vec: *mut u8) -> AxResult<isize> 
 
     {
         // Get current address space
-        let curr = current_user_task();
+        let curr = current;
         let aspace_arc = curr.as_thread().proc_data.aspace();
         let aspace = aspace_arc.lock();
         let mut i = 0;

@@ -9,11 +9,12 @@ use starry_vm::VmPtr;
 
 use crate::{
     mm::UserPtr,
-    task::{ProcessData, Thread, current_user_task, get_process_data},
+    task::{ProcessData, Thread, get_process_data},
     time::TimeValueLike,
 };
 
 pub fn sys_prlimit64(
+    current: &crate::task::UserTaskRef,
     pid: Pid,
     resource: u32,
     new_limit: *const rlimit64,
@@ -45,7 +46,7 @@ pub fn sys_prlimit64(
         // TODO: has_cap_sys_resource() is currently euid==0 until a
         // fine-grained capability bitmap is implemented (see cred.rs).
         if new_limit.rlim_max > limit.max {
-            let cred = current_user_task().as_thread().cred();
+            let cred = current.as_thread().cred();
             if !cred.has_cap_sys_resource() {
                 return Err(AxError::OperationNotPermitted);
             }
@@ -144,12 +145,16 @@ fn write_rusage(user: *mut rusage, usage: rusage) -> AxResult<()> {
     user.write_field(offset_of!(rusage, ru_nivcsw), usage.ru_nivcsw)
 }
 
-pub fn sys_getrusage(who: i32, usage: *mut rusage) -> AxResult<isize> {
+pub fn sys_getrusage(
+    current: &crate::task::UserTaskRef,
+    who: i32,
+    usage: *mut rusage,
+) -> AxResult<isize> {
     const RUSAGE_SELF: i32 = linux_raw_sys::general::RUSAGE_SELF as i32;
     const RUSAGE_CHILDREN: i32 = linux_raw_sys::general::RUSAGE_CHILDREN;
     const RUSAGE_THREAD: i32 = linux_raw_sys::general::RUSAGE_THREAD as i32;
 
-    let curr = current_user_task();
+    let curr = current;
     let thr = curr.as_thread();
 
     let result = match who {

@@ -16,9 +16,11 @@ use ax_runtime::hal::time::monotonic_time;
 use ax_std::os::arceos::task::{self as scheduler, CurrentParkStart, ThreadWakeBatch};
 use ax_sync::{LockdepMutexExt, PiMutex};
 
+#[cfg(axtest)]
+use crate::task::current_user_task;
 use crate::{
     mm::{AddrSpace, Backend, SharedPages},
-    task::{ProcessData, UserTaskRef, current_user_task, process_memory::ProcessMemoryShare},
+    task::{ProcessData, UserTaskRef, process_memory::ProcessMemoryShare},
 };
 
 const NESTED_FUTEX_BUCKET_LOCK_SUBCLASS: u32 = 1;
@@ -310,11 +312,12 @@ impl WaitQueue {
     /// the condition owner to retry after discarding its temporary state.
     pub fn wait_if(
         &self,
+        task: &UserTaskRef,
         bitset: u32,
         timeout: Option<Duration>,
         condition: impl FnOnce() -> bool + Unpin,
     ) -> AxResult<bool> {
-        self.wait_if_with_cleanup(bitset, timeout, None, condition)
+        self.wait_if_with_cleanup(task, bitset, timeout, None, condition)
     }
 
     /// Waits with explicit futex-table cleanup metadata.
@@ -323,14 +326,19 @@ impl WaitQueue {
     /// different wait queue before it times out or is interrupted.
     pub fn wait_if_with_cleanup(
         &self,
+        task: &UserTaskRef,
         bitset: u32,
         timeout: Option<Duration>,
         cleanup: Option<FutexWaitCleanup>,
         condition: impl FnOnce() -> bool + Unpin,
     ) -> AxResult<bool> {
-        finish_infallible_wait(
-            self.wait_if_with_cleanup_nofault(bitset, timeout, cleanup, || Ok(condition())),
-        )
+        finish_infallible_wait(self.wait_if_with_cleanup_nofault(
+            task,
+            bitset,
+            timeout,
+            cleanup,
+            || Ok(condition()),
+        ))
     }
 
     /// Waits while serializing a nofault user-word check with queue insertion.
@@ -339,18 +347,6 @@ impl WaitQueue {
     /// scheduler wake-before-park is reported separately so callers do not
     /// confuse a scheduling hint with a user-memory fault protocol.
     pub fn wait_if_with_cleanup_nofault(
-        &self,
-        bitset: u32,
-        timeout: Option<Duration>,
-        cleanup: Option<FutexWaitCleanup>,
-        condition: impl FnOnce() -> Result<bool, FutexAccessError> + Unpin,
-    ) -> Result<bool, FutexWaitError> {
-        let task = current_user_task();
-        self.wait_if_with_cleanup_nofault_for(&task, bitset, timeout, cleanup, condition)
-    }
-
-    /// Variant for a syscall that already captured its current task identity.
-    pub(crate) fn wait_if_with_cleanup_nofault_for(
         &self,
         task: &UserTaskRef,
         bitset: u32,
@@ -761,10 +757,12 @@ pub(crate) struct FutexContext {
 }
 
 impl FutexContext {
-    pub(crate) fn current() -> Self {
-        let task = current_user_task();
+    pub(crate) fn new(task: &UserTaskRef) -> Self {
         let memory = task.as_thread().proc_data.memory_share();
-        Self { task, memory }
+        Self {
+            task: task.clone(),
+            memory,
+        }
     }
 
     pub(crate) fn task(&self) -> &UserTaskRef {
@@ -1336,8 +1334,9 @@ pub(crate) fn futex_keys_follow_mm_and_backing_identity_for_test() -> bool {
 #[cfg(axtest)]
 pub(crate) fn false_wait_condition_allocations_for_test() -> usize {
     let queue = WaitQueue::new();
+    let task = current_user_task();
     assert_eq!(
-        queue.wait_if_with_cleanup_nofault(u32::MAX, None, None, || Ok(false)),
+        queue.wait_if_with_cleanup_nofault(&task, u32::MAX, None, None, || Ok(false)),
         Ok(false)
     );
     0

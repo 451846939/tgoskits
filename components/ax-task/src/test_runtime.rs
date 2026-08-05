@@ -140,17 +140,18 @@ impl TaskRuntime for UnitTestRuntime {
             unsafe { CpuRemoteHandle::from_raw(handle.get()) }
         })
     }
-    unsafe fn current_thread_identity() -> ThreadIdentityV1 {
-        let raw = CURRENT_CPU_REMOTE_HANDLE.with(Cell::get);
+    unsafe fn current_thread_publication() -> CurrentThreadPublication {
+        let raw = CPU_LOCAL_HANDLE.with(Cell::get);
         if raw == 0 {
-            return ThreadIdentityV1::NONE;
+            return CurrentThreadPublication::NONE;
         }
-        // SAFETY: fixtures keep the TaskSystem owning this endpoint alive.
-        let remote = unsafe { &*core::ptr::with_exposed_provenance::<crate::CpuRemote>(raw) };
-        remote
-            .current_thread()
-            .map_or(ThreadIdentityV1::NONE, |id| {
-                ThreadIdentityV1::new(id.slot(), id.generation())
+        // SAFETY: fixtures keep this pinned CpuLocal and its current-core Arc
+        // alive while the modeled task context is installed.
+        let local = unsafe { &*core::ptr::with_exposed_provenance::<crate::CpuLocal>(raw) };
+        local
+            .current_core()
+            .map_or(CurrentThreadPublication::NONE, |core| {
+                CurrentThreadPublication::from_core(core.id(), core)
             })
     }
     unsafe fn cpu_remote_handle(cpu: RuntimeCpuId) -> CpuRemoteHandle {

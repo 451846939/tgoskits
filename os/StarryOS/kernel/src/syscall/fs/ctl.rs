@@ -23,7 +23,6 @@ use starry_vm::{VmPtr, vm_write_slice};
 use crate::{
     file::{Directory, FileLike, current_fd_table, fd_is_path, get_file_like, resolve_at, with_fs},
     mm::{vm_load_path_string, vm_load_string},
-    task::current_user_task,
     time::TimeValueLike,
 };
 
@@ -96,7 +95,7 @@ pub fn sys_ioctl(fd: i32, cmd: u32, arg: usize) -> AxResult<isize> {
 }
 
 #[ddebug::named]
-pub fn sys_chdir(path: *const c_char) -> AxResult<isize> {
+pub fn sys_chdir(current: &crate::task::UserTaskRef, path: *const c_char) -> AxResult<isize> {
     let path = vm_load_path_string(path)?;
     debug_fn!("sys_chdir <= path: {path}");
 
@@ -105,7 +104,7 @@ pub fn sys_chdir(path: *const c_char) -> AxResult<isize> {
     let entry = fs.resolve(path)?;
     fs.set_current_dir(entry)?;
     let cwd = fs.current_dir().absolute_path()?.to_string();
-    current_user_task().as_thread().proc_data.set_cwd_path(cwd);
+    current.as_thread().proc_data.set_cwd_path(cwd);
     Ok(0)
 }
 
@@ -118,16 +117,25 @@ pub fn sys_fchdir(dirfd: i32) -> AxResult<isize> {
 }
 
 #[cfg(target_arch = "x86_64")]
-pub fn sys_mkdir(path: *const c_char, mode: u32) -> AxResult<isize> {
-    sys_mkdirat(AT_FDCWD, path, mode)
+pub fn sys_mkdir(
+    current: &crate::task::UserTaskRef,
+    path: *const c_char,
+    mode: u32,
+) -> AxResult<isize> {
+    sys_mkdirat(current, AT_FDCWD, path, mode)
 }
 
 #[cfg(target_arch = "x86_64")]
-pub fn sys_mknod(path: *const c_char, mode: u32, dev: u64) -> AxResult<isize> {
-    sys_mknodat(AT_FDCWD, path, mode, dev)
+pub fn sys_mknod(
+    current: &crate::task::UserTaskRef,
+    path: *const c_char,
+    mode: u32,
+    dev: u64,
+) -> AxResult<isize> {
+    sys_mknodat(current, AT_FDCWD, path, mode, dev)
 }
 
-pub fn sys_chroot(path: *const c_char) -> AxResult<isize> {
+pub fn sys_chroot(current: &crate::task::UserTaskRef, path: *const c_char) -> AxResult<isize> {
     let path = vm_load_path_string(path)?;
     debug!("sys_chroot <= path: {path}");
 
@@ -140,7 +148,7 @@ pub fn sys_chroot(path: *const c_char) -> AxResult<isize> {
     *fs = FsContext::new(loc);
     let root = fs.root_dir().absolute_path()?.to_string();
     let cwd = fs.current_dir().absolute_path()?.to_string();
-    let proc_data = current_user_task().as_thread().proc_data.clone();
+    let proc_data = current.as_thread().proc_data.clone();
     proc_data.set_root_path(root);
     proc_data.set_cwd_path(cwd);
     Ok(0)
@@ -179,8 +187,13 @@ ktracepoint::define_event_trace!(
     })
 );
 
-pub fn sys_mkdirat(dirfd: i32, path: *const c_char, mode: u32) -> AxResult<isize> {
-    let curr = current_user_task();
+pub fn sys_mkdirat(
+    current: &crate::task::UserTaskRef,
+    dirfd: i32,
+    path: *const c_char,
+    mode: u32,
+) -> AxResult<isize> {
+    let curr = current;
     let thread = curr.as_thread();
     let path = vm_load_path_string(path)?;
     debug!("sys_mkdirat <= dirfd: {dirfd}, path: {path}, mode: {mode}");
@@ -212,8 +225,14 @@ pub fn sys_mkdirat(dirfd: i32, path: *const c_char, mode: u32) -> AxResult<isize
     result
 }
 
-pub fn sys_mknodat(dirfd: i32, path: *const c_char, mode: u32, dev: u64) -> Result<isize, AxError> {
-    let curr = current_user_task();
+pub fn sys_mknodat(
+    current: &crate::task::UserTaskRef,
+    dirfd: i32,
+    path: *const c_char,
+    mode: u32,
+    dev: u64,
+) -> Result<isize, AxError> {
+    let curr = current;
     let thread = curr.as_thread();
     let path = vm_load_path_string(path)?;
     debug!(
@@ -455,11 +474,16 @@ pub fn sys_getcwd(buf: *mut u8, size: isize) -> AxResult<isize> {
 }
 
 #[cfg(target_arch = "x86_64")]
-pub fn sys_symlink(target: *const c_char, linkpath: *const c_char) -> AxResult<isize> {
-    sys_symlinkat(target, AT_FDCWD, linkpath)
+pub fn sys_symlink(
+    current: &crate::task::UserTaskRef,
+    target: *const c_char,
+    linkpath: *const c_char,
+) -> AxResult<isize> {
+    sys_symlinkat(current, target, AT_FDCWD, linkpath)
 }
 
 pub fn sys_symlinkat(
+    current: &crate::task::UserTaskRef,
     target: *const c_char,
     new_dirfd: i32,
     linkpath: *const c_char,
@@ -468,7 +492,7 @@ pub fn sys_symlinkat(
     let linkpath = vm_load_path_string(linkpath)?;
     debug!("sys_symlinkat <= target: {target:?}, new_dirfd: {new_dirfd}, linkpath: {linkpath:?}");
 
-    let cred = current_user_task().as_thread().cred();
+    let cred = current.as_thread().cred();
     let uid = cred.fsuid;
     let gid = cred.fsgid;
     with_fs(new_dirfd, |fs| {
@@ -528,21 +552,37 @@ pub fn sys_readlinkat(
 }
 
 #[cfg(target_arch = "x86_64")]
-pub fn sys_chown(path: *const c_char, uid: i32, gid: i32) -> AxResult<isize> {
-    sys_fchownat(AT_FDCWD, path, uid, gid, 0)
+pub fn sys_chown(
+    current: &crate::task::UserTaskRef,
+    path: *const c_char,
+    uid: i32,
+    gid: i32,
+) -> AxResult<isize> {
+    sys_fchownat(current, AT_FDCWD, path, uid, gid, 0)
 }
 
 #[cfg(target_arch = "x86_64")]
-pub fn sys_lchown(path: *const c_char, uid: i32, gid: i32) -> AxResult<isize> {
+pub fn sys_lchown(
+    current: &crate::task::UserTaskRef,
+    path: *const c_char,
+    uid: i32,
+    gid: i32,
+) -> AxResult<isize> {
     use linux_raw_sys::general::AT_SYMLINK_NOFOLLOW;
-    sys_fchownat(AT_FDCWD, path, uid, gid, AT_SYMLINK_NOFOLLOW)
+    sys_fchownat(current, AT_FDCWD, path, uid, gid, AT_SYMLINK_NOFOLLOW)
 }
 
-pub fn sys_fchown(fd: i32, uid: i32, gid: i32) -> AxResult<isize> {
-    sys_fchownat(fd, core::ptr::null(), uid, gid, AT_EMPTY_PATH)
+pub fn sys_fchown(
+    current: &crate::task::UserTaskRef,
+    fd: i32,
+    uid: i32,
+    gid: i32,
+) -> AxResult<isize> {
+    sys_fchownat(current, fd, core::ptr::null(), uid, gid, AT_EMPTY_PATH)
 }
 
 pub fn sys_fchownat(
+    current: &crate::task::UserTaskRef,
     dirfd: i32,
     path: *const c_char,
     uid: i32,
@@ -560,7 +600,7 @@ pub fn sys_fchownat(
         .ok_or(AxError::BadFileDescriptor)?;
     let meta = loc.metadata()?;
 
-    let cred = current_user_task().as_thread().cred();
+    let cred = current.as_thread().cred();
 
     // Permission checks following Linux semantics:
     // - Changing the file owner (uid) requires CAP_CHOWN.
@@ -614,15 +654,25 @@ pub fn sys_fchownat(
 }
 
 #[cfg(target_arch = "x86_64")]
-pub fn sys_chmod(path: *const c_char, mode: u32) -> AxResult<isize> {
-    sys_fchmodat(AT_FDCWD, path, mode, 0)
+pub fn sys_chmod(
+    current: &crate::task::UserTaskRef,
+    path: *const c_char,
+    mode: u32,
+) -> AxResult<isize> {
+    sys_fchmodat(current, AT_FDCWD, path, mode, 0)
 }
 
-pub fn sys_fchmod(fd: i32, mode: u32) -> AxResult<isize> {
-    sys_fchmodat(fd, core::ptr::null(), mode, AT_EMPTY_PATH)
+pub fn sys_fchmod(current: &crate::task::UserTaskRef, fd: i32, mode: u32) -> AxResult<isize> {
+    sys_fchmodat(current, fd, core::ptr::null(), mode, AT_EMPTY_PATH)
 }
 
-pub fn sys_fchmodat(dirfd: i32, path: *const c_char, mode: u32, flags: u32) -> AxResult<isize> {
+pub fn sys_fchmodat(
+    current: &crate::task::UserTaskRef,
+    dirfd: i32,
+    path: *const c_char,
+    mode: u32,
+    flags: u32,
+) -> AxResult<isize> {
     const FCHMODAT_VALID_FLAGS: u32 = AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW;
     if flags & !FCHMODAT_VALID_FLAGS != 0 {
         return Err(AxError::InvalidInput);
@@ -659,7 +709,7 @@ pub fn sys_fchmodat(dirfd: i32, path: *const c_char, mode: u32, flags: u32) -> A
         .ok_or(AxError::BadFileDescriptor)?;
 
     // Only the file owner or a process with CAP_FOWNER may change mode bits.
-    let cred = current_user_task().as_thread().cred();
+    let cred = current.as_thread().cred();
     if !cred.has_cap_fowner() {
         let meta = loc.metadata()?;
         if cred.fsuid != meta.uid {
@@ -740,6 +790,7 @@ pub fn sys_utimes(
 }
 
 pub fn sys_utimensat(
+    current: &crate::task::UserTaskRef,
     dirfd: i32,
     path: *const c_char,
     times: *const [timespec; 2],
@@ -785,7 +836,7 @@ pub fn sys_utimensat(
         .into_file()
         .ok_or(AxError::BadFileDescriptor)?;
 
-    let cred = current_user_task().as_thread().cred();
+    let cred = current.as_thread().cred();
     if !cred.has_cap_fowner() {
         let meta = loc.metadata()?;
         if cred.fsuid != meta.uid {

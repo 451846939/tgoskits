@@ -1,10 +1,8 @@
 use ax_errno::{AxError, AxResult};
 
-use crate::task::current_user_task;
-
 #[inline(never)]
-pub fn sys_getpid() -> AxResult<isize> {
-    let curr = current_user_task();
+pub fn sys_getpid(current: &crate::task::UserTaskRef) -> AxResult<isize> {
+    let curr = current;
     let thr = curr.as_thread();
     let global_pid = thr.proc_data.proc.pid() as u64;
     let nsproxy = thr.proc_data.namespace_snapshot();
@@ -17,8 +15,8 @@ pub fn sys_getpid() -> AxResult<isize> {
     }
 }
 
-pub fn sys_getppid() -> AxResult<isize> {
-    let curr = current_user_task();
+pub fn sys_getppid(current: &crate::task::UserTaskRef) -> AxResult<isize> {
+    let curr = current;
     let thr = curr.as_thread();
     let parent = thr.proc_data.proc.parent().ok_or(AxError::NoSuchProcess)?;
     let parent_global_pid = parent.pid() as u64;
@@ -29,11 +27,11 @@ pub fn sys_getppid() -> AxResult<isize> {
     }
 }
 
-pub fn sys_gettid() -> AxResult<isize> {
+pub fn sys_gettid(current: &crate::task::UserTaskRef) -> AxResult<isize> {
     // `Thread::tid` rather than the scheduler ID: after a non-leader
     // `execve` they differ (the calling thread inherits the leader's TID
     // so that `gettid() == getpid()` holds in the new image).
-    Ok(current_user_task().as_thread().tid() as _)
+    Ok(current.as_thread().tid() as _)
 }
 
 /// `getcpu(2)`: report the CPU and NUMA node the caller is running on.
@@ -80,8 +78,11 @@ enum ArchPrctlCode {
 /// To set the clear_child_tid field in the task extended data.
 ///
 /// The set_tid_address() always succeeds
-pub fn sys_set_tid_address(clear_child_tid: usize) -> AxResult<isize> {
-    let curr = current_user_task();
+pub fn sys_set_tid_address(
+    current: &crate::task::UserTaskRef,
+    clear_child_tid: usize,
+) -> AxResult<isize> {
+    let curr = current;
     let thr = curr.as_thread();
     thr.set_clear_child_tid(clear_child_tid);
     Ok(thr.tid() as isize)

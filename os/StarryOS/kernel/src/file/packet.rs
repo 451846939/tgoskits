@@ -19,11 +19,10 @@ use starry_vm::{vm_read_slice, vm_write_slice};
 
 use super::{
     FileLike, Kstat,
-    net::{ARPHRD_ETHER, first_visible_ethernet, visible_interface_by_id},
+    net::{ARPHRD_ETHER, first_visible_ethernet, in_root_net_ns, visible_interface_by_id},
 };
 use crate::{
     file::{IoDst, IoSrc, get_file_like},
-    syscall::in_root_net_ns,
     task::{
         current_user_task,
         future::{block_on_user, poll_io},

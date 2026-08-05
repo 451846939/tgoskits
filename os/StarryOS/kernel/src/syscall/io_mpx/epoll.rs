@@ -21,7 +21,6 @@ use crate::{
     mm::{UserConstPtr, UserPtr, check_access},
     syscall::signal::check_sigset_size,
     task::{
-        current_user_task,
         future::{UserWaitOutcome, block_on_user_timeout, poll_io},
         with_blocked_signals,
     },
@@ -177,6 +176,7 @@ pub fn sys_epoll_ctl(
 }
 
 fn do_epoll_wait(
+    current: &crate::task::UserTaskRef,
     epfd: i32,
     events: UserPtr<epoll_event>,
     maxevents: i32,
@@ -211,10 +211,10 @@ fn do_epoll_wait(
         Some(unsafe { sigmask.read_abi()? })
     };
 
-    let task = current_user_task();
+    let task = current;
     let count = with_blocked_signals(sigmask, || {
         match block_on_user_timeout(
-            &task,
+            task,
             timeout,
             poll_io(epoll.as_ref(), IoEvents::IN, false, || {
                 epoll.register_waiter_wakers()?;
@@ -234,6 +234,7 @@ fn do_epoll_wait(
 }
 
 pub fn sys_epoll_pwait(
+    current: &crate::task::UserTaskRef,
     epfd: i32,
     events: UserPtr<epoll_event>,
     maxevents: i32,
@@ -246,21 +247,25 @@ pub fn sys_epoll_pwait(
     } else {
         Some(Duration::from_millis(timeout as u64))
     };
-    do_epoll_wait(epfd, events, maxevents, timeout, sigmask, sigsetsize)
+    do_epoll_wait(
+        current, epfd, events, maxevents, timeout, sigmask, sigsetsize,
+    )
 }
 
 /// Implements legacy `epoll_wait` as an x86_64 wrapper around `epoll_pwait`.
 #[cfg(target_arch = "x86_64")]
 pub fn sys_epoll_wait(
+    current: &crate::task::UserTaskRef,
     epfd: i32,
     events: UserPtr<epoll_event>,
     maxevents: i32,
     timeout: i32,
 ) -> AxResult<isize> {
-    sys_epoll_pwait(epfd, events, maxevents, timeout, 0usize.into(), 0)
+    sys_epoll_pwait(current, epfd, events, maxevents, timeout, 0usize.into(), 0)
 }
 
 pub fn sys_epoll_pwait2(
+    current: &crate::task::UserTaskRef,
     epfd: i32,
     events: UserPtr<epoll_event>,
     maxevents: i32,
@@ -277,7 +282,9 @@ pub fn sys_epoll_pwait2(
     })
     .map(|ts| ts.try_into_time_value())
     .transpose()?;
-    do_epoll_wait(epfd, events, maxevents, timeout, sigmask, sigsetsize)
+    do_epoll_wait(
+        current, epfd, events, maxevents, timeout, sigmask, sigsetsize,
+    )
 }
 
 #[cfg(axtest)]

@@ -12,7 +12,7 @@ use starry_vm::{VmMutPtr, VmPtr};
 
 use crate::{
     task::{
-        block_next_signal, check_signals, current_user_task,
+        block_next_signal, check_signals,
         future::{UserWaitOutcome, block_on_user, block_on_user_timeout},
         get_process_cred, processes, send_signal_to_process, send_signal_to_thread,
     },
@@ -33,6 +33,7 @@ fn parse_signo(signo: u32) -> AxResult<Signo> {
 }
 
 pub fn sys_rt_sigprocmask(
+    current: &crate::task::UserTaskRef,
     how: i32,
     set: *const SignalSet,
     oldset: *mut SignalSet,
@@ -40,7 +41,7 @@ pub fn sys_rt_sigprocmask(
 ) -> AxResult<isize> {
     check_sigset_size(sigsetsize)?;
 
-    let curr = current_user_task();
+    let curr = current;
     let sig = curr.as_thread().signal();
     let old = sig.blocked();
 
@@ -66,6 +67,7 @@ pub fn sys_rt_sigprocmask(
 }
 
 pub fn sys_rt_sigaction(
+    current: &crate::task::UserTaskRef,
     signo: u32,
     act: *const kernel_sigaction,
     oldact: *mut kernel_sigaction,
@@ -78,25 +80,33 @@ pub fn sys_rt_sigaction(
         return Err(AxError::InvalidInput);
     }
 
-    current_user_task()
+    current
         .as_thread()
         .proc_data
         .signal
         .set_action(signo, act, oldact)
 }
 
-pub fn sys_rt_sigpending(set: *mut SignalSet, sigsetsize: usize) -> AxResult<isize> {
+pub fn sys_rt_sigpending(
+    current: &crate::task::UserTaskRef,
+    set: *mut SignalSet,
+    sigsetsize: usize,
+) -> AxResult<isize> {
     check_sigset_size(sigsetsize)?;
-    set.vm_write(current_user_task().as_thread().signal().pending())?;
+    set.vm_write(current.as_thread().signal().pending())?;
     Ok(0)
 }
 
-pub(crate) fn make_siginfo(signo: u32, code: i32) -> AxResult<Option<SignalInfo>> {
+pub(crate) fn make_siginfo(
+    current: &crate::task::UserTaskRef,
+    signo: u32,
+    code: i32,
+) -> AxResult<Option<SignalInfo>> {
     if signo == 0 {
         return Ok(None);
     }
     let signo = parse_signo(signo)?;
-    let curr = current_user_task();
+    let curr = current;
     let thread = curr.as_thread();
     Ok(Some(SignalInfo::new_user(
         signo,
@@ -117,12 +127,15 @@ pub(crate) fn make_siginfo(signo: u32, code: i32) -> AxResult<Option<SignalInfo>
 /// TODO: SIGCONT is allowed to any process in the same session (job control).
 /// Implementing this requires passing the signal number into this function
 /// and checking session membership.
-pub(crate) fn check_kill_permission(target_pid: Pid) -> AxResult<()> {
-    let sender = current_user_task().as_thread().cred();
+pub(crate) fn check_kill_permission(
+    current: &crate::task::UserTaskRef,
+    target_pid: Pid,
+) -> AxResult<()> {
+    let sender = current.as_thread().cred();
     if sender.euid == 0 {
         return Ok(());
     }
-    let self_pid = current_user_task().as_thread().proc_data.proc.pid();
+    let self_pid = current.as_thread().proc_data.proc.pid();
     if target_pid == self_pid {
         return Ok(());
     }
@@ -144,11 +157,15 @@ pub(crate) fn check_kill_permission(target_pid: Pid) -> AxResult<()> {
 /// Send a signal to each member of a process group, checking
 /// per-member permission. EPERM for individual members is swallowed
 /// (matches Linux behavior).
-fn kill_process_group_checked(pgid: Pid, sig: Option<SignalInfo>) -> AxResult<()> {
+fn kill_process_group_checked(
+    current: &crate::task::UserTaskRef,
+    pgid: Pid,
+    sig: Option<SignalInfo>,
+) -> AxResult<()> {
     let pg = crate::task::get_process_group(pgid)?;
     if let Some(sig) = sig {
         for proc in pg.processes() {
-            if check_kill_permission(proc.pid()).is_ok() {
+            if check_kill_permission(current, proc.pid()).is_ok() {
                 let _ = send_signal_to_process(proc.pid(), Some(sig));
             }
         }
@@ -156,15 +173,15 @@ fn kill_process_group_checked(pgid: Pid, sig: Option<SignalInfo>) -> AxResult<()
     Ok(())
 }
 
-pub fn sys_kill(pid: i32, signo: u32) -> AxResult<isize> {
+pub fn sys_kill(current: &crate::task::UserTaskRef, pid: i32, signo: u32) -> AxResult<isize> {
     debug!("sys_kill: pid = {pid}, signo = {signo}");
-    let sig = make_siginfo(signo, SI_USER as _)?;
+    let sig = make_siginfo(current, signo, SI_USER as _)?;
 
     match pid {
         1.. => {
-            check_kill_permission(pid as _)?;
+            check_kill_permission(current, pid as _)?;
             if let Some(sig) = sig {
-                let curr = current_user_task();
+                let curr = current;
                 let thread = curr.as_thread();
                 let signo = sig.signo();
                 if pid as Pid == thread.proc_data.proc.pid()
@@ -184,55 +201,56 @@ pub fn sys_kill(pid: i32, signo: u32) -> AxResult<isize> {
             }
         }
         0 => {
-            let pgid = current_user_task()
-                .as_thread()
-                .proc_data
-                .proc
-                .group()
-                .pgid();
-            kill_process_group_checked(pgid, sig)?;
+            let pgid = current.as_thread().proc_data.proc.group().pgid();
+            kill_process_group_checked(current, pgid, sig)?;
         }
         -1 => {
             // Broadcast: send to all processes the caller may signal,
             // except init and self. EPERM is silently swallowed per Linux.
-            let curr_pid = current_user_task().as_thread().proc_data.proc.pid();
+            let curr_pid = current.as_thread().proc_data.proc.pid();
             if let Some(sig) = sig {
                 for proc_data in processes() {
                     if proc_data.proc.is_init() || proc_data.proc.pid() == curr_pid {
                         continue;
                     }
-                    if check_kill_permission(proc_data.proc.pid()).is_ok() {
+                    if check_kill_permission(current, proc_data.proc.pid()).is_ok() {
                         let _ = send_signal_to_process(proc_data.proc.pid(), Some(sig));
                     }
                 }
             }
         }
         ..-1 => {
-            kill_process_group_checked((-pid) as Pid, sig)?;
+            kill_process_group_checked(current, (-pid) as Pid, sig)?;
         }
     }
     Ok(0)
 }
 
-pub fn sys_tkill(tid: i32, signo: u32) -> AxResult<isize> {
+pub fn sys_tkill(current: &crate::task::UserTaskRef, tid: i32, signo: u32) -> AxResult<isize> {
     if tid <= 0 {
         return Err(AxError::InvalidInput);
     }
     let tid = tid as Pid;
-    check_kill_permission(tid)?;
-    let sig = make_siginfo(signo, SI_TKILL)?;
+    check_kill_permission(current, tid)?;
+    let sig = make_siginfo(current, signo, SI_TKILL)?;
     send_signal_to_thread(None, tid, sig)?;
     Ok(0)
 }
 
-pub fn sys_tgkill(tgid: Pid, tid: Pid, signo: u32) -> AxResult<isize> {
-    check_kill_permission(tgid)?;
-    let sig = make_siginfo(signo, SI_TKILL)?;
+pub fn sys_tgkill(
+    current: &crate::task::UserTaskRef,
+    tgid: Pid,
+    tid: Pid,
+    signo: u32,
+) -> AxResult<isize> {
+    check_kill_permission(current, tgid)?;
+    let sig = make_siginfo(current, signo, SI_TKILL)?;
     send_signal_to_thread(Some(tgid), tid, sig)?;
     Ok(0)
 }
 
 pub(crate) fn make_queue_signal_info(
+    current: &crate::task::UserTaskRef,
     tgid: Pid,
     signo: u32,
     sig: *const SignalInfo,
@@ -244,7 +262,7 @@ pub(crate) fn make_queue_signal_info(
     let signo = parse_signo(signo)?;
     let mut sig = unsafe { sig.vm_read_uninit()?.assume_init() };
     sig.set_signo(signo);
-    if current_user_task().as_thread().proc_data.proc.pid() != tgid
+    if current.as_thread().proc_data.proc.pid() != tgid
         && (sig.code() >= 0 || sig.code() == SI_TKILL)
     {
         return Err(AxError::OperationNotPermitted);
@@ -253,6 +271,7 @@ pub(crate) fn make_queue_signal_info(
 }
 
 pub fn sys_rt_sigqueueinfo(
+    current: &crate::task::UserTaskRef,
     tgid: Pid,
     signo: u32,
     sig: *const SignalInfo,
@@ -260,12 +279,13 @@ pub fn sys_rt_sigqueueinfo(
 ) -> AxResult<isize> {
     check_sigset_size(sigsetsize)?;
 
-    let sig = make_queue_signal_info(tgid, signo, sig)?;
+    let sig = make_queue_signal_info(current, tgid, signo, sig)?;
     send_signal_to_process(tgid, sig)?;
     Ok(0)
 }
 
 pub fn sys_rt_tgsigqueueinfo(
+    current: &crate::task::UserTaskRef,
     tgid: Pid,
     tid: Pid,
     signo: u32,
@@ -274,18 +294,22 @@ pub fn sys_rt_tgsigqueueinfo(
 ) -> AxResult<isize> {
     check_sigset_size(sigsetsize)?;
 
-    let sig = make_queue_signal_info(tgid, signo, sig)?;
+    let sig = make_queue_signal_info(current, tgid, signo, sig)?;
     send_signal_to_thread(Some(tgid), tid, sig)?;
     Ok(0)
 }
 
-pub fn sys_rt_sigreturn(uctx: &mut UserContext) -> AxResult<isize> {
+pub fn sys_rt_sigreturn(
+    current: &crate::task::UserTaskRef,
+    uctx: &mut UserContext,
+) -> AxResult<isize> {
     block_next_signal();
-    current_user_task().as_thread().signal().restore(uctx)?;
+    current.as_thread().signal().restore(uctx)?;
     Ok(uctx.retval() as isize)
 }
 
 pub fn sys_rt_sigtimedwait(
+    current: &crate::task::UserTaskRef,
     uctx: &mut UserContext,
     set: *const SignalSet,
     info: *mut siginfo,
@@ -305,7 +329,7 @@ pub fn sys_rt_sigtimedwait(
 
     debug!("sys_rt_sigtimedwait => set = {set:?}, timeout = {timeout:?}");
 
-    let curr = current_user_task();
+    let curr = current;
     let thr = curr.as_thread();
     let signal = thr.signal();
 
@@ -338,7 +362,7 @@ pub fn sys_rt_sigtimedwait(
         }
     });
 
-    let sig = match block_on_user_timeout(&curr, timeout, fut) {
+    let sig = match block_on_user_timeout(curr, timeout, fut) {
         UserWaitOutcome::Ready(sig) => sig,
         UserWaitOutcome::Interrupted => None,
         UserWaitOutcome::TimedOut => {
@@ -362,13 +386,14 @@ pub fn sys_rt_sigtimedwait(
 }
 
 pub fn sys_rt_sigsuspend(
+    current: &crate::task::UserTaskRef,
     uctx: &mut UserContext,
     set: *const SignalSet,
     sigsetsize: usize,
 ) -> AxResult<isize> {
     check_sigset_size(sigsetsize)?;
 
-    let curr = current_user_task();
+    let curr = current;
     let thr = curr.as_thread();
 
     let set = unsafe { set.vm_read_uninit()?.assume_init() };
@@ -379,7 +404,7 @@ pub fn sys_rt_sigsuspend(
     uctx.set_retval(-LinuxError::EINTR.code() as usize);
 
     let _outcome = block_on_user(
-        &curr,
+        curr,
         poll_fn(|_cx| {
             if check_signals(thr, uctx, Some(old_blocked), None) {
                 return Poll::Ready(());
@@ -392,8 +417,12 @@ pub fn sys_rt_sigsuspend(
     Err(AxError::Interrupted)
 }
 
-pub fn sys_sigaltstack(ss: *const SignalStack, old_ss: *mut SignalStack) -> AxResult<isize> {
-    let curr = current_user_task();
+pub fn sys_sigaltstack(
+    current: &crate::task::UserTaskRef,
+    ss: *const SignalStack,
+    old_ss: *mut SignalStack,
+) -> AxResult<isize> {
+    let curr = current;
     let sig = curr.as_thread().signal();
 
     if let Some(old_ss) = old_ss.nullable() {

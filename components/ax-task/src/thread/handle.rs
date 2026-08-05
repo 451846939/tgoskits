@@ -70,6 +70,13 @@ impl ThreadHandle {
         }
     }
 
+    /// Returns the immutable runtime publication for this live scheduler
+    /// thread.
+    #[doc(hidden)]
+    pub fn runtime_publication(&self) -> crate::runtime::CurrentThreadPublication {
+        crate::runtime::CurrentThreadPublication::from_core(self.id(), &self.core)
+    }
+
     /// Returns the generation-checked registry identity.
     pub fn id(&self) -> ThreadId {
         self.core.id

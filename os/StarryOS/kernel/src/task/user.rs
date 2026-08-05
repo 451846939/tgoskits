@@ -158,7 +158,7 @@ pub fn new_user_task(
                         let _ = ptrace_stop_current(thr, Signo::SIGTRAP, &mut uctx);
                     }
 
-                    handle_syscall(thr, &mut uctx);
+                    handle_syscall(&curr, &mut uctx);
                     if ptrace_trace.is_some() {
                         if stop_for_pending_ptrace_event(thr, &mut uctx) {
                             continue;

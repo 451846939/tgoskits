@@ -34,7 +34,6 @@ use crate::{
     mm::{AddrSpace, Backend, IoVec},
     syscall::signal::check_sigset_size,
     task::{
-        current_user_task,
         future::{UserWaitOutcome, block_on, block_on_user_until_wall},
         with_blocked_signals,
     },
@@ -239,12 +238,8 @@ static NEXT_AIO_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 static AIO_CONTEXTS: RwLock<BTreeMap<AioContextId, Arc<AioContext>>> = RwLock::new(BTreeMap::new());
 
 // Return the process id that owns newly created or looked-up contexts.
-fn current_pid() -> Pid {
-    crate::task::current_user_task()
-        .as_thread()
-        .proc_data
-        .proc
-        .pid()
+fn current_pid(current: &crate::task::UserTaskRef) -> Pid {
+    current.as_thread().proc_data.proc.pid()
 }
 
 // Use Linux EINVAL for all invalid AIO context handles.
@@ -387,8 +382,11 @@ fn write_event_context(context: &AioContext, index: u32, event: &IoEvent) -> AxR
 }
 
 // Validate a userspace context handle and return its kernel object.
-fn lookup_context(ctx: AioContextId) -> AxResult<Arc<AioContext>> {
-    let owner = current_pid();
+fn lookup_context(
+    current: &crate::task::UserTaskRef,
+    ctx: AioContextId,
+) -> AxResult<Arc<AioContext>> {
+    let owner = current_pid(current);
     let ring = read_ring_user(ctx)?;
     let contexts = AIO_CONTEXTS.read();
     let ctx_id = ring.id as usize;
@@ -1078,6 +1076,7 @@ fn enqueue_request(context: &Arc<AioContext>, request: Arc<AioRequest>) -> AxRes
 
 // Wait for at least one completion or for the optional deadline to expire.
 fn wait_for_completion(
+    current: &crate::task::UserTaskRef,
     context: &AioContext,
     deadline: Option<core::time::Duration>,
 ) -> AxResult<bool> {
@@ -1104,8 +1103,8 @@ fn wait_for_completion(
         }
     });
 
-    let task = current_user_task();
-    match block_on_user_until_wall(&task, deadline, wait) {
+    let task = current;
+    match block_on_user_until_wall(task, deadline, wait) {
         UserWaitOutcome::Ready(()) => Ok(true),
         UserWaitOutcome::TimedOut => Ok(false),
         UserWaitOutcome::Interrupted => Err(AxError::Interrupted),
@@ -1193,6 +1192,7 @@ fn copy_completed_events(
 
 // Shared implementation for io_getevents and io_pgetevents.
 fn do_io_getevents(
+    current: &crate::task::UserTaskRef,
     context: Arc<AioContext>,
     min_nr: isize,
     nr: isize,
@@ -1223,7 +1223,7 @@ fn do_io_getevents(
         }
 
         // Sleep only when min_nr still requires more events.
-        match wait_for_completion(&context, deadline) {
+        match wait_for_completion(current, &context, deadline) {
             Ok(true) => {}
             Ok(false) => return Ok(completed as isize),
             Err(_) if completed > 0 => return Ok(completed as isize),
@@ -1233,7 +1233,11 @@ fn do_io_getevents(
 }
 
 // Create an AIO context and expose its ring address to userspace.
-pub fn sys_io_setup(nr_events: u32, ctxp: *mut AioContextId) -> AxResult<isize> {
+pub fn sys_io_setup(
+    current: &crate::task::UserTaskRef,
+    nr_events: u32,
+    ctxp: *mut AioContextId,
+) -> AxResult<isize> {
     debug!(
         "sys_io_setup called: nr_events={}, ctxp={:p}",
         nr_events, ctxp
@@ -1251,7 +1255,7 @@ pub fn sys_io_setup(nr_events: u32, ctxp: *mut AioContextId) -> AxResult<isize> 
     }
     // Allocate the user ring before publishing the context globally.
     let (ring_size, ring_events) = aio_ring_layout(nr_events)?;
-    let curr = crate::task::current_user_task();
+    let curr = current;
     let aspace = curr.as_thread().proc_data.aspace();
     let ring_vaddr = {
         let mut guard = aspace.lock();
@@ -1262,7 +1266,7 @@ pub fn sys_io_setup(nr_events: u32, ctxp: *mut AioContextId) -> AxResult<isize> 
 
     let context = Arc::new(AioContext::new(
         ctx_id,
-        current_pid(),
+        current_pid(current),
         aspace.clone(),
         ring_vaddr,
         ring_size,
@@ -1341,9 +1345,9 @@ pub fn cleanup_aio_contexts_for_pid(pid: Pid) {
 }
 
 // Destroy an AIO context after cancelling queued work and draining workers.
-pub fn sys_io_destroy(ctx: AioContextId) -> AxResult<isize> {
+pub fn sys_io_destroy(current: &crate::task::UserTaskRef, ctx: AioContextId) -> AxResult<isize> {
     debug!("sys_io_destroy called: ctx={:#x}", ctx);
-    let context = lookup_context(ctx)?;
+    let context = lookup_context(current, ctx)?;
     let context = AIO_CONTEXTS
         .write()
         .remove(&context.id)
@@ -1353,16 +1357,21 @@ pub fn sys_io_destroy(ctx: AioContextId) -> AxResult<isize> {
 }
 
 // Submit a batch of iocbs to the target AIO context.
-pub fn sys_io_submit(ctx: AioContextId, nr: isize, iocbpp: *const *const Iocb) -> AxResult<isize> {
+pub fn sys_io_submit(
+    current: &crate::task::UserTaskRef,
+    ctx: AioContextId,
+    nr: isize,
+    iocbpp: *const *const Iocb,
+) -> AxResult<isize> {
     debug!("sys_io_submit <= ctx: {ctx:#x}, nr: {nr}, iocbpp: {iocbpp:p}");
     if nr < 0 {
         return Err(AxError::InvalidInput);
     }
     if nr == 0 {
-        lookup_context(ctx)?;
+        lookup_context(current, ctx)?;
         return Ok(0);
     }
-    let context = lookup_context(ctx)?;
+    let context = lookup_context(current, ctx)?;
     if context.destroying.load(Ordering::Acquire) {
         return Err(invalid_context());
     }
@@ -1404,6 +1413,7 @@ pub fn sys_io_submit(ctx: AioContextId, nr: isize, iocbpp: *const *const Iocb) -
 
 // Retrieve completed events from an AIO context.
 pub fn sys_io_getevents(
+    current: &crate::task::UserTaskRef,
     ctx: AioContextId,
     min_nr: isize,
     nr: isize,
@@ -1411,14 +1421,15 @@ pub fn sys_io_getevents(
     timeout: *const timespec,
 ) -> AxResult<isize> {
     debug!("sys_io_getevents <= ctx: {ctx:#x}, min_nr: {min_nr}, nr: {nr}, events: {events:p}");
-    let context = lookup_context(ctx)?;
-    let result = do_io_getevents(context, min_nr, nr, events, timeout)?;
+    let context = lookup_context(current, ctx)?;
+    let result = do_io_getevents(current, context, min_nr, nr, events, timeout)?;
     debug!("sys_io_getevents => result={}", result);
     Ok(result)
 }
 
 // Retrieve events while temporarily applying a signal mask.
 pub fn sys_io_pgetevents(
+    current: &crate::task::UserTaskRef,
     ctx: AioContextId,
     min_nr: isize,
     nr: isize,
@@ -1426,9 +1437,9 @@ pub fn sys_io_pgetevents(
     timeout: *const timespec,
     sigmask: usize,
 ) -> AxResult<isize> {
-    let context = lookup_context(ctx)?;
+    let context = lookup_context(current, ctx)?;
     if sigmask == 0 {
-        return do_io_getevents(context, min_nr, nr, events, timeout);
+        return do_io_getevents(current, context, min_nr, nr, events, timeout);
     }
 
     let sigset = unsafe {
@@ -1444,18 +1455,19 @@ pub fn sys_io_pgetevents(
         Some(unsafe { sigset.sigmask.vm_read_uninit()?.assume_init() })
     };
     with_blocked_signals(blocked, || {
-        do_io_getevents(context, min_nr, nr, events, timeout)
+        do_io_getevents(current, context, min_nr, nr, events, timeout)
     })
 }
 
 // Cancel a queued request that has not started running.
 pub fn sys_io_cancel(
+    current: &crate::task::UserTaskRef,
     ctx: AioContextId,
     iocb: *const Iocb,
     result: *mut IoEvent,
 ) -> AxResult<isize> {
     debug!("sys_io_cancel <= ctx: {ctx:#x}, iocb: {iocb:p}, result: {result:p}");
-    let context = lookup_context(ctx)?;
+    let context = lookup_context(current, ctx)?;
     let cb_ptr = iocb as usize;
 
     let event = {

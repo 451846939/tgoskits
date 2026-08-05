@@ -1467,10 +1467,10 @@ mod tests {
     }
 
     #[test]
-    fn runtime_hooks_read_remote_publications_without_reentering_the_cpu_owner() {
+    fn runtime_hooks_read_current_publications_without_reentering_the_cpu_owner() {
         let system = Box::pin(TaskSystem::new(crate::TaskSystemConfig::new(1)).unwrap());
         let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
-        system
+        let bootstrap = system
             .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
             .unwrap();
         system.bring_cpu_online(cpu.as_mut()).unwrap();
@@ -1480,9 +1480,9 @@ mod tests {
         let owner_pin = owner.as_mut();
 
         assert_eq!(
-            current_thread_handle().unwrap_err(),
-            TaskError::CpuOwnerBorrowed,
-            "a reentrant current-handle query must fail instead of spinning"
+            current_thread_handle().unwrap().id(),
+            bootstrap.id(),
+            "a current-context publication must remain readable while the runqueue owner is borrowed"
         );
 
         test_runtime::reenter_current_thread_from_next_hook();
@@ -1566,6 +1566,37 @@ mod tests {
             test_runtime::preempt_guard_entries(),
             1,
             "an unpinned current identity read must use one migration pin"
+        );
+    }
+
+    #[test]
+    fn current_thread_handle_uses_one_migration_pin_without_claiming_the_cpu_owner() {
+        let system = Box::pin(TaskSystem::new(crate::TaskSystemConfig::new(1)).unwrap());
+        let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
+        let bootstrap = system
+            .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
+            .unwrap();
+        system.bring_cpu_online(cpu.as_mut()).unwrap();
+        let _runtime_handles = InstalledTaskHandles::new(system.as_ref(), cpu.as_mut());
+        test_runtime::reset_cpu_handle_reads();
+        test_runtime::reset_preempt_guard_entries();
+
+        assert_eq!(current_thread_handle().unwrap().id(), bootstrap.id());
+
+        assert_eq!(
+            test_runtime::current_cpu_remote_handle_reads(),
+            0,
+            "a current handle must come from its runtime context, not the remote rq endpoint"
+        );
+        assert_eq!(
+            test_runtime::cpu_owner_claims(),
+            0,
+            "a read-only current handle must not enter the mutable CPU owner gate"
+        );
+        assert_eq!(
+            test_runtime::preempt_guard_entries(),
+            1,
+            "an unpinned current handle acquisition must use one migration pin"
         );
     }
 

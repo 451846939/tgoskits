@@ -145,7 +145,7 @@ impl CurrentThreadHeader {
     /// Returns the immutable runtime-owned current-thread identity.
     #[inline(always)]
     pub fn runtime_thread_cookie(&self) -> Option<RuntimeThreadCookie> {
-        RuntimeThreadCookie::new(self.runtime_thread_cookie.load(Ordering::Relaxed))
+        RuntimeThreadCookie::new(self.runtime_thread_cookie.load(Ordering::Acquire))
     }
 
     /// Returns this execution context's ordinary preemption-guard depth.

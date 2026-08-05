@@ -44,8 +44,7 @@ use linux_raw_sys::{
 use spin::LazyLock;
 
 use crate::{
-    file::{FileLike, IoDst, IoSrc},
-    syscall::in_root_net_ns,
+    file::{FileLike, IoDst, IoSrc, net::in_root_net_ns},
     task::{
         current_user_task,
         future::{block_on_user, poll_io},

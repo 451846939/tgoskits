@@ -65,7 +65,7 @@ use crate::{
     lock::{IrqScope, PreemptTicketLock, SequenceCounter},
     runtime::{
         AddressSpaceDestroyOutcome, AddressSpaceReclaimArmOutcome, ContextThreadBinding,
-        CpuRemoteHandle, RuntimeCpuId, RuntimeStatus, ThreadIdentityV1, task_runtime,
+        CpuRemoteHandle, CurrentThreadPublication, RuntimeCpuId, RuntimeStatus, task_runtime,
     },
     system::cpu::{
         CpuRunQueueState, CurrentDispatch, CurrentDispatchState, CurrentSchedule,

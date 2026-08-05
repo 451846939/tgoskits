@@ -81,7 +81,7 @@ impl TaskSystem {
         if !context.is_none() {
             let status = task_runtime::bind_context_thread(ContextThreadBinding {
                 context,
-                identity: ThreadIdentityV1::new(id.slot(), id.generation()),
+                publication: CurrentThreadPublication::from_core(id, &core),
             });
             if status != RuntimeStatus::Success {
                 {

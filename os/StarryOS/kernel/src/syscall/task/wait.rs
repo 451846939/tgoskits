@@ -15,10 +15,10 @@ use super::wait_scan::WaitCandidateScan;
 use crate::{
     file::{PidFd, get_file_like},
     task::{
-        JobStatus, ProcessData, ProcessIdentity, current_user_task, decode_wait_status,
-        future::block_on_user, get_process_data, get_task, get_zombie_cred, is_reaped_process,
-        is_zombie_clone_child, is_zombie_process, processes, reap_process, traced_zombies_for,
-        wait_on_pollset, zombie_wait_parent_tid,
+        JobStatus, ProcessData, ProcessIdentity, decode_wait_status, future::block_on_user,
+        get_process_data, get_task, get_zombie_cred, is_reaped_process, is_zombie_clone_child,
+        is_zombie_process, processes, reap_process, traced_zombies_for, wait_on_pollset,
+        zombie_wait_parent_tid,
     },
 };
 
@@ -253,14 +253,19 @@ fn waitable_processes(
     candidates
 }
 
-pub fn sys_waitpid(pid: i32, exit_code: *mut i32, options: u32) -> AxResult<isize> {
+pub fn sys_waitpid(
+    current: &crate::task::UserTaskRef,
+    pid: i32,
+    exit_code: *mut i32,
+    options: u32,
+) -> AxResult<isize> {
     let options = WaitPidOptions::from_bits(options).ok_or(AxError::InvalidInput)?;
     if pid == i32::MIN {
         return Err(AxError::from(LinuxError::ESRCH));
     }
     info!("sys_waitpid <= pid: {pid:?}, options: {options:?}");
 
-    let curr = current_user_task();
+    let curr = current;
     let thr = curr.as_thread();
     let proc = &thr.proc_data.proc;
 
@@ -358,9 +363,9 @@ pub fn sys_waitpid(pid: i32, exit_code: *mut i32, options: u32) -> AxResult<isiz
         }
     };
 
-    let task = current_user_task();
+    let task = current;
     block_on_user(
-        &task,
+        task,
         wait_on_pollset(proc_data.child_exit_event(), || {
             check_children().transpose()
         }),
@@ -395,12 +400,13 @@ mod tests {
 }
 
 pub fn sys_waitid(
+    current: &crate::task::UserTaskRef,
     idtype: u32,
     id: i32,
     infop: *mut linux_raw_sys::general::siginfo,
     options: u32,
 ) -> AxResult<isize> {
-    let curr = current_user_task();
+    let curr = current;
     let thr = curr.as_thread();
     let proc = &thr.proc_data.proc;
 
@@ -550,9 +556,9 @@ pub fn sys_waitid(
         }
     };
 
-    let task = current_user_task();
+    let task = current;
     block_on_user(
-        &task,
+        task,
         wait_on_pollset(proc_data.child_exit_event(), || {
             check_children().transpose()
         }),

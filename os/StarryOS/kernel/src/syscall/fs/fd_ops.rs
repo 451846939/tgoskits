@@ -19,7 +19,7 @@ use crate::{
     },
     mm::vm_load_path_string,
     pseudofs::{Device, dev::tty},
-    task::{current_user_task, get_task},
+    task::get_task,
 };
 
 /// Convert open flags to [`OpenOptions`].
@@ -75,6 +75,7 @@ fn flags_to_options(flags: c_int, mode: __kernel_mode_t, (uid, gid): (u32, u32))
 }
 
 fn add_to_fd(
+    current: &crate::task::UserTaskRef,
     result: OpenResult,
     flags: u32,
     mount_table_namespace: Option<Arc<MountNamespace>>,
@@ -160,7 +161,7 @@ fn add_to_fd(
                     let loc = Location::new(file.location().mountpoint().clone(), entry);
                     file = ax_fs_ng::vfs::File::new(FileBackend::Direct(loc), file.flags());
                 } else if inner.is::<tty::CurrentTty>() {
-                    let term = current_user_task()
+                    let term = current
                         .as_thread()
                         .proc_data
                         .proc
@@ -208,7 +209,10 @@ fn add_to_fd(
     add_file_like(f, flags & O_CLOEXEC != 0)
 }
 
-fn mount_table_namespace(result: &OpenResult) -> Option<Arc<MountNamespace>> {
+fn mount_table_namespace(
+    current: &crate::task::UserTaskRef,
+    result: &OpenResult,
+) -> Option<Arc<MountNamespace>> {
     let OpenResult::File(file) = result else {
         return None;
     };
@@ -216,7 +220,7 @@ fn mount_table_namespace(result: &OpenResult) -> Option<Arc<MountNamespace>> {
     let components: Vec<_> = path.trim_start_matches('/').split('/').collect();
     let pid = match components.as_slice() {
         ["proc", "mountinfo" | "mounts"] | ["proc", "self", "mountinfo" | "mounts"] => {
-            current_user_task().as_thread().proc_data.proc.pid()
+            current.as_thread().proc_data.proc.pid()
         }
         ["proc", pid, "mountinfo" | "mounts"] => pid.parse().ok()?,
         ["proc", _, "task", tid, "mountinfo" | "mounts"] => tid.parse().ok()?,
@@ -285,7 +289,11 @@ fn openat2_check_extra_bytes(how: *const OpenHow, size: usize) -> AxResult<()> {
 ///
 /// Returns `Some(fd)` on success, `Some(Err(...))` on failure, or
 /// `None` if the path does not match (fall through to regular open).
-fn try_open_nsfd(path: &str, flags: u32) -> Option<AxResult<i32>> {
+fn try_open_nsfd(
+    current: &crate::task::UserTaskRef,
+    path: &str,
+    flags: u32,
+) -> Option<AxResult<i32>> {
     // Must be of the form /proc/<pid>/ns/<type>
     if !path.starts_with("/proc/") {
         return None;
@@ -301,7 +309,7 @@ fn try_open_nsfd(path: &str, flags: u32) -> Option<AxResult<i32>> {
     }
 
     let pid: u32 = if pid_str == "self" {
-        current_user_task().as_thread().proc_data.proc.pid()
+        current.as_thread().proc_data.proc.pid()
     } else {
         pid_str.parse().ok()?
     };
@@ -380,6 +388,7 @@ ktracepoint::define_event_trace!(
 /// mode: see man 7 inode
 /// return new file descriptor if succeed, or return -1.
 pub fn sys_openat(
+    current: &crate::task::UserTaskRef,
     dirfd: c_int,
     path: *const c_char,
     flags: i32,
@@ -388,7 +397,7 @@ pub fn sys_openat(
     // call tp:trace_sys_enter_openat
     trace_sys_enter_openat(dirfd, path as _, flags as _, mode);
 
-    let curr = current_user_task();
+    let curr = current;
     let thread = curr.as_thread();
     let path = vm_load_path_string(path)?;
     debug!("sys_openat <= {dirfd} {path:?} {flags:#o} {mode:#o}");
@@ -435,7 +444,7 @@ pub fn sys_openat(
 
     // Intercept /proc/<pid>/ns/<type> opens: create an NsFd instead of
     // a regular file descriptor so that setns(2) receives a valid target.
-    if let Some(result) = try_open_nsfd(&path, uflags) {
+    if let Some(result) = try_open_nsfd(current, &path, uflags) {
         return result.map(|fd| fd as isize);
     }
 
@@ -451,8 +460,8 @@ pub fn sys_openat(
 
     // Open first, then install the file so filesystem errors propagate unchanged.
     let result = with_fs(dirfd, |fs| options.open(fs, path))?;
-    let mount_table_namespace = mount_table_namespace(&result);
-    let fd = add_to_fd(result, flags as _, mount_table_namespace)?;
+    let mount_table_namespace = mount_table_namespace(current, &result);
+    let fd = add_to_fd(current, result, flags as _, mount_table_namespace)?;
     if should_notify_create {
         let file = get_file_like(fd)?;
         crate::file::inotify::notify_create_path(file.path().as_ref(), false);
@@ -461,6 +470,7 @@ pub fn sys_openat(
 }
 
 pub fn sys_openat2(
+    current: &crate::task::UserTaskRef,
     dirfd: c_int,
     path: *const c_char,
     how: *const OpenHow,
@@ -509,7 +519,7 @@ pub fn sys_openat2(
     }
 
     if how_value.resolve == 0 {
-        return sys_openat(dirfd, path, flags, mode);
+        return sys_openat(current, dirfd, path, flags, mode);
     }
 
     let path = vm_load_path_string(path)?;
@@ -520,7 +530,7 @@ pub fn sys_openat2(
         return Err(AxError::CrossesDevices);
     }
 
-    let curr = current_user_task();
+    let curr = current;
     let thread = curr.as_thread();
     let mode = mode & !thread.proc_data.umask();
     let cred = thread.cred();
@@ -537,8 +547,8 @@ pub fn sys_openat2(
         options.no_follow(true);
         options.open(&fs.with_current_dir(parent)?, name.as_ref())
     })?;
-    let mount_table_namespace = mount_table_namespace(&result);
-    add_to_fd(result, flags as u32, mount_table_namespace).map(|fd| fd as isize)
+    let mount_table_namespace = mount_table_namespace(current, &result);
+    add_to_fd(current, result, flags as u32, mount_table_namespace).map(|fd| fd as isize)
 }
 
 /// Open a file by `filename` and insert it into the file descriptor table.
@@ -546,13 +556,23 @@ pub fn sys_openat2(
 /// Return its index in the file table (`fd`). Return `EMFILE` if it already
 /// has the maximum number of files open.
 #[cfg(target_arch = "x86_64")]
-pub fn sys_open(path: *const c_char, flags: i32, mode: __kernel_mode_t) -> AxResult<isize> {
-    sys_openat(AT_FDCWD as _, path, flags, mode)
+pub fn sys_open(
+    current: &crate::task::UserTaskRef,
+    path: *const c_char,
+    flags: i32,
+    mode: __kernel_mode_t,
+) -> AxResult<isize> {
+    sys_openat(current, AT_FDCWD as _, path, flags, mode)
 }
 
 #[cfg(target_arch = "x86_64")]
-pub fn sys_creat(path: *const c_char, mode: __kernel_mode_t) -> AxResult<isize> {
+pub fn sys_creat(
+    current: &crate::task::UserTaskRef,
+    path: *const c_char,
+    mode: __kernel_mode_t,
+) -> AxResult<isize> {
     sys_openat(
+        current,
         AT_FDCWD as _,
         path,
         (O_CREAT | O_WRONLY | O_TRUNC) as _,
@@ -574,14 +594,19 @@ bitflags! {
     }
 }
 
-pub fn sys_close_range(first: u32, last: u32, flags: u32) -> AxResult<isize> {
+pub fn sys_close_range(
+    current: &crate::task::UserTaskRef,
+    first: u32,
+    last: u32,
+    flags: u32,
+) -> AxResult<isize> {
     if last < first {
         return Err(AxError::InvalidInput);
     }
     let flags = CloseRangeFlags::from_bits(flags).ok_or(AxError::InvalidInput)?;
     debug!("sys_close_range <= fds: [{first}, {last}], flags: {flags:?}");
     if flags.contains(CloseRangeFlags::UNSHARE) {
-        let curr = current_user_task();
+        let curr = current;
         let new_files = Arc::new(ax_kspin::SpinRwLock::new(
             crate::file::current_fd_table().read().clone(),
         ));
@@ -625,13 +650,17 @@ fn dup_fd(old_fd: c_int, cloexec: bool) -> AxResult<isize> {
     Ok(new_fd as _)
 }
 
-fn dup_fd_min(old_fd: c_int, min_fd: c_int, cloexec: bool) -> AxResult<isize> {
+fn dup_fd_min(
+    current: &crate::task::UserTaskRef,
+    old_fd: c_int,
+    min_fd: c_int,
+    cloexec: bool,
+) -> AxResult<isize> {
     if min_fd < 0 {
         return Err(AxError::InvalidInput);
     }
     let f = get_file_like(old_fd)?;
-    let max_nofile =
-        current_user_task().as_thread().proc_data.rlimits()[RLIMIT_NOFILE].current as i32;
+    let max_nofile = current.as_thread().proc_data.rlimits()[RLIMIT_NOFILE].current as i32;
     let current_fd_table = crate::file::current_fd_table();
     let mut fd_table = current_fd_table.write();
     for candidate in min_fd..max_nofile {
@@ -699,16 +728,21 @@ pub fn sys_dup3(old_fd: c_int, new_fd: c_int, flags: c_int) -> AxResult<isize> {
     Ok(new_fd as _)
 }
 
-pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> AxResult<isize> {
+pub fn sys_fcntl(
+    current: &crate::task::UserTaskRef,
+    fd: c_int,
+    cmd: c_int,
+    arg: usize,
+) -> AxResult<isize> {
     debug!("sys_fcntl <= fd: {fd} cmd: {cmd} arg: {arg}");
 
-    if let Some(r) = super::lock::dispatch_fcntl(fd, cmd, arg) {
+    if let Some(r) = super::lock::dispatch_fcntl(current, fd, cmd, arg) {
         return r;
     }
 
     match cmd as u32 {
-        F_DUPFD => dup_fd_min(fd, arg as _, false),
-        F_DUPFD_CLOEXEC => dup_fd_min(fd, arg as _, true),
+        F_DUPFD => dup_fd_min(current, fd, arg as _, false),
+        F_DUPFD_CLOEXEC => dup_fd_min(current, fd, arg as _, true),
         F_SETFL => {
             let f = get_file_like(fd)?;
             // linux-raw-sys exposes the O_ASYNC file status bit as FASYNC.
@@ -823,9 +857,13 @@ fn set_pipe_size(pipe: &Pipe, size: usize) -> AxResult<isize> {
     Ok(pipe.capacity() as _)
 }
 
-pub fn sys_flock(fd: c_int, operation: c_int) -> AxResult<isize> {
+pub fn sys_flock(
+    current: &crate::task::UserTaskRef,
+    fd: c_int,
+    operation: c_int,
+) -> AxResult<isize> {
     debug!("flock <= fd: {fd}, operation: {operation}");
-    super::lock::flock_op(fd, operation)
+    super::lock::flock_op(current, fd, operation)
 }
 
 #[cfg(axtest)]

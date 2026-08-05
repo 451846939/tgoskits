@@ -15,7 +15,6 @@ use starry_vm::{VmMutPtr, VmPtr};
 use crate::{
     file::{Directory, File, get_file_like, memfd::Memfd, resolve_at},
     mm::{UserPtr, vm_load_path_string},
-    task::current_user_task,
 };
 
 const FILE_HANDLE_BYTES: usize = size_of::<u64>() * 2;
@@ -144,16 +143,26 @@ pub fn sys_statx(
 }
 
 #[cfg(target_arch = "x86_64")]
-pub fn sys_access(path: *const c_char, mode: u32) -> AxResult<isize> {
+pub fn sys_access(
+    current: &crate::task::UserTaskRef,
+    path: *const c_char,
+    mode: u32,
+) -> AxResult<isize> {
     use linux_raw_sys::general::AT_FDCWD;
 
-    sys_faccessat2(AT_FDCWD, path, mode, 0)
+    sys_faccessat2(current, AT_FDCWD, path, mode, 0)
 }
 
 // Note: AT_EACCESS is not explicitly handled. This is functionally correct
 // because fsuid/fsgid track euid/egid by default in our credential model,
 // so the real-ID vs effective-ID distinction AT_EACCESS controls is a no-op.
-pub fn sys_faccessat2(dirfd: c_int, path: *const c_char, mode: u32, flags: u32) -> AxResult<isize> {
+pub fn sys_faccessat2(
+    current: &crate::task::UserTaskRef,
+    dirfd: c_int,
+    path: *const c_char,
+    mode: u32,
+    flags: u32,
+) -> AxResult<isize> {
     // man 2 access: mode is a mask of F_OK(0), R_OK, W_OK, and X_OK;
     // faccessat2 flags are limited to AT_EACCESS, AT_EMPTY_PATH, and
     // AT_SYMLINK_NOFOLLOW. Linux rejects invalid bits before path resolution.
@@ -172,7 +181,7 @@ pub fn sys_faccessat2(dirfd: c_int, path: *const c_char, mode: u32, flags: u32) 
         return Ok(0);
     }
 
-    let cred = current_user_task().as_thread().cred();
+    let cred = current.as_thread().cred();
 
     // Root (fsuid == 0) bypasses R_OK and W_OK checks.
     // For X_OK, at least one execute bit must be set (owner, group, or other).

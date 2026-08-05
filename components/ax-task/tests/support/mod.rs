@@ -144,17 +144,21 @@ impl_trait! {
             unsafe { CpuRemoteHandle::from_raw(raw) }
         }
 
-        unsafe fn current_thread_identity() -> ThreadIdentityV1 {
+        unsafe fn current_thread_publication() -> CurrentThreadPublication {
             let index = CURRENT_CPU.with(|cpu| cpu.get() as usize);
             let raw = CPU_REMOTES.with(|handles| handles.borrow().get(index).copied().unwrap_or(0));
             if raw == 0 {
-                return ThreadIdentityV1::NONE;
+                return CurrentThreadPublication::NONE;
             }
             // SAFETY: the fixture retains the TaskSystem owning this endpoint.
             let remote = unsafe { &*core::ptr::with_exposed_provenance::<CpuRemote>(raw) };
-            remote.current_thread().map_or(ThreadIdentityV1::NONE, |id| {
-                ThreadIdentityV1::new(id.slot(), id.generation())
-            })
+            let Some(id) = remote.current_thread() else {
+                return CurrentThreadPublication::NONE;
+            };
+            let system = unsafe { &*core::ptr::with_exposed_provenance::<TaskSystem>(TASK_SYSTEM.with(Cell::get)) };
+            system
+                .thread_handle(id)
+                .map_or(CurrentThreadPublication::NONE, |thread| thread.runtime_publication())
         }
 
         unsafe fn cpu_remote_handle(cpu: RuntimeCpuId) -> CpuRemoteHandle {

@@ -4,6 +4,8 @@
 //! transparent opaque handles. Runtime resources remain owned by explicit,
 //! move-only tokens held by the scheduler until task-context reclamation.
 
+use alloc::sync::Arc;
+
 use trait_ffi::def_extern_trait;
 
 macro_rules! opaque_handle {
@@ -59,6 +61,15 @@ opaque_handle!(
     /// Consumers must claim the corresponding [`crate::CpuRemote`] owner gate
     /// before reconstructing any reference from this address.
     CurrentCpuLocalHandle
+);
+opaque_handle!(
+    /// Opaque pointer to the Arc-backed scheduler core of the current thread.
+    ///
+    /// This value is useful only as part of a runtime-provided
+    /// [`CurrentThreadPublication`]. The scheduler may acquire a strong handle
+    /// from it only while a preemption pin proves that the published thread is
+    /// still current and therefore retains its owner-side strong reference.
+    CurrentThreadOwnerHandle
 );
 opaque_handle!(
     /// Opaque pointer-sized handle to one Arc-backed remote CPU endpoint.
@@ -482,6 +493,80 @@ pub struct ThreadIdentityV1 {
     pub generation: u32,
 }
 
+/// Immutable scheduler publication owned by one runtime execution context.
+///
+/// This is the Rust equivalent of Linux's architecture-selected `current`
+/// pointer: the identity and its Arc-backed owner address are installed once
+/// before the context can run, then read only while context switches are
+/// excluded. The owner address is never a standalone weak or strong handle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C)]
+pub struct CurrentThreadPublication {
+    identity: ThreadIdentityV1,
+    owner: CurrentThreadOwnerHandle,
+}
+
+impl CurrentThreadPublication {
+    /// Sentinel returned by an unbound bootstrap execution context.
+    pub const NONE: Self = Self {
+        identity: ThreadIdentityV1::NONE,
+        owner: CurrentThreadOwnerHandle::NONE,
+    };
+
+    /// Returns the generation-bearing scheduler identity.
+    pub const fn identity(self) -> ThreadIdentityV1 {
+        self.identity
+    }
+
+    /// Returns the opaque current-owner address.
+    pub const fn owner(self) -> CurrentThreadOwnerHandle {
+        self.owner
+    }
+
+    pub(crate) fn from_core(identity: crate::ThreadId, core: &Arc<crate::ThreadCore>) -> Self {
+        let owner = Arc::as_ptr(core).expose_provenance();
+        // SAFETY: `core` supplies the live Arc allocation. Consumers may
+        // dereference this address only through `acquire_handle` while the
+        // matching runtime context remains current under a preemption pin.
+        let owner = unsafe { CurrentThreadOwnerHandle::from_raw(owner) };
+        Self {
+            identity: ThreadIdentityV1::new(identity.slot(), identity.generation()),
+            owner,
+        }
+    }
+
+    /// Acquires an ordinary external scheduler handle from the current
+    /// context's owner publication.
+    ///
+    /// # Safety
+    ///
+    /// The caller must prevent context switches from before obtaining this
+    /// publication until this method returns. The runtime must have copied the
+    /// publication from the architecture-selected current context, and the
+    /// scheduler must retain that thread's owner-side `Arc` for the interval.
+    pub(crate) unsafe fn acquire_handle(self) -> Result<crate::ThreadHandle, crate::TaskError> {
+        if !self.identity.is_bound() {
+            return Err(crate::TaskError::NoRunnableThread);
+        }
+        if self.owner.is_none() {
+            return Err(crate::TaskError::InvalidRuntimeHandle);
+        }
+        let core = core::ptr::with_exposed_provenance::<crate::ThreadCore>(self.owner.into_raw());
+        // SAFETY: the caller's current-context pin and the runtime publication
+        // contract prove that an owner-side strong reference is still live.
+        unsafe { Arc::increment_strong_count(core) };
+        // SAFETY: the increment above created exactly one strong reference for
+        // this reconstruction.
+        let core = unsafe { Arc::from_raw(core) };
+        let handle = crate::ThreadHandle::from_core(core);
+        let expected = crate::ThreadId::from_parts(self.identity.slot, self.identity.generation);
+        if handle.id() != expected {
+            return Err(crate::TaskError::InvalidRuntimeHandle);
+        }
+        Ok(handle)
+    }
+}
+
 impl ThreadIdentityV1 {
     /// Sentinel returned before a runtime context is bound to a scheduler thread.
     pub const NONE: Self = Self {
@@ -500,20 +585,20 @@ impl ThreadIdentityV1 {
     }
 }
 
-/// Immutable association between one runtime context and scheduler identity.
+/// Immutable association between one runtime context and scheduler ownership.
 ///
 /// Contexts are created before the scheduler allocates a generation-bearing
 /// thread ID. The scheduler submits this value exactly once after ID allocation
-/// and before the thread can become `Ready`. Keeping both fields scalar makes
-/// the operation suitable for the trait-FFI boundary without exporting a
-/// scheduler object, reference, or ownership-bearing handle.
+/// and before the thread can become `Ready`. The publication keeps only a
+/// pointer-sized owner address; it does not transfer an Arc or external reaper
+/// lease across the trait-FFI boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(C)]
 pub struct ContextThreadBinding {
     /// Live runtime-owned execution context to bind.
     pub context: ExecutionContextHandle,
-    /// Typed scheduler identity without exposing [`crate::ThreadId`]'s encoding.
-    pub identity: ThreadIdentityV1,
+    /// Immutable current-thread publication for this execution context.
+    pub publication: CurrentThreadPublication,
 }
 
 /// Allocation requirements for a thread-local storage area.
@@ -661,20 +746,21 @@ pub trait TaskRuntime {
     /// allocation.
     unsafe fn current_cpu_remote_handle() -> CpuRemoteHandle;
 
-    /// Returns the scheduler identity bound to the calling execution context.
+    /// Returns the scheduler publication bound to the calling execution context.
     ///
     /// This is the local equivalent of Linux's direct `current` task pointer.
     /// Providers must read the task-owned runtime context selected by the
     /// architecture current-thread register; they must not resolve the local
-    /// identity through a remote runqueue endpoint. [`ThreadIdentityV1::NONE`]
-    /// denotes an unbound bootstrap context.
+    /// publication through a remote runqueue endpoint.
+    /// [`CurrentThreadPublication::NONE`] denotes an unbound bootstrap context.
     ///
     /// # Safety
     ///
     /// The caller must prevent migration and context switches until the value
-    /// has been copied. A bound result must remain immutable for the complete
-    /// lifetime of that runtime context.
-    unsafe fn current_thread_identity() -> ThreadIdentityV1;
+    /// has been copied. A bound result must match the scheduler core retained
+    /// by the current CPU and remain immutable for the complete lifetime of
+    /// that runtime context.
+    unsafe fn current_thread_publication() -> CurrentThreadPublication;
 
     /// Returns the Arc-backed [`crate::CpuRemote`] endpoint for `cpu`.
     ///

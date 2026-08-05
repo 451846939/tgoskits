@@ -13,7 +13,7 @@ use ax_task::{
         KernelContextRequest, PreemptGuardToken, RuntimeCpuId, RuntimeHandleResult,
         RuntimeScheduleOrigin, RuntimeSchedulerEntry, RuntimeSchedulerReturn, RuntimeStatus,
         SchedSwitchRecord, StackHandle, StackRequest, TaskDeadlineUpdate, TaskRuntime,
-        TaskSystemHandle, ThreadIdentityV1, TlsHandle, TlsRequest, UserContextRequest,
+        TaskSystemHandle, TlsHandle, TlsRequest, UserContextRequest,
     },
 };
 
@@ -91,16 +91,20 @@ impl_task_runtime! {
             // this cached current-CPU endpoint.
             unsafe { CpuRemoteHandle::from_raw(CPU_REMOTE.with(Cell::get)) }
         }
-        unsafe fn current_thread_identity() -> ThreadIdentityV1 {
+        unsafe fn current_thread_publication() -> CurrentThreadPublication {
             let raw = CPU_REMOTE.with(Cell::get);
             if raw == 0 {
-                return ThreadIdentityV1::NONE;
+                return CurrentThreadPublication::NONE;
             }
             // SAFETY: install/clear retain the TaskSystem owning this endpoint.
             let remote = unsafe { &*core::ptr::with_exposed_provenance::<CpuRemote>(raw) };
-            remote.current_thread().map_or(ThreadIdentityV1::NONE, |id| {
-                ThreadIdentityV1::new(id.slot(), id.generation())
-            })
+            let Some(id) = remote.current_thread() else {
+                return CurrentThreadPublication::NONE;
+            };
+            let system = unsafe { &*core::ptr::with_exposed_provenance::<TaskSystem>(TASK_SYSTEM.with(Cell::get)) };
+            system
+                .thread_handle(id)
+                .map_or(CurrentThreadPublication::NONE, |thread| thread.runtime_publication())
         }
         unsafe fn cpu_remote_handle(cpu: RuntimeCpuId) -> CpuRemoteHandle {
             let raw = TASK_SYSTEM.with(Cell::get);
@@ -226,7 +230,7 @@ fn pure_model_exports_the_context_binding_symbol() {
     assert_eq!(
         ax_task::runtime::task_runtime::bind_context_thread(ContextThreadBinding {
             context: ExecutionContextHandle::NONE,
-            identity: ThreadIdentityV1::new(0, 0),
+            publication: CurrentThreadPublication::NONE,
         }),
         RuntimeStatus::Success
     );
