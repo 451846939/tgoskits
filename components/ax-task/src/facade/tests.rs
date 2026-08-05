@@ -288,7 +288,7 @@ mod tests {
 
         let initial = {
             let _irq = RuntimeIrqGuard::enter();
-            cpu.as_mut().next_task_deadline_update(0, 1).unwrap()
+            cpu.as_mut().next_task_deadline_update(0).unwrap()
         };
         task_runtime::publish_task_deadline(initial);
         assert!(test_runtime::take_task_deadline_update().is_some());
@@ -548,7 +548,7 @@ mod tests {
             "a retryable owner mismatch must not consume the move-only deadline token"
         );
         assert_eq!(
-            cpu.as_mut().task_deadlines().next_deadline_ns(0, 1),
+            cpu.as_mut().task_deadlines().next_deadline_ns(),
             Some(10),
             "a failed cancellation must leave the physical queue entry intact"
         );
@@ -558,7 +558,7 @@ mod tests {
             .register_sleep_timer(CpuId::new(0), token.generation());
         assert!(cancel_current_park_deadline(&running, &mut ticket).unwrap());
         assert!(!ticket.has_deadline());
-        assert_eq!(cpu.as_mut().task_deadlines().next_deadline_ns(0, 1), None);
+        assert_eq!(cpu.as_mut().task_deadlines().next_deadline_ns(), None);
         cancel_current_park(&mut ticket).unwrap();
     }
 
@@ -623,7 +623,7 @@ mod tests {
         );
         assert!(!ticket.has_deadline());
         assert_eq!(running.core.sleep_timer_cpu(), None);
-        assert_eq!(cpu.as_mut().task_deadlines().next_deadline_ns(0, 1), None);
+        assert_eq!(cpu.as_mut().task_deadlines().next_deadline_ns(), None);
 
         cancel_current_park(&mut ticket).unwrap();
     }
@@ -655,7 +655,7 @@ mod tests {
         );
         assert_eq!(running.core.sleep_timer_cpu(), Some(CpuId::new(0)));
         assert_eq!(
-            cpu.as_mut().task_deadlines().next_deadline_ns(0, 1),
+            cpu.as_mut().task_deadlines().next_deadline_ns(),
             Some(10)
         );
 

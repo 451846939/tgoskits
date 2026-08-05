@@ -389,11 +389,7 @@ impl CpuLocal {
             .is_some_and(|deadline| deadline <= now_ns)
     }
 
-    pub(crate) fn next_oneshot_deadline_ns(
-        self: Pin<&mut Self>,
-        now_ns: u64,
-        timer_resolution_ns: u64,
-    ) -> Option<u64> {
+    pub(crate) fn next_oneshot_deadline_ns(self: Pin<&mut Self>, now_ns: u64) -> Option<u64> {
         // SAFETY: clockevent selection is an owner-only transition. The
         // mutable queue/scheduler projections cannot move CpuLocal.
         let this = unsafe { self.get_unchecked_mut() };
@@ -411,13 +407,8 @@ impl CpuLocal {
             // source remain the failsafe clockevent.
             None
         } else {
-            this.task_deadlines
-                .queue
-                .next_deadline_ns(now_ns, timer_resolution_ns)
+            this.task_deadlines.queue.next_deadline_ns()
         };
-        let earliest_future_ns = now_ns
-            .checked_add(timer_resolution_ns.max(1))
-            .or_else(|| now_ns.checked_add(1));
         let scheduler = match this.scheduler_deadline_ns(now_ns) {
             Some(deadline) if deadline <= now_ns => {
                 // Linux does not start a scheduler hrtimer whose expiry has
@@ -428,7 +419,7 @@ impl CpuLocal {
                 this.remote.request_scheduler_work();
                 None
             }
-            Some(deadline) => earliest_future_ns.map(|earliest| deadline.max(earliest)),
+            Some(deadline) => Some(deadline),
             None => None,
         };
         match (timer, scheduler) {
@@ -440,50 +431,64 @@ impl CpuLocal {
     }
 
     pub(crate) fn next_task_deadline_update(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         now_ns: u64,
-        timer_resolution_ns: u64,
     ) -> Result<TaskDeadlineUpdate, TaskError> {
-        self.prepare_task_deadline_update(now_ns, timer_resolution_ns, true)?
-            .ok_or(TaskError::InvalidConfiguration)
+        let publication = self.as_mut().task_deadline_publication(now_ns);
+        let task_deadlines = self.task_deadline_state_mut();
+        if task_deadlines.publication == Some(publication) {
+            return TaskDeadlineUpdate::try_new(
+                task_deadlines.generation,
+                publication.deadline,
+                publication.deferred_work,
+            )
+            .ok_or(TaskError::InvalidConfiguration);
+        }
+        Self::commit_task_deadline_publication(task_deadlines, publication)
     }
 
     pub(crate) fn next_task_deadline_update_if_changed(
-        self: Pin<&mut Self>,
-        now_ns: u64,
-        timer_resolution_ns: u64,
-    ) -> Result<Option<TaskDeadlineUpdate>, TaskError> {
-        self.prepare_task_deadline_update(now_ns, timer_resolution_ns, false)
-    }
-
-    fn prepare_task_deadline_update(
         mut self: Pin<&mut Self>,
         now_ns: u64,
-        timer_resolution_ns: u64,
-        force: bool,
     ) -> Result<Option<TaskDeadlineUpdate>, TaskError> {
-        let deadline = self
-            .as_mut()
-            .next_oneshot_deadline_ns(now_ns, timer_resolution_ns)
-            .and_then(MonotonicDeadline::from_nanos);
-        let deferred_work = self.remote.deadline_work_pending();
-        let publication = TaskDeadlinePublicationState {
-            deadline,
-            deferred_work,
-        };
+        let publication = self.as_mut().task_deadline_publication(now_ns);
         let task_deadlines = self.task_deadline_state_mut();
-        if !force && task_deadlines.publication == Some(publication) {
+        if task_deadlines.publication == Some(publication) {
             return Ok(None);
         }
+        Self::commit_task_deadline_publication(task_deadlines, publication).map(Some)
+    }
+
+    fn task_deadline_publication(
+        mut self: Pin<&mut Self>,
+        now_ns: u64,
+    ) -> TaskDeadlinePublicationState {
+        let deadline = self
+            .as_mut()
+            .next_oneshot_deadline_ns(now_ns)
+            .and_then(MonotonicDeadline::from_nanos);
+        TaskDeadlinePublicationState {
+            deadline,
+            deferred_work: self.remote.deadline_work_pending(),
+        }
+    }
+
+    fn commit_task_deadline_publication(
+        task_deadlines: &mut deadline_state::LocalTaskDeadlineState,
+        publication: TaskDeadlinePublicationState,
+    ) -> Result<TaskDeadlineUpdate, TaskError> {
         task_deadlines.generation = task_deadlines
             .generation
             .checked_add(1)
             .ok_or(TaskError::InvalidConfiguration)?;
-        let update =
-            TaskDeadlineUpdate::try_new(task_deadlines.generation, deadline, deferred_work)
-                .ok_or(TaskError::InvalidConfiguration)?;
+        let update = TaskDeadlineUpdate::try_new(
+            task_deadlines.generation,
+            publication.deadline,
+            publication.deferred_work,
+        )
+        .ok_or(TaskError::InvalidConfiguration)?;
         task_deadlines.publication = Some(publication);
-        Ok(Some(update))
+        Ok(update)
     }
 
     pub(crate) fn invalidate_task_deadline_publication(self: Pin<&mut Self>) {
@@ -607,7 +612,6 @@ impl CpuLocal {
     pub fn expire_task_deadlines(
         self: Pin<&mut Self>,
         now_ns: u64,
-        timer_resolution_ns: u64,
         budget: usize,
     ) -> TaskDeadlineExpireBatch {
         // SAFETY: hard-IRQ expiry owns this pinned CPU-local state. These
@@ -623,11 +627,8 @@ impl CpuLocal {
             .expired_buffer
             .len()
             .saturating_sub(task_deadlines.expired_count);
-        let request = TaskDeadlineExpireRequest::new(
-            now_ns,
-            budget.min(batch_limit).min(available),
-            timer_resolution_ns,
-        );
+        let request =
+            TaskDeadlineExpireRequest::new(now_ns, budget.min(batch_limit).min(available));
         let output = &mut task_deadlines.expired_buffer[task_deadlines.expired_count..];
         let batch = task_deadlines.queue.expire(request, output);
         task_deadlines.expired_count += batch.expired();

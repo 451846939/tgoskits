@@ -3595,13 +3595,13 @@ fn dequeue_removes_obsolete_scheduler_clockevent() {
     system.enqueue(cpu.as_mut(), contender.id(), 0).unwrap();
 
     assert!(
-        cpu.as_mut().next_oneshot_deadline_ns(0, 1).is_some(),
+        cpu.as_mut().next_oneshot_deadline_ns(0).is_some(),
         "two fair entities require a scheduler clockevent"
     );
     system.dequeue(cpu.as_mut(), contender.id()).unwrap();
 
     assert_eq!(
-        cpu.as_mut().next_oneshot_deadline_ns(0, 1),
+        cpu.as_mut().next_oneshot_deadline_ns(0),
         None,
         "removing the only queued contender must remove the obsolete scheduler clockevent"
     );

@@ -349,9 +349,6 @@ impl TaskRuntime for UnitTestRuntime {
         MONOTONIC_READS.with(|reads| reads.set(reads.get() + 1));
         MONOTONIC_NS.with(Cell::get)
     }
-    fn timer_resolution_ns() -> u64 {
-        1
-    }
     fn publish_task_deadline(update: TaskDeadlineUpdate) {
         run_hook_reentry_query();
         LAST_TASK_DEADLINE_UPDATE.with(|observed| observed.set(Some(update)));

@@ -280,8 +280,7 @@ impl TaskSystem {
             // recovery. Runtime scheduling enters through the facade and does
             // not call this promotion path a second time.
             let budget = cpu.batch_limit();
-            cpu.as_mut()
-                .expire_task_deadlines(now_ns, task_runtime::timer_resolution_ns(), budget);
+            cpu.as_mut().expire_task_deadlines(now_ns, budget);
         }
         let _processed = self.service_pending_deadline_timers(cpu, now_ns)?;
         Ok(())
@@ -477,10 +476,9 @@ impl TaskSystem {
         entry_now_ns: u64,
     ) -> Result<(), TaskError> {
         let completion_now_ns = Self::scheduler_completion_now_ns(entry_now_ns);
-        let resolution_ns = task_runtime::timer_resolution_ns();
         let Some(update) = cpu
             .as_mut()
-            .next_task_deadline_update_if_changed(completion_now_ns, resolution_ns)?
+            .next_task_deadline_update_if_changed(completion_now_ns)?
         else {
             return Ok(());
         };

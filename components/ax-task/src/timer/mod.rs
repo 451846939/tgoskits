@@ -58,16 +58,14 @@ impl FiniteTaskDeadline {
 pub struct TaskDeadlineExpireRequest {
     now_ns: u64,
     batch_limit: usize,
-    timer_resolution_ns: u64,
 }
 
 impl TaskDeadlineExpireRequest {
     /// Creates one bounded timer expiration request.
-    pub const fn new(now_ns: u64, batch_limit: usize, timer_resolution_ns: u64) -> Self {
+    pub const fn new(now_ns: u64, batch_limit: usize) -> Self {
         Self {
             now_ns,
             batch_limit,
-            timer_resolution_ns,
         }
     }
 }
@@ -97,7 +95,7 @@ impl TaskDeadlineExpireBatch {
         self.pending
     }
 
-    /// Returns the next representable one-shot timer deadline.
+    /// Returns the next logical task deadline.
     pub const fn next_deadline_ns(self) -> Option<u64> {
         self.next_deadline_ns
     }
@@ -242,14 +240,9 @@ impl TaskDeadlineQueue {
         self.heap.push(entry);
     }
 
-    /// Returns the earliest representable one-shot deadline without mutating the queue.
-    pub fn next_deadline_ns(&self, now_ns: u64, timer_resolution_ns: u64) -> Option<u64> {
-        self.next_wakeup(TaskDeadlineExpireRequest::new(
-            now_ns,
-            0,
-            timer_resolution_ns,
-        ))
-        .1
+    /// Returns the earliest logical task deadline without mutating the queue.
+    pub fn next_deadline_ns(&self) -> Option<u64> {
+        self.heap.peek().map(TimerEntry::deadline_ns)
     }
 
     pub(crate) fn has_immediately_actionable_entry(&self, now_ns: u64) -> bool {
@@ -323,15 +316,10 @@ impl TaskDeadlineQueue {
         let Some(entry) = self.heap.peek() else {
             return (false, None);
         };
-        let immediately_actionable = entry.deadline_ns() <= request.now_ns;
-        let earliest = request
-            .now_ns
-            .saturating_add(request.timer_resolution_ns.max(1));
-        if immediately_actionable {
-            (true, Some(earliest))
-        } else {
-            (false, Some(entry.deadline_ns().max(earliest)))
-        }
+        (
+            entry.deadline_ns() <= request.now_ns,
+            Some(entry.deadline_ns()),
+        )
     }
 }
 

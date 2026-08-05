@@ -134,6 +134,11 @@ fn timer_irq_facade_bounds_and_preserves_unconsumed_expirations() {
     assert_eq!(before_drain.expired(), 0);
     assert!(before_drain.pending(), "{before_drain:?}");
     assert!(before_drain.update().deferred_work());
+    assert_eq!(
+        before_drain.update().generation(),
+        first.update().generation(),
+        "an unchanged logical deadline publication must retain its generation"
+    );
 
     let mut expired = [ExpiredTaskDeadline::EMPTY; 2];
     assert_eq!(

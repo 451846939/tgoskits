@@ -13,12 +13,12 @@ fn expires_in_deadline_order_without_exceeding_the_batch() {
     let _third_registration = timers.arm(third.as_ref(), 30, park(3)).unwrap();
     let mut expired = [ExpiredTaskDeadline::EMPTY; 3];
 
-    let result = timers.expire(TaskDeadlineExpireRequest::new(30, 2, 5), &mut expired);
+    let result = timers.expire(TaskDeadlineExpireRequest::new(30, 2), &mut expired);
 
     assert_eq!(result.processed(), 2);
     assert_eq!(result.expired(), 2);
     assert!(result.pending());
-    assert_eq!(result.next_deadline_ns(), Some(35));
+    assert_eq!(result.next_deadline_ns(), Some(30));
     assert_eq!(expired[0].thread(), Some(thread(1)));
     assert_eq!(expired[1].thread(), Some(thread(2)));
 }
@@ -61,12 +61,21 @@ fn zero_is_an_immediately_due_logical_deadline() {
     let registration = timers.arm(node.as_ref(), 0, park(1)).unwrap();
     let mut expired = [ExpiredTaskDeadline::EMPTY; 1];
 
-    let batch = timers.expire(TaskDeadlineExpireRequest::new(0, 1, 1), &mut expired);
+    let batch = timers.expire(TaskDeadlineExpireRequest::new(0, 1), &mut expired);
 
     assert_eq!(batch.processed(), 1);
     assert_eq!(batch.expired(), 1);
     assert_eq!(expired[0].token(), registration.token());
     assert!(timers.is_empty());
+}
+
+#[test]
+fn logical_deadline_is_not_shifted_by_physical_timer_resolution() {
+    let node = timer(6);
+    let mut timers = TaskDeadlineQueue::new(1);
+    let _registration = timers.arm(node.as_ref(), 2, park(1)).unwrap();
+
+    assert_eq!(timers.next_deadline_ns(), Some(2));
 }
 
 #[test]
@@ -81,13 +90,13 @@ fn rearm_replaces_the_existing_entry_without_consuming_capacity() {
     assert_eq!(timers.len(), 1);
 
     let mut expired = [ExpiredTaskDeadline::EMPTY; 1];
-    let before_deadline = timers.expire(TaskDeadlineExpireRequest::new(10, 1, 1), &mut expired);
+    let before_deadline = timers.expire(TaskDeadlineExpireRequest::new(10, 1), &mut expired);
     assert_eq!(before_deadline.processed(), 0);
     assert_eq!(before_deadline.expired(), 0);
     assert!(!before_deadline.pending());
     assert_eq!(before_deadline.next_deadline_ns(), Some(20));
 
-    let at_deadline = timers.expire(TaskDeadlineExpireRequest::new(20, 1, 1), &mut expired);
+    let at_deadline = timers.expire(TaskDeadlineExpireRequest::new(20, 1), &mut expired);
     assert_eq!(at_deadline.processed(), 1);
     assert_eq!(at_deadline.expired(), 1);
     assert_eq!(expired[0].token(), second.token());
@@ -116,7 +125,7 @@ fn one_thread_can_own_independent_park_cbs_and_zero_lag_entries() {
     assert_eq!(timers.len(), 3);
 
     let mut expired = [ExpiredTaskDeadline::EMPTY; 3];
-    let batch = timers.expire(TaskDeadlineExpireRequest::new(30, 3, 1), &mut expired);
+    let batch = timers.expire(TaskDeadlineExpireRequest::new(30, 3), &mut expired);
     assert_eq!(batch.expired(), 3);
     assert_eq!(expired[0].kind(), Some(TaskDeadlineKind::DeadlineCbs));
     assert_eq!(expired[1].kind(), Some(TaskDeadlineKind::DeadlineZeroLag));
@@ -182,7 +191,7 @@ fn cancellation_transaction_restores_the_exact_registration_and_capacity() {
     assert!(timers.is_empty());
     cancellation.rollback(&mut timers);
     assert_eq!(timers.len(), 1);
-    assert_eq!(timers.next_deadline_ns(0, 1), Some(10));
+    assert_eq!(timers.next_deadline_ns(), Some(10));
     assert_eq!(
         timers.arm(second.as_ref(), 20, park(2)),
         Err(TaskDeadlineError::Capacity),
@@ -192,7 +201,7 @@ fn cancellation_transaction_restores_the_exact_registration_and_capacity() {
     let mut expired = [ExpiredTaskDeadline::EMPTY; 1];
     assert_eq!(
         timers
-            .expire(TaskDeadlineExpireRequest::new(10, 1, 1), &mut expired)
+            .expire(TaskDeadlineExpireRequest::new(10, 1), &mut expired)
             .expired(),
         1
     );
@@ -272,7 +281,7 @@ fn queued_deadline_owns_expiry_identity_by_value() {
     drop(node);
 
     let mut expired = [ExpiredTaskDeadline::EMPTY; 1];
-    let batch = timers.expire(TaskDeadlineExpireRequest::new(10, 1, 1), &mut expired);
+    let batch = timers.expire(TaskDeadlineExpireRequest::new(10, 1), &mut expired);
     assert_eq!(batch.expired(), 1);
     assert_eq!(expired[0].thread(), Some(thread(44)));
     assert_eq!(expired[0].token(), token);

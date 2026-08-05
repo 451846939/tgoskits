@@ -5,6 +5,10 @@ use linux_raw_sys::general::{
     timespec, timeval,
 };
 
+mod sleep_deadline;
+
+pub(crate) use sleep_deadline::{SleepClockSnapshot, SleepDeadline};
+
 /// A helper trait for converting from and to `TimeValue`.
 pub trait TimeValueLike {
     /// Converts from `TimeValue`.

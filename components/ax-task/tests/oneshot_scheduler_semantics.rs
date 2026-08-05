@@ -70,9 +70,8 @@ fn deadline_dispatch_programs_budget_before_its_absolute_deadline() {
 }
 
 #[test]
-fn scheduler_boundary_is_rounded_up_to_timer_resolution() {
+fn scheduler_boundary_is_published_in_the_logical_clock_domain() {
     let (system, mut cpu) = online_system();
-    support::set_timer_resolution_ns(10);
     let deadline = ready_thread(
         &system,
         SchedulePolicy::deadline(DeadlinePolicy::new(2, 10, 100, DeadlineFlags::NONE).unwrap()),
@@ -83,7 +82,7 @@ fn scheduler_boundary_is_rounded_up_to_timer_resolution() {
         system.schedule(cpu.as_mut(), 100).unwrap().next(),
         deadline.id()
     );
-    assert_eq!(support::last_oneshot_ns(), 110);
+    assert_eq!(support::last_oneshot_ns(), 102);
 }
 
 #[test]

@@ -1776,6 +1776,45 @@ Linux 的 `RT_PUSH_IPI` 同样通过 root-domain IRQ work 避免跨 rq 锁风暴
 而不是恢复旧 wake inbox 或同步双 rq 兼容路径。本节尚无新的端到端性能数据，不据此声称已经
 达到 Linux PREEMPT_RT 水平。
 
+### 2026-08-05 逻辑期限、物理 clockevent 与绝对睡眠
+
+继续对照 Linux v7.1 的 `kernel/time/hrtimer.c::hrtimer_interrupt()`、
+`hrtimer_nanosleep()` 和 `kernel/time/clockevents.c::clockevents_program_event()` 后，确认
+旧实现把两个不同层次混在一起：ax-task 通过 `TaskRuntime::timer_resolution_ns()` 读取物理
+设备粒度，并把 future task deadline 与 scheduler boundary 向后平移；与此同时，
+`LocalClockEvent` 只在 selected minimum 变早时重写设备，变晚时保留已经失效的旧 arm，
+等待一次多余 IRQ 再纠正。
+
+当前实现破坏性删除 `TaskRuntime::timer_resolution_ns()` 及所有 resolution 参数。ax-task 的
+deadline heap、CBS 和 rq boundary 只发布精确逻辑单调时钟值；过期值、sub-tick 值与 ns/tick
+饱和转换只由四架构 clockevent backend 处理。`LocalClockEvent` 则把 selected minimum 作为
+唯一物理真相：变早、变晚、删除来源都立即产生一个精确 `Program/Stop`，`Firing` 期间仍只在
+finish 合并提交一次。deadline/deferred-work 语义没有变化时保留原 generation，避免每次
+timer IRQ 制造无意义 publication 和硬件 reconciliation。
+
+Starry `clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME)` 原先先用第一次时钟读数把绝对值
+变成相对时长，随后 `sleep_impl()` 再用第二次 monotonic 读数加回；两次读数之间的处理成本
+因此永久推迟用户期限。现在 `SleepDeadline` 显式携带 `Monotonic/Realtime` 时钟域：monotonic
+绝对值原样进入 scheduler park，realtime 只在 user-wait 边界转换一次，relative sleep 统一
+用 monotonic elapsed 计算 `rem`。这与 Linux 直接把 `timespec64_to_ktime()` 交给
+`hrtimer_nanosleep(..., HRTIMER_MODE_ABS, clockid)` 的语义一致，不保留旧的 duration 兼容层。
+
+三类最低层红测在旧实现中稳定失败：逻辑 deadline 2ns 被 10ns 设备粒度平移；task deadline
+从 300ns 改到 400ns 时没有重编程物理 owner；两次 monotonic 读数相差 25ns 时，1,000ns 的
+绝对睡眠被解析为 1,025ns。修复后对应精确值为 2ns、`Program(400ns)` 和 1,000ns；另有
+重复 clockevent pass 断言未变事实保持同一 generation。`cargo test -p ax-task` 的 302 个
+unit、21 个 loom、全部 integration/doc test，以及 `starry-kernel` 26 个 clippy 配置通过。
+现有 x86_64 Starry timer-family 原始 syscall 组也保持 136/136、分组 3/3 正式通过，目标
+QEMU 命令总耗时 50.15 秒；它覆盖相对/绝对 nanosleep、信号中断、剩余时间和 timerfd/POSIX
+timer 组合，未以放宽 ABI 断言换取通过。
+
+本轮 review 的 N1(cpupri HIGHER)、C5(不可迁移 overload) 与 running dispatch 已由上一检查点
+完成。GRUB `extra_bw`、root-domain runtime borrowing 和 running 留队模型仍是下一阶段的调度
+架构工作；它们不会通过在现有 per-rq 字段旁增加兼容镜像来实现，而会先建立唯一
+root-domain bandwidth owner，再调整 rq class 生命周期。owner-side RT push 保留
+generation-bearing doorbell；Linux `RT_PUSH_IPI` 同样以 root-domain irq-work 避免 wake 路径
+同步持有任意两个 rq 锁，因此不采纳“waker 无条件同步双 rq push”的建议。
+
 ## 模块化结果
 
 - `TaskSystem` orchestration 只负责编排，registry/reap、placement、owner scheduling、deadline、PI、balance、deferred work 分模块；

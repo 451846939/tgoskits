@@ -21,7 +21,7 @@ mod scheduler_ipi_tests {
         let deadline = cpu.remote().fair_balance_deadline_ns();
 
         assert_eq!(
-            cpu.as_mut().next_oneshot_deadline_ns(deadline, 1),
+            cpu.as_mut().next_oneshot_deadline_ns(deadline),
             None,
             "an overdue scheduler event must not be rearmed at timer resolution"
         );

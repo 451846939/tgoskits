@@ -173,9 +173,7 @@ fn service_scheduler_safe_point_deadlines_at(
             let mut cpu = runtime_current_cpu_mut(pin)?;
             if cpu.task_deadline_expiry_due(now_ns) {
                 let budget = cpu.batch_limit();
-                cpu.as_mut()
-                    .expire_task_deadlines(now_ns, task_runtime::timer_resolution_ns(), budget)
-                    .pending()
+                cpu.as_mut().expire_task_deadlines(now_ns, budget).pending()
             } else {
                 false
             }

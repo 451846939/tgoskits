@@ -103,7 +103,6 @@ std::thread_local! {
     static LAST_ONESHOT_NS: Cell<u64> = const { Cell::new(0) };
     static LAST_DEADLINE_GENERATION: Cell<u64> = const { Cell::new(0) };
     static LAST_DEFERRED_WORK: Cell<bool> = const { Cell::new(false) };
-    static TIMER_RESOLUTION_NS: Cell<u64> = const { Cell::new(1) };
     static MONOTONIC_NS: Cell<u64> = const { Cell::new(0) };
 }
 
@@ -367,7 +366,6 @@ impl_trait! {
             RuntimeStatus::Success
         }
         fn monotonic_ns() -> u64 { MONOTONIC_NS.with(Cell::get) }
-        fn timer_resolution_ns() -> u64 { TIMER_RESOLUTION_NS.with(Cell::get) }
         fn publish_task_deadline(update: TaskDeadlineUpdate) {
             LAST_ONESHOT_NS.with(|deadline| {
                 deadline.set(update.deadline().map_or(0, MonotonicDeadline::as_nanos))
@@ -657,10 +655,6 @@ pub fn last_task_deadline_update() -> (u64, u64, bool) {
     )
 }
 
-pub fn set_timer_resolution_ns(resolution_ns: u64) {
-    TIMER_RESOLUTION_NS.with(|resolution| resolution.set(resolution_ns));
-}
-
 pub fn set_monotonic_ns(now_ns: u64) {
     MONOTONIC_NS.with(|now| now.set(now_ns));
 }
@@ -691,7 +685,6 @@ pub fn clear_handles() {
     LAST_DEADLINE_GENERATION.with(|generation| generation.set(0));
     LAST_DEFERRED_WORK.with(|pending| pending.set(false));
     let _cleared_oneshot = last_oneshot_ns();
-    set_timer_resolution_ns(1);
     set_monotonic_ns(0);
     let _reset_counts = resource_release_counts();
 }

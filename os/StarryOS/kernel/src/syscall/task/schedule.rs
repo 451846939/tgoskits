@@ -23,10 +23,10 @@ use crate::{
     syscall::time::write_timespec,
     task::{
         Cred, ProcessData, UserTaskRef,
-        future::{UserWaitOutcome, block_on_user_until},
+        future::{UserWaitOutcome, block_on_user_until, block_on_user_until_wall},
         get_process_data, get_process_group, get_task, get_zombie_nice, processes,
     },
-    time::TimeValueLike,
+    time::{SleepDeadline, TimeValueLike},
 };
 
 #[repr(C)]
@@ -75,25 +75,33 @@ pub fn sys_sched_rr_get_interval_time64(
     Ok(0)
 }
 
-fn sleep_impl(
-    current: &crate::task::UserTaskRef,
-    clock: impl Fn() -> TimeValue,
-    dur: TimeValue,
-) -> (AxResult<()>, TimeValue) {
-    debug!("sleep_impl <= {dur:?}");
-
-    let start = clock();
-
-    // TODO: currently ignoring concrete clock type
-    let task = current;
-    let deadline = hal::time::monotonic_time().saturating_add(dur);
-    let result = match block_on_user_until(task, Some(deadline), core::future::pending::<()>()) {
+fn sleep_until(current: &crate::task::UserTaskRef, deadline: SleepDeadline) -> AxResult<()> {
+    debug!("sleep_until <= {deadline:?}");
+    let outcome = match deadline {
+        SleepDeadline::Monotonic(deadline) => {
+            block_on_user_until(current, Some(deadline), core::future::pending::<()>())
+        }
+        SleepDeadline::Realtime(deadline) => {
+            block_on_user_until_wall(current, Some(deadline), core::future::pending::<()>())
+        }
+    };
+    match outcome {
         UserWaitOutcome::TimedOut => Ok(()),
         UserWaitOutcome::Interrupted => Err(AxError::Interrupted),
         UserWaitOutcome::Ready(()) => unreachable!("a pending sleep future cannot complete"),
-    };
+    }
+}
 
-    (result, clock() - start)
+fn sleep_relative(
+    current: &crate::task::UserTaskRef,
+    duration: TimeValue,
+) -> (AxResult<()>, TimeValue) {
+    debug!("sleep_relative <= {duration:?}");
+    let start = hal::time::monotonic_time();
+    let deadline = start.saturating_add(duration);
+    let result = sleep_until(current, SleepDeadline::Monotonic(deadline));
+
+    (result, hal::time::monotonic_time().saturating_sub(start))
 }
 
 /// Sleep some nanoseconds
@@ -106,7 +114,7 @@ pub fn sys_nanosleep(
     let req = unsafe { req.vm_read_uninit(current)?.assume_init() }.try_into_time_value()?;
     debug!("sys_nanosleep <= req: {req:?}");
 
-    let (result, actual) = sleep_impl(current, hal::time::monotonic_time, req);
+    let (result, actual) = sleep_relative(current, req);
 
     match result {
         Ok(()) => Ok(0),
@@ -128,9 +136,9 @@ pub fn sys_clock_nanosleep(
     req: *const timespec,
     rem: *mut timespec,
 ) -> AxResult<isize> {
-    let clock = match clock_id as u32 {
-        CLOCK_REALTIME => hal::time::wall_time,
-        CLOCK_MONOTONIC => hal::time::monotonic_time,
+    let absolute_deadline = match clock_id as u32 {
+        CLOCK_REALTIME => SleepDeadline::Realtime,
+        CLOCK_MONOTONIC => SleepDeadline::Monotonic,
         _ => {
             warn!("Unsupported clock_id: {clock_id}");
             return Err(AxError::InvalidInput);
@@ -141,19 +149,20 @@ pub fn sys_clock_nanosleep(
     debug!("sys_clock_nanosleep <= clock_id: {clock_id}, flags: {flags}, req: {req:?}");
 
     let is_abstime = flags & TIMER_ABSTIME != 0;
-    let dur = if is_abstime {
-        req.saturating_sub(clock())
+    let (result, elapsed) = if is_abstime {
+        (
+            sleep_until(current, absolute_deadline(req)),
+            TimeValue::ZERO,
+        )
     } else {
-        req
+        sleep_relative(current, req)
     };
-
-    let (result, actual) = sleep_impl(current, clock, dur);
 
     match result {
         Ok(()) => Ok(0),
         Err(err) => {
             if !is_abstime {
-                let diff = dur.saturating_sub(actual);
+                let diff = req.saturating_sub(elapsed);
                 debug!("sys_clock_nanosleep => rem: {diff:?}");
                 if let Some(rem) = rem.nullable() {
                     write_timespec(current, rem, timespec::from_time_value(diff))?;

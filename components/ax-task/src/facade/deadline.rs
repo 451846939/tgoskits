@@ -167,23 +167,18 @@ pub fn on_clock_event_with_scheduler_tick(
 ) -> Result<TaskClockEventOutcome, TaskError> {
     let system = runtime_task_system()?;
     let mut irq = RuntimeIrqGuard::enter();
-    let timer_resolution_ns = task_runtime::timer_resolution_ns();
     let mut cpu = runtime_current_cpu_mut(&mut irq)?;
     let charge = system.charge_current_until(cpu.as_mut(), now_ns, 0)?;
     if scheduler_tick {
         system.publish_current_scheduler_tick_work(&cpu, now_ns);
     }
-    let batch = cpu
-        .as_mut()
-        .expire_task_deadlines(now_ns, timer_resolution_ns, budget);
+    let batch = cpu.as_mut().expire_task_deadlines(now_ns, budget);
     let scheduler_due = cpu.as_mut().scheduler_deadline_due(now_ns);
     let pending = batch.pending() || scheduler_due;
     if charge.slice_expired() || charge.deadline_overrun() || batch.expired() != 0 || pending {
         cpu.request_reschedule();
     }
-    let update = cpu
-        .as_mut()
-        .next_task_deadline_update(now_ns, timer_resolution_ns)?;
+    let update = cpu.as_mut().next_task_deadline_update(now_ns)?;
     Ok(TaskClockEventOutcome {
         slice_expired: charge.slice_expired(),
         deadline_overrun: charge.deadline_overrun(),
@@ -259,7 +254,6 @@ pub(crate) fn arm_current_park_deadline(
         return Ok(());
     }
     let now_ns = task_runtime::monotonic_ns();
-    let resolution_ns = task_runtime::timer_resolution_ns();
     let (registration, update) = {
         let owner = cpu.owner();
         let registration = cpu
@@ -278,10 +272,7 @@ pub(crate) fn arm_current_park_deadline(
             })?;
         let token = registration.token();
         thread.core.register_sleep_timer(owner, token.generation());
-        let update = match cpu
-            .as_mut()
-            .next_task_deadline_update(now_ns, resolution_ns)
-        {
+        let update = match cpu.as_mut().next_task_deadline_update(now_ns) {
             Ok(update) => update,
             Err(error) => {
                 let removed = cpu.as_mut().task_deadlines().cancel(&registration);
@@ -330,7 +321,6 @@ pub(crate) fn cancel_current_park_deadline(
         });
     }
     let now_ns = task_runtime::monotonic_ns();
-    let resolution_ns = task_runtime::timer_resolution_ns();
     let (cancellation, update) = {
         let registration = ticket
             .deadline()
@@ -349,10 +339,7 @@ pub(crate) fn cancel_current_park_deadline(
                 task_runtime::fatal_invariant(0x5444_0006, thread.id().as_u64() as usize);
             }
         };
-        let update = match cpu
-            .as_mut()
-            .next_task_deadline_update(now_ns, resolution_ns)
-        {
+        let update = match cpu.as_mut().next_task_deadline_update(now_ns) {
             Ok(update) => update,
             Err(error) => {
                 cancellation.rollback(cpu.as_mut().task_deadlines());

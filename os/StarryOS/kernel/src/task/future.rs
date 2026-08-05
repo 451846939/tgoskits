@@ -16,7 +16,7 @@ use core::{
 };
 
 use ax_errno::{AxError, AxResult};
-use ax_runtime::hal::time::{TimeValue, monotonic_time, wall_time};
+use ax_runtime::hal::time::{TimeValue, epochoffset_nanos, monotonic_time};
 use ax_std::os::arceos::task::{
     self as scheduler, IrqRegisterResult, IrqWaitCell, IrqWaitRegistration, LocalExecutor,
     WaitQueue,
@@ -27,6 +27,7 @@ use spin::Once;
 
 pub use super::user_wait::{UserWaitError, UserWaitOutcome};
 use super::{UserTaskRef, user_wait::resolve_user_wait};
+use crate::time::{SleepClockSnapshot, SleepDeadline};
 
 static TIMER_WAIT: WaitQueue = WaitQueue::new();
 static TIMER_RUNTIME: PiMutex<TimerRuntime> = PiMutex::new(TimerRuntime::new());
@@ -493,15 +494,10 @@ fn publish_timer_change() {
 }
 
 fn wall_deadline_to_monotonic(deadline: TimeValue) -> TimeValue {
-    let now_wall = wall_time();
-    let now_monotonic = monotonic_time();
-    if deadline <= now_wall {
-        now_monotonic
-    } else {
-        now_monotonic
-            .checked_add(deadline - now_wall)
-            .unwrap_or(TimeValue::MAX)
-    }
+    let monotonic_now = monotonic_time();
+    let realtime_now = monotonic_now.saturating_add(TimeValue::from_nanos(epochoffset_nanos()));
+    SleepDeadline::Realtime(deadline)
+        .resolve_monotonic(SleepClockSnapshot::new(monotonic_now, realtime_now))
 }
 
 #[cfg(test)]

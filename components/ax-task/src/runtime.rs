@@ -920,9 +920,6 @@ pub trait TaskRuntime {
     /// Returns monotonic time in nanoseconds.
     fn monotonic_ns() -> u64;
 
-    /// Returns the smallest programmable timer interval in nanoseconds.
-    fn timer_resolution_ns() -> u64;
-
     /// Commits the current CPU's complete task-deadline state.
     ///
     /// The runtime owns the physical clockevent. It must ignore generations

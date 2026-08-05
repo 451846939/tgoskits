@@ -312,21 +312,6 @@ pub(crate) const fn next_periodic_deadline(
     }
 }
 
-#[cfg(any(feature = "multitask", test))]
-pub(crate) const fn timer_resolution_from_frequency(frequency_hz: u64) -> u64 {
-    if frequency_hz == 0 {
-        return ax_hal::time::NANOS_PER_SEC;
-    }
-    let nanos_per_second = ax_hal::time::NANOS_PER_SEC as u128;
-    let frequency_hz = frequency_hz as u128;
-    let resolution_ns = nanos_per_second.div_ceil(frequency_hz);
-    if resolution_ns == 0 {
-        1
-    } else {
-        resolution_ns as u64
-    }
-}
-
 #[cfg(feature = "irq")]
 pub(crate) fn timer_irq_handler(ctx: ax_hal::irq::IrqContext) -> ax_hal::irq::IrqReturn {
     run_clock_event_irq_scope(ax_kernel_guard::IrqSave::new, || {

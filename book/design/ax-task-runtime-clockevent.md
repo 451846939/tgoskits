@@ -76,7 +76,9 @@ notify 与 timeout 只能有一个 winner。
 - `Option<MonotonicDeadline>`；
 - 是否有必须在 safe point 处理的 deferred work。
 
-runtime 只能丢弃旧 generation，不得以相同 deadline 值推断 publication 已被处理。
+deadline 与 deferred-work 语义未改变时，owner 保留原 generation，不制造一次新的物理
+发布；任一语义字段改变时才递增 generation。runtime 只能丢弃旧 generation，不得以相同
+deadline 值推断 publication 已被处理。
 
 ## ax-runtime 的所有权
 
@@ -141,11 +143,17 @@ min(platform_cpu_count, CPU_CAPACITY)
 
 ### 时间转换
 
+- ax-task 的 heap、CBS 和调度边界只保存逻辑单调时钟期限，不接受物理 timer resolution；
+- ax-task 可以发布已经到期的精确值，scheduler safe point 负责正确性推进；
 - 无期限使用 `None`；
 - ns 到 tick 向上取整；
 - 已过期或 sub-tick deadline 钳制到设备最小非零 delta；
 - 超出设备参数宽度时饱和；
 - 架构 absolute-counter/alignment 运算前先完成饱和，禁止回绕为早期时间。
+
+后三项只发生在 ax-runtime/platform 的物理编程边界。禁止把设备 resolution 反向传入
+ax-task 并平移逻辑期限；否则 scheduler 与用户 absolute sleep 会永久多出一个架构相关的
+固定尾延迟。
 
 ## hard IRQ 顺序
 

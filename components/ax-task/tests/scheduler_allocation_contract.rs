@@ -157,7 +157,6 @@ fn retain_fake_runtime_helpers() {
         support::ipi_count as fn(u32) -> usize,
         support::resource_release_counts as fn() -> (usize, usize, usize, usize),
         support::last_oneshot_ns as fn() -> u64,
-        support::set_timer_resolution_ns as fn(u64),
         support::set_monotonic_ns as fn(u64),
         support::reset_resource_release_counts as fn(),
         support::clear_handles as fn(),

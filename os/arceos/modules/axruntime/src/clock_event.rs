@@ -110,10 +110,7 @@ impl LocalClockEvent {
             return ClockEventAction::None;
         };
         self.scheduler_tick = SchedulerTickState::Stopped { resume_from: next };
-        // Unlike ordinary lazy hrtimer updates, NOHZ entry must withdraw the
-        // physical tick immediately. Keeping an earlier arm would wake an idle
-        // CPU at every discarded scheduler period.
-        self.reconcile_arm_exact()
+        self.reconcile_arm()
     }
 
     /// Restarts the scheduler tick after idle work becomes runnable.
@@ -352,46 +349,6 @@ impl LocalClockEvent {
             return ClockEventAction::None;
         }
         let selected = self.selected_deadline();
-        match (self.phase, self.armed_deadline, selected) {
-            (ClockEventPhase::Idle, None, Some(deadline)) => {
-                self.armed_deadline = Some(deadline);
-                self.phase = ClockEventPhase::Armed;
-                ClockEventAction::Program(deadline)
-            }
-            // Moving an expiry later cannot miss work: keep the earlier
-            // physical interrupt and reconcile the latest logical deadline
-            // when it fires. This is the same lazy-rearm invariant used by
-            // Linux hrtick to avoid a hardware write on every context switch.
-            (ClockEventPhase::Armed, Some(armed), Some(deadline)) if deadline < armed => {
-                self.armed_deadline = Some(deadline);
-                ClockEventAction::Program(deadline)
-            }
-            (ClockEventPhase::Armed, Some(_), None) => {
-                self.armed_deadline = None;
-                self.phase = ClockEventPhase::Idle;
-                ClockEventAction::Stop
-            }
-            (ClockEventPhase::Idle, None, None) | (ClockEventPhase::Armed, Some(_), Some(_)) => {
-                ClockEventAction::None
-            }
-            (phase, armed, selected) => {
-                panic!(
-                    "invalid clockevent state: phase={phase:?}, armed={armed:?}, \
-                     selected={selected:?}"
-                );
-            }
-        }
-    }
-
-    #[cfg(feature = "multitask")]
-    fn reconcile_arm_exact(&mut self) -> ClockEventAction {
-        if matches!(
-            self.phase,
-            ClockEventPhase::Offline | ClockEventPhase::Firing
-        ) {
-            return ClockEventAction::None;
-        }
-        let selected = self.selected_deadline();
         if selected == self.armed_deadline {
             return ClockEventAction::None;
         }
@@ -585,7 +542,7 @@ mod tests {
     }
 
     #[test]
-    fn only_an_earlier_selected_deadline_reprograms_the_physical_owner() {
+    fn every_changed_selected_deadline_reprograms_the_physical_owner() {
         let mut event = LocalClockEvent::offline();
         assert_eq!(
             event.online(Some(deadline(500))),
@@ -597,45 +554,14 @@ mod tests {
         );
         assert_eq!(
             event.publish_task(2, Some(400), false),
-            ClockEventAction::None
+            ClockEventAction::Program(deadline(400))
         );
-        assert_eq!(event.armed_deadline(), Some(deadline(300)));
-        assert_eq!(event.publish_task(3, None, false), ClockEventAction::None);
-        assert_eq!(event.armed_deadline(), Some(deadline(300)));
-
-        let firing = claim_due(&mut event, 300);
+        assert_eq!(event.armed_deadline(), Some(deadline(400)));
         assert_eq!(
-            event.finish_firing(firing),
+            event.publish_task(3, None, false),
             ClockEventAction::Program(deadline(500))
         );
         assert_eq!(event.armed_deadline(), Some(deadline(500)));
-    }
-
-    #[test]
-    fn later_task_deadline_keeps_the_earlier_physical_arm() {
-        let mut event = LocalClockEvent::offline();
-        assert_eq!(
-            event.online(Some(deadline(500))),
-            ClockEventAction::Program(deadline(500))
-        );
-        assert_eq!(
-            event.publish_task(1, Some(300), false),
-            ClockEventAction::Program(deadline(300))
-        );
-
-        assert_eq!(
-            event.publish_task(2, Some(400), false),
-            ClockEventAction::None,
-            "an already armed earlier interrupt cannot miss the later task deadline"
-        );
-        assert_eq!(event.task_deadline(), Some(deadline(400)));
-        assert_eq!(event.armed_deadline(), Some(deadline(300)));
-
-        let firing = claim_due(&mut event, 300);
-        assert_eq!(
-            event.finish_firing(firing),
-            ClockEventAction::Program(deadline(400))
-        );
     }
 
     #[test]

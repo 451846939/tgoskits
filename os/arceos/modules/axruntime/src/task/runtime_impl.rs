@@ -220,16 +220,6 @@ impl_task_runtime! {
             ax_hal::time::monotonic_time_nanos()
         }
 
-        fn timer_resolution_ns() -> u64 {
-            // The four supported architectures expose different counter
-            // frequencies. Deriving one representable tick avoids rounding a
-            // nanosecond deadline back to the current hardware tick and
-            // repeatedly delivering an early interrupt.
-            let frequency_hz =
-                ax_hal::time::nanos_to_ticks(ax_hal::time::NANOS_PER_SEC);
-            crate::clock_event_runtime::timer_resolution_from_frequency(frequency_hz)
-        }
-
         fn publish_task_deadline(update: ax_task::runtime::TaskDeadlineUpdate) {
             crate::clock_event_runtime::publish_local_task_deadline(update);
         }

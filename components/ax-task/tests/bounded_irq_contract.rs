@@ -28,7 +28,7 @@ fn timer_irq_work_is_bounded() {
         .collect::<Vec<_>>();
     let mut output = [ExpiredTaskDeadline::EMPTY; 3];
 
-    let batch = queue.expire(TaskDeadlineExpireRequest::new(10, 2, 1), &mut output);
+    let batch = queue.expire(TaskDeadlineExpireRequest::new(10, 2), &mut output);
 
     assert_eq!(batch.processed(), 2);
     assert_eq!(batch.expired(), 2);
