@@ -175,6 +175,8 @@ pub(crate) struct QueuedThread {
     pub(crate) entity: SchedulingEntity,
     pub(crate) core: Arc<ThreadCore>,
     pub(crate) rt_quota_exempt: bool,
+    /// The affinity snapshot allows this queued entity to leave its owner rq.
+    migration_capable: bool,
     balance_scan_epoch: u64,
     pub(super) sequence: u64,
 }
@@ -186,6 +188,7 @@ impl QueuedThread {
         entity: SchedulingEntity,
         core: Arc<ThreadCore>,
         rt_quota_exempt: bool,
+        migration_capable: bool,
     ) -> Self {
         Self {
             id,
@@ -193,6 +196,7 @@ impl QueuedThread {
             entity,
             core,
             rt_quota_exempt,
+            migration_capable,
             balance_scan_epoch: 0,
             sequence: 0,
         }
@@ -404,6 +408,48 @@ impl RunQueue {
             return false;
         };
         self.replace_membership_class(id, QueueMembershipClass::Deadline(new_key));
+        self.recompute_pushable_summary();
+        true
+    }
+
+    pub(crate) fn update_migration_capability(
+        &mut self,
+        id: ThreadId,
+        migration_capable: bool,
+    ) -> bool {
+        let Some(class) = self.membership_class(id) else {
+            return false;
+        };
+        match class {
+            QueueMembershipClass::Deadline(key) => {
+                self.deadline
+                    .get_mut(key)
+                    .expect("Deadline membership must retain its queue node")
+                    .migration_capable = migration_capable;
+            }
+            QueueMembershipClass::Realtime(priority) => {
+                self.rt
+                    .get_mut(priority, id)
+                    .expect("RT membership must retain its queue node")
+                    .migration_capable = migration_capable;
+            }
+            QueueMembershipClass::Fair => {
+                let mut thread = self
+                    .fair
+                    .remove(id)
+                    .expect("fair membership must retain its queue node");
+                thread.migration_capable = migration_capable;
+                self.fair.insert(thread);
+            }
+            QueueMembershipClass::IdleFair => {
+                let mut thread = self
+                    .idle_fair
+                    .remove(id)
+                    .expect("idle-fair membership must retain its queue node");
+                thread.migration_capable = migration_capable;
+                self.idle_fair.insert(thread);
+            }
+        }
         self.recompute_pushable_summary();
         true
     }
@@ -624,7 +670,7 @@ impl RunQueue {
         let sched = Arc::new(crate::ThreadSchedCell::new_test(id, policy));
         let core = Arc::new(ThreadCore::new(id, policy, sched, None, None, None));
         self.enqueue(
-            QueuedThread::new(id, policy, entity, core, false),
+            QueuedThread::new(id, policy, entity, core, false, true),
             reason,
             None,
         )
@@ -647,6 +693,7 @@ impl RunQueue {
                 SchedulingEntity::new(policy, 1, 0),
                 core,
                 quota_exempt,
+                true,
             ),
             EnqueueReason::Wake,
             None,
@@ -792,13 +839,14 @@ impl RunQueue {
     }
 
     fn pushable_summary_for(thread: &QueuedThread) -> Option<PushableSummary> {
-        (!matches!(
-            thread.policy,
-            SchedulePolicy::Fair {
-                mode: FairMode::Idle,
-                ..
-            }
-        ))
+        (thread.migration_capable
+            && !matches!(
+                thread.policy,
+                SchedulePolicy::Fair {
+                    mode: FairMode::Idle,
+                    ..
+                }
+            ))
         .then(|| PushableSummary {
             thread: thread.id,
             key: thread.balance_key(),
@@ -1121,6 +1169,7 @@ mod tests {
                     detached.thread.entity,
                     detached.thread.core,
                     false,
+                    true,
                 ),
                 EnqueueReason::Migrated,
                 None,

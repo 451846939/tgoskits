@@ -172,6 +172,7 @@ USB/vsock 控制器协议属于外围驱动；除非它们违反上述调度交�
 | --- | --- | --- | --- |
 | placement | `try_to_wake_up()`、rq locking | rq 独占 queued/running，CPU switch baton 独占 outgoing stack | 已删除 `target_cpu` CPU 身份双真相和 task 级 `SwitchingOut/ExitedAwaitingTail`；线程只保存最终 rq/migration placement 与独立 `on_cpu` 发布位，outgoing stack 生命周期唯一归 per-CPU `SwitchHandoff` |
 | Fair/EEVDF | `avg_vruntime()`、`place_entity()`、`pick_eevdf()` | 唯一加权平均 V；sleep/migration 保存 `vlag`；eligible current 保留请求保护 | 已删除旧 wakeup granularity 与重复单调 V，迁移使用 detach 事务 |
+| RT/DL 选核 | `cpupri`、`cpudl`、`RT_PUSH_IPI` | 优先级与 load 正交；DL runnable CPU 属于 cpupri HIGHER；只有可迁移候选才能发布 overload | root-domain cpupri/cpudl 已接入 wake placement；cpupri 包含 101 个桶，DL current/queued 发布 HIGHER；pushable summary 随 affinity generation 更新，不可迁移 RT/DL 不触发 owner balance doorbell |
 | 远程投递 | `try_to_wake_up()`、`ttwu_queue()`、`resched_curr()`、`irq_work_claim()` | PREEMPT_RT 关闭 `TTWU_QUEUE`，waker 直接锁目标 rq 激活；仅实际需要抢占时发送 reschedule IPI；IPI claim 必须先于 callback/drain | 已删除 remote-wake inbox；runtime 门铃改为 generation + physical edge ownership，coalescing 只返回成功，不再把 `Busy` 暴露为模糊的 transport 状态 |
 | CPU 生命周期 | `sched_cpu_deactivate()`、`sched_cpu_dying()` | 先关 placement，再 drain producer，最后 offline | `Online/Inactive/Draining/Offline` 已实现 |
 | active mm | `exit_mm()`、`context_switch()`、`enter_lazy_tlb()`、`finish_task_switch()` | task-mm 所有权在 zombie 前解除；lazy CPU carrier 与页表根存储保留到最后 CPU lease | move-only token + task detach + per-CPU active lease 已实现 |
@@ -1738,6 +1739,42 @@ Linux/Starry raw clock-pair 最小值分别为 0.665/19.962 微秒。这个测�
 用户写、缩短 wake/runqueue 事务、把 policy 更新改为 Linux rq-lock 式同步提交，并统一
 scheduler-work generation 与 switch-tail 的完成协议。不能用提高 tick 频率或加入兼容轮询掩盖
 这些所有权问题。
+
+### 2026-08-05 cpupri HIGHER、可迁移 overload 与 running dispatch
+
+对 root-domain priority index 的增量 review 逐项对照 Linux v7.1 后，确认三项可以在同一
+runqueue owner 阶段直接修复：
+
+1. Linux `cpupri` 有独立的 `CPUPRI_HIGHER=100`。旧实现只有 100 个桶，DL current 或
+   queued 因没有 RT priority 被发布成 NORMAL，RT wake 会先投到不能抢占的 DL CPU，再经
+   owner push 二次迁移。当前索引扩为 101 桶，只要 rq 存在 runnable DL entity 就发布
+   HIGHER；最后一个 DL entity 离开后，在同一 rq summary 事务中恢复实际 RT priority。
+2. Linux 的 pushable RT/DL entity 必须满足 `nr_cpus_allowed > 1`。旧 summary 只判断
+   `workload > 1`，被单 CPU affinity 固定的候选也会发布 overload、发送无效 IPI。当前
+   `QueuedThread` 保存随 affinity generation 更新的“可迁移能力”，增量 pushable cache
+   只考虑能离开 owner rq 的实体；publication 仍为 O(1)，不为每次 wake 扫描 runnable set。
+3. Linux 的 running entity 在 `update_curr()` 后仍是当前 rq entity，只有真实
+   `put_prev_task()` 才离开 current。旧 safe point 无论是否切换都会 take dispatch、提交到
+   thread state、重新构造并 install。当前无切换路径原地结算 `CurrentDispatch`，只增量同步
+   task-context 可观察的 runtime/entity 状态；真实切换才结束 runtime interval、释放 DL donor
+   baton 并进入 schedule-out/pick/set-next。这样既避免重复构造，也不把 CPU-local CBS 副本
+   与线程可观察状态分成永久双真相。
+
+三条原始行为红测分别稳定得到：RT 错留在 DL CPU、不可迁移 RT wake 发送 1 次 IPI、work-only
+safe point 重建 1 次 dispatch。修复后同一断言为目标 CPU0、0 次 IPI、0 次重建；另有 affinity
+窄化再放宽回归验证 cached pushability 随 owner-control generation 更新。第一次仅删除 dispatch
+commit 会让 GRUB 测试观察到未同步的 CBS runtime，该失败未放宽；最终实现明确分离“运行态
+增量同步”和“切出时最终提交”，`cargo test -p ax-task` 的 301 个 unit、21 个 loom 及全部
+integration/doc test 通过。
+
+review 中其余建议按所有权依赖处理：GRUB `extra_bw` 与跨 CPU runtime borrowing 必须先有
+独立 root-domain bandwidth owner，不能只加一个永远为零的 per-rq 字段；blocked DL 在
+zero-lag 前保留 `bandwidth_cpu` 与 Linux non-contending 语义一致，不是现有正确性缺陷。
+RT/DL push 继续使用 generation-bearing owner doorbell，不改成 waker 同时持两个 rq lock；
+Linux 的 `RT_PUSH_IPI` 同样通过 root-domain IRQ work 避免跨 rq 锁风暴。后续若延迟仍不达标，
+应在该 owner 模型上补 `need_pull_rt_task`、equal-priority preemption 与 topology/capacity 选择，
+而不是恢复旧 wake inbox 或同步双 rq 兼容路径。本节尚无新的端到端性能数据，不据此声称已经
+达到 Linux PREEMPT_RT 水平。
 
 ## 模块化结果
 

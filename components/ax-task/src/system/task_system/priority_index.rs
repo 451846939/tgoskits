@@ -7,7 +7,9 @@ use super::*;
 use crate::RtPriority;
 
 const RT_NORMAL_LEVEL: u8 = 0;
-const RT_LEVEL_COUNT: usize = 100;
+// Linux CPUPRI_HIGHER: CPUs with runnable DL work are never RT wake targets.
+const RT_HIGHER_LEVEL: u8 = 100;
+const RT_LEVEL_COUNT: usize = 101;
 const RT_OFFLINE_LEVEL: u8 = u8::MAX;
 
 /// Derived root-domain indexes used by class-specific wake placement.
@@ -35,6 +37,7 @@ impl RootDomainPriorityIndex {
             cpu,
             online,
             run_queue.highest_rt_priority_including_current(),
+            run_queue.earliest_deadline_including_current().is_some(),
         );
         self.deadline
             .lock()
@@ -42,7 +45,7 @@ impl RootDomainPriorityIndex {
     }
 
     pub(super) fn publish_offline(&self, cpu: CpuId) {
-        self.rt.publish(cpu, false, None);
+        self.rt.publish(cpu, false, None, false);
         self.deadline.lock().publish(cpu, false, None);
     }
 
@@ -93,11 +96,19 @@ impl RtCpuPriorityIndex {
         }
     }
 
-    fn publish(&self, cpu: CpuId, online: bool, highest_rt_priority: Option<u8>) {
+    fn publish(
+        &self,
+        cpu: CpuId,
+        online: bool,
+        highest_rt_priority: Option<u8>,
+        has_deadline_work: bool,
+    ) {
         let Some(level) = self.levels.get(cpu.as_usize()) else {
             return;
         };
-        let new_level = if online {
+        let new_level = if online && has_deadline_work {
+            RT_HIGHER_LEVEL
+        } else if online {
             highest_rt_priority.unwrap_or(RT_NORMAL_LEVEL)
         } else {
             RT_OFFLINE_LEVEL
@@ -360,6 +371,27 @@ mod tests {
     use core::cell::Cell;
 
     use super::*;
+
+    #[test]
+    fn deadline_work_occupies_the_cpupri_higher_bucket() {
+        let index = RtCpuPriorityIndex::new(1);
+        let cpu = CpuId::new(0);
+        let affinity = CpuSet::all(1);
+        index.publish(cpu, true, None, true);
+
+        assert_eq!(
+            index.find_lower(50, &affinity, Some(cpu), &mut |_| true),
+            None,
+            "RT placement must not treat runnable Deadline work as normal-priority CPU capacity"
+        );
+
+        index.publish(cpu, true, Some(10), false);
+        assert_eq!(
+            index.find_lower(50, &affinity, Some(cpu), &mut |_| true),
+            Some(cpu),
+            "removing the last Deadline entity must restore the published RT priority"
+        );
+    }
 
     #[test]
     fn nonfree_deadline_lookup_reads_only_the_max_heap_root() {

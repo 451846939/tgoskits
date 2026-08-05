@@ -247,8 +247,8 @@ impl CurrentDispatch {
         self.runtime_core().finish_runtime_accounting(now_ns);
     }
 
-    pub(crate) const fn charged_runtime_ns(&self) -> u64 {
-        self.charged_runtime_ns
+    pub(crate) fn take_charged_runtime_ns(&mut self) -> u64 {
+        core::mem::take(&mut self.charged_runtime_ns)
     }
 
     pub(super) fn unaccounted_runtime(&self, now_ns: u64) -> u64 {

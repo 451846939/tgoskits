@@ -753,6 +753,46 @@ fn wide_affinity_rt_wake_uses_cpu_priority_instead_of_load() {
 }
 
 #[test]
+fn rt_placement_does_not_select_a_cpu_running_deadline_work() {
+    let system = TaskSystem::new(TaskSystemConfig::new(2)).unwrap();
+    let mut cpu0 = system.create_cpu_local(CpuId::new(0)).unwrap();
+    let mut cpu1 = system.create_cpu_local(CpuId::new(1)).unwrap();
+    for cpu in [&mut cpu0, &mut cpu1] {
+        system
+            .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
+            .unwrap();
+        system.bring_cpu_online(cpu.as_mut()).unwrap();
+    }
+
+    let deadline = system
+        .create_thread(ThreadSpec::new(SchedulePolicy::deadline(
+            DeadlinePolicy::new(10, 100, 1_000, DeadlineFlags::NONE).unwrap(),
+        )))
+        .unwrap();
+    system.make_ready(deadline.id()).unwrap();
+    system.enqueue(cpu1.as_mut(), deadline.id(), 1).unwrap();
+    assert_eq!(
+        system.schedule(cpu1.as_mut(), 1).unwrap().next(),
+        deadline.id()
+    );
+    system.complete_context_switch(cpu1.as_mut()).unwrap();
+
+    let realtime = system
+        .create_thread(ThreadSpec::new(SchedulePolicy::fifo(
+            RtPriority::new(50).unwrap(),
+        )))
+        .unwrap();
+    system.make_ready(realtime.id()).unwrap();
+    system.place_ready(cpu1.as_mut(), realtime.id(), 2).unwrap();
+
+    assert_eq!(
+        realtime.core.sched().lock().placement.migration_target(),
+        Some(CpuId::new(0)),
+        "cpupri must publish a CPU with runnable Deadline work in the HIGHER bucket"
+    );
+}
+
+#[test]
 fn wide_affinity_deadline_placement_uses_latest_cpu_deadline() {
     let system = TaskSystem::new(TaskSystemConfig::new(2)).unwrap();
     let mut cpu0 = system.create_cpu_local(CpuId::new(0)).unwrap();
@@ -858,6 +898,103 @@ fn nonpreempting_rt_wake_kicks_overloaded_owner_balance() {
         "an RT enqueue on an overloaded remote runqueue must queue owner-side push work even when \
          the wakee cannot preempt"
     );
+}
+
+#[test]
+fn pinned_rt_work_does_not_kick_owner_push() {
+    crate::test_runtime::reset_irq_state();
+    let system = Box::pin(TaskSystem::new(TaskSystemConfig::new(2)).unwrap());
+    let mut cpu0 = system.create_cpu_local(CpuId::new(0)).unwrap();
+    let mut cpu1 = system.create_cpu_local(CpuId::new(1)).unwrap();
+    for cpu in [&mut cpu0, &mut cpu1] {
+        system
+            .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
+            .unwrap();
+        system.bring_cpu_online(cpu.as_mut()).unwrap();
+    }
+
+    let mut cpu0_only = CpuSet::empty(2);
+    assert!(cpu0_only.insert(CpuId::new(0)));
+    let sleeper = system
+        .create_thread(
+            ThreadSpec::new(SchedulePolicy::fifo(RtPriority::new(5).unwrap()))
+                .with_affinity(cpu0_only.clone()),
+        )
+        .unwrap();
+    system.make_ready(sleeper.id()).unwrap();
+    system.enqueue(cpu0.as_mut(), sleeper.id(), 1).unwrap();
+    assert_eq!(
+        system.schedule(cpu0.as_mut(), 1).unwrap().next(),
+        sleeper.id()
+    );
+    system.complete_context_switch(cpu0.as_mut()).unwrap();
+    system.block_current(cpu0.as_mut(), 2).unwrap();
+    system.complete_context_switch(cpu0.as_mut()).unwrap();
+
+    let high = install_running_fifo(&system, cpu0.as_mut(), 90, 3);
+    assert_eq!(system.schedule(cpu0.as_mut(), 3).unwrap().next(), high.id());
+    system.complete_context_switch(cpu0.as_mut()).unwrap();
+    let pinned = system
+        .create_thread(
+            ThreadSpec::new(SchedulePolicy::fifo(RtPriority::new(10).unwrap()))
+                .with_affinity(cpu0_only),
+        )
+        .unwrap();
+    system.make_ready(pinned.id()).unwrap();
+    system.enqueue(cpu0.as_mut(), pinned.id(), 4).unwrap();
+    cpu0.remote().scheduler_enter();
+
+    let _runtime_handles = InstalledTaskHandles::new(system.as_ref(), cpu1.as_mut());
+    crate::test_runtime::configure_scheduler_ipi(RuntimeStatus::Success);
+    assert_eq!(
+        sleeper.wake_handle().wake_from_task(),
+        crate::WakeResult::Notified
+    );
+    assert_eq!(
+        crate::test_runtime::scheduler_ipi_send_count(),
+        0,
+        "single-CPU-affinity RT work cannot be pushed and must not ring an owner balance doorbell"
+    );
+}
+
+#[test]
+fn queued_affinity_update_refreshes_pushability_summary() {
+    let system = TaskSystem::new(TaskSystemConfig::new(2)).unwrap();
+    let mut cpu0 = system.create_cpu_local(CpuId::new(0)).unwrap();
+    let mut cpu1 = system.create_cpu_local(CpuId::new(1)).unwrap();
+    for cpu in [&mut cpu0, &mut cpu1] {
+        system.bring_cpu_online(cpu.as_mut()).unwrap();
+    }
+
+    let high = install_running_fifo(&system, cpu0.as_mut(), 90, 1);
+    assert_eq!(system.schedule(cpu0.as_mut(), 1).unwrap().next(), high.id());
+    system.complete_context_switch(cpu0.as_mut()).unwrap();
+    let queued = system
+        .create_thread(ThreadSpec::new(SchedulePolicy::fifo(
+            RtPriority::new(10).unwrap(),
+        )))
+        .unwrap();
+    system.make_ready(queued.id()).unwrap();
+    system.enqueue(cpu0.as_mut(), queued.id(), 2).unwrap();
+    assert!(cpu0.try_load_summary().unwrap().is_overloaded());
+
+    let mut cpu0_only = CpuSet::empty(2);
+    assert!(cpu0_only.insert(CpuId::new(0)));
+    let narrow = system.request_affinity(queued.id(), cpu0_only).unwrap();
+    system.drain_policy_updates(cpu0.as_mut(), 3).unwrap();
+    assert_eq!(narrow.try_result(), Some(Ok(())));
+    let pinned = cpu0.try_load_summary().unwrap();
+    assert!(!pinned.is_overloaded());
+    assert_eq!(pinned.pushable_key(), None);
+
+    let widen = system
+        .request_affinity(queued.id(), CpuSet::all(2))
+        .unwrap();
+    system.drain_policy_updates(cpu0.as_mut(), 4).unwrap();
+    assert_eq!(widen.try_result(), Some(Ok(())));
+    let movable = cpu0.try_load_summary().unwrap();
+    assert!(movable.is_overloaded());
+    assert!(movable.pushable_key().is_some());
 }
 
 #[test]
@@ -2845,6 +2982,7 @@ fn scheduler_work_without_preemption_preserves_current_dispatch() {
     system.bring_cpu_online(cpu.as_mut()).unwrap();
 
     let control_drains = cpu.remote().owner_control_inbox().drain_attempts();
+    dispatch::reset_owner_dispatch_constructions();
     cpu.request_scheduler_work();
     assert!(matches!(
         system.schedule_if_requested(cpu.as_mut(), 1).unwrap(),
@@ -2854,6 +2992,11 @@ fn scheduler_work_without_preemption_preserves_current_dispatch() {
         cpu.remote().owner_control_inbox().drain_attempts(),
         control_drains,
         "a work-only safe point must not enter an empty policy inbox"
+    );
+    assert_eq!(
+        dispatch::owner_dispatch_constructions(),
+        0,
+        "a work-only safe point must retain the running dispatch instead of rebuilding it"
     );
     system
         .charge_current(cpu.as_mut(), 2, 1, 0)
@@ -3543,7 +3686,14 @@ fn queued_affinity_migration_captures_lag_before_detaching_from_source() {
         ));
         cpu0.lock_run_queue()
             .enqueue(
-                QueuedThread::new(thread.id(), policy, entity, Arc::clone(&thread.core), false),
+                QueuedThread::new(
+                    thread.id(),
+                    policy,
+                    entity,
+                    Arc::clone(&thread.core),
+                    false,
+                    true,
+                ),
                 EnqueueReason::Preempted,
                 None,
             )

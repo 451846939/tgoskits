@@ -354,7 +354,9 @@ impl TaskSystem {
             return Ok(SchedulerOutcome::ParkingDeferred);
         }
         let mut switch_requested = cpu.as_mut().scheduler_enter();
-        self.commit_owner_current_dispatch(cpu.as_mut(), now_ns)?;
+        if cpu.dispatch_state().current_dispatch.is_some() {
+            cpu.as_mut().settle_current_dispatch(now_ns, 0)?;
+        }
         if matches!(deadline_entry, DeadlineEntry::Service) {
             self.service_deadline_timers(cpu.as_mut(), now_ns)?;
         }
@@ -365,14 +367,8 @@ impl TaskSystem {
         switch_requested |= cpu.as_mut().scheduler_enter();
         let previous = cpu.current();
         let previous_core = cpu.current_core().cloned();
-        if let Some(core) = previous_core.as_ref()
-            && !switch_requested
-        {
-            let dispatch = {
-                let sched = core.sched().lock();
-                Self::owner_dispatch(core, &sched, now_ns)?
-            };
-            cpu.as_mut().install_dispatch(dispatch);
+        if previous_core.is_some() && !switch_requested {
+            self.sync_owner_current_dispatch(cpu.as_mut())?;
             self.publish_owner_cpu_load_summary(cpu.as_mut());
             // `scheduler_enter` consumed the sticky entry request, but a
             // bounded inbox drain may have left another batch behind. Preserve
@@ -388,6 +384,7 @@ impl TaskSystem {
                 SchedulerOutcome::Quiescent
             });
         }
+        self.commit_owner_current_dispatch(cpu.as_mut(), now_ns)?;
         let mut migration_target = None;
         if let Some(core) = previous_core.as_ref() {
             migration_target = self.schedule_out_owner_running(

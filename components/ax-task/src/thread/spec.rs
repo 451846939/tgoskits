@@ -182,6 +182,16 @@ impl CpuSet {
         self.allowed.len()
     }
 
+    /// Returns whether a runnable thread can leave its current allowed CPU.
+    pub(crate) fn is_migration_capable(&self) -> bool {
+        self.allowed
+            .iter()
+            .filter(|allowed| **allowed)
+            .take(2)
+            .count()
+            == 2
+    }
+
     /// Returns whether this set permits every CPU selected by `required`.
     pub fn covers(&self, required: &Self) -> bool {
         self.allowed.len() == required.allowed.len()

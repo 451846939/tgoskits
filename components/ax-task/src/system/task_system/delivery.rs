@@ -179,10 +179,17 @@ impl TaskSystem {
         }
 
         if queued_cpu == Some(owner) {
+            if !cpu.lock_run_queue().update_migration_capability(
+                core.id(),
+                sched.placement.affinity.is_migration_capable(),
+            ) {
+                return Err(TaskError::InvalidConfiguration);
+            }
             if target == owner {
                 sched.placement.set_migration_target(None)?;
                 let completed = Self::complete_affinity_if_satisfied_locked(core, &sched);
                 drop(sched);
+                self.publish_owner_cpu_load_summary(cpu.as_mut());
                 if completed {
                     core.notify_affinity_waiters();
                 }

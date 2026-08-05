@@ -7,6 +7,9 @@ std::thread_local! {
     static WAKE_TARGET_SELECTIONS: core::cell::Cell<usize> = const {
         core::cell::Cell::new(0)
     };
+    static OWNER_DISPATCH_CONSTRUCTIONS: core::cell::Cell<usize> = const {
+        core::cell::Cell::new(0)
+    };
 }
 
 #[cfg(test)]
@@ -17,6 +20,16 @@ pub(super) fn reset_wake_target_selections() {
 #[cfg(test)]
 pub(super) fn wake_target_selections() -> usize {
     WAKE_TARGET_SELECTIONS.get()
+}
+
+#[cfg(test)]
+pub(super) fn reset_owner_dispatch_constructions() {
+    OWNER_DISPATCH_CONSTRUCTIONS.set(0);
+}
+
+#[cfg(test)]
+pub(super) fn owner_dispatch_constructions() -> usize {
+    OWNER_DISPATCH_CONSTRUCTIONS.get()
 }
 
 impl TaskSystem {
@@ -173,6 +186,7 @@ impl TaskSystem {
                 queued_entity,
                 Arc::clone(&core),
                 sched.is_pi_boosted_rt_owner(),
+                sched.placement.affinity.is_migration_capable(),
             ),
             EnqueueReason::Wake,
             current_fair,
@@ -320,6 +334,7 @@ impl TaskSystem {
                 queued_entity,
                 Arc::clone(core),
                 sched.is_pi_boosted_rt_owner(),
+                sched.placement.affinity.is_migration_capable(),
             ),
             reason,
             current_fair,
@@ -529,6 +544,8 @@ impl TaskSystem {
         sched: &ThreadSchedState,
         now_ns: u64,
     ) -> Result<CurrentDispatch, TaskError> {
+        #[cfg(test)]
+        OWNER_DISPATCH_CONSTRUCTIONS.set(OWNER_DISPATCH_CONSTRUCTIONS.get().saturating_add(1));
         let mut dispatch_policy = sched.policy.effective;
         let mut dispatch_entity = sched.policy.effective_entity;
         let mut pi_critical_rescue = sched.pi.critical_rescue;
@@ -612,7 +629,7 @@ impl TaskSystem {
             return Ok(());
         }
         let _charge = cpu.as_mut().settle_current_dispatch(now_ns, 0)?;
-        let Some(dispatch) = cpu.as_mut().take_dispatch() else {
+        let Some(mut dispatch) = cpu.as_mut().take_dispatch() else {
             return Ok(());
         };
         if cpu.current() != Some(dispatch.thread)
@@ -624,7 +641,6 @@ impl TaskSystem {
         }
         dispatch.finish_runtime_accounting(now_ns);
         let mut donor_overrun_work = None;
-        let mut runtime_overrun_work = None;
         let mut deadline_owner_reconcile = None;
         if let (Some(donor_core), Some(cbs_generation)) = (
             dispatch.deadline_donor_core(),
@@ -688,20 +704,58 @@ impl TaskSystem {
                 self.publish_owner_deadline_refresh(&donor_core, owner, generation)?;
             }
         }
-        let mut sched = dispatch.runtime_core_arc().sched().lock();
+        let runtime_overrun_work = Self::sync_runtime_dispatch_state(&mut dispatch)?;
+        if let Some(core) = donor_overrun_work {
+            self.publish_deadline_overrun_work(core);
+        }
+        if let Some(core) = runtime_overrun_work {
+            self.publish_deadline_overrun_work(core);
+        }
+        Ok(())
+    }
+
+    pub(super) fn sync_owner_current_dispatch(
+        &self,
+        mut cpu: Pin<&mut CpuLocal>,
+    ) -> Result<(), TaskError> {
+        let current = cpu.current();
+        let current_core = cpu.current_core().cloned();
+        let Some(dispatch) = cpu.as_mut().dispatch_state_mut().current_dispatch.as_mut() else {
+            return Ok(());
+        };
+        if current != Some(dispatch.thread)
+            || current_core
+                .as_ref()
+                .is_none_or(|core| !Arc::ptr_eq(core, dispatch.runtime_core_arc()))
+        {
+            return Err(TaskError::InvalidConfiguration);
+        }
+        let runtime_overrun_work = Self::sync_runtime_dispatch_state(dispatch)?;
+        if let Some(core) = runtime_overrun_work {
+            self.publish_deadline_overrun_work(core);
+        }
+        Ok(())
+    }
+
+    fn sync_runtime_dispatch_state(
+        dispatch: &mut CurrentDispatch,
+    ) -> Result<Option<Arc<ThreadCore>>, TaskError> {
+        // CurrentDispatch remains the owner-CPU execution entity. This copy
+        // only publishes accounting that task-context diagnostics and policy
+        // updates may observe; it does not finish the interval or release a
+        // borrowed Deadline CBS baton.
+        let runtime_core = Arc::clone(dispatch.runtime_core_arc());
+        let mut sched = runtime_core.sched().lock();
         sched.runtime.charged_runtime_ns = sched
             .runtime
             .charged_runtime_ns
-            .saturating_add(dispatch.charged_runtime_ns());
+            .saturating_add(dispatch.take_charged_runtime_ns());
         if sched.policy.dispatch_generation != dispatch.policy_generation {
-            drop(sched);
-            if let Some(core) = donor_overrun_work {
-                self.publish_deadline_overrun_work(core);
-            }
-            return Ok(());
+            return Ok(None);
         }
         sched.policy.effective_entity = dispatch.entity;
         sched.pi.critical_rescue = dispatch.pi_critical_rescue;
+        let mut runtime_overrun_work = None;
         if !sched.is_pi_boosted() {
             sched.policy.base_entity = dispatch.entity;
             if dispatch.deadline_overrun {
@@ -710,17 +764,11 @@ impl TaskSystem {
                     .overrun_events
                     .checked_add(1)
                     .ok_or(TaskError::InvalidConfiguration)?;
-                runtime_overrun_work = Some(Arc::clone(dispatch.runtime_core_arc()));
+                runtime_overrun_work = Some(Arc::clone(&runtime_core));
+                dispatch.deadline_overrun = false;
             }
         }
-        drop(sched);
-        if let Some(core) = donor_overrun_work {
-            self.publish_deadline_overrun_work(core);
-        }
-        if let Some(core) = runtime_overrun_work {
-            self.publish_deadline_overrun_work(core);
-        }
-        Ok(())
+        Ok(runtime_overrun_work)
     }
 
     pub(super) fn apply_owner_policy_generation(
