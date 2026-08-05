@@ -177,7 +177,7 @@ impl TaskSystem {
         &self,
         core: &Arc<ThreadCore>,
         sched: &mut ThreadSchedState,
-        mut cpu: Pin<&mut CpuLocal>,
+        cpu: Pin<&mut CpuLocal>,
         now_ns: u64,
         cbs_due: bool,
         zero_lag_due: bool,
@@ -259,12 +259,16 @@ impl TaskSystem {
             return Err(TaskError::InvalidConfiguration);
         }
         if replenish {
+            let mut run_queue = cpu.lock_run_queue();
+            let _clock = run_queue.update_clock();
             let preempts_current = self.link_owner_ready_thread_locked(
-                cpu.as_mut(),
+                cpu.as_ref().get_ref(),
+                &mut run_queue,
                 core,
                 sched,
                 EnqueueReason::Replenished,
             )?;
+            drop(run_queue);
             self.finish_owner_enqueue(cpu, EnqueueReason::Replenished, preempts_current);
         }
         Ok(())
@@ -445,27 +449,29 @@ impl TaskSystem {
     pub(super) fn service_deadline_timers(
         &self,
         mut cpu: Pin<&mut CpuLocal>,
-        now_ns: u64,
+        scheduler_now_ns: u64,
     ) -> Result<(), TaskError> {
-        let now = MonotonicInstant::from_nanos(now_ns).ok_or(TaskError::InvalidConfiguration)?;
-        let _processed = self.service_pending_deadline_timers(cpu.as_mut(), now_ns)?;
-        if cpu.task_deadline_expiry_due(now) {
+        let monotonic_now = task_runtime::monotonic_now();
+        let _processed =
+            self.service_pending_deadline_timers(cpu.as_mut(), scheduler_now_ns, monotonic_now)?;
+        if cpu.task_deadline_expiry_due(monotonic_now) {
             // Direct TaskSystem users retain the facade's lost-clockevent
             // recovery. Runtime scheduling enters through the facade and does
             // not call this promotion path a second time.
             let budget = cpu.batch_limit();
-            cpu.as_mut().expire_task_deadlines(now, budget);
+            cpu.as_mut().expire_task_deadlines(monotonic_now, budget);
         }
-        let _processed = self.service_pending_deadline_timers(cpu, now_ns)?;
+        let _processed =
+            self.service_pending_deadline_timers(cpu, scheduler_now_ns, monotonic_now)?;
         Ok(())
     }
 
     pub(crate) fn service_pending_deadline_timers(
         &self,
         mut cpu: Pin<&mut CpuLocal>,
-        now_ns: u64,
+        scheduler_now_ns: u64,
+        monotonic_now: MonotonicInstant,
     ) -> Result<usize, TaskError> {
-        let now = MonotonicInstant::from_nanos(now_ns).ok_or(TaskError::InvalidConfiguration)?;
         let mut processed = 0;
         if cpu.as_mut().begin_deadline_work() {
             let budget = cpu.batch_limit();
@@ -474,7 +480,7 @@ impl TaskSystem {
                     let Some(event) = cpu.as_mut().take_expired_scheduler_deadline() else {
                         break;
                     };
-                    self.service_expired_scheduler_deadline(cpu.as_mut(), event, now_ns)?;
+                    self.service_expired_scheduler_deadline(cpu.as_mut(), event, scheduler_now_ns)?;
                     processed += 1;
                 }
                 Ok(())
@@ -483,7 +489,8 @@ impl TaskSystem {
                 cpu.as_mut().finish_deadline_work(true);
                 return Err(error);
             }
-            let pending = cpu.has_expired_task_deadlines() || cpu.task_deadline_expiry_due(now);
+            let pending =
+                cpu.has_expired_task_deadlines() || cpu.task_deadline_expiry_due(monotonic_now);
             cpu.as_mut().finish_deadline_work(pending);
         }
         Ok(processed)
@@ -559,14 +566,14 @@ impl TaskSystem {
         self.refresh_owner_deadline_timers_locked(&core, &mut sched, cpu, now_ns)
     }
 
-    pub(super) fn program_local_timer(
-        mut cpu: Pin<&mut CpuLocal>,
-        scheduler_now_ns: u64,
-    ) -> Result<(), TaskError> {
+    pub(super) fn program_local_timer(mut cpu: Pin<&mut CpuLocal>) -> Result<(), TaskError> {
+        let clock = cpu
+            .run_queue_clock()
+            .ok_or(TaskError::InvalidConfiguration)?;
         let monotonic_now = task_runtime::monotonic_now();
         let Some(update) = cpu
             .as_mut()
-            .next_task_deadline_update_if_changed(scheduler_now_ns, monotonic_now)?
+            .next_task_deadline_update_if_changed(clock, monotonic_now)?
         else {
             return Ok(());
         };

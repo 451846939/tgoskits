@@ -40,20 +40,19 @@ impl TaskSystem {
         &self,
         mut cpu: Pin<&mut CpuLocal>,
         decision: ScheduleDecision,
-        now_ns: u64,
     ) -> ScheduleDecision {
         // Selection, lifecycle, and switch-handoff state are already committed
         // before this tail. Reporting a recoverable error would let block or
         // yield callers attempt to resume an outgoing thread that is no longer
         // current, so runtime failures beyond this boundary are fatal.
-        if self.owner_balance_work_pending(cpu.as_ref().get_ref(), decision.next(), now_ns)
+        if self.owner_balance_work_pending(cpu.as_ref().get_ref(), decision.next())
             && self
-                .service_owner_balance(cpu.as_mut(), decision.next(), now_ns)
+                .service_owner_balance(cpu.as_mut(), decision.next())
                 .is_err()
         {
             task_runtime::fatal_invariant(0x5343_0001, decision.next().as_u64() as usize);
         }
-        if Self::program_local_timer(cpu.as_mut(), now_ns).is_err() {
+        if Self::program_local_timer(cpu.as_mut()).is_err() {
             task_runtime::fatal_invariant(0x5343_0002, decision.next().as_u64() as usize);
         }
         decision
@@ -194,8 +193,7 @@ impl TaskSystem {
             core.set_wake_cpu_hint(owner);
             false
         } else {
-            match self.enqueue_owner_thread_locked(cpu.as_mut(), &core, &mut sched, now_ns, reason)
-            {
+            match self.enqueue_owner_thread_locked(cpu.as_mut(), &core, &mut sched, reason) {
                 Ok(preempts_current) => preempts_current,
                 Err(error) => {
                     let rollback = sched.transition(&core, ThreadState::Running);
@@ -243,7 +241,6 @@ impl TaskSystem {
         affinity: &CpuSet,
         preferred: Option<CpuId>,
         excluded: Option<CpuId>,
-        _now_ns: u64,
     ) -> Option<CpuId> {
         let accepts = |cpu: CpuId| {
             Some(cpu) != excluded
@@ -459,6 +456,7 @@ impl TaskSystem {
         previous: Option<&Arc<ThreadCore>>,
         next: &Arc<ThreadCore>,
         switch_reason: SwitchReason,
+        timestamp_ns: u64,
     ) -> ScheduleDecision {
         ScheduleDecision {
             previous: previous.map(|core| core.id()),
@@ -466,6 +464,7 @@ impl TaskSystem {
             previous_endpoint: previous.map(|core| SwitchEndpoint::from_core(core)),
             next_endpoint: SwitchEndpoint::from_core(next),
             switch_reason,
+            timestamp_ns,
         }
     }
 }

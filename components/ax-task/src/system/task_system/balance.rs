@@ -10,7 +10,6 @@ use super::*;
 pub(super) struct OwnerBalanceSelection {
     candidate: QueuedThread,
     target: CpuId,
-    now_ns: u64,
     reason: BalanceReason,
 }
 
@@ -150,7 +149,6 @@ impl TaskSystem {
     fn select_owner_balance_transfer_by(
         &self,
         cpu: &CpuLocal,
-        now_ns: u64,
         reason: BalanceReason,
         mut select_target: impl FnMut(&QueuedThread, &ThreadSchedState) -> Option<CpuId>,
     ) -> Option<OwnerBalanceSelection> {
@@ -160,7 +158,6 @@ impl TaskSystem {
             .current_dispatch
             .as_ref()
             .map(CurrentDispatch::schedule_policy);
-        let fair_balance_due = cpu.fair_balance_due(now_ns);
         let scan_epoch = cpu.lock_run_queue().begin_balance_scan();
         loop {
             let candidate = {
@@ -172,16 +169,13 @@ impl TaskSystem {
                     #[cfg(test)]
                     BALANCE_CANDIDATE_VISITS.set(BALANCE_CANDIDATE_VISITS.get().saturating_add(1));
                     let class_allowed = match reason {
-                        BalanceReason::IdlePull => {
-                            !matches!(
-                                candidate.policy,
-                                SchedulePolicy::Fair {
-                                    mode: FairMode::Idle,
-                                    ..
-                                }
-                            ) && (!matches!(candidate.policy, SchedulePolicy::Fair { .. })
-                                || fair_balance_due)
-                        }
+                        BalanceReason::IdlePull => !matches!(
+                            candidate.policy,
+                            SchedulePolicy::Fair {
+                                mode: FairMode::Idle,
+                                ..
+                            }
+                        ),
                         BalanceReason::RtDeadlinePush => matches!(
                             candidate.policy,
                             SchedulePolicy::Deadline(_)
@@ -251,7 +245,6 @@ impl TaskSystem {
                 return Some(OwnerBalanceSelection {
                     candidate: queued,
                     target,
-                    now_ns,
                     reason,
                 });
             }
@@ -262,22 +255,19 @@ impl TaskSystem {
         &self,
         cpu: &CpuLocal,
         target: CpuId,
-        now_ns: u64,
         reason: BalanceReason,
     ) -> Option<OwnerBalanceSelection> {
-        self.select_owner_balance_transfer_by(cpu, now_ns, reason, |_, _| Some(target))
+        self.select_owner_balance_transfer_by(cpu, reason, |_, _| Some(target))
     }
 
     pub(super) fn select_rt_deadline_balance_transfer(
         &self,
         cpu: &CpuLocal,
         source_load: usize,
-        now_ns: u64,
     ) -> Option<OwnerBalanceSelection> {
         let source = cpu.owner();
         self.select_owner_balance_transfer_by(
             cpu,
-            now_ns,
             BalanceReason::RtDeadlinePush,
             |candidate, sched| {
                 let key = candidate.balance_key();
@@ -320,7 +310,6 @@ impl TaskSystem {
         let OwnerBalanceSelection {
             candidate,
             target,
-            now_ns,
             reason,
         } = selection;
         if self
@@ -397,8 +386,10 @@ impl TaskSystem {
         carrier.commit();
         self.publish_owner_cpu_load_summary(cpu.as_mut());
         if migrated_fair && reason != BalanceReason::FairPeriodic {
-            cpu.as_mut()
-                .reset_fair_balance(now_ns, self.config.balance_interval_ns());
+            cpu.as_mut().reset_fair_balance(
+                task_runtime::monotonic_now(),
+                self.config.balance_interval_ns(),
+            );
         }
         Ok(BalanceTransferOutcome::Migrated(core.id()))
     }
@@ -407,12 +398,11 @@ impl TaskSystem {
         &self,
         cpu: Pin<&mut CpuLocal>,
         target: CpuId,
-        now_ns: u64,
         reason: BalanceReason,
     ) -> Result<BalanceTransferOutcome, TaskError> {
         self.ensure_owner_cpu_online(&cpu)?;
         let Some(selection) =
-            self.select_owner_balance_transfer(cpu.as_ref().get_ref(), target, now_ns, reason)
+            self.select_owner_balance_transfer(cpu.as_ref().get_ref(), target, reason)
         else {
             return Ok(BalanceTransferOutcome::NoCandidate);
         };
@@ -425,16 +415,11 @@ impl TaskSystem {
     /// rq balance callbacks, an ordinary context switch is not itself a reason
     /// to enter SMP balancing: idle entry, an overloaded RT/Deadline queue, or
     /// the periodic Fair deadline must request the work explicitly.
-    pub(super) fn owner_balance_work_pending(
-        &self,
-        cpu: &CpuLocal,
-        next: ThreadId,
-        now_ns: u64,
-    ) -> bool {
+    pub(super) fn owner_balance_work_pending(&self, cpu: &CpuLocal, next: ThreadId) -> bool {
         if task_runtime::in_hard_irq() {
             return false;
         }
-        if cpu.idle() == Some(next) || cpu.fair_balance_due(now_ns) {
+        if cpu.idle() == Some(next) || cpu.fair_balance_pending() {
             return true;
         }
         cpu.try_load_summary().is_some_and(|summary| {
@@ -450,15 +435,15 @@ impl TaskSystem {
         &self,
         mut cpu: Pin<&mut CpuLocal>,
         next: ThreadId,
-        now_ns: u64,
     ) -> Result<(), TaskError> {
         #[cfg(test)]
         OWNER_BALANCE_PASSES.set(OWNER_BALANCE_PASSES.get().saturating_add(1));
         if cpu.idle() == Some(next) {
             let _requested = self.request_idle_pull(cpu.as_ref())?;
+            let _fair = self.balance_fair(cpu.as_mut())?;
         } else {
             let _pushed = self.push_overloaded_from_published_summary(cpu.as_mut())?;
-            let _fair = self.balance_fair(cpu.as_mut(), now_ns)?;
+            let _fair = self.balance_fair(cpu.as_mut())?;
         }
         Ok(())
     }
@@ -466,9 +451,8 @@ impl TaskSystem {
     pub(super) fn balance_fair(
         &self,
         mut cpu: Pin<&mut CpuLocal>,
-        now_ns: u64,
     ) -> Result<Option<ThreadId>, TaskError> {
-        if task_runtime::in_hard_irq() || !cpu.fair_balance_due(now_ns) {
+        if task_runtime::in_hard_irq() || !cpu.fair_balance_pending() {
             return Ok(None);
         }
         self.ensure_owner_cpu_online(&cpu)?;
@@ -486,7 +470,6 @@ impl TaskSystem {
                 });
             let selection = self.select_owner_balance_transfer_by(
                 cpu.as_ref().get_ref(),
-                now_ns,
                 BalanceReason::FairPeriodic,
                 |candidate, sched| {
                     let candidate_demand = candidate.placement_demand();
@@ -531,23 +514,23 @@ impl TaskSystem {
         // the end of the pass (`sd->last_balance = jiffies`). Do not reuse the
         // entry sample: a long owner-side scan would otherwise publish an
         // already-expired retry deadline.
-        let completion_now_ns = task_runtime::scheduler_now().as_nanos();
+        let completion_now = task_runtime::monotonic_now();
         let minimum_interval_ns = self.config.balance_interval_ns();
         match result {
             FairBalanceResult::Migrated(_) => {
                 cpu.as_mut()
-                    .reset_fair_balance(completion_now_ns, minimum_interval_ns);
+                    .reset_fair_balance(completion_now, minimum_interval_ns);
             }
             FairBalanceResult::Balanced => {
                 cpu.as_mut().backoff_fair_balance(
-                    completion_now_ns,
+                    completion_now,
                     minimum_interval_ns,
                     minimum_interval_ns.saturating_mul(FAIR_BALANCE_BALANCED_BACKOFF_FACTOR),
                 );
             }
             FairBalanceResult::Constrained => {
                 cpu.as_mut().backoff_fair_balance(
-                    completion_now_ns,
+                    completion_now,
                     minimum_interval_ns,
                     minimum_interval_ns.saturating_mul(FAIR_BALANCE_CONSTRAINED_BACKOFF_FACTOR),
                 );
@@ -587,13 +570,12 @@ mod tests {
             .create_thread(ThreadSpec::new(SchedulePolicy::default()))
             .unwrap();
         system.make_ready(thread.id()).unwrap();
-        system.enqueue(cpu0.as_mut(), thread.id(), 0).unwrap();
+        system.enqueue(cpu0.as_mut(), thread.id()).unwrap();
 
         let selection = system
             .select_owner_balance_transfer(
                 cpu0.as_ref().get_ref(),
                 CpuId::new(1),
-                0,
                 BalanceReason::FairPeriodic,
             )
             .expect("the initial affinity permits a CPU 1 transfer");
@@ -618,7 +600,7 @@ mod tests {
         let second = system.create_thread(ThreadSpec::new(policy)).unwrap();
         for thread in [&first, &second] {
             system.make_ready(thread.id()).unwrap();
-            system.enqueue(cpu0.as_mut(), thread.id(), 0).unwrap();
+            system.enqueue(cpu0.as_mut(), thread.id()).unwrap();
         }
 
         fail_next_balance_transfer_publication_reservation();
@@ -626,7 +608,6 @@ mod tests {
             system.transfer_owner_balance_candidate(
                 cpu0.as_mut(),
                 CpuId::new(1),
-                0,
                 BalanceReason::RtDeadlinePush,
             ),
             Ok(BalanceTransferOutcome::Retry)

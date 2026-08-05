@@ -16,7 +16,8 @@ use ax_task::{
     TaskSystemConfig, ThreadExtension, ThreadExtensionOps, ThreadId, ThreadSpec,
 };
 
-mod support;
+pub mod support;
+use support::TaskSystemClockTestExt;
 
 struct CountingAllocator;
 
@@ -158,10 +159,10 @@ fn deadline_overrun_fixture(
         .create_thread(ThreadSpec::new(SchedulePolicy::deadline(policy)).with_extension(extension))
         .expect("deadline thread must initialize");
     system.make_ready(deadline.id()).unwrap();
-    system.enqueue(cpu.as_mut(), deadline.id(), 0).unwrap();
-    system.schedule(cpu.as_mut(), 0).unwrap();
-    system.charge_current(cpu.as_mut(), 5, 5, 0).unwrap();
-    system.schedule(cpu.as_mut(), 5).unwrap();
+    system.enqueue_at(cpu.as_mut(), deadline.id(), 0).unwrap();
+    system.schedule_at(cpu.as_mut(), 0).unwrap();
+    system.charge_current_at(cpu.as_mut(), 5, 5, 0).unwrap();
+    system.schedule_at(cpu.as_mut(), 5).unwrap();
     (system, cpu)
 }
 

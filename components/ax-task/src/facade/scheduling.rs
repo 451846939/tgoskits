@@ -1,5 +1,5 @@
 use super::*;
-use crate::{SchedulerTimestamp, runtime::ContextSwitch};
+use crate::runtime::ContextSwitch;
 
 /// Runs one scheduler decision at a task/IRQ-return safe point.
 ///
@@ -63,33 +63,25 @@ fn schedule_current_cpu_with_entry(
         {
             (None, monotonic_now)
         } else {
-            let scheduler_now_ns = task_runtime::scheduler_now().as_nanos();
             (
-                Some((
-                    schedule_cpu_after_deadline_service(system, cpu.as_mut(), scheduler_now_ns)?,
-                    scheduler_now_ns,
-                )),
+                Some(schedule_cpu_after_deadline_service(system, cpu.as_mut())?),
                 None,
             )
         }
     };
-    let (outcome, scheduler_now_ns) = if let Some(outcome) = fast_outcome {
+    let outcome = if let Some(outcome) = fast_outcome {
         outcome
     } else {
-        let scheduler_now_ns = service_scheduler_safe_point_deadlines_at(
+        service_scheduler_safe_point_deadlines_at(
             system,
             &mut scheduler_frame,
             deadline_service_now.expect("deadline slow path must retain its physical clock sample"),
-        )?
-        .as_nanos();
+        )?;
         let mut cpu = runtime_current_cpu_mut(&mut scheduler_frame)?;
-        (
-            schedule_cpu_after_deadline_service(system, cpu.as_mut(), scheduler_now_ns)?,
-            scheduler_now_ns,
-        )
+        schedule_cpu_after_deadline_service(system, cpu.as_mut())?
     };
     if let Some(decision) = outcome.decision() {
-        execute_switch_plan(&mut scheduler_frame, decision, scheduler_now_ns);
+        execute_switch_plan(&mut scheduler_frame, decision);
     }
     Ok(outcome)
 }
@@ -97,7 +89,6 @@ fn schedule_current_cpu_with_entry(
 fn schedule_cpu_after_deadline_service(
     system: &TaskSystem,
     mut cpu: Pin<&mut CpuLocal>,
-    now_ns: u64,
 ) -> Result<SchedulerOutcome, TaskError> {
     let current_state = cpu.current_lifecycle_state();
     if !cpu.needs_reschedule() && !cpu.has_remote_work() {
@@ -107,7 +98,7 @@ fn schedule_cpu_after_deadline_service(
             SchedulerOutcome::Quiescent
         })
     } else {
-        system.schedule_if_requested_after_deadline_service(cpu.as_mut(), now_ns)
+        system.schedule_if_requested_after_deadline_service(cpu.as_mut())
     }
 }
 
@@ -150,25 +141,30 @@ pub(super) fn service_scheduler_safe_point_deadlines(
     system: &TaskSystem,
     pin: &mut impl RuntimeCpuPin,
 ) -> Result<u64, TaskError> {
-    service_scheduler_safe_point_deadlines_at(system, pin, task_runtime::monotonic_now())
-        .map(SchedulerTimestamp::as_nanos)
+    service_scheduler_safe_point_deadlines_at(system, pin, task_runtime::monotonic_now()).map(
+        |()| {
+            let mut cpu = runtime_current_cpu_mut(pin)
+                .expect("test scheduler pin must retain its current CPU");
+            cpu.as_mut().update_rq_clock().as_nanos()
+        },
+    )
 }
 
 fn service_scheduler_safe_point_deadlines_at(
     system: &TaskSystem,
     pin: &mut impl RuntimeCpuPin,
     now: MonotonicInstant,
-) -> Result<SchedulerTimestamp, TaskError> {
+) -> Result<(), TaskError> {
     let should_run = {
         let mut cpu = runtime_current_cpu_mut(pin)?;
         let expiry_due = cpu.task_deadline_expiry_due(now);
         if !cpu.deadline_work_pending() && !expiry_due {
-            return Ok(task_runtime::scheduler_now());
+            return Ok(());
         }
         cpu.as_mut().begin_deadline_work() || expiry_due
     };
     if !should_run {
-        return Ok(task_runtime::scheduler_now());
+        return Ok(());
     }
 
     let result = (|| {
@@ -198,12 +194,12 @@ fn service_scheduler_safe_point_deadlines_at(
         cpu.as_mut().finish_deadline_work(true);
     }
     let _drained = result?;
-    let scheduler_now = task_runtime::scheduler_now();
     let _scheduler_events = {
         let mut cpu = runtime_current_cpu_mut(pin)?;
-        system.service_pending_deadline_timers(cpu.as_mut(), scheduler_now.as_nanos())?
+        let scheduler_now_ns = cpu.as_mut().update_rq_clock().as_nanos();
+        system.service_pending_deadline_timers(cpu.as_mut(), scheduler_now_ns, now)?
     };
-    Ok(scheduler_now)
+    Ok(())
 }
 
 /// Yields the calling thread and executes the resulting context switch.
@@ -214,12 +210,11 @@ pub fn yield_current_cpu() -> Result<ScheduleDecision, TaskError> {
         RuntimeSchedulerEntry::Task,
     )?;
     let system = runtime_task_system()?;
-    let now_ns = task_runtime::scheduler_now().as_nanos();
     let decision = {
         let mut cpu = runtime_current_cpu_mut(&mut scheduler_frame)?;
-        system.yield_current(cpu.as_mut(), now_ns)?
+        system.yield_current(cpu.as_mut())?
     };
-    execute_switch_plan(&mut scheduler_frame, decision, now_ns);
+    execute_switch_plan(&mut scheduler_frame, decision);
     Ok(decision)
 }
 
@@ -241,9 +236,8 @@ pub fn prepare_current_exit() -> Result<ExitPermit, TaskError> {
     validate_schedule_context(RuntimeScheduleOrigin::Exit)?;
     let mut irq = RuntimeIrqGuard::enter();
     let system = runtime_task_system()?;
-    let now_ns = task_runtime::scheduler_now().as_nanos();
     let mut cpu = runtime_current_cpu_mut(&mut irq)?;
-    let system = system.prepare_current_exit(cpu.as_mut(), now_ns)?;
+    let system = system.prepare_current_exit(cpu.as_mut())?;
     Ok(ExitPermit {
         system,
         _not_send: PhantomData,
@@ -261,7 +255,6 @@ pub fn commit_current_exit(permit: ExitPermit) -> ! {
             .unwrap_or_else(|_| task_runtime::fatal_invariant(0x4558_0010, thread.as_u64() as _));
     let system = runtime_task_system()
         .unwrap_or_else(|_| task_runtime::fatal_invariant(0x4558_0011, thread.as_u64() as _));
-    let now_ns = task_runtime::scheduler_now().as_nanos();
     let decision = {
         let mut cpu = runtime_current_cpu_mut(&mut scheduler_frame)
             .unwrap_or_else(|_| task_runtime::fatal_invariant(0x4558_0013, thread.as_u64() as _));
@@ -269,10 +262,10 @@ pub fn commit_current_exit(permit: ExitPermit) -> ! {
             task_runtime::fatal_invariant(0x4558_0014, thread.as_u64() as _);
         }
         system
-            .commit_prepared_current_exit(cpu.as_mut(), permit.system, now_ns)
+            .commit_prepared_current_exit(cpu.as_mut(), permit.system)
             .unwrap_or_else(|_| task_runtime::fatal_invariant(0x4558_0015, thread.as_u64() as _))
     };
-    execute_switch_plan(&mut scheduler_frame, decision, now_ns);
+    execute_switch_plan(&mut scheduler_frame, decision);
     // An exited context is never re-enqueued, so returning here indicates a
     // broken architecture switch contract.
     task_runtime::fatal_invariant(4, decision.previous().map_or(0, ThreadId::as_u64) as usize)
@@ -281,7 +274,6 @@ pub fn commit_current_exit(permit: ExitPermit) -> ! {
 pub(super) fn execute_switch_plan(
     scheduler_frame: &mut RuntimeSchedulerFrameGuard,
     decision: ScheduleDecision,
-    now_ns: u64,
 ) {
     if !decision.requires_context_switch() {
         return;
@@ -300,7 +292,7 @@ pub(super) fn execute_switch_plan(
         cpu: scheduler_frame.cpu_id(),
         previous_thread: previous.thread().as_u64(),
         next_thread: next.thread().as_u64(),
-        timestamp_ns: now_ns,
+        timestamp_ns: decision.timestamp_ns(),
         reason: decision.switch_reason() as u32,
     });
     if let Some(extension) = previous.extension() {

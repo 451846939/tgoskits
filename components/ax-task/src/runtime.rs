@@ -1022,12 +1022,15 @@ pub trait TaskRuntime {
     /// Returns one sample from the finite monotonic `ktime` domain.
     fn monotonic_now() -> MonotonicInstant;
 
-    /// Returns one sample from the wrapping scheduler `rq_clock` domain.
+    /// Returns one source sample for `cpu`'s wrapping scheduler clock.
     ///
-    /// The runtime may derive both clocks from the same hardware counter, but
-    /// it must publish them through distinct capabilities. Scheduler absolute
-    /// values must never be compared directly with monotonic deadlines.
-    fn scheduler_now() -> crate::SchedulerTimestamp;
+    /// Linux calls `sched_clock_cpu(cpu_of(rq))` while holding the target
+    /// runqueue lock, including direct remote wakeups. The runtime may derive
+    /// every CPU source from one synchronized hardware counter, but it must not
+    /// silently substitute the calling CPU when per-CPU sources differ.
+    /// Scheduler absolute values must never be compared directly with
+    /// monotonic deadlines.
+    fn scheduler_clock_source(cpu: RuntimeCpuId) -> crate::SchedulerTimestamp;
 
     /// Commits the current CPU's complete task-deadline state.
     ///

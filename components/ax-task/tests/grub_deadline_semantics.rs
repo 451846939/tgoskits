@@ -5,26 +5,27 @@ use ax_task::{
     TaskError, TaskSystem, TaskSystemConfig, ThreadSpec, ThreadState, WakeResult,
 };
 
-mod support;
+pub mod support;
+use support::TaskSystemClockTestExt;
 
 #[test]
 fn reclaim_includes_unreserved_root_domain_bandwidth() {
     let (system, mut cpu) = online_system();
     let reclaimer = ready_deadline(&system, 500, 1_000, 1_000, DeadlineFlags::RECLAIM);
-    system.enqueue(cpu.as_mut(), reclaimer.id(), 0).unwrap();
+    system.enqueue_at(cpu.as_mut(), reclaimer.id(), 0).unwrap();
     assert_eq!(
-        system.schedule(cpu.as_mut(), 0).unwrap().next(),
+        system.schedule_at(cpu.as_mut(), 0).unwrap().next(),
         reclaimer.id()
     );
 
     assert!(
         !system
-            .charge_current(cpu.as_mut(), 100, 100, 0)
+            .charge_current_at(cpu.as_mut(), 100, 100, 0)
             .unwrap()
             .slice_expired()
     );
     assert_eq!(
-        system.schedule(cpu.as_mut(), 100).unwrap().next(),
+        system.schedule_at(cpu.as_mut(), 100).unwrap().next(),
         reclaimer.id()
     );
     assert_eq!(
@@ -42,19 +43,22 @@ fn reclaim_starts_only_after_the_blocked_reservation_zero_lag_time() {
     let (system, mut cpu) = online_system();
     let donor = ready_deadline(&system, 4, 8, 8, DeadlineFlags::NONE);
     let reclaimer = ready_deadline(&system, 4, 8, 16, DeadlineFlags::RECLAIM);
-    system.enqueue(cpu.as_mut(), donor.id(), 0).unwrap();
-    system.enqueue(cpu.as_mut(), reclaimer.id(), 0).unwrap();
-    assert_eq!(system.schedule(cpu.as_mut(), 0).unwrap().next(), donor.id());
+    system.enqueue_at(cpu.as_mut(), donor.id(), 0).unwrap();
+    system.enqueue_at(cpu.as_mut(), reclaimer.id(), 0).unwrap();
+    assert_eq!(
+        system.schedule_at(cpu.as_mut(), 0).unwrap().next(),
+        donor.id()
+    );
     assert!(
         !system
-            .charge_current(cpu.as_mut(), 2, 2, 0)
+            .charge_current_at(cpu.as_mut(), 2, 2, 0)
             .unwrap()
             .slice_expired()
     );
 
     support::set_monotonic_ns(2);
     assert_eq!(
-        system.block_current(cpu.as_mut(), 2).unwrap().next(),
+        system.block_current_at(cpu.as_mut(), 2).unwrap().next(),
         reclaimer.id()
     );
     // The donor has q=2 and d=8, so zero-lag is 8 - 2*8/4 = 4.
@@ -63,9 +67,10 @@ fn reclaim_starts_only_after_the_blocked_reservation_zero_lag_time() {
     assert_eq!(activity.zero_lag_ns(), Some(4));
     assert_eq!(cpu.deadline_bandwidth().this_bw_scaled(), 750_000_000);
     assert_eq!(cpu.deadline_bandwidth().running_bw_scaled(), 750_000_000);
+    support::set_monotonic_ns(4);
     assert!(
         system
-            .schedule_if_requested(cpu.as_mut(), 4)
+            .schedule_if_requested_at(cpu.as_mut(), 4)
             .unwrap()
             .decision()
             .is_none()
@@ -84,12 +89,12 @@ fn reclaim_starts_only_after_the_blocked_reservation_zero_lag_time() {
 
     assert!(
         !system
-            .charge_current(cpu.as_mut(), 6, 2, 0)
+            .charge_current_at(cpu.as_mut(), 6, 2, 0)
             .unwrap()
             .slice_expired()
     );
     assert_eq!(
-        system.schedule(cpu.as_mut(), 6).unwrap().next(),
+        system.schedule_at(cpu.as_mut(), 6).unwrap().next(),
         reclaimer.id()
     );
     // Umax=.95, Uinactive=.5 and Ui=.25: Linux's fixed-point GRUB rule
@@ -108,14 +113,17 @@ fn deadline_yield_does_not_publish_immediate_reclaimable_runtime() {
     let (system, mut cpu) = online_system();
     let donor = ready_deadline(&system, 4, 8, 8, DeadlineFlags::NONE);
     let reclaimer = ready_deadline(&system, 4, 8, 16, DeadlineFlags::RECLAIM);
-    system.enqueue(cpu.as_mut(), donor.id(), 0).unwrap();
-    system.enqueue(cpu.as_mut(), reclaimer.id(), 0).unwrap();
-    assert_eq!(system.schedule(cpu.as_mut(), 0).unwrap().next(), donor.id());
-    system.charge_current(cpu.as_mut(), 2, 2, 0).unwrap();
+    system.enqueue_at(cpu.as_mut(), donor.id(), 0).unwrap();
+    system.enqueue_at(cpu.as_mut(), reclaimer.id(), 0).unwrap();
+    assert_eq!(
+        system.schedule_at(cpu.as_mut(), 0).unwrap().next(),
+        donor.id()
+    );
+    system.charge_current_at(cpu.as_mut(), 2, 2, 0).unwrap();
 
     support::set_monotonic_ns(2);
     assert_eq!(
-        system.yield_current(cpu.as_mut(), 2).unwrap().next(),
+        system.yield_current_at(cpu.as_mut(), 2).unwrap().next(),
         reclaimer.id()
     );
     let activity = system.deadline_activity(donor.id()).unwrap();
@@ -124,13 +132,13 @@ fn deadline_yield_does_not_publish_immediate_reclaimable_runtime() {
     assert_eq!(cpu.deadline_bandwidth().inactive_bw_scaled(), 0);
     assert!(
         !system
-            .charge_current(cpu.as_mut(), 6, 4, 0)
+            .charge_current_at(cpu.as_mut(), 6, 4, 0)
             .unwrap()
             .slice_expired(),
         "root-domain Uextra remains reclaimable before zero-lag"
     );
     assert_eq!(
-        system.schedule(cpu.as_mut(), 6).unwrap().next(),
+        system.schedule_at(cpu.as_mut(), 6).unwrap().next(),
         reclaimer.id()
     );
     assert_eq!(
@@ -147,14 +155,14 @@ fn deadline_yield_does_not_publish_immediate_reclaimable_runtime() {
 fn wake_before_zero_lag_cancels_the_pending_inactive_transition() {
     let (system, mut cpu) = online_system();
     let thread = ready_deadline(&system, 4, 8, 8, DeadlineFlags::NONE);
-    system.enqueue(cpu.as_mut(), thread.id(), 0).unwrap();
+    system.enqueue_at(cpu.as_mut(), thread.id(), 0).unwrap();
     assert_eq!(
-        system.schedule(cpu.as_mut(), 0).unwrap().next(),
+        system.schedule_at(cpu.as_mut(), 0).unwrap().next(),
         thread.id()
     );
-    system.charge_current(cpu.as_mut(), 2, 2, 0).unwrap();
+    system.charge_current_at(cpu.as_mut(), 2, 2, 0).unwrap();
     support::set_monotonic_ns(2);
-    system.block_current(cpu.as_mut(), 2).unwrap();
+    system.block_current_at(cpu.as_mut(), 2).unwrap();
     system.complete_context_switch(cpu.as_mut()).unwrap();
 
     install_runtime_handles(&system, cpu.as_mut());
@@ -167,14 +175,14 @@ fn wake_before_zero_lag_cancels_the_pending_inactive_transition() {
     );
     assert_eq!(activity.zero_lag_ns(), None);
     assert_eq!(cpu.deadline_bandwidth().inactive_bw_scaled(), 0);
-    system.drain_policy_updates(cpu.as_mut(), 3).unwrap();
+    system.drain_policy_updates_at(cpu.as_mut(), 3).unwrap();
     let activity = system.deadline_activity(thread.id()).unwrap();
     assert_eq!(activity.activity(), DeadlineActivity::ActiveContending);
     assert_eq!(activity.zero_lag_ns(), None);
     assert_eq!(cpu.deadline_bandwidth().inactive_bw_scaled(), 0);
 
     assert_eq!(
-        system.schedule(cpu.as_mut(), 4).unwrap().next(),
+        system.schedule_at(cpu.as_mut(), 4).unwrap().next(),
         thread.id()
     );
     assert_eq!(
@@ -188,19 +196,19 @@ fn wake_before_zero_lag_cancels_the_pending_inactive_transition() {
 fn throttled_wake_cannot_restore_cbs_budget_before_replenishment() {
     let (system, mut cpu) = online_system();
     let thread = ready_deadline(&system, 2, 10, 20, DeadlineFlags::NONE);
-    system.enqueue(cpu.as_mut(), thread.id(), 0).unwrap();
+    system.enqueue_at(cpu.as_mut(), thread.id(), 0).unwrap();
     assert_eq!(
-        system.schedule(cpu.as_mut(), 0).unwrap().next(),
+        system.schedule_at(cpu.as_mut(), 0).unwrap().next(),
         thread.id()
     );
     assert!(
         system
-            .charge_current(cpu.as_mut(), 2, 2, 0)
+            .charge_current_at(cpu.as_mut(), 2, 2, 0)
             .unwrap()
             .slice_expired()
     );
     assert_ne!(
-        system.schedule(cpu.as_mut(), 2).unwrap().next(),
+        system.schedule_at(cpu.as_mut(), 2).unwrap().next(),
         thread.id()
     );
     system.complete_context_switch(cpu.as_mut()).unwrap();
@@ -215,7 +223,7 @@ fn throttled_wake_cannot_restore_cbs_budget_before_replenishment() {
 
     install_runtime_handles(&system, cpu.as_mut());
     assert_eq!(thread.wake_handle().wake(), WakeResult::Notified);
-    system.drain_policy_updates(cpu.as_mut(), 3).unwrap();
+    system.drain_policy_updates_at(cpu.as_mut(), 3).unwrap();
     assert_eq!(thread.state(), ThreadState::Blocked);
     assert_eq!(
         system
@@ -224,8 +232,9 @@ fn throttled_wake_cannot_restore_cbs_budget_before_replenishment() {
             .remaining_runtime_ns(),
         0
     );
+    support::set_monotonic_ns(9);
     if let Some(decision) = system
-        .schedule_if_requested(cpu.as_mut(), 9)
+        .schedule_if_requested_at(cpu.as_mut(), 9)
         .unwrap()
         .decision()
     {
@@ -235,15 +244,17 @@ fn throttled_wake_cannot_restore_cbs_budget_before_replenishment() {
     // CBS depletion waits for the next release. For constrained D<P
     // reservations, replenishing at the scheduling deadline would provide a
     // second budget inside the same period.
+    support::set_monotonic_ns(10);
     if let Some(decision) = system
-        .schedule_if_requested(cpu.as_mut(), 10)
+        .schedule_if_requested_at(cpu.as_mut(), 10)
         .unwrap()
         .decision()
     {
         assert_ne!(decision.next(), thread.id());
     }
     assert_eq!(thread.state(), ThreadState::Blocked);
-    let decision = system.schedule(cpu.as_mut(), 20).unwrap();
+    support::set_monotonic_ns(20);
+    let decision = system.schedule_at(cpu.as_mut(), 20).unwrap();
     assert_eq!(decision.next(), thread.id());
     assert_eq!(
         system
@@ -272,8 +283,8 @@ fn deadline_bandwidth_moves_between_owner_runqueues() {
     }
     let first = ready_deadline(&system, 2, 10, 20, DeadlineFlags::NONE);
     let second = ready_deadline(&system, 2, 10, 20, DeadlineFlags::NONE);
-    system.enqueue(cpu0.as_mut(), first.id(), 0).unwrap();
-    system.enqueue(cpu0.as_mut(), second.id(), 0).unwrap();
+    system.enqueue_at(cpu0.as_mut(), first.id(), 0).unwrap();
+    system.enqueue_at(cpu0.as_mut(), second.id(), 0).unwrap();
     assert_eq!(cpu0.deadline_bandwidth().this_bw_scaled(), 200_000_000);
 
     let migrated = system
@@ -282,7 +293,7 @@ fn deadline_bandwidth_moves_between_owner_runqueues() {
         .expect("an overloaded Deadline runqueue must push one reservation");
     assert_eq!(cpu0.deadline_bandwidth().this_bw_scaled(), 100_000_000);
     assert_eq!(cpu1.deadline_bandwidth().this_bw_scaled(), 0);
-    system.drain_policy_updates(cpu1.as_mut(), 1).unwrap();
+    system.drain_policy_updates_at(cpu1.as_mut(), 1).unwrap();
     assert_eq!(cpu1.deadline_bandwidth().this_bw_scaled(), 100_000_000);
     assert_eq!(
         system.deadline_activity(migrated).unwrap().bandwidth_cpu(),
@@ -294,19 +305,19 @@ fn deadline_bandwidth_moves_between_owner_runqueues() {
 fn queued_policy_change_replaces_the_deadline_reservation_accounting() {
     let (system, mut cpu) = online_system();
     let thread = ready_deadline(&system, 4, 8, 8, DeadlineFlags::NONE);
-    system.enqueue(cpu.as_mut(), thread.id(), 0).unwrap();
+    system.enqueue_at(cpu.as_mut(), thread.id(), 0).unwrap();
     assert_eq!(cpu.deadline_bandwidth().this_bw_scaled(), 500_000_000);
 
     system
         .set_thread_policy(thread.id(), SchedulePolicy::default())
         .unwrap();
-    system.drain_policy_updates(cpu.as_mut(), 1).unwrap();
+    system.drain_policy_updates_at(cpu.as_mut(), 1).unwrap();
     assert_eq!(cpu.deadline_bandwidth().this_bw_scaled(), 0);
 
     let replacement =
         SchedulePolicy::deadline(DeadlinePolicy::new(2, 10, 20, DeadlineFlags::NONE).unwrap());
     system.set_thread_policy(thread.id(), replacement).unwrap();
-    system.drain_policy_updates(cpu.as_mut(), 2).unwrap();
+    system.drain_policy_updates_at(cpu.as_mut(), 2).unwrap();
     assert_eq!(cpu.deadline_bandwidth().this_bw_scaled(), 100_000_000);
     assert_eq!(
         system.deadline_activity(thread.id()).unwrap().activity(),
@@ -327,7 +338,7 @@ fn scheduler_capacity_is_rejected_before_deadline_runqueue_publication() {
         .unwrap();
     system.bring_cpu_online(cpu.as_mut()).unwrap();
     let first = ready_deadline(&system, 1, 10, 10, DeadlineFlags::NONE);
-    system.enqueue(cpu.as_mut(), first.id(), 0).unwrap();
+    system.enqueue_at(cpu.as_mut(), first.id(), 0).unwrap();
     let second_policy =
         SchedulePolicy::deadline(DeadlinePolicy::new(1, 10, 10, DeadlineFlags::NONE).unwrap());
     assert_eq!(
@@ -342,17 +353,17 @@ fn scheduler_capacity_is_rejected_before_deadline_runqueue_publication() {
 fn blocked_deadline_exit_waits_for_owner_member_cleanup() {
     let (system, mut cpu) = online_system();
     let thread = ready_deadline(&system, 1, 10, 10, DeadlineFlags::NONE);
-    system.enqueue(cpu.as_mut(), thread.id(), 0).unwrap();
+    system.enqueue_at(cpu.as_mut(), thread.id(), 0).unwrap();
     assert_eq!(
-        system.schedule(cpu.as_mut(), 0).unwrap().next(),
+        system.schedule_at(cpu.as_mut(), 0).unwrap().next(),
         thread.id()
     );
-    system.block_current(cpu.as_mut(), 0).unwrap();
+    system.block_current_at(cpu.as_mut(), 0).unwrap();
     system.complete_context_switch(cpu.as_mut()).unwrap();
 
     assert_eq!(system.mark_exited(thread.id()), Err(TaskError::ThreadBusy));
     assert_eq!(cpu.deadline_bandwidth().this_bw_scaled(), 100_000_000);
-    let drain = system.drain_policy_updates(cpu.as_mut(), 0).unwrap();
+    let drain = system.drain_policy_updates_at(cpu.as_mut(), 0).unwrap();
     assert_eq!((drain.drained(), drain.pending()), (1, false));
     assert_eq!(
         system

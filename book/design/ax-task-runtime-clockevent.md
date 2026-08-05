@@ -40,6 +40,30 @@
 
 TGOSKits 采用相同的所有权与排序，不复制 Linux callback 形态：ax-task 发布调度期限，ax-runtime 独占物理 clockevent。
 
+### runqueue clock 与物理时间域
+
+Linux v7.1 的 `struct rq` 自己保存 `clock`/`clock_task`，`update_rq_clock()` 要求持有目标
+`rq->lock`，并在一次 rq 事务内用 `RQCF_UPDATED` 阻止重复更新；后续调度类只读已经接受的
+`rq_clock()` 快照。TGOSKits 采用相同所有权：
+
+- `CpuRunQueueState::RunQueueClock` 是 scheduler 时间的唯一状态源，只能在目标 runqueue 的
+  IRQ-safe raw lock 内更新；
+- `TaskRuntime::scheduler_clock_source(cpu)` 只提供指定 CPU 的原始 counter 样本，不直接成为
+  Deadline、RT 或 Fair 的时间真值；远程 wake 锁定目标 rq 后，也必须读取目标 CPU 的 source；
+- 第一个样本建立基线，随后按 Linux 的 signed-delta 回绕顺序累计；负向 source 抖动不允许
+  把 rq clock 倒退；
+- 一个 owner rq 事务最多更新一次。dispatch settle、timer 重编程和 switch plan 等事务尾只能
+  读取 `RunQueueClockSnapshot`，不得再次读取 source；
+- 当前 runtime 没有可独立证明的 IRQ/steal-time source，因此不伪造第二个 `clock_task`。
+  将来只有在这些来源成为独立权威后，才可按 Linux 的 subtraction 模型增加 task clock。
+
+物理 timer 仍使用 `MonotonicInstant/MonotonicDeadline`。周期 Fair balance 对应 Linux 的
+`jiffies`/`sd->last_balance`，因此也属于 monotonic cadence：clockevent 到期只把它提升为
+sticky owner work，scheduler 在任务上下文消费并从完成时刻重置或 backoff。idle/newidle
+balance 是独立事件，不受周期 deadline gate 限制。任何测试若要让 CBS、zero-lag、sleep 或
+periodic balance 的物理事件到期，必须显式推进 monotonic fake；`*_at(now)` 只推进 rq source，
+不能重新把两个时间域耦合成测试兼容路径。
+
 ## ax-task 的所有权
 
 每个 `CpuLocal` 独占一个固定容量 `TaskDeadlineQueue`。条目必须是 generation-bearing 的值记录，只允许：
@@ -143,7 +167,9 @@ min(platform_cpu_count, CPU_CAPACITY)
 
 ### 时间转换
 
-- ax-task 的 heap、CBS 和调度边界只保存逻辑单调时钟期限，不接受物理 timer resolution；
+- ax-task 的 heap 保存物理 monotonic task deadline；CBS、RT/Fair 调度边界保存 rq-clock
+  deadline。两者只能通过“目标 rq 已接受的 snapshot + 同一事务的 monotonic sample”按正向
+  delta 映射，不能直接比较绝对值；
 - ax-task 可以发布已经到期的精确值，scheduler safe point 负责正确性推进；
 - 无期限使用 `None`；
 - ns 到 tick 向上取整；

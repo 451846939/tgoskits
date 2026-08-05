@@ -39,7 +39,6 @@ impl TaskSystem {
             target_remote.cancel_idle_pull(reservation);
             return Ok(false);
         }
-        let now_ns = task_runtime::scheduler_now().as_nanos();
         let target = cpu.owner();
         let source = self
             .cpu_remotes
@@ -53,9 +52,7 @@ impl TaskSystem {
                 let summary = local.try_load_summary()?;
                 let key = summary.pushable_key()?;
                 let class = summary.pushable_class()?;
-                if !summary.is_overloaded()
-                    || (class == SchedulingClass::Fair && !local.fair_balance_due(now_ns))
-                {
+                if !summary.is_overloaded() {
                     return None;
                 }
                 let load = if class == SchedulingClass::Fair {
@@ -138,11 +135,9 @@ impl TaskSystem {
         {
             return Ok(None);
         }
-        let now_ns = task_runtime::scheduler_now().as_nanos();
         let Some(selection) = self.select_rt_deadline_balance_transfer(
             cpu.as_ref().get_ref(),
             source_summary.runnable_count(),
-            now_ns,
         ) else {
             return Ok(None);
         };
@@ -164,9 +159,9 @@ impl TaskSystem {
         &self,
         mut cpu: Pin<&mut CpuLocal>,
         thread: ThreadId,
-        now_ns: u64,
     ) -> Result<(), TaskError> {
         self.ensure_owner_cpu_context(&cpu)?;
+        let now_ns = cpu.update_rq_clock().as_nanos();
         let core = {
             let state = self.state.lock();
             Arc::clone(&state.thread_record(thread)?.core)
@@ -197,15 +192,14 @@ impl TaskSystem {
             }
             sched.deadline.replenish_pending = false;
         }
-        self.enqueue_owner_thread(cpu.as_mut(), core, now_ns, EnqueueReason::Replenished)?;
-        Self::program_local_timer(cpu.as_mut(), now_ns)
+        self.enqueue_owner_thread(cpu.as_mut(), core, EnqueueReason::Replenished)?;
+        Self::program_local_timer(cpu.as_mut())
     }
 
     /// Charges the current dispatch and reports class budget expiration.
     pub fn charge_current(
         &self,
         mut cpu: Pin<&mut CpuLocal>,
-        now_ns: u64,
         runtime_ns: u64,
         reclaimed_ns: u64,
     ) -> Result<ChargeOutcome, TaskError> {
@@ -214,7 +208,6 @@ impl TaskSystem {
             return Err(TaskError::CpuOffline(cpu.owner().as_u32()));
         }
         let charge = cpu.as_mut().charge_current_dispatch(
-            now_ns,
             runtime_ns,
             reclaimed_ns,
             self.root_domain.deadline_extra_bw_scaled(),
@@ -229,34 +222,44 @@ impl TaskSystem {
     /// or was last sampled.
     pub fn charge_current_until(
         &self,
-        mut cpu: Pin<&mut CpuLocal>,
-        now_ns: u64,
+        cpu: Pin<&mut CpuLocal>,
         reclaimed_ns: u64,
     ) -> Result<ChargeOutcome, TaskError> {
+        self.charge_current_until_with_clock(cpu, reclaimed_ns)
+            .map(|(charge, _clock)| charge)
+    }
+
+    pub(crate) fn charge_current_until_with_clock(
+        &self,
+        mut cpu: Pin<&mut CpuLocal>,
+        reclaimed_ns: u64,
+    ) -> Result<(ChargeOutcome, RunQueueClockSnapshot), TaskError> {
         self.ensure_owner_cpu_context(&cpu)?;
         if !cpu.is_online() {
             return Err(TaskError::CpuOffline(cpu.owner().as_u32()));
         }
-        let charge = cpu.as_mut().settle_current_dispatch(
-            now_ns,
+        let (charge, clock) = cpu.as_mut().settle_current_dispatch_with_clock(
             reclaimed_ns,
             self.root_domain.deadline_extra_bw_scaled(),
         )?;
-        Ok(ChargeOutcome {
-            slice_expired: charge.slice_expired,
-            deadline_overrun: charge.deadline_overrun,
-        })
+        Ok((
+            ChargeOutcome {
+                slice_expired: charge.slice_expired,
+                deadline_overrun: charge.deadline_overrun,
+            },
+            clock,
+        ))
     }
 
     /// Tests RT bandwidth, allowing a PI-boosted owner to run to unlock.
     pub fn rt_may_run(
         &self,
         mut cpu: Pin<&mut CpuLocal>,
-        now_ns: u64,
         pi_boosted_owner: bool,
     ) -> Result<bool, TaskError> {
         self.ensure_owner_cpu_context(&cpu)?;
         self.ensure_owner_cpu_online(&cpu)?;
+        let now_ns = cpu.update_rq_clock().as_nanos();
         Ok(cpu
             .as_mut()
             .dispatch_state_mut()
@@ -265,11 +268,8 @@ impl TaskSystem {
     }
 
     /// Selects the next thread according to strict class precedence.
-    pub fn schedule(
-        &self,
-        cpu: Pin<&mut CpuLocal>,
-        now_ns: u64,
-    ) -> Result<ScheduleDecision, TaskError> {
+    pub fn schedule(&self, cpu: Pin<&mut CpuLocal>) -> Result<ScheduleDecision, TaskError> {
+        let now_ns = cpu.update_rq_clock().as_nanos();
         self.schedule_with_deadline_entry(cpu, now_ns, DeadlineEntry::Service)
     }
 
@@ -284,7 +284,7 @@ impl TaskSystem {
         self.drain_owner_work(cpu.as_mut(), now_ns)?;
         self.ensure_owner_cpu_online(&cpu)?;
         cpu.as_mut().scheduler_enter();
-        self.commit_owner_current_dispatch(cpu.as_mut(), now_ns)?;
+        self.commit_owner_current_dispatch(cpu.as_mut())?;
         if matches!(deadline_entry, DeadlineEntry::Service) {
             self.service_deadline_timers(cpu.as_mut(), now_ns)?;
         }
@@ -320,24 +320,24 @@ impl TaskSystem {
         } else {
             SwitchReason::Preempted
         };
-        let decision = Self::owner_switch_plan(previous_core.as_ref(), &next_core, reason);
-        Ok(self.finish_owner_selection(cpu, decision, now_ns))
+        let decision = Self::owner_switch_plan(previous_core.as_ref(), &next_core, reason, now_ns);
+        Ok(self.finish_owner_selection(cpu, decision))
     }
 
     /// Services sticky scheduler work and switches only for a real preemption.
     pub fn schedule_if_requested(
         &self,
         cpu: Pin<&mut CpuLocal>,
-        now_ns: u64,
     ) -> Result<SchedulerOutcome, TaskError> {
+        let now_ns = cpu.update_rq_clock().as_nanos();
         self.schedule_if_requested_with_deadline_entry(cpu, now_ns, DeadlineEntry::Service)
     }
 
     pub(crate) fn schedule_if_requested_after_deadline_service(
         &self,
         cpu: Pin<&mut CpuLocal>,
-        now_ns: u64,
     ) -> Result<SchedulerOutcome, TaskError> {
+        let now_ns = cpu.update_rq_clock().as_nanos();
         self.schedule_if_requested_with_deadline_entry(cpu, now_ns, DeadlineEntry::AlreadyServiced)
     }
 
@@ -363,11 +363,9 @@ impl TaskSystem {
         }
         let mut switch_requested = cpu.as_mut().scheduler_enter();
         if cpu.dispatch_state().current_dispatch.is_some() {
-            cpu.as_mut().settle_current_dispatch(
-                now_ns,
-                0,
-                self.root_domain.deadline_extra_bw_scaled(),
-            )?;
+            let _settled = cpu
+                .as_mut()
+                .settle_current_dispatch(0, self.root_domain.deadline_extra_bw_scaled())?;
         }
         if matches!(deadline_entry, DeadlineEntry::Service) {
             self.service_deadline_timers(cpu.as_mut(), now_ns)?;
@@ -389,14 +387,14 @@ impl TaskSystem {
             if cpu.has_remote_work() {
                 cpu.request_scheduler_work();
             }
-            Self::program_local_timer(cpu.as_mut(), now_ns)?;
+            Self::program_local_timer(cpu.as_mut())?;
             return Ok(if cpu.needs_reschedule() || cpu.has_remote_work() {
                 SchedulerOutcome::OwnerWorkPending
             } else {
                 SchedulerOutcome::Quiescent
             });
         }
-        self.commit_owner_current_dispatch(cpu.as_mut(), now_ns)?;
+        self.commit_owner_current_dispatch(cpu.as_mut())?;
         let mut migration = None;
         if let Some(core) = previous_core.as_ref() {
             migration = self.schedule_out_owner_running(
@@ -424,9 +422,9 @@ impl TaskSystem {
         } else {
             SwitchReason::Preempted
         };
-        let decision = Self::owner_switch_plan(previous_core.as_ref(), &next_core, reason);
+        let decision = Self::owner_switch_plan(previous_core.as_ref(), &next_core, reason, now_ns);
         Ok(SchedulerOutcome::Decision(
-            self.finish_owner_selection(cpu, decision, now_ns),
+            self.finish_owner_selection(cpu, decision),
         ))
     }
 
@@ -434,12 +432,12 @@ impl TaskSystem {
     pub fn yield_current(
         &self,
         mut cpu: Pin<&mut CpuLocal>,
-        now_ns: u64,
     ) -> Result<ScheduleDecision, TaskError> {
         self.ensure_owner_cpu_context(&cpu)?;
         self.complete_context_switch(cpu.as_mut())?;
         self.ensure_owner_cpu_online(&cpu)?;
-        self.commit_owner_current_dispatch(cpu.as_mut(), now_ns)?;
+        let now_ns = cpu.update_rq_clock().as_nanos();
+        self.commit_owner_current_dispatch(cpu.as_mut())?;
         // Forced yield owns the current entity's class transition, not the
         // general scheduler safe point. Consume the preemption request covered
         // by this selection while preserving sticky remote/deadline work for
@@ -465,8 +463,9 @@ impl TaskSystem {
                 // yielded service.
                 cpu.as_mut().install_dispatch(dispatch);
                 self.publish_owner_cpu_load_summary(cpu.as_mut());
-                let decision = Self::owner_switch_plan(Some(core), core, SwitchReason::Yield);
-                return Ok(self.finish_owner_selection(cpu, decision, now_ns));
+                let decision =
+                    Self::owner_switch_plan(Some(core), core, SwitchReason::Yield, now_ns);
+                return Ok(self.finish_owner_selection(cpu, decision));
             }
         }
         let mut migration = None;
@@ -537,7 +536,7 @@ impl TaskSystem {
         } else {
             SwitchReason::Yield
         };
-        let decision = Self::owner_switch_plan(previous_core.as_ref(), &next_core, reason);
-        Ok(self.finish_owner_selection(cpu, decision, now_ns))
+        let decision = Self::owner_switch_plan(previous_core.as_ref(), &next_core, reason, now_ns);
+        Ok(self.finish_owner_selection(cpu, decision))
     }
 }

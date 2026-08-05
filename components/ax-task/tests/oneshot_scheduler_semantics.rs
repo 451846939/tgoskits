@@ -4,16 +4,17 @@ use ax_task::{
     ThreadSpec,
 };
 
-mod support;
+pub mod support;
+use support::TaskSystemClockTestExt;
 
 #[test]
 fn sole_fair_dispatch_does_not_program_a_service_request() {
     let (system, mut cpu) = online_system();
     let fair = ready_thread(&system, SchedulePolicy::default());
-    system.enqueue(cpu.as_mut(), fair.id(), 100).unwrap();
+    system.enqueue_at(cpu.as_mut(), fair.id(), 100).unwrap();
 
     assert_eq!(
-        system.schedule(cpu.as_mut(), 100).unwrap().next(),
+        system.schedule_at(cpu.as_mut(), 100).unwrap().next(),
         fair.id()
     );
     assert_eq!(support::last_oneshot_ns(), 0);
@@ -28,11 +29,11 @@ fn contended_fair_dispatch_programs_its_remaining_service_request() {
     let (system, mut cpu) = online_system();
     let first = ready_thread(&system, SchedulePolicy::default());
     let second = ready_thread(&system, SchedulePolicy::default());
-    system.enqueue(cpu.as_mut(), first.id(), 100).unwrap();
-    system.enqueue(cpu.as_mut(), second.id(), 100).unwrap();
+    system.enqueue_at(cpu.as_mut(), first.id(), 100).unwrap();
+    system.enqueue_at(cpu.as_mut(), second.id(), 100).unwrap();
     support::set_monotonic_ns(100);
 
-    let selected = system.schedule(cpu.as_mut(), 100).unwrap().next();
+    let selected = system.schedule_at(cpu.as_mut(), 100).unwrap().next();
     assert!(selected == first.id() || selected == second.id());
     let initial_deadline = 100 + NORMALIZED_FAIR_SLICE_NS / 2;
     assert_eq!(support::last_oneshot_ns(), initial_deadline);
@@ -49,10 +50,13 @@ fn round_robin_dispatch_programs_its_remaining_quantum() {
         &system,
         SchedulePolicy::round_robin(RtPriority::new(40).unwrap()),
     );
-    system.enqueue(cpu.as_mut(), rr.id(), 100).unwrap();
+    system.enqueue_at(cpu.as_mut(), rr.id(), 100).unwrap();
     support::set_monotonic_ns(100);
 
-    assert_eq!(system.schedule(cpu.as_mut(), 100).unwrap().next(), rr.id());
+    assert_eq!(
+        system.schedule_at(cpu.as_mut(), 100).unwrap().next(),
+        rr.id()
+    );
     assert_eq!(support::last_oneshot_ns(), 100 + DEFAULT_RR_QUANTUM_NS);
 }
 
@@ -63,11 +67,11 @@ fn deadline_dispatch_programs_budget_before_its_absolute_deadline() {
         &system,
         SchedulePolicy::deadline(DeadlinePolicy::new(2, 10, 100, DeadlineFlags::NONE).unwrap()),
     );
-    system.enqueue(cpu.as_mut(), deadline.id(), 100).unwrap();
+    system.enqueue_at(cpu.as_mut(), deadline.id(), 100).unwrap();
     support::set_monotonic_ns(100);
 
     assert_eq!(
-        system.schedule(cpu.as_mut(), 100).unwrap().next(),
+        system.schedule_at(cpu.as_mut(), 100).unwrap().next(),
         deadline.id()
     );
     assert_eq!(support::last_oneshot_ns(), 102);
@@ -80,11 +84,11 @@ fn scheduler_boundary_is_translated_by_delta_into_the_monotonic_clock_domain() {
         &system,
         SchedulePolicy::deadline(DeadlinePolicy::new(2, 10, 100, DeadlineFlags::NONE).unwrap()),
     );
-    system.enqueue(cpu.as_mut(), deadline.id(), 100).unwrap();
+    system.enqueue_at(cpu.as_mut(), deadline.id(), 100).unwrap();
     support::set_monotonic_ns(10);
 
     assert_eq!(
-        system.schedule(cpu.as_mut(), 100).unwrap().next(),
+        system.schedule_at(cpu.as_mut(), 100).unwrap().next(),
         deadline.id()
     );
     assert_eq!(
@@ -98,11 +102,11 @@ fn scheduler_boundary_is_translated_by_delta_into_the_monotonic_clock_domain() {
 fn fifo_dispatch_programs_the_rt_quota_exhaustion_boundary() {
     let (system, mut cpu) = online_system();
     let fifo = ready_thread(&system, SchedulePolicy::fifo(RtPriority::new(40).unwrap()));
-    system.enqueue(cpu.as_mut(), fifo.id(), 100).unwrap();
+    system.enqueue_at(cpu.as_mut(), fifo.id(), 100).unwrap();
     support::set_monotonic_ns(100);
 
     assert_eq!(
-        system.schedule(cpu.as_mut(), 100).unwrap().next(),
+        system.schedule_at(cpu.as_mut(), 100).unwrap().next(),
         fifo.id()
     );
     assert_eq!(support::last_oneshot_ns(), 950_000_100);
@@ -114,22 +118,22 @@ fn blocking_fifo_reprograms_the_fair_successor_deadline() {
     let fifo = ready_thread(&system, SchedulePolicy::fifo(RtPriority::new(40).unwrap()));
     let fair = ready_thread(&system, SchedulePolicy::default());
     let fair_contender = ready_thread(&system, SchedulePolicy::default());
-    system.enqueue(cpu.as_mut(), fifo.id(), 100).unwrap();
-    system.enqueue(cpu.as_mut(), fair.id(), 100).unwrap();
+    system.enqueue_at(cpu.as_mut(), fifo.id(), 100).unwrap();
+    system.enqueue_at(cpu.as_mut(), fair.id(), 100).unwrap();
     system
-        .enqueue(cpu.as_mut(), fair_contender.id(), 100)
+        .enqueue_at(cpu.as_mut(), fair_contender.id(), 100)
         .unwrap();
     support::set_monotonic_ns(100);
 
     assert_eq!(
-        system.schedule(cpu.as_mut(), 100).unwrap().next(),
+        system.schedule_at(cpu.as_mut(), 100).unwrap().next(),
         fifo.id()
     );
     assert_eq!(support::last_oneshot_ns(), 10_000_000);
 
     support::set_monotonic_ns(200);
     assert_eq!(
-        system.block_current(cpu.as_mut(), 200).unwrap().next(),
+        system.block_current_at(cpu.as_mut(), 200).unwrap().next(),
         fair.id()
     );
     assert_eq!(
@@ -159,21 +163,21 @@ fn exiting_fifo_reprograms_the_fair_successor_deadline() {
     system.bring_cpu_online(cpu.as_mut()).unwrap();
     let fair = ready_thread(&system, SchedulePolicy::default());
     let fair_contender = ready_thread(&system, SchedulePolicy::default());
-    system.enqueue(cpu.as_mut(), fair.id(), 100).unwrap();
+    system.enqueue_at(cpu.as_mut(), fair.id(), 100).unwrap();
     system
-        .enqueue(cpu.as_mut(), fair_contender.id(), 100)
+        .enqueue_at(cpu.as_mut(), fair_contender.id(), 100)
         .unwrap();
     support::set_monotonic_ns(100);
 
     assert_eq!(
-        system.schedule(cpu.as_mut(), 100).unwrap().next(),
+        system.schedule_at(cpu.as_mut(), 100).unwrap().next(),
         fifo.id()
     );
     assert_eq!(support::last_oneshot_ns(), 10_000_000);
 
     support::set_monotonic_ns(200);
     assert_eq!(
-        system.exit_current(cpu.as_mut(), 200).unwrap().next(),
+        system.exit_current_at(cpu.as_mut(), 200).unwrap().next(),
         fair.id()
     );
     assert_eq!(
@@ -190,25 +194,28 @@ fn constrained_deadline_replenishment_preemption_is_seen_in_the_same_safe_point(
         SchedulePolicy::deadline(DeadlinePolicy::new(1, 10, 100, DeadlineFlags::NONE).unwrap()),
     );
     let fair = ready_thread(&system, SchedulePolicy::default());
-    system.enqueue(cpu.as_mut(), deadline.id(), 0).unwrap();
-    system.enqueue(cpu.as_mut(), fair.id(), 0).unwrap();
+    system.enqueue_at(cpu.as_mut(), deadline.id(), 0).unwrap();
+    system.enqueue_at(cpu.as_mut(), fair.id(), 0).unwrap();
     assert_eq!(
-        system.schedule(cpu.as_mut(), 0).unwrap().next(),
+        system.schedule_at(cpu.as_mut(), 0).unwrap().next(),
         deadline.id()
     );
     assert!(
         system
-            .charge_current(cpu.as_mut(), 1, 1, 0)
+            .charge_current_at(cpu.as_mut(), 1, 1, 0)
             .unwrap()
             .slice_expired()
     );
     support::set_monotonic_ns(1);
-    assert_eq!(system.schedule(cpu.as_mut(), 1).unwrap().next(), fair.id());
+    assert_eq!(
+        system.schedule_at(cpu.as_mut(), 1).unwrap().next(),
+        fair.id()
+    );
     support::set_monotonic_ns(2);
-    let _consumed_prior_request = system.schedule_if_requested(cpu.as_mut(), 2).unwrap();
+    let _consumed_prior_request = system.schedule_if_requested_at(cpu.as_mut(), 2).unwrap();
     assert!(
         system
-            .schedule_if_requested(cpu.as_mut(), 2)
+            .schedule_if_requested_at(cpu.as_mut(), 2)
             .unwrap()
             .decision()
             .is_none()
@@ -221,7 +228,7 @@ fn constrained_deadline_replenishment_preemption_is_seen_in_the_same_safe_point(
 
     support::set_monotonic_ns(100);
     let decision = system
-        .schedule_if_requested(cpu.as_mut(), 100)
+        .schedule_if_requested_at(cpu.as_mut(), 100)
         .unwrap()
         .decision()
         .expect("replenishment must be reconsidered before leaving this safe point");
@@ -235,14 +242,14 @@ fn yielded_deadline_rearms_replenishment_after_earlier_zero_lag_event() {
         &system,
         SchedulePolicy::deadline(DeadlinePolicy::new(2, 10, 100, DeadlineFlags::NONE).unwrap()),
     );
-    system.enqueue(cpu.as_mut(), deadline.id(), 0).unwrap();
+    system.enqueue_at(cpu.as_mut(), deadline.id(), 0).unwrap();
     assert_eq!(
-        system.schedule(cpu.as_mut(), 0).unwrap().next(),
+        system.schedule_at(cpu.as_mut(), 0).unwrap().next(),
         deadline.id()
     );
 
     support::set_monotonic_ns(1);
-    system.yield_current(cpu.as_mut(), 1).unwrap();
+    system.yield_current_at(cpu.as_mut(), 1).unwrap();
     assert_eq!(support::last_oneshot_ns(), 10, "zero-lag must fire first");
 
     support::install_handles(
@@ -265,14 +272,15 @@ fn yielded_deadline_rearms_replenishment_after_earlier_zero_lag_event() {
         !event.pending(),
         "no second immediately due event remains after the bounded IRQ pass"
     );
-    system.schedule(cpu.as_mut(), 10).unwrap();
+    system.schedule_at(cpu.as_mut(), 10).unwrap();
     assert_eq!(
         support::last_oneshot_ns(),
         100,
         "zero-lag servicing must preserve the later CBS replenishment",
     );
+    support::set_monotonic_ns(100);
     assert_eq!(
-        system.schedule(cpu.as_mut(), 100).unwrap().next(),
+        system.schedule_at(cpu.as_mut(), 100).unwrap().next(),
         deadline.id()
     );
     support::clear_handles();

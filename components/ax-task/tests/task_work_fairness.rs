@@ -5,7 +5,8 @@ use ax_task::{
     TaskSystemConfig, ThreadExtension, ThreadExtensionOps, ThreadId, ThreadSpec, ThreadState,
 };
 
-mod support;
+pub mod support;
+use support::TaskSystemClockTestExt;
 
 static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static LAST_EXIT_MARKER: AtomicUsize = AtomicUsize::new(0);
@@ -105,16 +106,19 @@ fn deadline_backlog_cannot_starve_exit_or_reap_classes() {
     let second = system.create_thread(ThreadSpec::new(policy)).unwrap();
     for thread in [&first, &second] {
         system.make_ready(thread.id()).unwrap();
-        system.enqueue(cpu.as_mut(), thread.id(), 0).unwrap();
+        system.enqueue_at(cpu.as_mut(), thread.id(), 0).unwrap();
     }
-    assert_eq!(system.schedule(cpu.as_mut(), 0).unwrap().next(), first.id());
-    system.charge_current(cpu.as_mut(), 1, 1, 0).unwrap();
     assert_eq!(
-        system.schedule(cpu.as_mut(), 1).unwrap().next(),
+        system.schedule_at(cpu.as_mut(), 0).unwrap().next(),
+        first.id()
+    );
+    system.charge_current_at(cpu.as_mut(), 1, 1, 0).unwrap();
+    assert_eq!(
+        system.schedule_at(cpu.as_mut(), 1).unwrap().next(),
         second.id()
     );
-    system.charge_current(cpu.as_mut(), 1, 2, 0).unwrap();
-    system.schedule(cpu.as_mut(), 2).unwrap();
+    system.charge_current_at(cpu.as_mut(), 1, 2, 0).unwrap();
+    system.schedule_at(cpu.as_mut(), 2).unwrap();
 
     let exited = create_detached_extended_thread(&system, 7);
     let deadline_pass = system.service_deferred_task_work(1).unwrap();

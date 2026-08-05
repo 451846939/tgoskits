@@ -177,7 +177,6 @@ impl CpuLocal {
 
     pub(crate) fn charge_current_dispatch(
         self: Pin<&mut Self>,
-        now_ns: u64,
         runtime_ns: u64,
         reclaimed_ns: u64,
         deadline_extra_bw_scaled: u64,
@@ -187,12 +186,33 @@ impl CpuLocal {
         // runtime-accounting update.
         let this = unsafe { self.get_unchecked_mut() };
         let remote = &this.remote;
+        let dispatch = &mut this.dispatch;
         let mut run_queue = remote.lock_run_queue();
+        let now_ns = run_queue.update_clock().as_nanos();
+        Self::charge_current_dispatch_locked(
+            remote,
+            dispatch,
+            &mut run_queue,
+            now_ns,
+            runtime_ns,
+            reclaimed_ns,
+            deadline_extra_bw_scaled,
+        )
+    }
+
+    fn charge_current_dispatch_locked(
+        remote: &CpuRemote,
+        dispatch_state: &mut dispatch_state::OwnerDispatchState,
+        run_queue: &mut CpuRunQueueState,
+        now_ns: u64,
+        runtime_ns: u64,
+        reclaimed_ns: u64,
+        deadline_extra_bw_scaled: u64,
+    ) -> Result<DispatchCharge, TaskError> {
         let bandwidth = run_queue.deadline_bandwidth();
         let admitted_bw_scaled = bandwidth.this_bw_scaled();
         let running_bw_scaled = bandwidth.running_bw_scaled();
         let max_bw_scaled = bandwidth.max_bw_scaled();
-        let dispatch_state = &mut this.dispatch;
         let current_is_non_idle =
             dispatch_state.current.is_some() && dispatch_state.current != dispatch_state.idle;
         let grub_reclaimed_ns = dispatch_state
@@ -241,25 +261,73 @@ impl CpuLocal {
     }
 
     pub(crate) fn settle_current_dispatch(
-        mut self: Pin<&mut Self>,
-        now_ns: u64,
+        self: Pin<&mut Self>,
         reclaimed_ns: u64,
         deadline_extra_bw_scaled: u64,
-    ) -> Result<DispatchCharge, TaskError> {
-        let runtime_ns = self
-            .as_ref()
-            .get_ref()
-            .dispatch
+    ) -> Result<(DispatchCharge, RunQueueClockSnapshot), TaskError> {
+        // SAFETY: the owner scheduler serializes this pinned runqueue state.
+        let this = unsafe { self.get_unchecked_mut() };
+        let remote = &this.remote;
+        let dispatch = &mut this.dispatch;
+        let mut run_queue = remote.lock_run_queue();
+        let clock = run_queue
+            .clock_snapshot()
+            .ok_or(TaskError::InvalidConfiguration)?;
+        Self::settle_current_dispatch_locked(
+            remote,
+            dispatch,
+            &mut run_queue,
+            clock,
+            reclaimed_ns,
+            deadline_extra_bw_scaled,
+        )
+    }
+
+    pub(crate) fn settle_current_dispatch_with_clock(
+        self: Pin<&mut Self>,
+        reclaimed_ns: u64,
+        deadline_extra_bw_scaled: u64,
+    ) -> Result<(DispatchCharge, RunQueueClockSnapshot), TaskError> {
+        // SAFETY: the owner scheduler serializes this pinned runqueue state.
+        let this = unsafe { self.get_unchecked_mut() };
+        let remote = &this.remote;
+        let dispatch = &mut this.dispatch;
+        let mut run_queue = remote.lock_run_queue();
+        let clock = run_queue.update_clock();
+        Self::settle_current_dispatch_locked(
+            remote,
+            dispatch,
+            &mut run_queue,
+            clock,
+            reclaimed_ns,
+            deadline_extra_bw_scaled,
+        )
+    }
+
+    fn settle_current_dispatch_locked(
+        remote: &CpuRemote,
+        dispatch: &mut dispatch_state::OwnerDispatchState,
+        run_queue: &mut CpuRunQueueState,
+        clock: RunQueueClockSnapshot,
+        reclaimed_ns: u64,
+        deadline_extra_bw_scaled: u64,
+    ) -> Result<(DispatchCharge, RunQueueClockSnapshot), TaskError> {
+        let now_ns = clock.as_nanos();
+        let runtime_ns = dispatch
             .current_dispatch
             .as_ref()
             .ok_or(TaskError::NoRunnableThread)?
             .unaccounted_runtime(now_ns);
-        self.as_mut().charge_current_dispatch(
+        let charge = Self::charge_current_dispatch_locked(
+            remote,
+            dispatch,
+            run_queue,
             now_ns,
             runtime_ns,
             reclaimed_ns,
             deadline_extra_bw_scaled,
-        )
+        )?;
+        Ok((charge, clock))
     }
 
     pub(crate) fn set_idle(self: Pin<&mut Self>, idle: ThreadId, core: Arc<ThreadCore>) {
@@ -350,6 +418,10 @@ impl CpuLocal {
         self.remote.lock_run_queue()
     }
 
+    pub(crate) fn update_rq_clock(&self) -> RunQueueClockSnapshot {
+        self.remote.lock_run_queue().update_clock()
+    }
+
     fn task_deadline_state_mut(
         self: Pin<&mut Self>,
     ) -> &mut deadline_state::LocalTaskDeadlineState {
@@ -392,19 +464,27 @@ impl CpuLocal {
         self.remote.lock_run_queue().deadline_bandwidth()
     }
 
-    pub(crate) fn scheduler_deadline_due(self: Pin<&mut Self>, now_ns: u64) -> bool {
+    pub(crate) fn scheduler_work_due(
+        self: Pin<&mut Self>,
+        clock: RunQueueClockSnapshot,
+        monotonic_now: MonotonicInstant,
+    ) -> bool {
+        let now_ns = clock.as_nanos();
         // SAFETY: the scheduler owns this pinned runqueue while refreshing RT
         // bandwidth periods and querying its next local event.
-        unsafe { self.get_unchecked_mut() }
+        let this = unsafe { self.get_unchecked_mut() };
+        let scheduler_due = this
             .scheduler_deadline_ns(now_ns)
-            .is_some_and(|deadline| scheduler_time_reached(now_ns, deadline))
+            .is_some_and(|deadline| scheduler_time_reached(now_ns, deadline));
+        scheduler_due || this.publish_fair_balance_due(monotonic_now)
     }
 
     pub(crate) fn next_oneshot_deadline(
         self: Pin<&mut Self>,
-        scheduler_now_ns: u64,
+        clock: RunQueueClockSnapshot,
         monotonic_now: MonotonicInstant,
     ) -> Option<MonotonicDeadline> {
+        let scheduler_now_ns = clock.as_nanos();
         // SAFETY: clockevent selection is an owner-only transition. The
         // mutable queue/scheduler projections cannot move CpuLocal.
         let this = unsafe { self.get_unchecked_mut() };
@@ -440,22 +520,18 @@ impl CpuLocal {
             Some(SchedulerClockEvent::Future(deadline)) => Some(deadline),
             None => None,
         };
-        match (timer, scheduler) {
-            (Some(timer), Some(scheduler)) => Some(timer.min(scheduler)),
-            (Some(timer), None) => Some(timer),
-            (None, Some(scheduler)) => Some(scheduler),
-            (None, None) => None,
-        }
+        let fair_balance = this.fair_balance_clockevent_deadline(monotonic_now);
+        [timer, scheduler, fair_balance].into_iter().flatten().min()
     }
 
     pub(crate) fn next_task_deadline_update(
         mut self: Pin<&mut Self>,
-        scheduler_now_ns: u64,
+        clock: RunQueueClockSnapshot,
         monotonic_now: MonotonicInstant,
     ) -> Result<TaskDeadlineUpdate, TaskError> {
         let publication = self
             .as_mut()
-            .task_deadline_publication(scheduler_now_ns, monotonic_now);
+            .task_deadline_publication(clock, monotonic_now);
         let task_deadlines = self.task_deadline_state_mut();
         if task_deadlines.publication == Some(publication) {
             return TaskDeadlineUpdate::try_new(
@@ -470,12 +546,12 @@ impl CpuLocal {
 
     pub(crate) fn next_task_deadline_update_if_changed(
         mut self: Pin<&mut Self>,
-        scheduler_now_ns: u64,
+        clock: RunQueueClockSnapshot,
         monotonic_now: MonotonicInstant,
     ) -> Result<Option<TaskDeadlineUpdate>, TaskError> {
         let publication = self
             .as_mut()
-            .task_deadline_publication(scheduler_now_ns, monotonic_now);
+            .task_deadline_publication(clock, monotonic_now);
         let task_deadlines = self.task_deadline_state_mut();
         if task_deadlines.publication == Some(publication) {
             return Ok(None);
@@ -485,12 +561,10 @@ impl CpuLocal {
 
     fn task_deadline_publication(
         mut self: Pin<&mut Self>,
-        scheduler_now_ns: u64,
+        clock: RunQueueClockSnapshot,
         monotonic_now: MonotonicInstant,
     ) -> TaskDeadlinePublicationState {
-        let deadline = self
-            .as_mut()
-            .next_oneshot_deadline(scheduler_now_ns, monotonic_now);
+        let deadline = self.as_mut().next_oneshot_deadline(clock, monotonic_now);
         TaskDeadlinePublicationState {
             deadline,
             deferred_work: self.remote.deadline_work_pending(),
@@ -521,6 +595,10 @@ impl CpuLocal {
 
     pub(crate) fn deadline_work_pending(&self) -> bool {
         self.remote.deadline_work_pending()
+    }
+
+    pub(crate) fn run_queue_clock(&self) -> Option<RunQueueClockSnapshot> {
+        self.remote.lock_run_queue().clock_snapshot()
     }
 
     pub(crate) fn has_task_deadlines(&self) -> bool {
@@ -573,18 +651,31 @@ impl CpuLocal {
             let deadline = self.dispatch.rt_bandwidth.next_period_ns(now_ns);
             next_deadline_ns = earliest(next_deadline_ns, deadline);
         }
+        next_deadline_ns
+    }
+
+    fn fair_balance_clockevent_deadline(
+        &self,
+        monotonic_now: MonotonicInstant,
+    ) -> Option<MonotonicDeadline> {
+        if !self.has_periodic_fair_balance_work() {
+            return None;
+        }
+        if self.remote.publish_fair_balance_due(monotonic_now) {
+            return None;
+        }
+        self.remote.fair_balance_deadline()
+    }
+
+    fn has_periodic_fair_balance_work(&self) -> bool {
+        let run_queue = self.remote.lock_run_queue();
         let current_non_idle =
             self.dispatch.current.is_some() && self.dispatch.current != self.dispatch.idle;
-        if run_queue.has_fair()
+        run_queue.has_fair()
             && run_queue
                 .len()
                 .saturating_add(usize::from(current_non_idle))
                 > 1
-            && let Some(deadline) = self.remote.fair_balance_deadline_ns()
-        {
-            next_deadline_ns = earliest(next_deadline_ns, deadline);
-        }
-        next_deadline_ns
     }
 
     /// Attempts to return a coherent remotely observable scheduling snapshot.
@@ -597,21 +688,29 @@ impl CpuLocal {
         self.remote.try_runnable_summary()
     }
 
-    pub(crate) fn fair_balance_due(&self, now_ns: u64) -> bool {
-        self.remote.fair_balance_due(now_ns)
+    pub(crate) fn publish_fair_balance_due(&self, now: MonotonicInstant) -> bool {
+        self.has_periodic_fair_balance_work() && self.remote.publish_fair_balance_due(now)
     }
 
-    pub(crate) fn reset_fair_balance(self: Pin<&mut Self>, now_ns: u64, minimum_interval_ns: u64) {
+    pub(crate) fn fair_balance_pending(&self) -> bool {
+        self.remote.fair_balance_pending()
+    }
+
+    pub(crate) fn reset_fair_balance(
+        self: Pin<&mut Self>,
+        now: MonotonicInstant,
+        minimum_interval_ns: u64,
+    ) {
         // SAFETY: this owner-only runqueue update does not move CpuLocal.
         let this = unsafe { self.get_unchecked_mut() };
         let interval_ns = minimum_interval_ns.max(1);
         this.dispatch.fair_balance_interval_ns = interval_ns;
-        this.remote.defer_fair_balance(now_ns, interval_ns);
+        this.remote.defer_fair_balance(now, interval_ns);
     }
 
     pub(crate) fn backoff_fair_balance(
         self: Pin<&mut Self>,
-        now_ns: u64,
+        now: MonotonicInstant,
         minimum_interval_ns: u64,
         maximum_interval_ns: u64,
     ) {
@@ -627,7 +726,7 @@ impl CpuLocal {
             .saturating_mul(2)
             .min(maximum_interval_ns);
         this.dispatch.fair_balance_interval_ns = next_interval_ns;
-        this.remote.defer_fair_balance(now_ns, next_interval_ns);
+        this.remote.defer_fair_balance(now, next_interval_ns);
     }
 
     /// Returns scheduler-internal owner access to the preallocated deadline heap.

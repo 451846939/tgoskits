@@ -149,7 +149,7 @@ mod tests {
             })
             .unwrap();
         system.make_ready(next.id()).unwrap();
-        system.enqueue(cpu.as_mut(), next.id(), 0).unwrap();
+        system.enqueue(cpu.as_mut(), next.id()).unwrap();
         let _runtime_handles = InstalledTaskHandles::new(system.as_ref(), cpu.as_mut());
         let _context_switch = test_runtime::allow_context_switch();
 
@@ -296,8 +296,9 @@ mod tests {
 
         let initial = {
             let _irq = RuntimeIrqGuard::enter();
+            let clock = cpu.update_rq_clock();
             cpu.as_mut()
-                .next_task_deadline_update(0, instant(0))
+                .next_task_deadline_update(clock, instant(0))
                 .unwrap()
         };
         task_runtime::publish_task_deadline(initial);
@@ -797,13 +798,13 @@ mod tests {
             )
             .unwrap();
         system.make_ready(exited.id()).unwrap();
-        system.enqueue(cpu.as_mut(), exited.id(), 0).unwrap();
+        system.enqueue(cpu.as_mut(), exited.id()).unwrap();
         assert_eq!(
-            system.schedule(cpu.as_mut(), 0).unwrap().next(),
+            system.schedule(cpu.as_mut()).unwrap().next(),
             exited.id()
         );
         system.complete_context_switch(cpu.as_mut()).unwrap();
-        let exit_decision = system.exit_current(cpu.as_mut(), 0).unwrap();
+        let exit_decision = system.exit_current(cpu.as_mut()).unwrap();
         assert_ne!(exit_decision.next(), exited.id());
         assert_eq!(PARKING_EXIT_CALLBACKS.load(Ordering::Acquire), 0);
 
@@ -893,14 +894,14 @@ mod tests {
             )
             .unwrap();
         system.make_ready(exiting.id()).unwrap();
-        system.enqueue(cpu.as_mut(), exiting.id(), 0).unwrap();
+        system.enqueue(cpu.as_mut(), exiting.id()).unwrap();
         assert_eq!(
-            system.schedule(cpu.as_mut(), 0).unwrap().next(),
+            system.schedule(cpu.as_mut()).unwrap().next(),
             exiting.id()
         );
         system.complete_context_switch(cpu.as_mut()).unwrap();
         assert_eq!(
-            system.exit_current(cpu.as_mut(), 0).unwrap().next(),
+            system.exit_current(cpu.as_mut()).unwrap().next(),
             bootstrap.id()
         );
         system.complete_context_switch(cpu.as_mut()).unwrap();
@@ -968,7 +969,7 @@ mod tests {
             .create_thread(ThreadSpec::new(SchedulePolicy::default()))
             .unwrap();
         system.make_ready(waiting.id()).unwrap();
-        system.enqueue(cpu.as_mut(), waiting.id(), 0).unwrap();
+        system.enqueue(cpu.as_mut(), waiting.id()).unwrap();
 
         system
             .set_thread_policy(
@@ -1031,7 +1032,7 @@ mod tests {
             })
             .unwrap();
         system.make_ready(next.id()).unwrap();
-        system.enqueue(cpu.as_mut(), next.id(), 0).unwrap();
+        system.enqueue(cpu.as_mut(), next.id()).unwrap();
         let _runtime_handles = InstalledTaskHandles::new(system.as_ref(), cpu.as_mut());
         let _context_switch = test_runtime::allow_context_switch();
         test_runtime::reset_scheduler_frame_state();
@@ -1111,7 +1112,7 @@ mod tests {
             })
             .unwrap();
         system.make_ready(next.id()).unwrap();
-        system.enqueue(cpu.as_mut(), next.id(), 0).unwrap();
+        system.enqueue(cpu.as_mut(), next.id()).unwrap();
         let _runtime_handles = InstalledTaskHandles::new(system.as_ref(), cpu.as_mut());
         let _context_switch = test_runtime::allow_context_switch();
 
@@ -1363,7 +1364,7 @@ mod tests {
             })
             .unwrap();
         system.make_ready(next.id()).unwrap();
-        system.enqueue(cpu.as_mut(), next.id(), 0).unwrap();
+        system.enqueue(cpu.as_mut(), next.id()).unwrap();
         let _runtime_handles = InstalledTaskHandles::new(system.as_ref(), cpu.as_mut());
         let unrelated =
             publish_unrelated_expired_deadline(system.as_ref().get_ref(), cpu.as_mut(), 10);
@@ -1550,7 +1551,7 @@ mod tests {
             .unwrap();
         system.bring_cpu_online(cpu.as_mut()).unwrap();
         assert_eq!(
-            system.block_current(cpu.as_mut(), 0).unwrap().next(),
+            system.block_current(cpu.as_mut()).unwrap().next(),
             idle.id()
         );
         system.complete_context_switch(cpu.as_mut()).unwrap();

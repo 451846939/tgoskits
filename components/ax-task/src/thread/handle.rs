@@ -119,11 +119,6 @@ impl ThreadHandle {
         self.core.effective_scheduling_urgency()
     }
 
-    /// Returns cumulative charged CPU runtime, including a running residual.
-    pub fn runtime_snapshot(&self, now_ns: u64) -> ThreadRuntimeSnapshot {
-        self.core.runtime_snapshot(now_ns)
-    }
-
     /// Returns the physical CPU that must cross a scheduler boundary.
     ///
     /// Unlike direct wake placement, this snapshot remains on the source CPU
@@ -531,7 +526,7 @@ impl ThreadCore {
         self.finish_runtime_write();
     }
 
-    pub(crate) fn runtime_snapshot(&self, now_ns: u64) -> ThreadRuntimeSnapshot {
+    pub(crate) fn runtime_snapshot(&self, running_now_ns: Option<u64>) -> ThreadRuntimeSnapshot {
         loop {
             let sequence = self.runtime_sequence.load(Ordering::Acquire);
             if sequence & 1 != 0 {
@@ -543,7 +538,9 @@ impl ThreadCore {
             let running = self.runtime_running.load(Ordering::Relaxed);
             if self.runtime_sequence.load(Ordering::Acquire) == sequence {
                 let residual = if running {
-                    now_ns.saturating_sub(accounted_until)
+                    running_now_ns
+                        .expect("a running thread snapshot must hold its runqueue clock")
+                        .saturating_sub(accounted_until)
                 } else {
                     0
                 };

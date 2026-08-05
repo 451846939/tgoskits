@@ -2,20 +2,15 @@ use super::*;
 
 impl TaskSystem {
     /// Enqueues a ready thread on an affinity-compatible owner CPU.
-    pub fn enqueue(
-        &self,
-        mut cpu: Pin<&mut CpuLocal>,
-        thread: ThreadId,
-        now_ns: u64,
-    ) -> Result<(), TaskError> {
+    pub fn enqueue(&self, mut cpu: Pin<&mut CpuLocal>, thread: ThreadId) -> Result<(), TaskError> {
         self.ensure_owner_cpu_context(&cpu)?;
         let core = {
             let state = self.state.lock();
             state.ensure_cpu_online(&cpu)?;
             Arc::clone(&state.thread_record(thread)?.core)
         };
-        self.enqueue_owner_thread(cpu.as_mut(), core, now_ns, EnqueueReason::Wake)?;
-        Self::program_local_timer(cpu.as_mut(), now_ns)
+        self.enqueue_owner_thread(cpu.as_mut(), core, EnqueueReason::Wake)?;
+        Self::program_local_timer(cpu.as_mut())
     }
 
     /// Places a newly ready thread on an allowed active CPU.
@@ -35,7 +30,6 @@ impl TaskSystem {
         &self,
         mut cpu: Pin<&mut CpuLocal>,
         thread: ThreadId,
-        now_ns: u64,
     ) -> Result<(), TaskError> {
         self.ensure_owner_cpu_context(&cpu)?;
         let owner = cpu.owner();
@@ -77,7 +71,6 @@ impl TaskSystem {
                     affinity,
                     Some(owner),
                     None,
-                    now_ns,
                 )
             } else if affinity.contains(owner) {
                 Some(owner)
@@ -89,7 +82,7 @@ impl TaskSystem {
             if target == owner {
                 drop(sched);
                 drop(state);
-                self.enqueue_owner_thread(cpu.as_mut(), core, now_ns, EnqueueReason::Wake)?;
+                self.enqueue_owner_thread(cpu.as_mut(), core, EnqueueReason::Wake)?;
                 None
             } else {
                 let carrier = self.prepare_owner_migration(&core, owner, target)?;
@@ -107,7 +100,7 @@ impl TaskSystem {
             carrier.commit();
             return Ok(());
         }
-        Self::program_local_timer(cpu.as_mut(), now_ns)
+        Self::program_local_timer(cpu.as_mut())
     }
 
     /// Removes a ready thread from its owner run queue for migration or update.
@@ -266,6 +259,14 @@ impl TaskSystem {
     /// Applies a bounded batch of owner-CPU effective-policy updates.
     pub fn drain_policy_updates(
         &self,
+        cpu: Pin<&mut CpuLocal>,
+    ) -> Result<OwnerControlDrain, TaskError> {
+        let now_ns = cpu.update_rq_clock().as_nanos();
+        self.drain_policy_updates_with_clock(cpu, now_ns)
+    }
+
+    pub(super) fn drain_policy_updates_with_clock(
+        &self,
         mut cpu: Pin<&mut CpuLocal>,
         now_ns: u64,
     ) -> Result<OwnerControlDrain, TaskError> {
@@ -350,7 +351,6 @@ impl TaskSystem {
                 let migrated = self.transfer_owner_balance_candidate(
                     cpu.as_mut(),
                     target,
-                    now_ns,
                     BalanceReason::IdlePull,
                 );
                 drop(claim);
@@ -481,7 +481,6 @@ impl TaskSystem {
                 self.enqueue_owner_thread(
                     cpu.as_mut(),
                     Arc::clone(&core),
-                    now_ns,
                     EnqueueReason::Migrated,
                 )?;
                 if needs_affinity_move {
@@ -513,11 +512,9 @@ impl TaskSystem {
             }
             if queued_cpu == Some(owner) && execution_cpu.is_none() {
                 if cpu.dispatch_state().current_dispatch.is_some() {
-                    cpu.as_mut().settle_current_dispatch(
-                        now_ns,
-                        0,
-                        self.root_domain.deadline_extra_bw_scaled(),
-                    )?;
+                    let _settled = cpu
+                        .as_mut()
+                        .settle_current_dispatch(0, self.root_domain.deadline_extra_bw_scaled())?;
                 } else {
                     cpu.lock_run_queue().update_fair_virtual_time(None);
                 }
@@ -542,10 +539,10 @@ impl TaskSystem {
                     detached
                 };
                 drop(detached);
-                let applied = match self.apply_owner_policy_generation(
+                let applied = match self.apply_policy_generation(
                     &core,
                     message.generation(),
-                    now_ns,
+                    Some(now_ns),
                     fair_placement,
                     true,
                 ) {
@@ -561,7 +558,6 @@ impl TaskSystem {
                     .enqueue_owner_thread(
                         cpu.as_mut(),
                         Arc::clone(&core),
-                        now_ns,
                         EnqueueReason::PolicyChanged,
                     )
                     .is_err()
@@ -570,7 +566,7 @@ impl TaskSystem {
                 }
                 cpu.request_reschedule();
             } else if execution_cpu == Some(owner) && cpu.current() == Some(core.id()) {
-                self.commit_owner_current_dispatch(cpu.as_mut(), now_ns)?;
+                self.commit_owner_current_dispatch(cpu.as_mut())?;
                 let fair_placement =
                     Self::owner_fair_policy_placement(cpu.as_ref().get_ref(), &core);
                 {
@@ -578,10 +574,10 @@ impl TaskSystem {
                     Self::validate_owner_policy_generation(&sched, message.generation())?;
                     Self::detach_owner_deadline_bandwidth_locked(&core, &mut sched, cpu.as_mut());
                 }
-                let applied = match self.apply_owner_policy_generation(
+                let applied = match self.apply_policy_generation(
                     &core,
                     message.generation(),
-                    now_ns,
+                    Some(now_ns),
                     fair_placement,
                     true,
                 ) {
@@ -633,10 +629,10 @@ impl TaskSystem {
                 if core.sched().lock().deadline.bandwidth_cpu == Some(owner) {
                     Self::detach_owner_deadline_bandwidth(&core, cpu.as_mut());
                 }
-                let applied = self.apply_owner_policy_generation(
+                let applied = self.apply_policy_generation(
                     &core,
                     message.generation(),
-                    now_ns,
+                    Some(now_ns),
                     None,
                     false,
                 )?;
@@ -666,7 +662,7 @@ impl TaskSystem {
     ) -> Result<(), TaskError> {
         let policy_pending = cpu.remote().owner_control_inbox().has_pending();
         if policy_pending {
-            self.drain_policy_updates(cpu.as_mut(), now_ns)?;
+            self.drain_policy_updates_with_clock(cpu.as_mut(), now_ns)?;
         }
         if cpu.has_remote_work() {
             cpu.defer_scheduler_work();

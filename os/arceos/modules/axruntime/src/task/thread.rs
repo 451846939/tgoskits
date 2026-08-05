@@ -603,9 +603,7 @@ fn publish_prepared_thread(
     handle: ThreadHandle,
 ) -> Result<ThreadHandle, TaskError> {
     let result = system.make_ready(handle.id()).and_then(|()| {
-        with_current_cpu_local_mut_owner(|cpu| {
-            system.place_ready(cpu, handle.id(), ax_hal::time::monotonic_time_nanos())
-        })
+        with_current_cpu_local_mut_owner(|cpu| system.place_ready(cpu, handle.id()))
     });
     if let Err(error) = result {
         cleanup_failed_thread(system, handle);

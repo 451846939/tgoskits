@@ -130,7 +130,7 @@ impl_task_runtime! {
             )
             .expect("platform monotonic clock exceeded the ktime domain")
         }
-        fn scheduler_now() -> ax_task::SchedulerTimestamp {
+        fn scheduler_clock_source(_cpu: RuntimeCpuId) -> ax_task::SchedulerTimestamp {
             ax_task::SchedulerTimestamp::from_nanos(ax_hal::time::monotonic_time_nanos())
         }
         fn publish_task_deadline(_update: TaskDeadlineUpdate) {}

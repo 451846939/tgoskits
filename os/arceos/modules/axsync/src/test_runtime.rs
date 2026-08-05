@@ -179,7 +179,7 @@ impl_task_runtime! {
         fn monotonic_now() -> ax_task::runtime::MonotonicInstant {
             ax_task::runtime::MonotonicInstant::from_nanos(0).unwrap()
         }
-        fn scheduler_now() -> ax_task::SchedulerTimestamp {
+        fn scheduler_clock_source(_cpu: RuntimeCpuId) -> ax_task::SchedulerTimestamp {
             ax_task::SchedulerTimestamp::from_nanos(0)
         }
         fn publish_task_deadline(_update: TaskDeadlineUpdate) {}

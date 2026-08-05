@@ -117,6 +117,8 @@ impl WakePreemptionDecision {
 /// physical queue membership so a remote waker can evaluate preemption.
 #[derive(Debug)]
 pub(crate) struct CpuRunQueueState {
+    owner: CpuId,
+    clock: RunQueueClock,
     queue: RunQueue,
     current: Option<CurrentSchedule>,
     /// Deadline bandwidth and membership belong to the same transaction as
@@ -127,8 +129,10 @@ pub(crate) struct CpuRunQueueState {
 }
 
 impl CpuRunQueueState {
-    pub(crate) fn new(config: TaskSystemConfig) -> Self {
+    pub(crate) fn new(owner: CpuId, config: TaskSystemConfig) -> Self {
         Self {
+            owner,
+            clock: RunQueueClock::new(),
             queue: RunQueue::new(),
             current: None,
             deadline_members: Vec::with_capacity(config.thread_capacity()),
@@ -136,6 +140,17 @@ impl CpuRunQueueState {
                 u64::from(config.deadline_cap_percent()) * 10_000_000,
             ),
         }
+    }
+
+    /// Updates and snapshots Linux-style `rq->clock` under this runqueue lock.
+    pub(crate) fn update_clock(&mut self) -> RunQueueClockSnapshot {
+        let source = task_runtime::scheduler_clock_source(RuntimeCpuId::new(self.owner.as_u32()));
+        self.clock.update(source)
+    }
+
+    /// Reads the last owner-accepted runqueue clock without sampling hardware.
+    pub(crate) fn clock_snapshot(&self) -> Option<RunQueueClockSnapshot> {
+        self.clock.snapshot()
     }
 
     pub(crate) const fn current(&self) -> Option<CurrentSchedule> {

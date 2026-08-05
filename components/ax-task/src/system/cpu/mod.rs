@@ -1,5 +1,6 @@
 //! Pinned owner-CPU scheduler state.
 
+mod clock;
 mod dispatch;
 mod load;
 mod local;
@@ -15,6 +16,7 @@ use core::{
     sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, AtomicUsize, Ordering},
 };
 
+pub(crate) use clock::{RunQueueClock, RunQueueClockSnapshot};
 pub(crate) use dispatch::{
     CurrentDispatch, CurrentDispatchState, CurrentSchedule, DispatchCharge, SwitchHandoff,
 };

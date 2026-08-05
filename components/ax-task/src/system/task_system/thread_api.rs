@@ -15,21 +15,31 @@ impl TaskSystem {
             .state())
     }
 
-    /// Returns cumulative charged CPU runtime at `now_ns`.
+    /// Returns cumulative charged CPU runtime.
     ///
-    /// The thread header uses a lock-free sequence snapshot, so a running
-    /// thread includes time since its last timer or scheduler accounting point.
-    pub fn thread_runtime(
-        &self,
-        thread: ThreadId,
-        now_ns: u64,
-    ) -> Result<ThreadRuntimeSnapshot, TaskError> {
-        let state = self.state.lock();
-        let record = state.thread_record(thread)?;
-        let snapshot = record.core.runtime_snapshot(now_ns);
-        debug_assert!(
-            snapshot.charged_runtime_ns() >= record.sched.lock().runtime.charged_runtime_ns
-        );
+    /// Like Linux `task_sched_runtime()`, a running thread is sampled only
+    /// after locking its assigned runqueue and updating that runqueue's clock.
+    /// A stopped thread returns its already charged value without inventing a
+    /// scheduler timestamp.
+    pub fn thread_runtime(&self, thread: ThreadId) -> Result<ThreadRuntimeSnapshot, TaskError> {
+        let (core, sched_cell) = {
+            let state = self.state.lock();
+            let record = state.thread_record(thread)?;
+            (Arc::clone(&record.core), Arc::clone(&record.sched))
+        };
+        let sched = sched_cell.lock();
+        let running_now_ns = sched
+            .placement
+            .execution_cpu()
+            .map(|cpu| {
+                self.cpu_remotes
+                    .get(cpu.as_usize())
+                    .ok_or(TaskError::InvalidCpu(cpu.as_u32()))
+                    .map(|remote| remote.lock_run_queue().update_clock().as_nanos())
+            })
+            .transpose()?;
+        let snapshot = core.runtime_snapshot(running_now_ns);
+        debug_assert!(snapshot.charged_runtime_ns() >= sched.runtime.charged_runtime_ns);
         Ok(snapshot)
     }
 
@@ -212,13 +222,7 @@ impl TaskSystem {
                 owner_publication,
             );
         } else {
-            let applied = self.apply_owner_policy_generation(
-                &core,
-                generation,
-                task_runtime::scheduler_now().as_nanos(),
-                None,
-                false,
-            )?;
+            let applied = self.apply_policy_generation(&core, generation, None, None, false)?;
             if applied {
                 self.recompute_pi_after_policy_update(thread)?;
             }

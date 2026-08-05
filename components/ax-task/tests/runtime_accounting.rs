@@ -7,7 +7,8 @@ use ax_task::{
     runtime::{AddressSpaceToken, ExecutionContextHandle, StackHandle, TlsHandle},
 };
 
-mod support;
+pub mod support;
+use support::TaskSystemClockTestExt;
 
 static RESOURCE_RELEASE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -30,8 +31,9 @@ fn runtime_snapshot_includes_the_running_residual_before_switch_commit() {
         .unwrap();
     system.bring_cpu_online(cpu.as_mut()).unwrap();
 
-    system.charge_current(cpu.as_mut(), 4, 4, 0).unwrap();
-    let snapshot = system.thread_runtime(running.id(), 7).unwrap();
+    system.charge_current_at(cpu.as_mut(), 4, 4, 0).unwrap();
+    support::set_scheduler_ns(7);
+    let snapshot = system.thread_runtime(running.id()).unwrap();
     assert_eq!(snapshot.charged_runtime_ns(), 7);
     assert!(snapshot.is_running());
 
@@ -41,12 +43,13 @@ fn runtime_snapshot_includes_the_running_residual_before_switch_commit() {
         )))
         .unwrap();
     system.make_ready(fifo.id()).unwrap();
-    system.enqueue(cpu.as_mut(), fifo.id(), 7).unwrap();
+    system.enqueue_at(cpu.as_mut(), fifo.id(), 7).unwrap();
 
-    let decision = system.yield_current(cpu.as_mut(), 10).unwrap();
+    let decision = system.yield_current_at(cpu.as_mut(), 10).unwrap();
     assert_eq!(decision.next(), fifo.id());
     assert_eq!(decision.switch_reason(), SwitchReason::Yield);
-    let snapshot = system.thread_runtime(running.id(), 100).unwrap();
+    support::set_scheduler_ns(100);
+    let snapshot = system.thread_runtime(running.id()).unwrap();
     assert_eq!(snapshot.charged_runtime_ns(), 10);
     assert!(!snapshot.is_running());
     support::clear_handles();
@@ -73,18 +76,18 @@ fn cpu_busy_runtime_counts_non_idle_dispatches_only() {
     system.bring_cpu_online(cpu.as_mut()).unwrap();
 
     assert_eq!(system.cpu_busy_runtime_ns(CpuId::new(0)).unwrap(), 0);
-    system.charge_current_until(cpu.as_mut(), 4, 0).unwrap();
+    system.charge_current_until_at(cpu.as_mut(), 4, 0).unwrap();
     assert_eq!(system.cpu_busy_runtime_ns(CpuId::new(0)).unwrap(), 4);
 
     support::set_monotonic_ns(7);
     assert_eq!(
-        system.exit_current(cpu.as_mut(), 7).unwrap().next(),
+        system.exit_current_at(cpu.as_mut(), 7).unwrap().next(),
         idle.id()
     );
     assert_eq!(system.cpu_busy_runtime_ns(CpuId::new(0)).unwrap(), 7);
     system.complete_context_switch(cpu.as_mut()).unwrap();
 
-    system.charge_current_until(cpu.as_mut(), 20, 0).unwrap();
+    system.charge_current_until_at(cpu.as_mut(), 20, 0).unwrap();
     assert_eq!(
         system.cpu_busy_runtime_ns(CpuId::new(0)).unwrap(),
         7,
@@ -154,12 +157,15 @@ fn current_address_space_replacement_updates_only_the_running_owner_record() {
         })
         .unwrap();
     system.make_ready(next.id()).unwrap();
-    system.enqueue(cpu.as_mut(), next.id(), 0).unwrap();
+    system.enqueue_at(cpu.as_mut(), next.id(), 0).unwrap();
 
-    assert_eq!(system.schedule(cpu.as_mut(), 0).unwrap().next(), next.id());
+    assert_eq!(
+        system.schedule_at(cpu.as_mut(), 0).unwrap().next(),
+        next.id()
+    );
     system.complete_context_switch(cpu.as_mut()).unwrap();
     assert_eq!(
-        system.exit_current(cpu.as_mut(), 0).unwrap().next(),
+        system.exit_current_at(cpu.as_mut(), 0).unwrap().next(),
         bootstrap.id()
     );
     system.complete_context_switch(cpu.as_mut()).unwrap();

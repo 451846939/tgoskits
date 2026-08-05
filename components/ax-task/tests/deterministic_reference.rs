@@ -6,7 +6,8 @@ use ax_task::{
     TaskSystemConfig, ThreadId, ThreadSpec,
 };
 
-mod support;
+pub mod support;
+use support::TaskSystemClockTestExt;
 
 // The ordinary host gate retains the full semantic workload required by the
 // scheduler contract. Miri interprets every operation and is used here for
@@ -63,6 +64,10 @@ fn production_snapshot_matches_reference_for_fixed_event_streams() {
 }
 
 fn compare_scenario(seed: u64, scenario: Scenario) {
+    // Each scenario models a fresh CPU lifecycle. Reset both independent time
+    // domains before the runqueue accepts its first scheduler-clock sample.
+    support::set_scheduler_ns_for_cpu(0, 0);
+    support::set_monotonic_ns(0);
     let system = TaskSystem::new(TaskSystemConfig::new(1)).unwrap();
     let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
     system.bring_cpu_online(cpu.as_mut()).unwrap();
@@ -71,10 +76,10 @@ fn compare_scenario(seed: u64, scenario: Scenario) {
     for _ in 0..4 {
         let thread = system.create_thread(ThreadSpec::new(policy)).unwrap();
         system.make_ready(thread.id()).unwrap();
-        system.enqueue(cpu.as_mut(), thread.id(), 0).unwrap();
+        system.enqueue_at(cpu.as_mut(), thread.id(), 0).unwrap();
         ids.push(thread.id());
     }
-    let initial = system.schedule(cpu.as_mut(), 0).unwrap().next();
+    let initial = system.schedule_at(cpu.as_mut(), 0).unwrap().next();
     let mut reference = ReferenceScheduler::new(scenario, ids);
     assert_eq!(initial, reference.current.id);
     let mut random = XorShift64::new(seed ^ scenario.seed_salt());
@@ -87,7 +92,7 @@ fn compare_scenario(seed: u64, scenario: Scenario) {
                 reference.request_reschedule();
             }
             1 => {
-                let next = system.schedule(cpu.as_mut(), now_ns).unwrap().next();
+                let next = system.schedule_at(cpu.as_mut(), now_ns).unwrap().next();
                 assert_eq!(
                     next,
                     reference.preempt(now_ns),
@@ -97,14 +102,17 @@ fn compare_scenario(seed: u64, scenario: Scenario) {
             }
             2 => {
                 if scenario == Scenario::Deadline {
-                    let next = system.schedule(cpu.as_mut(), now_ns).unwrap().next();
+                    let next = system.schedule_at(cpu.as_mut(), now_ns).unwrap().next();
                     assert_eq!(
                         next,
                         reference.preempt(now_ns),
                         "scenario={scenario:?} seed={seed:#x} event={event_index}"
                     );
                 } else {
-                    let next = system.yield_current(cpu.as_mut(), now_ns).unwrap().next();
+                    let next = system
+                        .yield_current_at(cpu.as_mut(), now_ns)
+                        .unwrap()
+                        .next();
                     assert_eq!(
                         next,
                         reference.yield_current(now_ns),
@@ -113,7 +121,9 @@ fn compare_scenario(seed: u64, scenario: Scenario) {
                 }
             }
             _ => {
-                let charge = system.charge_current(cpu.as_mut(), now_ns, 1, 0).unwrap();
+                let charge = system
+                    .charge_current_at(cpu.as_mut(), now_ns, 1, 0)
+                    .unwrap();
                 assert_eq!(
                     charge.slice_expired(),
                     reference.charge(now_ns, 1),

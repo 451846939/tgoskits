@@ -172,6 +172,7 @@ impl TaskSystem {
 
         let thread = self.create_thread(unpublished.into_spec())?;
         let setup = (|| {
+            let now_ns = cpu.update_rq_clock().as_nanos();
             let state = self.state.lock();
             let record = state.thread_record(thread.id())?;
             let core = Arc::clone(&record.core);
@@ -179,8 +180,7 @@ impl TaskSystem {
                 let mut sched = record.sched.lock();
                 sched.transition(&core, ThreadState::Ready)?;
                 sched.transition(&core, ThreadState::Running)?;
-                let dispatch =
-                    Self::owner_dispatch(&core, &sched, task_runtime::scheduler_now().as_nanos())?;
+                let dispatch = Self::owner_dispatch(&core, &sched, now_ns)?;
                 sched.placement.activate(cpu.owner());
                 sched.placement.set_next_task(cpu.owner());
                 core.set_wake_cpu_hint(cpu.owner());

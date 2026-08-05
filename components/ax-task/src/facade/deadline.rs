@@ -171,21 +171,17 @@ pub fn on_clock_event_with_scheduler_tick(
     let system = runtime_task_system()?;
     let mut irq = RuntimeIrqGuard::enter();
     let mut cpu = runtime_current_cpu_mut(&mut irq)?;
-    let scheduler_now_ns = task_runtime::scheduler_now().as_nanos();
-    let charge = system.charge_current_until(cpu.as_mut(), scheduler_now_ns, 0)?;
+    let (charge, clock) = system.charge_current_until_with_clock(cpu.as_mut(), 0)?;
     if scheduler_tick {
-        system.publish_current_scheduler_tick_work(&cpu, scheduler_now_ns);
+        system.publish_current_scheduler_tick_work(&cpu, clock.as_nanos());
     }
     let batch = cpu.as_mut().expire_task_deadlines(now, budget);
-    let scheduler_due = cpu.as_mut().scheduler_deadline_due(scheduler_now_ns);
+    let scheduler_due = cpu.as_mut().scheduler_work_due(clock, now);
     let pending = batch.pending() || scheduler_due;
     if charge.slice_expired() || charge.deadline_overrun() || batch.expired() != 0 || pending {
         cpu.request_reschedule();
     }
-    let monotonic_now = task_runtime::monotonic_now();
-    let update = cpu
-        .as_mut()
-        .next_task_deadline_update(scheduler_now_ns, monotonic_now)?;
+    let update = cpu.as_mut().next_task_deadline_update(clock, now)?;
     Ok(TaskClockEventOutcome {
         slice_expired: charge.slice_expired(),
         deadline_overrun: charge.deadline_overrun(),
@@ -220,15 +216,14 @@ pub(crate) fn commit_current_park(ticket: &mut crate::ParkTicket) -> Result<(), 
         RuntimeSchedulerEntry::Task,
     )?;
     let system = runtime_task_system()?;
-    let now_ns = task_runtime::scheduler_now().as_nanos();
     let commit = {
         let mut cpu = runtime_current_cpu_mut(&mut scheduler_frame)?;
-        system.commit_park(cpu.as_mut(), ticket, now_ns)?
+        system.commit_park(cpu.as_mut(), ticket)?
     };
     match commit {
         ParkCommit::Notified => Ok(()),
         ParkCommit::Blocked(decision) => {
-            execute_switch_plan(&mut scheduler_frame, decision, now_ns);
+            execute_switch_plan(&mut scheduler_frame, decision);
             Ok(())
         }
     }
@@ -271,12 +266,9 @@ pub(crate) fn arm_current_park_deadline(
             })?;
         let token = registration.token();
         thread.core.register_sleep_timer(owner, token.generation());
-        let scheduler_now_ns = task_runtime::scheduler_now().as_nanos();
+        let clock = cpu.update_rq_clock();
         let monotonic_now = task_runtime::monotonic_now();
-        let update = match cpu
-            .as_mut()
-            .next_task_deadline_update(scheduler_now_ns, monotonic_now)
-        {
+        let update = match cpu.as_mut().next_task_deadline_update(clock, monotonic_now) {
             Ok(update) => update,
             Err(error) => {
                 let removed = cpu.as_mut().task_deadlines().cancel(&registration);
@@ -342,12 +334,9 @@ pub(crate) fn cancel_current_park_deadline(
                 task_runtime::fatal_invariant(0x5444_0006, thread.id().as_u64() as usize);
             }
         };
-        let scheduler_now_ns = task_runtime::scheduler_now().as_nanos();
+        let clock = cpu.update_rq_clock();
         let monotonic_now = task_runtime::monotonic_now();
-        let update = match cpu
-            .as_mut()
-            .next_task_deadline_update(scheduler_now_ns, monotonic_now)
-        {
+        let update = match cpu.as_mut().next_task_deadline_update(clock, monotonic_now) {
             Ok(update) => update,
             Err(error) => {
                 cancellation.rollback(cpu.as_mut().task_deadlines());

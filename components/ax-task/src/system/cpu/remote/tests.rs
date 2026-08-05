@@ -6,7 +6,42 @@ mod scheduler_ipi_tests {
     use crate::{TaskSystem, ThreadSpec, runtime::MonotonicInstant};
 
     #[test]
-    fn overdue_scheduler_deadline_becomes_sticky_work_instead_of_a_resolution_timer() {
+    fn fair_balance_clockevent_uses_monotonic_time_not_runqueue_time() {
+        const BALANCE_INTERVAL_NS: u64 = 1_000;
+
+        let system = TaskSystem::new(
+            TaskSystemConfig::new(1).with_balance_interval_ns(BALANCE_INTERVAL_NS),
+        )
+        .unwrap();
+        let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
+        system
+            .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
+            .unwrap();
+        crate::test_runtime::set_monotonic_ns(0);
+        system.bring_cpu_online(cpu.as_mut()).unwrap();
+        let contender = system
+            .create_thread(ThreadSpec::new(SchedulePolicy::default()))
+            .unwrap();
+        system.make_ready(contender.id()).unwrap();
+        system.enqueue(cpu.as_mut(), contender.id()).unwrap();
+
+        crate::test_runtime::set_scheduler_ns_for_cpu(cpu.owner().as_u32(), 10_000);
+        let clock = cpu.update_rq_clock();
+        let monotonic_now = MonotonicInstant::from_nanos(100).unwrap();
+
+        assert_eq!(
+            cpu.as_mut().next_oneshot_deadline(clock, monotonic_now),
+            MonotonicDeadline::from_nanos(BALANCE_INTERVAL_NS),
+            "an unrelated runqueue-clock epoch must not expire the periodic balance clockevent"
+        );
+        assert!(
+            !cpu.remote().needs_reschedule(),
+            "a future monotonic balance deadline must not publish scheduler work"
+        );
+    }
+
+    #[test]
+    fn overdue_fair_balance_deadline_becomes_sticky_owner_work() {
         let system = TaskSystem::new(TaskSystemConfig::new(1)).unwrap();
         let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
         system
@@ -17,19 +52,20 @@ mod scheduler_ipi_tests {
             .create_thread(ThreadSpec::new(SchedulePolicy::default()))
             .unwrap();
         system.make_ready(contender.id()).unwrap();
-        system.enqueue(cpu.as_mut(), contender.id(), 0).unwrap();
-        let deadline = cpu.remote().fair_balance_deadline_ns();
+        system.enqueue(cpu.as_mut(), contender.id()).unwrap();
+        let deadline = cpu
+            .remote()
+            .fair_balance_deadline()
+            .expect("online fair balancing must own a monotonic deadline");
+        let clock = cpu.update_rq_clock();
 
-        assert_eq!(
-            cpu.as_mut().next_oneshot_deadline(
-                deadline.expect("online fair balancing must own a scheduler deadline"),
-                MonotonicInstant::from_nanos(
-                    deadline.expect("online fair balancing must own a scheduler deadline"),
-                )
-                .unwrap(),
-            ),
-            None,
-            "an overdue scheduler event must not be rearmed at timer resolution"
+        let next = cpu.as_mut().next_oneshot_deadline(
+            clock,
+            MonotonicInstant::from_nanos(deadline.as_nanos()).unwrap(),
+        );
+        assert!(
+            next.is_none_or(|next| next > deadline),
+            "an overdue balance event must not be rearmed at timer resolution: {next:?}"
         );
         assert!(
             cpu.remote().needs_reschedule(),

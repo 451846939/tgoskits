@@ -11,22 +11,26 @@ use ax_task::{
     TaskSystemConfig, ThreadSpec, ThreadState, WakeResult,
 };
 
-mod support;
+pub mod support;
+use support::TaskSystemClockTestExt;
 
 #[test]
 fn higher_priority_fifo_wake_requests_preemption() {
     let (system, mut cpu) = online_system(1, CpuId::new(0));
     let lower = ready_thread(&system, fifo(10));
-    system.enqueue(cpu.as_mut(), lower.id(), 0).unwrap();
-    assert_eq!(system.schedule(cpu.as_mut(), 0).unwrap().next(), lower.id());
+    system.enqueue_at(cpu.as_mut(), lower.id(), 0).unwrap();
+    assert_eq!(
+        system.schedule_at(cpu.as_mut(), 0).unwrap().next(),
+        lower.id()
+    );
 
     let higher = ready_thread(&system, fifo(20));
-    system.enqueue(cpu.as_mut(), higher.id(), 1).unwrap();
+    system.enqueue_at(cpu.as_mut(), higher.id(), 1).unwrap();
 
     assert!(cpu.needs_reschedule());
     assert_eq!(
         system
-            .schedule_if_requested(cpu.as_mut(), 1)
+            .schedule_if_requested_at(cpu.as_mut(), 1)
             .unwrap()
             .decision()
             .unwrap()
@@ -39,19 +43,19 @@ fn higher_priority_fifo_wake_requests_preemption() {
 fn same_priority_fifo_wake_does_not_request_preemption() {
     let (system, mut cpu) = online_system(1, CpuId::new(0));
     let running = ready_thread(&system, fifo(10));
-    system.enqueue(cpu.as_mut(), running.id(), 0).unwrap();
+    system.enqueue_at(cpu.as_mut(), running.id(), 0).unwrap();
     assert_eq!(
-        system.schedule(cpu.as_mut(), 0).unwrap().next(),
+        system.schedule_at(cpu.as_mut(), 0).unwrap().next(),
         running.id()
     );
 
     let peer = ready_thread(&system, fifo(10));
-    system.enqueue(cpu.as_mut(), peer.id(), 1).unwrap();
+    system.enqueue_at(cpu.as_mut(), peer.id(), 1).unwrap();
 
     assert!(!cpu.needs_reschedule());
     assert!(
         system
-            .schedule_if_requested(cpu.as_mut(), 1)
+            .schedule_if_requested_at(cpu.as_mut(), 1)
             .unwrap()
             .decision()
             .is_none()
@@ -63,19 +67,19 @@ fn same_priority_fifo_wake_does_not_request_preemption() {
 fn batch_wake_does_not_request_ordinary_fair_preemption() {
     let (system, mut cpu) = online_system(1, CpuId::new(0));
     let running = ready_thread(&system, SchedulePolicy::fair(Nice::ZERO, FairMode::Normal));
-    system.enqueue(cpu.as_mut(), running.id(), 0).unwrap();
+    system.enqueue_at(cpu.as_mut(), running.id(), 0).unwrap();
     assert_eq!(
-        system.schedule(cpu.as_mut(), 0).unwrap().next(),
+        system.schedule_at(cpu.as_mut(), 0).unwrap().next(),
         running.id()
     );
 
     let batch = ready_thread(&system, SchedulePolicy::fair(Nice::ZERO, FairMode::Batch));
-    system.enqueue(cpu.as_mut(), batch.id(), 1).unwrap();
+    system.enqueue_at(cpu.as_mut(), batch.id(), 1).unwrap();
 
     assert!(!cpu.needs_reschedule());
     assert!(
         system
-            .schedule_if_requested(cpu.as_mut(), 1)
+            .schedule_if_requested_at(cpu.as_mut(), 1)
             .unwrap()
             .decision()
             .is_none()
@@ -87,11 +91,14 @@ fn batch_wake_does_not_request_ordinary_fair_preemption() {
 fn batch_wake_preempts_sched_idle_current() {
     let (system, mut cpu) = online_system(1, CpuId::new(0));
     let idle = ready_thread(&system, SchedulePolicy::fair(Nice::LOWEST, FairMode::Idle));
-    system.enqueue(cpu.as_mut(), idle.id(), 0).unwrap();
-    assert_eq!(system.schedule(cpu.as_mut(), 0).unwrap().next(), idle.id());
+    system.enqueue_at(cpu.as_mut(), idle.id(), 0).unwrap();
+    assert_eq!(
+        system.schedule_at(cpu.as_mut(), 0).unwrap().next(),
+        idle.id()
+    );
 
     let batch = ready_thread(&system, SchedulePolicy::fair(Nice::ZERO, FairMode::Batch));
-    system.enqueue(cpu.as_mut(), batch.id(), 1).unwrap();
+    system.enqueue_at(cpu.as_mut(), batch.id(), 1).unwrap();
 
     assert!(
         cpu.needs_reschedule(),
@@ -99,7 +106,7 @@ fn batch_wake_preempts_sched_idle_current() {
     );
     assert_eq!(
         system
-            .schedule_if_requested(cpu.as_mut(), 1)
+            .schedule_if_requested_at(cpu.as_mut(), 1)
             .unwrap()
             .decision()
             .unwrap()
@@ -113,22 +120,25 @@ fn fifo_preemption_preserves_position_and_yield_moves_to_tail() {
     let (system, mut cpu) = online_system(1, CpuId::new(0));
     let first = ready_thread(&system, fifo(10));
     let second = ready_thread(&system, fifo(10));
-    system.enqueue(cpu.as_mut(), first.id(), 0).unwrap();
-    system.enqueue(cpu.as_mut(), second.id(), 0).unwrap();
-    assert_eq!(system.schedule(cpu.as_mut(), 0).unwrap().next(), first.id());
+    system.enqueue_at(cpu.as_mut(), first.id(), 0).unwrap();
+    system.enqueue_at(cpu.as_mut(), second.id(), 0).unwrap();
+    assert_eq!(
+        system.schedule_at(cpu.as_mut(), 0).unwrap().next(),
+        first.id()
+    );
 
     let higher = ready_thread(&system, fifo(20));
-    system.enqueue(cpu.as_mut(), higher.id(), 1).unwrap();
+    system.enqueue_at(cpu.as_mut(), higher.id(), 1).unwrap();
     assert_eq!(
-        system.schedule(cpu.as_mut(), 1).unwrap().next(),
+        system.schedule_at(cpu.as_mut(), 1).unwrap().next(),
         higher.id()
     );
     assert_eq!(
-        system.block_current(cpu.as_mut(), 1).unwrap().next(),
+        system.block_current_at(cpu.as_mut(), 1).unwrap().next(),
         first.id()
     );
     assert_eq!(
-        system.yield_current(cpu.as_mut(), 2).unwrap().next(),
+        system.yield_current_at(cpu.as_mut(), 2).unwrap().next(),
         second.id()
     );
 }
@@ -139,44 +149,47 @@ fn round_robin_preserves_partial_quantum_then_resets_after_rotation() {
     let rr = SchedulePolicy::round_robin_with_quantum(RtPriority::new(10).unwrap(), 5).unwrap();
     let first = ready_thread(&system, rr);
     let second = ready_thread(&system, rr);
-    system.enqueue(cpu.as_mut(), first.id(), 0).unwrap();
-    system.enqueue(cpu.as_mut(), second.id(), 0).unwrap();
-    assert_eq!(system.schedule(cpu.as_mut(), 0).unwrap().next(), first.id());
+    system.enqueue_at(cpu.as_mut(), first.id(), 0).unwrap();
+    system.enqueue_at(cpu.as_mut(), second.id(), 0).unwrap();
+    assert_eq!(
+        system.schedule_at(cpu.as_mut(), 0).unwrap().next(),
+        first.id()
+    );
     assert!(
         !system
-            .charge_current(cpu.as_mut(), 2, 2, 0)
+            .charge_current_at(cpu.as_mut(), 2, 2, 0)
             .unwrap()
             .slice_expired()
     );
 
     let higher = ready_thread(&system, fifo(20));
-    system.enqueue(cpu.as_mut(), higher.id(), 2).unwrap();
+    system.enqueue_at(cpu.as_mut(), higher.id(), 2).unwrap();
     assert_eq!(
-        system.schedule(cpu.as_mut(), 2).unwrap().next(),
+        system.schedule_at(cpu.as_mut(), 2).unwrap().next(),
         higher.id()
     );
     assert_eq!(
-        system.block_current(cpu.as_mut(), 2).unwrap().next(),
+        system.block_current_at(cpu.as_mut(), 2).unwrap().next(),
         first.id()
     );
     assert!(
         system
-            .charge_current(cpu.as_mut(), 5, 3, 0)
+            .charge_current_at(cpu.as_mut(), 5, 3, 0)
             .unwrap()
             .slice_expired()
     );
     assert_eq!(
-        system.yield_current(cpu.as_mut(), 5).unwrap().next(),
+        system.yield_current_at(cpu.as_mut(), 5).unwrap().next(),
         second.id()
     );
     assert_eq!(
-        system.yield_current(cpu.as_mut(), 6).unwrap().next(),
+        system.yield_current_at(cpu.as_mut(), 6).unwrap().next(),
         first.id()
     );
 
     assert!(
         !system
-            .charge_current(cpu.as_mut(), 7, 1, 0)
+            .charge_current_at(cpu.as_mut(), 7, 1, 0)
             .unwrap()
             .slice_expired()
     );
@@ -189,18 +202,21 @@ fn round_robin_preserves_partial_quantum_across_block_and_wake() {
     let rr = SchedulePolicy::round_robin_with_quantum(RtPriority::new(10).unwrap(), 5).unwrap();
     let first = ready_thread(&system, rr);
     let second = ready_thread(&system, rr);
-    system.enqueue(cpu.as_mut(), first.id(), 0).unwrap();
-    system.enqueue(cpu.as_mut(), second.id(), 0).unwrap();
-    assert_eq!(system.schedule(cpu.as_mut(), 0).unwrap().next(), first.id());
+    system.enqueue_at(cpu.as_mut(), first.id(), 0).unwrap();
+    system.enqueue_at(cpu.as_mut(), second.id(), 0).unwrap();
+    assert_eq!(
+        system.schedule_at(cpu.as_mut(), 0).unwrap().next(),
+        first.id()
+    );
 
     assert!(
         !system
-            .charge_current(cpu.as_mut(), 2, 2, 0)
+            .charge_current_at(cpu.as_mut(), 2, 2, 0)
             .unwrap()
             .slice_expired()
     );
     assert_eq!(
-        system.block_current(cpu.as_mut(), 2).unwrap().next(),
+        system.block_current_at(cpu.as_mut(), 2).unwrap().next(),
         second.id()
     );
     support::install_handles(
@@ -209,13 +225,13 @@ fn round_robin_preserves_partial_quantum_across_block_and_wake() {
     );
     assert_eq!(first.wake_handle().wake(), WakeResult::Notified);
     assert_eq!(
-        system.yield_current(cpu.as_mut(), 2).unwrap().next(),
+        system.yield_current_at(cpu.as_mut(), 2).unwrap().next(),
         first.id()
     );
 
     assert!(
         system
-            .charge_current(cpu.as_mut(), 5, 3, 0)
+            .charge_current_at(cpu.as_mut(), 5, 3, 0)
             .unwrap()
             .slice_expired(),
         "Linux SCHED_RR preserves a partially consumed quantum across blocking"
@@ -261,10 +277,10 @@ fn affinity_rejects_enqueue_on_a_disallowed_cpu() {
     system.make_ready(thread.id()).unwrap();
 
     assert_eq!(
-        system.enqueue(cpu0.as_mut(), thread.id(), 0),
+        system.enqueue_at(cpu0.as_mut(), thread.id(), 0),
         Err(TaskError::InvalidCpu(0))
     );
-    system.enqueue(cpu1.as_mut(), thread.id(), 0).unwrap();
+    system.enqueue_at(cpu1.as_mut(), thread.id(), 0).unwrap();
 }
 
 #[test]
@@ -283,17 +299,17 @@ fn repeated_smp_wake_distributes_rt_threads_without_duplicate_entries() {
     system.bring_cpu_online(cpu1.as_mut()).unwrap();
     let first = ready_thread(&system, fifo(10));
     let second = ready_thread(&system, fifo(10));
-    system.enqueue(cpu1.as_mut(), first.id(), 0).unwrap();
-    system.enqueue(cpu1.as_mut(), second.id(), 0).unwrap();
+    system.enqueue_at(cpu1.as_mut(), first.id(), 0).unwrap();
+    system.enqueue_at(cpu1.as_mut(), second.id(), 0).unwrap();
     assert_eq!(
-        system.schedule(cpu1.as_mut(), 0).unwrap().next(),
+        system.schedule_at(cpu1.as_mut(), 0).unwrap().next(),
         first.id()
     );
     assert_eq!(
-        system.block_current(cpu1.as_mut(), 0).unwrap().next(),
+        system.block_current_at(cpu1.as_mut(), 0).unwrap().next(),
         second.id()
     );
-    system.block_current(cpu1.as_mut(), 0).unwrap();
+    system.block_current_at(cpu1.as_mut(), 0).unwrap();
     assert_eq!(first.state(), ThreadState::Blocked);
     assert_eq!(second.state(), ThreadState::Blocked);
     support::install_handles(

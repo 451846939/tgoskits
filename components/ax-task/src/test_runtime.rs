@@ -9,6 +9,7 @@ use crate::runtime::{TaskRuntime, *};
 
 static NEXT_TOKEN: AtomicUsize = AtomicUsize::new(1);
 static INSTALLED_ADDRESS_SPACE: AtomicUsize = AtomicUsize::new(usize::MAX);
+const MAX_TEST_CPUS: usize = 64;
 
 std::thread_local! {
     static ACTIVE_IRQ_TOKENS: RefCell<std::vec::Vec<usize>> = const { RefCell::new(std::vec::Vec::new()) };
@@ -46,7 +47,9 @@ std::thread_local! {
     static IRQ_EXIT_SCHEDULE_ACTIVE: Cell<bool> = const { Cell::new(false) };
     static LOCAL_SCHEDULER_WORK_PUBLICATIONS: Cell<usize> = const { Cell::new(0) };
     static MONOTONIC_NS: Cell<u64> = const { Cell::new(0) };
-    static SCHEDULER_NS: Cell<u64> = const { Cell::new(0) };
+    static SCHEDULER_NS: RefCell<[u64; MAX_TEST_CPUS]> = const {
+        RefCell::new([0; MAX_TEST_CPUS])
+    };
     static MONOTONIC_READS: Cell<usize> = const { Cell::new(0) };
     static SCHEDULER_READS: Cell<usize> = const { Cell::new(0) };
     static LAST_TASK_DEADLINE_UPDATE: Cell<Option<TaskDeadlineUpdate>> = const { Cell::new(None) };
@@ -352,10 +355,17 @@ impl TaskRuntime for UnitTestRuntime {
         crate::runtime::MonotonicInstant::from_nanos(MONOTONIC_NS.with(Cell::get))
             .expect("test monotonic clock must remain in the ktime domain")
     }
-    fn scheduler_now() -> crate::SchedulerTimestamp {
+    fn scheduler_clock_source(cpu: RuntimeCpuId) -> crate::SchedulerTimestamp {
         run_hook_reentry_query();
         SCHEDULER_READS.with(|reads| reads.set(reads.get() + 1));
-        crate::SchedulerTimestamp::from_nanos(SCHEDULER_NS.with(Cell::get))
+        let now_ns = SCHEDULER_NS.with(|clocks| {
+            clocks
+                .borrow()
+                .get(cpu.as_u32() as usize)
+                .copied()
+                .expect("test scheduler CPU must fit the fake clock table")
+        });
+        crate::SchedulerTimestamp::from_nanos(now_ns)
     }
     fn publish_task_deadline(update: TaskDeadlineUpdate) {
         run_hook_reentry_query();
@@ -722,7 +732,7 @@ pub(crate) fn clear_task_handles() {
     install_task_handles(0, 0);
     reset_cpu_handle_reads();
     MONOTONIC_NS.with(|now| now.set(0));
-    SCHEDULER_NS.with(|now| now.set(0));
+    SCHEDULER_NS.with(|clocks| clocks.borrow_mut().fill(0));
     MONOTONIC_READS.with(|reads| reads.set(0));
     SCHEDULER_READS.with(|reads| reads.set(0));
     LAST_TASK_DEADLINE_UPDATE.with(|observed| observed.set(None));
@@ -735,7 +745,16 @@ pub(crate) fn set_monotonic_ns(now_ns: u64) {
 }
 
 pub(crate) fn set_scheduler_ns(now_ns: u64) {
-    SCHEDULER_NS.with(|now| now.set(now_ns));
+    set_scheduler_ns_for_cpu(0, now_ns);
+}
+
+pub(crate) fn set_scheduler_ns_for_cpu(cpu: u32, now_ns: u64) {
+    SCHEDULER_NS.with(|clocks| {
+        *clocks
+            .borrow_mut()
+            .get_mut(cpu as usize)
+            .expect("test scheduler CPU must fit the fake clock table") = now_ns;
+    });
 }
 
 pub(crate) fn reset_monotonic_reads() {

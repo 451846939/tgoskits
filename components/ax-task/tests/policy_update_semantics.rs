@@ -3,15 +3,16 @@ use ax_task::{
     TaskSystem, TaskSystemConfig, ThreadSpec,
 };
 
-mod support;
+pub mod support;
+use support::TaskSystemClockTestExt;
 
 #[test]
 fn queued_policy_update_is_applied_by_the_runqueue_owner() {
     let (system, mut cpu) = online_system(1);
     let fair = ready_thread(&system, SchedulePolicy::default());
     let promoted = ready_thread(&system, SchedulePolicy::default());
-    system.enqueue(cpu.as_mut(), fair.id(), 0).unwrap();
-    system.enqueue(cpu.as_mut(), promoted.id(), 0).unwrap();
+    system.enqueue_at(cpu.as_mut(), fair.id(), 0).unwrap();
+    system.enqueue_at(cpu.as_mut(), promoted.id(), 0).unwrap();
 
     let fifo = SchedulePolicy::fifo(RtPriority::new(80).unwrap());
     system.set_thread_policy(promoted.id(), fifo).unwrap();
@@ -20,14 +21,14 @@ fn queued_policy_update_is_applied_by_the_runqueue_owner() {
 
     assert_eq!(
         system
-            .drain_policy_updates(cpu.as_mut(), 1)
+            .drain_policy_updates_at(cpu.as_mut(), 1)
             .unwrap()
             .drained(),
         1
     );
     assert_eq!(promoted.effective_policy(), fifo);
     assert_eq!(
-        system.schedule(cpu.as_mut(), 1).unwrap().next(),
+        system.schedule_at(cpu.as_mut(), 1).unwrap().next(),
         promoted.id()
     );
 }
@@ -36,22 +37,22 @@ fn queued_policy_update_is_applied_by_the_runqueue_owner() {
 fn running_policy_update_survives_old_dispatch_commit() {
     let (system, mut cpu) = online_system(1);
     let running = ready_thread(&system, SchedulePolicy::default());
-    system.enqueue(cpu.as_mut(), running.id(), 0).unwrap();
+    system.enqueue_at(cpu.as_mut(), running.id(), 0).unwrap();
     assert_eq!(
-        system.schedule(cpu.as_mut(), 0).unwrap().next(),
+        system.schedule_at(cpu.as_mut(), 0).unwrap().next(),
         running.id()
     );
-    system.charge_current(cpu.as_mut(), 7, 7, 0).unwrap();
+    system.charge_current_at(cpu.as_mut(), 7, 7, 0).unwrap();
 
     let fifo = SchedulePolicy::fifo(RtPriority::new(80).unwrap());
     system.set_thread_policy(running.id(), fifo).unwrap();
-    system.drain_policy_updates(cpu.as_mut(), 7).unwrap();
+    system.drain_policy_updates_at(cpu.as_mut(), 7).unwrap();
     assert_eq!(running.effective_policy(), fifo);
 
     let lower = ready_thread(&system, SchedulePolicy::fifo(RtPriority::new(70).unwrap()));
-    system.enqueue(cpu.as_mut(), lower.id(), 7).unwrap();
+    system.enqueue_at(cpu.as_mut(), lower.id(), 7).unwrap();
     assert_eq!(
-        system.yield_current(cpu.as_mut(), 8).unwrap().next(),
+        system.yield_current_at(cpu.as_mut(), 8).unwrap().next(),
         running.id()
     );
 }
@@ -72,9 +73,9 @@ fn remote_running_policy_update_is_delivered_to_its_owner_cpu() {
     support::set_online_cpu_count(2);
 
     let running = ready_thread(&system, SchedulePolicy::default());
-    system.enqueue(cpu1.as_mut(), running.id(), 0).unwrap();
+    system.enqueue_at(cpu1.as_mut(), running.id(), 0).unwrap();
     assert_eq!(
-        system.schedule(cpu1.as_mut(), 0).unwrap().next(),
+        system.schedule_at(cpu1.as_mut(), 0).unwrap().next(),
         running.id()
     );
 
@@ -84,7 +85,7 @@ fn remote_running_policy_update_is_delivered_to_its_owner_cpu() {
     assert_eq!(support::ipi_count(1), 1);
     assert_eq!(
         system
-            .drain_policy_updates(cpu1.as_mut(), 1)
+            .drain_policy_updates_at(cpu1.as_mut(), 1)
             .unwrap()
             .drained(),
         1
@@ -97,14 +98,14 @@ fn remote_running_policy_update_is_delivered_to_its_owner_cpu() {
 fn owner_applies_deadline_to_fair_and_fair_to_deadline_transitions() {
     let (system, mut cpu) = online_system(1);
     let thread = ready_thread(&system, SchedulePolicy::default());
-    system.enqueue(cpu.as_mut(), thread.id(), 0).unwrap();
+    system.enqueue_at(cpu.as_mut(), thread.id(), 0).unwrap();
 
     let deadline =
         SchedulePolicy::deadline(DeadlinePolicy::new(2, 5, 10, DeadlineFlags::NONE).unwrap());
     system.set_thread_policy(thread.id(), deadline).unwrap();
-    system.drain_policy_updates(cpu.as_mut(), 3).unwrap();
+    system.drain_policy_updates_at(cpu.as_mut(), 3).unwrap();
     assert_eq!(
-        system.schedule(cpu.as_mut(), 3).unwrap().next(),
+        system.schedule_at(cpu.as_mut(), 3).unwrap().next(),
         thread.id()
     );
     assert_eq!(thread.effective_policy(), deadline);
@@ -118,7 +119,7 @@ fn owner_applies_deadline_to_fair_and_fair_to_deadline_transitions() {
 
     let fair = SchedulePolicy::fair(Nice::new(5).unwrap(), FairMode::Normal);
     system.set_thread_policy(thread.id(), fair).unwrap();
-    system.drain_policy_updates(cpu.as_mut(), 4).unwrap();
+    system.drain_policy_updates_at(cpu.as_mut(), 4).unwrap();
     assert_eq!(thread.effective_policy(), fair);
     assert_eq!(
         system.deadline_runtime(thread.id()),
@@ -130,7 +131,7 @@ fn owner_applies_deadline_to_fair_and_fair_to_deadline_transitions() {
 fn coalesced_stale_message_applies_only_the_latest_policy_generation() {
     let (system, mut cpu) = online_system(1);
     let thread = ready_thread(&system, SchedulePolicy::default());
-    system.enqueue(cpu.as_mut(), thread.id(), 0).unwrap();
+    system.enqueue_at(cpu.as_mut(), thread.id(), 0).unwrap();
 
     let stale = SchedulePolicy::fifo(RtPriority::new(90).unwrap());
     let latest = SchedulePolicy::fair(Nice::new(10).unwrap(), FairMode::Batch);
@@ -141,7 +142,7 @@ fn coalesced_stale_message_applies_only_the_latest_policy_generation() {
 
     assert_eq!(
         system
-            .drain_policy_updates(cpu.as_mut(), 1)
+            .drain_policy_updates_at(cpu.as_mut(), 1)
             .unwrap()
             .drained(),
         1
@@ -154,7 +155,7 @@ fn exited_thread_waits_for_in_flight_policy_delivery() {
     let (system, mut cpu) = online_system(1);
     let thread = ready_thread(&system, SchedulePolicy::default());
     let thread_id = thread.id();
-    system.enqueue(cpu.as_mut(), thread_id, 0).unwrap();
+    system.enqueue_at(cpu.as_mut(), thread_id, 0).unwrap();
 
     system
         .set_thread_policy(
@@ -174,7 +175,7 @@ fn exited_thread_waits_for_in_flight_policy_delivery() {
         0,
         "an inbox-held policy delivery must pin registry-owned resources"
     );
-    system.drain_policy_updates(cpu.as_mut(), 1).unwrap();
+    system.drain_policy_updates_at(cpu.as_mut(), 1).unwrap();
     assert_eq!(
         system
             .service_deferred_task_work(ax_task::DEFAULT_BATCH_LIMIT)
@@ -213,7 +214,7 @@ fn exited_thread_rejects_policy_and_affinity_mutation() {
 fn pending_deadline_to_fair_update_keeps_active_admission_reserved() {
     let (system, mut cpu) = online_system(1);
     let active = ready_thread(&system, deadline(90, 100));
-    system.enqueue(cpu.as_mut(), active.id(), 0).unwrap();
+    system.enqueue_at(cpu.as_mut(), active.id(), 0).unwrap();
 
     system
         .set_thread_policy(active.id(), SchedulePolicy::default())
@@ -223,7 +224,7 @@ fn pending_deadline_to_fair_update_keeps_active_admission_reserved() {
         Err(TaskError::DeadlineAdmission)
     ));
 
-    system.drain_policy_updates(cpu.as_mut(), 1).unwrap();
+    system.drain_policy_updates_at(cpu.as_mut(), 1).unwrap();
     system
         .create_thread(ThreadSpec::new(deadline(10, 100)))
         .unwrap();
@@ -233,7 +234,7 @@ fn pending_deadline_to_fair_update_keeps_active_admission_reserved() {
 fn pending_deadline_reduction_releases_admission_only_after_owner_apply() {
     let (system, mut cpu) = online_system(1);
     let active = ready_thread(&system, deadline(90, 100));
-    system.enqueue(cpu.as_mut(), active.id(), 0).unwrap();
+    system.enqueue_at(cpu.as_mut(), active.id(), 0).unwrap();
 
     system
         .set_thread_policy(active.id(), deadline(50, 100))
@@ -243,7 +244,7 @@ fn pending_deadline_reduction_releases_admission_only_after_owner_apply() {
         Err(TaskError::DeadlineAdmission)
     ));
 
-    system.drain_policy_updates(cpu.as_mut(), 1).unwrap();
+    system.drain_policy_updates_at(cpu.as_mut(), 1).unwrap();
     system
         .create_thread(ThreadSpec::new(deadline(45, 100)))
         .unwrap();
@@ -253,7 +254,7 @@ fn pending_deadline_reduction_releases_admission_only_after_owner_apply() {
 fn pending_fair_to_deadline_update_reserves_before_owner_apply() {
     let (system, mut cpu) = online_system(1);
     let active = ready_thread(&system, SchedulePolicy::default());
-    system.enqueue(cpu.as_mut(), active.id(), 0).unwrap();
+    system.enqueue_at(cpu.as_mut(), active.id(), 0).unwrap();
 
     system
         .set_thread_policy(active.id(), deadline(90, 100))
@@ -269,7 +270,7 @@ fn pending_fair_to_deadline_update_reserves_before_owner_apply() {
     // test does not strand the publication outside TaskSystem's registry.
     assert_eq!(
         system
-            .drain_policy_updates(cpu.as_mut(), 1)
+            .drain_policy_updates_at(cpu.as_mut(), 1)
             .unwrap()
             .drained(),
         1

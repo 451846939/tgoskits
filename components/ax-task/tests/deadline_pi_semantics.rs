@@ -4,7 +4,8 @@ use ax_task::{
     ThreadId, ThreadSpec,
 };
 
-mod support;
+pub mod support;
+use support::TaskSystemClockTestExt;
 
 #[test]
 fn pi_orders_equal_relative_deadlines_by_the_active_absolute_job_deadline() {
@@ -18,16 +19,19 @@ fn pi_orders_equal_relative_deadlines_by_the_active_absolute_job_deadline() {
     let early = ready_thread(&system, deadline(1, 10, 100));
     let lock = PiMutexCore::new();
 
-    system.enqueue(cpu.as_mut(), early.id(), 0).unwrap();
-    assert_eq!(system.schedule(cpu.as_mut(), 0).unwrap().next(), early.id());
-    system.block_current(cpu.as_mut(), 0).unwrap();
-
-    system.enqueue(cpu.as_mut(), late.id(), 100).unwrap();
+    system.enqueue_at(cpu.as_mut(), early.id(), 0).unwrap();
     assert_eq!(
-        system.schedule(cpu.as_mut(), 100).unwrap().next(),
+        system.schedule_at(cpu.as_mut(), 0).unwrap().next(),
+        early.id()
+    );
+    system.block_current_at(cpu.as_mut(), 0).unwrap();
+
+    system.enqueue_at(cpu.as_mut(), late.id(), 100).unwrap();
+    assert_eq!(
+        system.schedule_at(cpu.as_mut(), 100).unwrap().next(),
         late.id()
     );
-    system.block_current(cpu.as_mut(), 100).unwrap();
+    system.block_current_at(cpu.as_mut(), 100).unwrap();
 
     assert!(early.effective_scheduling_key() < late.effective_scheduling_key());
     let late_wait = support::commit_pi_wait(&system, &lock, late.id(), owner.id()).unwrap();
@@ -54,13 +58,13 @@ fn pi_orders_equal_relative_deadlines_by_the_active_absolute_job_deadline() {
 fn exhausted_deadline_with_only_an_uncontended_lock_is_throttled() {
     let (system, mut cpu) = online_system();
     let deadline = ready_thread(&system, deadline(2, 10, 100));
-    system.enqueue(cpu.as_mut(), deadline.id(), 0).unwrap();
+    system.enqueue_at(cpu.as_mut(), deadline.id(), 0).unwrap();
     assert_eq!(
-        system.schedule(cpu.as_mut(), 0).unwrap().next(),
+        system.schedule_at(cpu.as_mut(), 0).unwrap().next(),
         deadline.id()
     );
 
-    let charged = system.charge_current(cpu.as_mut(), 2, 2, 0).unwrap();
+    let charged = system.charge_current_at(cpu.as_mut(), 2, 2, 0).unwrap();
     assert!(charged.slice_expired());
     assert!(
         !system
@@ -89,15 +93,18 @@ fn exhausted_deadline_donation_rescues_every_contended_owner_in_the_chain() {
     let first_lock = PiMutexCore::new();
     let second_lock = PiMutexCore::new();
 
-    system.enqueue(cpu.as_mut(), donor.id(), 0).unwrap();
-    assert_eq!(system.schedule(cpu.as_mut(), 0).unwrap().next(), donor.id());
+    system.enqueue_at(cpu.as_mut(), donor.id(), 0).unwrap();
+    assert_eq!(
+        system.schedule_at(cpu.as_mut(), 0).unwrap().next(),
+        donor.id()
+    );
     assert!(
         system
-            .charge_current(cpu.as_mut(), 1, 1, 0)
+            .charge_current_at(cpu.as_mut(), 1, 1, 0)
             .unwrap()
             .slice_expired()
     );
-    system.schedule(cpu.as_mut(), 1).unwrap();
+    system.schedule_at(cpu.as_mut(), 1).unwrap();
     assert_eq!(
         system
             .deadline_runtime(donor.id())
@@ -128,20 +135,26 @@ fn queued_owner_receives_an_exhausted_donor_as_runnable_rescue_work() {
     let donor = ready_thread(&system, deadline(1, 10, 100));
     let lock = PiMutexCore::new();
 
-    system.enqueue(cpu.as_mut(), donor.id(), 0).unwrap();
-    assert_eq!(system.schedule(cpu.as_mut(), 0).unwrap().next(), donor.id());
+    system.enqueue_at(cpu.as_mut(), donor.id(), 0).unwrap();
+    assert_eq!(
+        system.schedule_at(cpu.as_mut(), 0).unwrap().next(),
+        donor.id()
+    );
     assert!(
         system
-            .charge_current(cpu.as_mut(), 1, 1, 0)
+            .charge_current_at(cpu.as_mut(), 1, 1, 0)
             .unwrap()
             .slice_expired()
     );
-    system.schedule(cpu.as_mut(), 1).unwrap();
+    system.schedule_at(cpu.as_mut(), 1).unwrap();
 
-    system.enqueue(cpu.as_mut(), owner.id(), 1).unwrap();
+    system.enqueue_at(cpu.as_mut(), owner.id(), 1).unwrap();
     let wait = support::commit_pi_wait(&system, &lock, donor.id(), owner.id()).unwrap();
-    system.drain_policy_updates(cpu.as_mut(), 1).unwrap();
-    assert_eq!(system.schedule(cpu.as_mut(), 1).unwrap().next(), owner.id());
+    system.drain_policy_updates_at(cpu.as_mut(), 1).unwrap();
+    assert_eq!(
+        system.schedule_at(cpu.as_mut(), 1).unwrap().next(),
+        owner.id()
+    );
     assert!(
         system
             .deadline_runtime(owner.id())
@@ -156,11 +169,11 @@ fn uncontended_rt_lock_owner_does_not_bypass_exhausted_rt_bandwidth() {
     let (system, mut cpu) = online_system();
     let rt = ready_thread(&system, SchedulePolicy::fifo(RtPriority::new(80).unwrap()));
     let fair = ready_thread(&system, SchedulePolicy::default());
-    system.enqueue(cpu.as_mut(), rt.id(), 0).unwrap();
-    system.enqueue(cpu.as_mut(), fair.id(), 0).unwrap();
-    assert_eq!(system.schedule(cpu.as_mut(), 0).unwrap().next(), rt.id());
+    system.enqueue_at(cpu.as_mut(), rt.id(), 0).unwrap();
+    system.enqueue_at(cpu.as_mut(), fair.id(), 0).unwrap();
+    assert_eq!(system.schedule_at(cpu.as_mut(), 0).unwrap().next(), rt.id());
     system
-        .charge_current(cpu.as_mut(), 950_000_000, 950_000_000, 0)
+        .charge_current_at(cpu.as_mut(), 950_000_000, 950_000_000, 0)
         .unwrap();
     assert!(
         cpu.needs_reschedule(),
@@ -168,7 +181,10 @@ fn uncontended_rt_lock_owner_does_not_bypass_exhausted_rt_bandwidth() {
     );
 
     assert_eq!(
-        system.schedule(cpu.as_mut(), 950_000_000).unwrap().next(),
+        system
+            .schedule_at(cpu.as_mut(), 950_000_000)
+            .unwrap()
+            .next(),
         fair.id()
     );
 }
@@ -183,26 +199,29 @@ fn withdrawing_an_rt_boost_preserves_the_owners_base_rr_quantum() {
             RtPriority::new(80).unwrap(),
         )))
         .unwrap();
-    system.enqueue(cpu.as_mut(), owner.id(), 0).unwrap();
+    system.enqueue_at(cpu.as_mut(), owner.id(), 0).unwrap();
     let lock = PiMutexCore::new();
     let wait = support::commit_pi_wait(&system, &lock, donor.id(), owner.id()).unwrap();
-    system.drain_policy_updates(cpu.as_mut(), 0).unwrap();
-    assert_eq!(system.schedule(cpu.as_mut(), 0).unwrap().next(), owner.id());
+    system.drain_policy_updates_at(cpu.as_mut(), 0).unwrap();
+    assert_eq!(
+        system.schedule_at(cpu.as_mut(), 0).unwrap().next(),
+        owner.id()
+    );
 
     assert!(
         !system
-            .charge_current(cpu.as_mut(), 3, 3, 0)
+            .charge_current_at(cpu.as_mut(), 3, 3, 0)
             .unwrap()
             .slice_expired()
     );
-    system.schedule(cpu.as_mut(), 3).unwrap();
+    system.schedule_at(cpu.as_mut(), 3).unwrap();
     system.pi_wait_cancel(wait).unwrap();
-    system.drain_policy_updates(cpu.as_mut(), 3).unwrap();
-    system.schedule(cpu.as_mut(), 3).unwrap();
+    system.drain_policy_updates_at(cpu.as_mut(), 3).unwrap();
+    system.schedule_at(cpu.as_mut(), 3).unwrap();
 
     assert!(
         system
-            .charge_current(cpu.as_mut(), 13, 10, 0)
+            .charge_current_at(cpu.as_mut(), 13, 10, 0)
             .unwrap()
             .slice_expired(),
         "effective FIFO accounting must never replace the base RR entity"

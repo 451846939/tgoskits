@@ -14,6 +14,7 @@ pub struct ScheduleDecision {
     pub(super) previous_endpoint: Option<SwitchEndpoint>,
     pub(super) next_endpoint: SwitchEndpoint,
     pub(super) switch_reason: SwitchReason,
+    pub(super) timestamp_ns: u64,
 }
 
 /// Callback work that becomes valid only after the incoming thread is current.
@@ -106,6 +107,11 @@ impl ScheduleDecision {
     /// Returns why the previous thread relinquished the CPU.
     pub const fn switch_reason(self) -> SwitchReason {
         self.switch_reason
+    }
+
+    /// Returns the runqueue timestamp that committed this decision.
+    pub const fn timestamp_ns(self) -> u64 {
+        self.timestamp_ns
     }
 
     /// Returns whether the architecture execution context must change.

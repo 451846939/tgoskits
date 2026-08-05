@@ -91,21 +91,7 @@ impl TaskSystem {
     }
 
     /// Completes CPU registration and publishes it in the online root domain.
-    pub fn bring_cpu_online(&self, cpu: Pin<&mut CpuLocal>) -> Result<(), TaskError> {
-        self.bring_cpu_online_at(cpu, task_runtime::scheduler_now().as_nanos())
-    }
-
-    /// Completes CPU registration at `now_ns` and publishes it online.
-    ///
-    /// The explicit runqueue-clock sample keeps deterministic scheduler models
-    /// and OS runtimes on the same wrapping scheduler time base. In particular, the
-    /// first fair-balance deadline is one interval after online publication,
-    /// rather than one interval after an unrelated zero epoch.
-    pub fn bring_cpu_online_at(
-        &self,
-        mut cpu: Pin<&mut CpuLocal>,
-        now_ns: u64,
-    ) -> Result<(), TaskError> {
+    pub fn bring_cpu_online(&self, mut cpu: Pin<&mut CpuLocal>) -> Result<(), TaskError> {
         let _irq = IrqScope::enter();
         self.ensure_owner_cpu_context(&cpu)?;
         let id = cpu.owner();
@@ -137,8 +123,10 @@ impl TaskSystem {
         ensure_runtime_success(task_runtime::prepare_cpu_online(RuntimeCpuId::new(
             id.as_u32(),
         )))?;
+        let _clock = cpu.update_rq_clock();
+        let monotonic_now = task_runtime::monotonic_now();
         cpu.as_mut()
-            .reset_fair_balance(now_ns, self.config.balance_interval_ns());
+            .reset_fair_balance(monotonic_now, self.config.balance_interval_ns());
         let online_count = state
             .online_cpu_count()
             .checked_add(1)
@@ -388,14 +376,11 @@ mod tests {
             .create_thread(ThreadSpec::new(SchedulePolicy::default()))
             .unwrap();
         system.make_ready(sleeper.id()).unwrap();
-        system.enqueue(cpu1.as_mut(), sleeper.id(), 0).unwrap();
-        assert_eq!(
-            system.schedule(cpu1.as_mut(), 0).unwrap().next(),
-            sleeper.id()
-        );
+        system.enqueue(cpu1.as_mut(), sleeper.id()).unwrap();
+        assert_eq!(system.schedule(cpu1.as_mut()).unwrap().next(), sleeper.id());
         system.complete_context_switch(cpu1.as_mut()).unwrap();
         assert_ne!(
-            system.block_current(cpu1.as_mut(), 0).unwrap().next(),
+            system.block_current(cpu1.as_mut()).unwrap().next(),
             sleeper.id()
         );
         system.complete_context_switch(cpu1.as_mut()).unwrap();

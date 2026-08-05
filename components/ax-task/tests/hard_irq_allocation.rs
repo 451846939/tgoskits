@@ -18,7 +18,8 @@ use ax_task::{
     },
 };
 
-mod support;
+pub mod support;
+use support::TaskSystemClockTestExt;
 
 #[global_allocator]
 static ALLOCATOR: AuditAllocator = AuditAllocator;
@@ -99,18 +100,18 @@ fn hard_irq_contract_is_zero_alloc_zero_free_and_zero_poll() {
         .make_ready(thread.id())
         .expect("thread must be ready");
     system
-        .enqueue(cpu.as_mut(), thread.id(), 0)
+        .enqueue_at(cpu.as_mut(), thread.id(), 0)
         .expect("thread must be queued");
     assert_eq!(
         system
-            .schedule(cpu.as_mut(), 0)
+            .schedule_at(cpu.as_mut(), 0)
             .expect("thread must be selected")
             .next(),
         thread.id()
     );
     assert_eq!(
         system
-            .block_current(cpu.as_mut(), 0)
+            .block_current_at(cpu.as_mut(), 0)
             .expect("thread must block back to the executor")
             .next(),
         executor_thread.id()

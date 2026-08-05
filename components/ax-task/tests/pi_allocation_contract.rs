@@ -6,7 +6,7 @@ use std::{
 
 use ax_task::{CpuLocal, PiMutexCore, SchedulePolicy, TaskSystem, TaskSystemConfig, ThreadSpec};
 
-mod support;
+pub mod support;
 
 struct CountingAllocator;
 

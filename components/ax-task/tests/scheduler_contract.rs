@@ -3,7 +3,8 @@ use ax_task::{
     TaskSystem, TaskSystemConfig, ThreadSpec, ThreadState,
 };
 
-mod support;
+pub mod support;
+use support::TaskSystemClockTestExt;
 
 #[test]
 fn rejects_invalid_policy_parameters() {
@@ -50,12 +51,12 @@ fn scheduler_obeys_class_precedence() {
         &system,
         SchedulePolicy::deadline(DeadlinePolicy::new(1, 2, 3, DeadlineFlags::NONE).unwrap()),
     );
-    system.enqueue(cpu.as_mut(), fair.id(), 0).unwrap();
-    system.enqueue(cpu.as_mut(), fifo.id(), 0).unwrap();
-    system.enqueue(cpu.as_mut(), deadline.id(), 0).unwrap();
+    system.enqueue_at(cpu.as_mut(), fair.id(), 0).unwrap();
+    system.enqueue_at(cpu.as_mut(), fifo.id(), 0).unwrap();
+    system.enqueue_at(cpu.as_mut(), deadline.id(), 0).unwrap();
 
     assert_eq!(
-        system.schedule(cpu.as_mut(), 0).unwrap().next(),
+        system.schedule_at(cpu.as_mut(), 0).unwrap().next(),
         deadline.id()
     );
 }

@@ -27,6 +27,7 @@ pub(super) struct RemoteLoadState {
     pushable_primary: AtomicU64,
     pushable_sequence: AtomicU64,
     fair_balance_armed: AtomicBool,
+    fair_balance_pending: AtomicBool,
     fair_balance_deadline_ns: AtomicU64,
 }
 
@@ -45,6 +46,7 @@ impl RemoteLoadState {
             pushable_primary: AtomicU64::new(0),
             pushable_sequence: AtomicU64::new(0),
             fair_balance_armed: AtomicBool::new(false),
+            fair_balance_pending: AtomicBool::new(false),
             fair_balance_deadline_ns: AtomicU64::new(0),
         }
     }
@@ -232,33 +234,63 @@ impl CpuRemote {
         }
     }
 
-    pub(crate) fn fair_balance_due(&self, now_ns: u64) -> bool {
-        self.load.fair_balance_armed.load(Ordering::Acquire)
-            && crate::scheduler_time_reached(
-                now_ns,
-                self.load.fair_balance_deadline_ns.load(Ordering::Relaxed),
-            )
+    /// Promotes one elapsed monotonic balance deadline into sticky owner work.
+    ///
+    /// The owner CPU serializes this transition with its IRQ/scheduler guard.
+    /// Remote CPUs only observe [`Self::fair_balance_pending`]; they never
+    /// compare their runqueue clock against this CPU's cadence.
+    pub(crate) fn publish_fair_balance_due(&self, now: MonotonicInstant) -> bool {
+        if !self.load.fair_balance_armed.load(Ordering::Acquire) {
+            return self.fair_balance_pending();
+        }
+        let deadline = MonotonicDeadline::from_nanos(
+            self.load.fair_balance_deadline_ns.load(Ordering::Relaxed),
+        )
+        .expect("an armed balance deadline must remain in the ktime domain");
+        if !now.reached(deadline) {
+            return false;
+        }
+        self.load.fair_balance_armed.store(false, Ordering::Release);
+        self.load
+            .fair_balance_pending
+            .store(true, Ordering::Release);
+        self.request_scheduler_work();
+        true
     }
 
-    pub(crate) fn defer_fair_balance(&self, now_ns: u64, interval_ns: u64) {
-        let interval_ns = interval_ns.max(1);
-        assert!(interval_ns < crate::SCHEDULER_TIME_HALF_RANGE);
-        self.load.fair_balance_deadline_ns.store(
-            crate::scheduler_time_advance(now_ns, interval_ns),
-            Ordering::Relaxed,
-        );
+    pub(crate) fn defer_fair_balance(&self, now: MonotonicInstant, interval_ns: u64) {
+        let deadline = now.deadline_after(core::time::Duration::from_nanos(interval_ns.max(1)));
+        self.load.fair_balance_armed.store(false, Ordering::Relaxed);
+        self.load
+            .fair_balance_pending
+            .store(false, Ordering::Relaxed);
+        self.load
+            .fair_balance_deadline_ns
+            .store(deadline.as_nanos(), Ordering::Relaxed);
         self.load.fair_balance_armed.store(true, Ordering::Release);
     }
 
-    pub(in crate::system::cpu) fn fair_balance_deadline_ns(&self) -> Option<u64> {
+    pub(in crate::system::cpu) fn fair_balance_deadline(&self) -> Option<MonotonicDeadline> {
         self.load
             .fair_balance_armed
             .load(Ordering::Acquire)
-            .then(|| self.load.fair_balance_deadline_ns.load(Ordering::Relaxed))
+            .then(|| {
+                MonotonicDeadline::from_nanos(
+                    self.load.fair_balance_deadline_ns.load(Ordering::Relaxed),
+                )
+                .expect("an armed balance deadline must remain in the ktime domain")
+            })
+    }
+
+    pub(crate) fn fair_balance_pending(&self) -> bool {
+        self.load.fair_balance_pending.load(Ordering::Acquire)
     }
 
     pub(super) fn reset_fair_balance_for_offline(&self) {
-        self.load.fair_balance_armed.store(false, Ordering::Release);
+        self.load.fair_balance_armed.store(false, Ordering::Relaxed);
+        self.load
+            .fair_balance_pending
+            .store(false, Ordering::Release);
     }
 
     #[cfg(test)]

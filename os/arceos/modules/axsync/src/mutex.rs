@@ -528,7 +528,7 @@ mod tests {
             .create_thread(ThreadSpec::new(SchedulePolicy::default()))
             .unwrap();
         system.make_ready(waiter_thread.id()).unwrap();
-        system.enqueue(cpu.as_mut(), waiter_thread.id(), 0).unwrap();
+        system.enqueue(cpu.as_mut(), waiter_thread.id()).unwrap();
         let token = commit_pi_wait(&system, &raw.core, waiter_thread.id(), owner.id()).unwrap();
         assert!(!token.is_selected());
         drop(
@@ -560,7 +560,7 @@ mod tests {
             .create_thread(ThreadSpec::new(SchedulePolicy::default()))
             .unwrap();
         system.make_ready(waiter_thread.id()).unwrap();
-        system.enqueue(cpu.as_mut(), waiter_thread.id(), 0).unwrap();
+        system.enqueue(cpu.as_mut(), waiter_thread.id()).unwrap();
         let token = commit_pi_wait(&system, &raw.core, waiter_thread.id(), owner.id()).unwrap();
 
         unlock_test_owner(&raw);
@@ -588,7 +588,7 @@ mod tests {
             .create_thread(ThreadSpec::new(SchedulePolicy::default()))
             .unwrap();
         system.make_ready(waiter_thread.id()).unwrap();
-        system.enqueue(cpu.as_mut(), waiter_thread.id(), 0).unwrap();
+        system.enqueue(cpu.as_mut(), waiter_thread.id()).unwrap();
         let token = commit_pi_wait(&system, &raw.core, waiter_thread.id(), owner.id()).unwrap();
         unlock_test_owner(&raw);
 
@@ -611,7 +611,7 @@ mod tests {
             .create_thread(ThreadSpec::new(SchedulePolicy::default()))
             .unwrap();
         system.make_ready(waiter_thread.id()).unwrap();
-        system.enqueue(cpu.as_mut(), waiter_thread.id(), 0).unwrap();
+        system.enqueue(cpu.as_mut(), waiter_thread.id()).unwrap();
         let token = commit_pi_wait(&system, &raw.core, waiter_thread.id(), owner.id()).unwrap();
 
         unlock_test_owner(&raw);
@@ -642,7 +642,7 @@ mod tests {
             .unwrap();
         for thread in [&first_thread, &second_thread] {
             system.make_ready(thread.id()).unwrap();
-            system.enqueue(cpu.as_mut(), thread.id(), 0).unwrap();
+            system.enqueue(cpu.as_mut(), thread.id()).unwrap();
         }
         let first_token =
             commit_pi_wait(&system, &raw.core, first_thread.id(), owner.id()).unwrap();

@@ -11,7 +11,8 @@ use ax_task::{
     schedule_current_cpu,
 };
 
-mod support;
+pub mod support;
+use support::TaskSystemClockTestExt;
 
 static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static SCHEDULER_TICK_CALLBACKS: AtomicUsize = AtomicUsize::new(0);
@@ -78,13 +79,13 @@ fn facade_reports_uninitialized_then_uses_runtime_owned_objects() {
         .create_thread(ThreadSpec::new(SchedulePolicy::default()))
         .unwrap();
     system.make_ready(sleeper.id()).unwrap();
-    system.enqueue(cpu.as_mut(), sleeper.id(), 1).unwrap();
+    system.enqueue_at(cpu.as_mut(), sleeper.id(), 1).unwrap();
     assert_eq!(
-        system.schedule(cpu.as_mut(), 1).unwrap().next(),
+        system.schedule_at(cpu.as_mut(), 1).unwrap().next(),
         sleeper.id()
     );
     assert_eq!(
-        system.block_current(cpu.as_mut(), 1).unwrap().next(),
+        system.block_current_at(cpu.as_mut(), 1).unwrap().next(),
         bootstrap.id()
     );
     assert_eq!(sleeper.wake_handle().wake(), WakeResult::Notified);
@@ -498,7 +499,7 @@ fn scheduler_tick_delivery_pins_extension_across_thread_exit() {
     );
 
     publish_scheduler_tick(1);
-    system.block_current(cpu.as_mut(), 1).unwrap();
+    system.block_current_at(cpu.as_mut(), 1).unwrap();
     system.complete_context_switch(cpu.as_mut()).unwrap();
 
     let exit_result = std::thread::scope(|scope| {

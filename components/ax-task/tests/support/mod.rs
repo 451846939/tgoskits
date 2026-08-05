@@ -6,10 +6,208 @@ use core::{
 };
 
 use ax_task::{
-    CpuId, CpuLocal, CpuRemote, PiMutexAcquire, PiMutexCore, PiMutexLockResult, PiWaitToken,
-    TaskError, TaskSystem, ThreadId, impl_trait,
+    ChargeOutcome, CpuId, CpuLocal, CpuRemote, PiMutexAcquire, PiMutexCore, PiMutexLockResult,
+    PiWaitToken, TaskError, TaskSystem, ThreadId, impl_trait,
     runtime::{TaskRuntime, *},
 };
+
+pub trait TaskSystemClockTestExt {
+    fn enqueue_at(
+        &self,
+        cpu: Pin<&mut CpuLocal>,
+        thread: ThreadId,
+        now_ns: u64,
+    ) -> Result<(), TaskError>;
+
+    fn place_ready_at(
+        &self,
+        cpu: Pin<&mut CpuLocal>,
+        thread: ThreadId,
+        now_ns: u64,
+    ) -> Result<(), TaskError>;
+
+    fn charge_current_at(
+        &self,
+        cpu: Pin<&mut CpuLocal>,
+        now_ns: u64,
+        runtime_ns: u64,
+        reclaimed_ns: u64,
+    ) -> Result<ChargeOutcome, TaskError>;
+
+    fn charge_current_until_at(
+        &self,
+        cpu: Pin<&mut CpuLocal>,
+        now_ns: u64,
+        reclaimed_ns: u64,
+    ) -> Result<ChargeOutcome, TaskError>;
+
+    fn schedule_at(
+        &self,
+        cpu: Pin<&mut CpuLocal>,
+        now_ns: u64,
+    ) -> Result<ax_task::ScheduleDecision, TaskError>;
+
+    fn schedule_if_requested_at(
+        &self,
+        cpu: Pin<&mut CpuLocal>,
+        now_ns: u64,
+    ) -> Result<ax_task::SchedulerOutcome, TaskError>;
+
+    fn yield_current_at(
+        &self,
+        cpu: Pin<&mut CpuLocal>,
+        now_ns: u64,
+    ) -> Result<ax_task::ScheduleDecision, TaskError>;
+
+    fn block_current_at(
+        &self,
+        cpu: Pin<&mut CpuLocal>,
+        now_ns: u64,
+    ) -> Result<ax_task::ScheduleDecision, TaskError>;
+
+    fn exit_current_at(
+        &self,
+        cpu: Pin<&mut CpuLocal>,
+        now_ns: u64,
+    ) -> Result<ax_task::ScheduleDecision, TaskError>;
+
+    fn replenish_deadline_at(
+        &self,
+        cpu: Pin<&mut CpuLocal>,
+        thread: ThreadId,
+        now_ns: u64,
+    ) -> Result<(), TaskError>;
+
+    fn rt_may_run_at(
+        &self,
+        cpu: Pin<&mut CpuLocal>,
+        now_ns: u64,
+        pi_boosted_owner: bool,
+    ) -> Result<bool, TaskError>;
+
+    fn drain_policy_updates_at(
+        &self,
+        cpu: Pin<&mut CpuLocal>,
+        now_ns: u64,
+    ) -> Result<ax_task::OwnerControlDrain, TaskError>;
+}
+
+impl TaskSystemClockTestExt for TaskSystem {
+    fn enqueue_at(
+        &self,
+        cpu: Pin<&mut CpuLocal>,
+        thread: ThreadId,
+        now_ns: u64,
+    ) -> Result<(), TaskError> {
+        set_scheduler_ns_for_cpu(cpu.owner().as_u32(), now_ns);
+        self.enqueue(cpu, thread)
+    }
+
+    fn place_ready_at(
+        &self,
+        cpu: Pin<&mut CpuLocal>,
+        thread: ThreadId,
+        now_ns: u64,
+    ) -> Result<(), TaskError> {
+        set_scheduler_ns_for_cpu(cpu.owner().as_u32(), now_ns);
+        self.place_ready(cpu, thread)
+    }
+
+    fn charge_current_at(
+        &self,
+        cpu: Pin<&mut CpuLocal>,
+        now_ns: u64,
+        runtime_ns: u64,
+        reclaimed_ns: u64,
+    ) -> Result<ChargeOutcome, TaskError> {
+        set_scheduler_ns_for_cpu(cpu.owner().as_u32(), now_ns);
+        self.charge_current(cpu, runtime_ns, reclaimed_ns)
+    }
+
+    fn charge_current_until_at(
+        &self,
+        cpu: Pin<&mut CpuLocal>,
+        now_ns: u64,
+        reclaimed_ns: u64,
+    ) -> Result<ChargeOutcome, TaskError> {
+        set_scheduler_ns_for_cpu(cpu.owner().as_u32(), now_ns);
+        self.charge_current_until(cpu, reclaimed_ns)
+    }
+
+    fn schedule_at(
+        &self,
+        cpu: Pin<&mut CpuLocal>,
+        now_ns: u64,
+    ) -> Result<ax_task::ScheduleDecision, TaskError> {
+        set_scheduler_ns_for_cpu(cpu.owner().as_u32(), now_ns);
+        self.schedule(cpu)
+    }
+
+    fn schedule_if_requested_at(
+        &self,
+        cpu: Pin<&mut CpuLocal>,
+        now_ns: u64,
+    ) -> Result<ax_task::SchedulerOutcome, TaskError> {
+        set_scheduler_ns_for_cpu(cpu.owner().as_u32(), now_ns);
+        self.schedule_if_requested(cpu)
+    }
+
+    fn yield_current_at(
+        &self,
+        cpu: Pin<&mut CpuLocal>,
+        now_ns: u64,
+    ) -> Result<ax_task::ScheduleDecision, TaskError> {
+        set_scheduler_ns_for_cpu(cpu.owner().as_u32(), now_ns);
+        self.yield_current(cpu)
+    }
+
+    fn block_current_at(
+        &self,
+        cpu: Pin<&mut CpuLocal>,
+        now_ns: u64,
+    ) -> Result<ax_task::ScheduleDecision, TaskError> {
+        set_scheduler_ns_for_cpu(cpu.owner().as_u32(), now_ns);
+        self.block_current(cpu)
+    }
+
+    fn exit_current_at(
+        &self,
+        cpu: Pin<&mut CpuLocal>,
+        now_ns: u64,
+    ) -> Result<ax_task::ScheduleDecision, TaskError> {
+        set_scheduler_ns_for_cpu(cpu.owner().as_u32(), now_ns);
+        self.exit_current(cpu)
+    }
+
+    fn replenish_deadline_at(
+        &self,
+        cpu: Pin<&mut CpuLocal>,
+        thread: ThreadId,
+        now_ns: u64,
+    ) -> Result<(), TaskError> {
+        set_scheduler_ns_for_cpu(cpu.owner().as_u32(), now_ns);
+        self.replenish_deadline(cpu, thread)
+    }
+
+    fn rt_may_run_at(
+        &self,
+        cpu: Pin<&mut CpuLocal>,
+        now_ns: u64,
+        pi_boosted_owner: bool,
+    ) -> Result<bool, TaskError> {
+        set_scheduler_ns_for_cpu(cpu.owner().as_u32(), now_ns);
+        self.rt_may_run(cpu, pi_boosted_owner)
+    }
+
+    fn drain_policy_updates_at(
+        &self,
+        cpu: Pin<&mut CpuLocal>,
+        now_ns: u64,
+    ) -> Result<ax_task::OwnerControlDrain, TaskError> {
+        set_scheduler_ns_for_cpu(cpu.owner().as_u32(), now_ns);
+        self.drain_policy_updates(cpu)
+    }
+}
 
 /// Commits a scheduler-only PI wait used by model tests.
 pub fn commit_pi_wait<'lock>(
@@ -104,7 +302,9 @@ std::thread_local! {
     static LAST_DEADLINE_GENERATION: Cell<u64> = const { Cell::new(0) };
     static LAST_DEFERRED_WORK: Cell<bool> = const { Cell::new(false) };
     static MONOTONIC_NS: Cell<u64> = const { Cell::new(0) };
-    static SCHEDULER_NS: Cell<u64> = const { Cell::new(0) };
+    static SCHEDULER_NS: RefCell<[u64; MAX_TEST_CPUS]> = const {
+        RefCell::new([0; MAX_TEST_CPUS])
+    };
 }
 
 struct IntegrationRuntime;
@@ -370,8 +570,15 @@ impl_trait! {
             MonotonicInstant::from_nanos(MONOTONIC_NS.with(Cell::get))
                 .expect("test monotonic clock must remain in the ktime domain")
         }
-        fn scheduler_now() -> ax_task::SchedulerTimestamp {
-            ax_task::SchedulerTimestamp::from_nanos(SCHEDULER_NS.with(Cell::get))
+        fn scheduler_clock_source(cpu: RuntimeCpuId) -> ax_task::SchedulerTimestamp {
+            let now_ns = SCHEDULER_NS.with(|clocks| {
+                clocks
+                    .borrow()
+                    .get(cpu.as_u32() as usize)
+                    .copied()
+                    .expect("virtual CPU must fit the fake scheduler clock table")
+            });
+            ax_task::SchedulerTimestamp::from_nanos(now_ns)
         }
         fn publish_task_deadline(update: TaskDeadlineUpdate) {
             LAST_ONESHOT_NS.with(|deadline| {
@@ -667,7 +874,17 @@ pub fn set_monotonic_ns(now_ns: u64) {
 }
 
 pub fn set_scheduler_ns(now_ns: u64) {
-    SCHEDULER_NS.with(|now| now.set(now_ns));
+    let cpu = CURRENT_CPU.with(Cell::get);
+    set_scheduler_ns_for_cpu(cpu, now_ns);
+}
+
+pub fn set_scheduler_ns_for_cpu(cpu: u32, now_ns: u64) {
+    SCHEDULER_NS.with(|clocks| {
+        *clocks
+            .borrow_mut()
+            .get_mut(cpu as usize)
+            .expect("virtual CPU must fit the fake scheduler clock table") = now_ns;
+    });
 }
 
 pub fn reset_resource_release_counts() {
@@ -697,6 +914,6 @@ pub fn clear_handles() {
     LAST_DEFERRED_WORK.with(|pending| pending.set(false));
     let _cleared_oneshot = last_oneshot_ns();
     set_monotonic_ns(0);
-    set_scheduler_ns(0);
+    SCHEDULER_NS.with(|clocks| clocks.borrow_mut().fill(0));
     let _reset_counts = resource_release_counts();
 }

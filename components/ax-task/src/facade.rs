@@ -233,7 +233,7 @@ pub fn thread_policy(thread: ThreadId) -> Result<SchedulePolicy, TaskError> {
 
 /// Returns a cumulative charged-runtime snapshot for a live thread.
 pub fn thread_runtime(thread: ThreadId) -> Result<ThreadRuntimeSnapshot, TaskError> {
-    runtime_task_system()?.thread_runtime(thread, task_runtime::scheduler_now().as_nanos())
+    runtime_task_system()?.thread_runtime(thread)
 }
 
 /// Returns cumulative non-idle runtime charged by one online CPU.
@@ -298,7 +298,7 @@ pub fn set_current_thread_affinity(affinity: CpuSet) -> Result<(), TaskError> {
         RuntimeSchedulerEntry::Task,
     )?;
     let system = runtime_task_system()?;
-    let (decision, now_ns) = {
+    let decision = {
         let mut cpu = runtime_current_cpu_mut(&mut scheduler_frame)?;
         let must_migrate = system.set_current_affinity(cpu.as_mut(), affinity)?;
         if !must_migrate {
@@ -312,18 +312,14 @@ pub fn set_current_thread_affinity(affinity: CpuSet) -> Result<(), TaskError> {
         let thread = cpu.current().unwrap_or_else(|| {
             task_runtime::fatal_invariant(0x4558_0020, 0);
         });
-        let now_ns = task_runtime::scheduler_now().as_nanos();
-        let decision = system
-            .yield_current(cpu.as_mut(), now_ns)
-            .unwrap_or_else(|_| {
-                // Affinity publication cannot be rolled back safely after another CPU
-                // may have observed the migration target. Scheduler commit failures are
-                // therefore runtime invariants, like failures after exit publication.
-                task_runtime::fatal_invariant(0x4558_0021, thread.as_u64() as usize);
-            });
-        (decision, now_ns)
+        system.yield_current(cpu.as_mut()).unwrap_or_else(|_| {
+            // Affinity publication cannot be rolled back safely after another CPU
+            // may have observed the migration target. Scheduler commit failures are
+            // therefore runtime invariants, like failures after exit publication.
+            task_runtime::fatal_invariant(0x4558_0021, thread.as_u64() as usize);
+        })
     };
-    execute_switch_plan(&mut scheduler_frame, decision, now_ns);
+    execute_switch_plan(&mut scheduler_frame, decision);
     Ok(())
 }
 

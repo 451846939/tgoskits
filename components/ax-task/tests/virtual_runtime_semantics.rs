@@ -12,7 +12,8 @@ use ax_task::{
 };
 use support::VirtualRuntimeEventKind;
 
-mod support;
+pub mod support;
+use support::TaskSystemClockTestExt;
 
 #[test]
 fn scheduler_ipi_claim_publishes_work_on_the_target_cpu() {
@@ -122,7 +123,7 @@ fn scheduler_switch_completes_tail_before_returning_to_task_context() {
         ))
         .unwrap();
     system.make_ready(next.id()).unwrap();
-    system.enqueue(cpu.as_mut(), next.id(), 0).unwrap();
+    system.enqueue_at(cpu.as_mut(), next.id(), 0).unwrap();
     support::install_handles(
         (system.as_ref().get_ref() as *const TaskSystem).expose_provenance(),
         cpu.as_mut(),
@@ -164,7 +165,7 @@ fn cpu_offline_waits_for_the_physical_ipi_and_local_work_to_quiesce() {
         .unwrap();
     system.bring_cpu_online(cpu0.as_mut()).unwrap();
     system.bring_cpu_online(cpu1.as_mut()).unwrap();
-    system.schedule(cpu1.as_mut(), 0).unwrap();
+    system.schedule_at(cpu1.as_mut(), 0).unwrap();
     system.complete_context_switch(cpu1.as_mut()).unwrap();
     support::install_handles(
         (system.as_ref().get_ref() as *const TaskSystem).expose_provenance(),

@@ -94,16 +94,22 @@ impl TaskSystem {
     }
 
     /// Rechecks a prepared park and either cancels it or commits schedule-out.
-    ///
-    /// `now_ns` is the single monotonic snapshot for this owner transition.
-    /// The caller must sample it after acquiring scheduler ownership.
     pub fn commit_park(
+        &self,
+        cpu: Pin<&mut CpuLocal>,
+        token: &mut ParkTicket,
+    ) -> Result<ParkCommit, TaskError> {
+        self.ensure_owner_cpu_context(&cpu)?;
+        let now_ns = cpu.update_rq_clock().as_nanos();
+        self.commit_park_at(cpu, token, now_ns)
+    }
+
+    fn commit_park_at(
         &self,
         mut cpu: Pin<&mut CpuLocal>,
         token: &mut ParkTicket,
         now_ns: u64,
     ) -> Result<ParkCommit, TaskError> {
-        self.ensure_owner_cpu_context(&cpu)?;
         if token.is_resolved() {
             return Err(TaskError::StaleThreadId);
         }
@@ -132,7 +138,7 @@ impl TaskSystem {
         }
         let scheduler_requested = cpu.as_mut().scheduler_enter();
         cpu.defer_park_preemption(scheduler_requested);
-        self.commit_owner_current_dispatch(cpu.as_mut(), now_ns)?;
+        self.commit_owner_current_dispatch(cpu.as_mut())?;
         #[cfg(test)]
         park_commit_wake_race_hook(self, previous_core.id());
         let resumed_dispatch = {
@@ -211,9 +217,13 @@ impl TaskSystem {
             next_core.id(),
             None,
         )?;
-        let decision =
-            Self::owner_switch_plan(Some(&previous_core), &next_core, SwitchReason::Blocked);
-        let decision = self.finish_owner_selection(cpu, decision, now_ns);
+        let decision = Self::owner_switch_plan(
+            Some(&previous_core),
+            &next_core,
+            SwitchReason::Blocked,
+            now_ns,
+        );
+        let decision = self.finish_owner_selection(cpu, decision);
         token.mark_resolved();
         Ok(ParkCommit::Blocked(decision))
     }
@@ -243,18 +253,15 @@ impl TaskSystem {
     }
 
     /// Parks the current thread and selects its replacement.
-    ///
-    /// `now_ns` is the single monotonic snapshot for the complete
-    /// prepare-to-commit transaction.
     pub fn block_current(
         &self,
         mut cpu: Pin<&mut CpuLocal>,
-        now_ns: u64,
     ) -> Result<ScheduleDecision, TaskError> {
         self.ensure_owner_cpu_context(&cpu)?;
+        let now_ns = cpu.update_rq_clock().as_nanos();
         match self.prepare_park(cpu.as_mut())? {
             ParkPrepare::Prepared(mut ticket) => {
-                match self.commit_park(cpu.as_mut(), &mut ticket, now_ns)? {
+                match self.commit_park_at(cpu.as_mut(), &mut ticket, now_ns)? {
                     ParkCommit::Blocked(decision) => Ok(decision),
                     ParkCommit::Notified => {
                         let core = cpu.current_core().ok_or(TaskError::NoRunnableThread)?;
@@ -262,6 +269,7 @@ impl TaskSystem {
                             Some(core),
                             core,
                             SwitchReason::Blocked,
+                            now_ns,
                         ))
                     }
                 }
@@ -272,6 +280,7 @@ impl TaskSystem {
                     Some(core),
                     core,
                     SwitchReason::Blocked,
+                    now_ns,
                 ))
             }
         }
@@ -282,8 +291,8 @@ impl TaskSystem {
     pub(crate) fn prepare_current_exit(
         &self,
         cpu: Pin<&mut CpuLocal>,
-        now_ns: u64,
     ) -> Result<CurrentExitPermit, TaskError> {
+        let now_ns = cpu.update_rq_clock().as_nanos();
         self.prepare_current_exit_inner(cpu, now_ns, true)
     }
 
@@ -350,29 +359,23 @@ impl TaskSystem {
     ///
     /// Runtime integrations that publish OS completion between those phases
     /// use the crate-private prepared form instead.
-    pub fn exit_current(
-        &self,
-        mut cpu: Pin<&mut CpuLocal>,
-        now_ns: u64,
-    ) -> Result<ScheduleDecision, TaskError> {
+    pub fn exit_current(&self, mut cpu: Pin<&mut CpuLocal>) -> Result<ScheduleDecision, TaskError> {
         // Pure scheduler users may model a transition without installing an
         // architecture context. The runtime facade uses the stricter prepared
         // form before publishing OS-visible completion.
+        let now_ns = cpu.update_rq_clock().as_nanos();
         let permit = self.prepare_current_exit_inner(cpu.as_mut(), now_ns, false)?;
         self.commit_current_exit_after_owner_drain(cpu, permit, now_ns)
     }
 
     /// Commits a prepared current-thread exit and selects a replacement.
-    ///
-    /// `now_ns` is the single monotonic snapshot shared by dispatch
-    /// accounting, successor selection, tracing, and the runtime switch.
     pub(crate) fn commit_prepared_current_exit(
         &self,
         mut cpu: Pin<&mut CpuLocal>,
         permit: CurrentExitPermit,
-        now_ns: u64,
     ) -> Result<ScheduleDecision, TaskError> {
         self.ensure_owner_cpu_context(&cpu)?;
+        let now_ns = cpu.update_rq_clock().as_nanos();
         self.complete_context_switch(cpu.as_mut())?;
         self.drain_owner_work(cpu.as_mut(), now_ns)?;
         self.commit_current_exit_after_owner_drain(cpu, permit, now_ns)
@@ -405,7 +408,7 @@ impl TaskSystem {
             }
             record.callbacks.validate_prepare_exit()?;
             cpu.as_mut().scheduler_enter();
-            self.commit_owner_current_dispatch(cpu.as_mut(), now_ns)?;
+            self.commit_owner_current_dispatch(cpu.as_mut())?;
             let previous_core = previous_core.ok_or(TaskError::NoRunnableThread)?;
             Self::detach_owner_deadline_bandwidth(&previous_core, cpu.as_mut());
             let held_reservation;
@@ -478,13 +481,18 @@ impl TaskSystem {
                 task_runtime::fatal_invariant(0x4558_0006, previous.as_u64() as usize);
             }
             (
-                Self::owner_switch_plan(Some(&previous_core), &next_core, SwitchReason::Exited),
+                Self::owner_switch_plan(
+                    Some(&previous_core),
+                    &next_core,
+                    SwitchReason::Exited,
+                    now_ns,
+                ),
                 Arc::clone(&previous_core),
             )
         };
         exited_core.notify_affinity_waiters();
         drop(permit);
-        Ok(self.finish_owner_selection(cpu, decision, now_ns))
+        Ok(self.finish_owner_selection(cpu, decision))
     }
 
     /// Completes the physical switch-out handoff in the newly active context.
@@ -578,7 +586,7 @@ impl TaskSystem {
             migration.commit();
         }
         if wake_after_tail {
-            self.finish_switch_tail_wake(&previous_core, task_runtime::scheduler_now().as_nanos());
+            self.finish_switch_tail_wake(&previous_core);
         }
         self.publish_owner_cpu_load_summary(cpu.as_mut());
         if previous_exited {

@@ -76,7 +76,6 @@ impl TaskSystem {
         policy: SchedulePolicy,
         entity: SchedulingEntity,
         preferred: Option<CpuId>,
-        now_ns: u64,
     ) -> Option<CpuId> {
         #[cfg(test)]
         WAKE_TARGET_SELECTIONS.set(WAKE_TARGET_SELECTIONS.get().saturating_add(1));
@@ -91,14 +90,7 @@ impl TaskSystem {
                     .is_some_and(|remote| remote.accepts_placement())
             })
             .or_else(|| {
-                self.select_priority_cpu(
-                    policy,
-                    entity,
-                    &sched.placement.affinity,
-                    preferred,
-                    None,
-                    now_ns,
-                )
+                self.select_priority_cpu(policy, entity, &sched.placement.affinity, preferred, None)
             })
     }
 
@@ -111,7 +103,6 @@ impl TaskSystem {
         &self,
         core: Arc<ThreadCore>,
         preferred: Option<CpuId>,
-        now_ns: u64,
     ) -> WakeResult {
         #[cfg(feature = "qperf-metrics")]
         crate::metrics::record_direct_wake_attempt();
@@ -152,7 +143,7 @@ impl TaskSystem {
         }
         let policy = sched.policy.effective;
         let queued_entity = sched.policy.effective_entity;
-        let target = self.select_wake_target(&sched, policy, queued_entity, preferred, now_ns);
+        let target = self.select_wake_target(&sched, policy, queued_entity, preferred);
         let Some(target) = target else {
             core.discard_failed_wake();
             return WakeResult::Unavailable;
@@ -168,7 +159,7 @@ impl TaskSystem {
         match transition {
             WakeTransition::Notified => WakeResult::Notified,
             WakeTransition::Activate => {
-                self.activate_waking_thread_locked(&core, sched, target, publication, now_ns)
+                self.activate_waking_thread_locked(&core, sched, target, publication)
             }
             WakeTransition::DeferredUntilSwitchTail => {
                 task_runtime::fatal_invariant(0x574b_0004, core.id().as_u64() as usize)
@@ -182,7 +173,6 @@ impl TaskSystem {
         mut sched: crate::lock::IrqTicketGuard<'_, ThreadSchedState>,
         target: CpuId,
         publication: CpuRemotePublication<'_>,
-        now_ns: u64,
     ) -> WakeResult {
         if sched.lifecycle.state() != ThreadState::Waking || sched.placement.on_cpu().is_some() {
             task_runtime::fatal_invariant(0x574b_0005, core.id().as_u64() as usize);
@@ -193,6 +183,10 @@ impl TaskSystem {
         #[cfg(feature = "qperf-metrics")]
         crate::metrics::record_direct_wake_activation();
 
+        let remote = &self.cpu_remotes[target.as_usize()];
+        remote.cancel_idle_pull_if_uncommitted();
+        let mut run_queue = remote.lock_run_queue();
+        let now_ns = run_queue.update_clock().as_nanos();
         let policy = sched.policy.effective;
         let mut queued_entity = sched.policy.effective_entity;
         let deadline_wake = matches!(policy, SchedulePolicy::Deadline(_)) && !sched.is_pi_boosted();
@@ -203,9 +197,6 @@ impl TaskSystem {
                 sched.policy.base_entity = queued_entity;
             }
         }
-        let remote = &self.cpu_remotes[target.as_usize()];
-        remote.cancel_idle_pull_if_uncommitted();
-        let mut run_queue = remote.lock_run_queue();
         Self::activate_deadline_bandwidth_locked(core, &mut sched, &mut run_queue, target);
         if deadline_wake
             && queued_entity
@@ -308,7 +299,7 @@ impl TaskSystem {
     }
 
     /// Completes Linux's `TASK_WAKING` handoff after `finish_task()`.
-    pub(super) fn finish_switch_tail_wake(&self, core: &Arc<ThreadCore>, now_ns: u64) {
+    pub(super) fn finish_switch_tail_wake(&self, core: &Arc<ThreadCore>) {
         let sched = core.sched().lock();
         if sched.lifecycle.state() != ThreadState::Waking {
             return;
@@ -326,7 +317,7 @@ impl TaskSystem {
             .assigned_cpu()
             .or_else(|| core.wake_cpu_hint());
         let target = self
-            .select_wake_target(&sched, policy, entity, preferred, now_ns)
+            .select_wake_target(&sched, policy, entity, preferred)
             .unwrap_or_else(|| {
                 task_runtime::fatal_invariant(0x574b_0008, core.id().as_u64() as usize)
             });
@@ -335,20 +326,19 @@ impl TaskSystem {
             .unwrap_or_else(|| {
                 task_runtime::fatal_invariant(0x574b_0009, core.id().as_u64() as usize)
             });
-        let _result = self.activate_waking_thread_locked(core, sched, target, publication, now_ns);
+        let _result = self.activate_waking_thread_locked(core, sched, target, publication);
     }
 
     pub(super) fn enqueue_owner_thread(
         &self,
         mut cpu: Pin<&mut CpuLocal>,
         core: Arc<ThreadCore>,
-        now_ns: u64,
         reason: EnqueueReason,
     ) -> Result<(), TaskError> {
         self.ensure_owner_cpu_online(&cpu)?;
         let mut sched = core.sched().lock();
         let preempts_current =
-            self.enqueue_owner_thread_locked(cpu.as_mut(), &core, &mut sched, now_ns, reason)?;
+            self.enqueue_owner_thread_locked(cpu.as_mut(), &core, &mut sched, reason)?;
         let affinity_completed = Self::complete_affinity_if_satisfied_locked(&core, &sched);
         drop(sched);
         if affinity_completed {
@@ -363,7 +353,6 @@ impl TaskSystem {
         mut cpu: Pin<&mut CpuLocal>,
         core: &Arc<ThreadCore>,
         sched: &mut ThreadSchedState,
-        now_ns: u64,
         reason: EnqueueReason,
     ) -> Result<bool, TaskError> {
         let owner = cpu.owner();
@@ -377,6 +366,8 @@ impl TaskSystem {
             .get_ref()
             .remote()
             .cancel_idle_pull_if_uncommitted();
+        let mut run_queue = cpu.lock_run_queue();
+        let now_ns = run_queue.update_clock().as_nanos();
         let policy = sched.policy.effective;
         let mut queued_entity = sched.policy.effective_entity;
         let mut deadline_wake_throttled = false;
@@ -392,7 +383,6 @@ impl TaskSystem {
             }
         }
         if deadline_wake_throttled {
-            let mut run_queue = cpu.lock_run_queue();
             Self::activate_deadline_bandwidth_locked(core, sched, &mut run_queue, owner);
             sched.deadline.replenish_pending = true;
             sched.throttle_ready_deadline(core)?;
@@ -402,15 +392,22 @@ impl TaskSystem {
             self.refresh_owner_deadline_timers_locked(core, sched, cpu.as_mut(), now_ns)?;
             return Ok(false);
         }
-        let preempts_current =
-            self.link_owner_ready_thread_locked(cpu.as_mut(), core, sched, reason)?;
+        let preempts_current = self.link_owner_ready_thread_locked(
+            cpu.as_ref().get_ref(),
+            &mut run_queue,
+            core,
+            sched,
+            reason,
+        )?;
+        drop(run_queue);
         self.refresh_owner_deadline_timers_locked(core, sched, cpu, now_ns)?;
         Ok(preempts_current)
     }
 
     pub(super) fn link_owner_ready_thread_locked(
         &self,
-        cpu: Pin<&mut CpuLocal>,
+        cpu: &CpuLocal,
+        run_queue: &mut CpuRunQueueState,
         core: &Arc<ThreadCore>,
         sched: &mut ThreadSchedState,
         reason: EnqueueReason,
@@ -418,8 +415,7 @@ impl TaskSystem {
         let owner = cpu.owner();
         let policy = sched.policy.effective;
         let queued_entity = sched.policy.effective_entity;
-        let mut run_queue = cpu.lock_run_queue();
-        Self::activate_deadline_bandwidth_locked(core, sched, &mut run_queue, owner);
+        Self::activate_deadline_bandwidth_locked(core, sched, run_queue, owner);
         let current_fair = cpu
             .dispatch_state()
             .current_dispatch
@@ -458,7 +454,6 @@ impl TaskSystem {
             sched.placement.activate(owner);
         }
         core.set_wake_cpu_hint(owner);
-        drop(run_queue);
         Ok(preempts_current)
     }
 
@@ -728,16 +723,14 @@ impl TaskSystem {
     pub(super) fn commit_owner_current_dispatch(
         &self,
         mut cpu: Pin<&mut CpuLocal>,
-        now_ns: u64,
     ) -> Result<(), TaskError> {
         if cpu.dispatch_state().current_dispatch.is_none() {
             return Ok(());
         }
-        let _charge = cpu.as_mut().settle_current_dispatch(
-            now_ns,
-            0,
-            self.root_domain.deadline_extra_bw_scaled(),
-        )?;
+        let (_charge, clock) = cpu
+            .as_mut()
+            .settle_current_dispatch(0, self.root_domain.deadline_extra_bw_scaled())?;
+        let now_ns = clock.as_nanos();
         let Some(mut dispatch) = cpu.as_mut().take_dispatch() else {
             return Ok(());
         };
@@ -885,11 +878,11 @@ impl TaskSystem {
         Ok(runtime_overrun_work)
     }
 
-    pub(super) fn apply_owner_policy_generation(
+    pub(super) fn apply_policy_generation(
         &self,
         core: &Arc<ThreadCore>,
         generation: u64,
-        now_ns: u64,
+        owner_now_ns: Option<u64>,
         fair_placement: Option<FairPolicyPlacement>,
         activate_deadline: bool,
     ) -> Result<bool, TaskError> {
@@ -924,6 +917,7 @@ impl TaskSystem {
             ),
         };
         if activate_deadline {
+            let now_ns = owner_now_ns.ok_or(TaskError::InvalidConfiguration)?;
             base_entity.activate_deadline(now_ns);
         }
         let previous_held = sched
@@ -956,6 +950,7 @@ impl TaskSystem {
         core.publish_effective_schedule(effective_policy, effective_entity);
         drop(sched);
         if running_policy_changed && let Some(extension) = core.extension_view() {
+            let now_ns = owner_now_ns.ok_or(TaskError::InvalidConfiguration)?;
             // SAFETY: the thread-state lock is released. A running update
             // executes on the placement owner while it retains the scheduler
             // baton. Construction guarantees that the callback is bounded and

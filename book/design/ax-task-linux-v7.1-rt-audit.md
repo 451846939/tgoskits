@@ -572,12 +572,29 @@ root。Starry 的 `SchedulerAddressSpaceLease` 因此把“scheduler slot 已解
 这对应 Linux v7.1 `start_dl_timer()`：`rq_clock()` 空间的 release/deadline 通过 delta
 映射到 `ktime_get()`，而不是假定两者绝对纪元相同。
 
-`TaskRuntime` 因而分别提供 `scheduler_now()` 与 `monotonic_now()` 两个 capability。平台
-当前可以让两者读取同一个硬件 counter，但调用方不能据此合并接口或依赖相同 epoch。
+`CpuRunQueueState` 现在像 Linux `struct rq` 一样独占 `RunQueueClock`。它只在目标 rq 的
+IRQ-safe lock 内调用 `TaskRuntime::scheduler_clock_source(RuntimeCpuId)` 接受一个 source
+样本：首样本建立基线，负向 delta 被拒绝，counter wrap 按 signed-delta 顺序前进。远程
+wake 必须锁定目标 rq 并读取目标 CPU source，不能把 waker CPU 的时间带入目标实体。
+一次 owner rq 事务只允许更新一次；后续 dispatch settle、switch plan 和 timer programming
+读取同一个 `RunQueueClockSnapshot`，对应 Linux 的 `RQCF_UPDATED` 与 `rq_clock()` accessor，
+不得通过第二次 source 读取制造微小双重记账。当前没有独立 IRQ/steal-time authority，因而
+不虚构 `clock_task`；将来只有建立对应来源后才能按 Linux 模型扣除。
+
+`TaskRuntime` 因而分别提供按 CPU 取样的 `scheduler_clock_source(cpu)` 与
+`monotonic_now()` 两个 capability。平台当前可以让两者读取同一个硬件 counter，但调用方
+不能据此合并接口或依赖相同 epoch。
 timer IRQ 使用入口的 monotonic 样本提升物理 task deadline，另取 scheduler 样本完成
 runtime charge、scheduler tick 与 CBS 状态转换，最后再取 monotonic 样本把下一 scheduler
 delta 映射到物理 clockevent。普通 `__schedule` 等价 fast path 在 task deadline heap 为空且
 没有 sticky deadline work 时只读取 scheduler clock，不额外触碰物理 timer clock。
+
+Fair 周期 balance 不属于 rq-clock deadline。Linux 的 `sched_balance_domains()` 以全局
+`jiffies` 和 `sd->last_balance` 判定周期，并在 pass 完成后更新下一期限；TGOSKits 对应使用
+monotonic deadline、`armed -> pending` sticky publication 和 owner task-context consume。
+clockevent 负责把到期 cadence 发布为 work，普通 schedule 不扫描时间；newidle balance 则像
+Linux 一样立即尝试，不受周期 deadline gate 限制。selection/carrier 不携带时间戳，源与目标
+rq 的 mutation 分别在自己的 owner 事务里接受本地 rq clock。
 
 `start_dl_timer()` 对已经过去的 scheduler deadline 返回 false，不建立 hrtimer。当前
 实现同样只给 `Future` 建 `TaskDeadlineQueue` 节点；`Due` 由 owner 在持有线程 scheduler
@@ -629,6 +646,14 @@ Linux `timespec64_to_ktime()` 规则饱和到有限 `KTIME_MAX`；相对 timeout
 按 clockevent 的最小非零 delta 编程，不回写逻辑 deadline。
 
 物理 timer 是加速路径，不是唯一正确性来源。scheduler safe point 会有界提升已经过期的 task deadline，避免丢失或过晚的硬件边永久挂起 sleeper。
+
+旧测试 runtime 曾让 `*_at(now)` 同时隐式代表 scheduler 与 monotonic 时间，并在多个新建
+`TaskSystem` 场景间保留同一 fake source；这既掩盖跨 CPU/rq epoch 错误，也让物理 timer 在
+测试中无条件提前到期。当前 fake clock 按 CPU 分开，测试必须在每个 CPU 生命周期建立前
+初始化 scheduler source，并显式推进 monotonic clockevent。确定性回归覆盖：目标 CPU 与
+waker CPU 使用不同 rq epoch、未来 monotonic deadline 不被较大的 scheduler 时间提前触发、
+Fair cadence 相对 CPU online 的 monotonic 时刻建立、zero-lag/CBS 两阶段事件只在物理
+clockevent 后推进。测试不得用 no-op timer、共享全局时间或源码字符串断言替代这些行为。
 
 Linux 在 `dequeue_task_dl()`、`inactive_task_timer()` 与 switch-tail 的
 `task_dead` 回调中，都由持有对应 rq 所有权的一侧移除 Deadline bandwidth；任务退出侧

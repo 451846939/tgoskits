@@ -10,7 +10,8 @@ use ax_task::{
     ThreadSpec,
 };
 
-mod support;
+pub mod support;
+use support::TaskSystemClockTestExt;
 
 struct AuditAllocator;
 
@@ -56,7 +57,7 @@ fn first_class_enqueue_uses_thread_prepared_storage() {
         let thread = system.create_thread(ThreadSpec::new(policy)).unwrap();
         system.make_ready(thread.id()).unwrap();
         assert_no_alloc_or_free(|| {
-            system.enqueue(cpu.as_mut(), thread.id(), 0).unwrap();
+            system.enqueue_at(cpu.as_mut(), thread.id(), 0).unwrap();
         });
         threads.push(thread);
     }
@@ -75,15 +76,15 @@ fn fair_schedule_rotation_reuses_owner_runqueue_storage() {
                 .create_thread(ThreadSpec::new(SchedulePolicy::default()))
                 .unwrap();
             system.make_ready(thread.id()).unwrap();
-            system.enqueue(cpu.as_mut(), thread.id(), 0).unwrap();
+            system.enqueue_at(cpu.as_mut(), thread.id(), 0).unwrap();
             thread
         })
         .collect::<Vec<_>>();
-    system.schedule(cpu.as_mut(), 0).unwrap();
-    system.yield_current(cpu.as_mut(), 1).unwrap();
+    system.schedule_at(cpu.as_mut(), 0).unwrap();
+    system.yield_current_at(cpu.as_mut(), 1).unwrap();
 
     assert_no_alloc_or_free(|| {
-        system.yield_current(cpu.as_mut(), 2).unwrap();
+        system.yield_current_at(cpu.as_mut(), 2).unwrap();
     });
     assert_eq!(threads.len(), 2);
 }
@@ -100,14 +101,14 @@ fn deadline_selection_reuses_owner_runqueue_storage() {
         .map(|_| {
             let thread = system.create_thread(ThreadSpec::new(policy)).unwrap();
             system.make_ready(thread.id()).unwrap();
-            system.enqueue(cpu.as_mut(), thread.id(), 0).unwrap();
+            system.enqueue_at(cpu.as_mut(), thread.id(), 0).unwrap();
             thread
         })
         .collect::<Vec<_>>();
-    system.schedule(cpu.as_mut(), 0).unwrap();
+    system.schedule_at(cpu.as_mut(), 0).unwrap();
 
     assert_no_alloc_or_free(|| {
-        system.yield_current(cpu.as_mut(), 1).unwrap();
+        system.yield_current_at(cpu.as_mut(), 1).unwrap();
     });
     assert_eq!(threads.len(), 2);
 }

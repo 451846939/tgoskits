@@ -38,7 +38,7 @@ impl CpuRemote {
     pub(crate) fn create(owner: CpuId, config: TaskSystemConfig) -> Arc<Self> {
         Arc::new(Self {
             owner,
-            run_queue: IrqTicketLock::new(CpuRunQueueState::new(config)),
+            run_queue: IrqTicketLock::new(CpuRunQueueState::new(owner, config)),
             owner_state: owner::OwnerState::new(),
             publication: lifecycle::CpuPublicationState::new(),
             scheduler: scheduler::SchedulerDoorbellState::new(),

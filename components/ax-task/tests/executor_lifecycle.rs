@@ -7,7 +7,7 @@ use ax_task::{
     executor::LocalExecutor,
 };
 
-mod support;
+pub mod support;
 
 static TEST_RUNTIME_LOCK: Mutex<()> = Mutex::new(());
 
