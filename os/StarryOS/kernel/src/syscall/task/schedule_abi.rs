@@ -96,6 +96,7 @@ fn policy_from_kept_params(
 ) -> AxResult<SchedulePolicy> {
     let deadline_flag_mask = (SCHED_FLAG_RECLAIM | SCHED_FLAG_DL_OVERRUN) as u64;
     match current_policy {
+        SchedulePolicy::KernelStop => return Err(AxError::InvalidInput),
         SchedulePolicy::Fair { nice, .. } => {
             attr.sched_nice = i32::from(nice.get());
             // Linux get_params() also replaces sched_runtime with the current
@@ -148,6 +149,9 @@ fn policy_from_kept_params(
 /// Serializes a core policy into Linux's current `sched_attr` layout.
 pub(crate) fn sched_attr_from_policy(policy: SchedulePolicy, reset_on_fork: bool) -> SchedAttr {
     let mut attr = match policy {
+        SchedulePolicy::KernelStop => {
+            panic!("kernel stopper policy must not cross the Linux task ABI")
+        }
         SchedulePolicy::Fair { nice, mode } => {
             SchedAttr::fair(linux_fair_policy(mode), i32::from(nice.get()))
         }
@@ -176,6 +180,9 @@ pub(crate) fn sched_attr_from_policy(policy: SchedulePolicy, reset_on_fork: bool
 /// Returns the Linux policy number represented by a core policy.
 pub(crate) const fn linux_policy_number(policy: SchedulePolicy) -> u32 {
     match policy {
+        SchedulePolicy::KernelStop => {
+            panic!("kernel stopper policy must not cross the Linux task ABI")
+        }
         SchedulePolicy::Fair { mode, .. } => linux_fair_policy(mode),
         SchedulePolicy::Fifo { .. } => SCHED_FIFO,
         SchedulePolicy::RoundRobin { .. } => SCHED_RR,
@@ -186,6 +193,9 @@ pub(crate) const fn linux_policy_number(policy: SchedulePolicy) -> u32 {
 /// Returns the `sched_param` priority represented by a core policy.
 pub(crate) const fn linux_sched_priority(policy: SchedulePolicy) -> i32 {
     match policy {
+        SchedulePolicy::KernelStop => {
+            panic!("kernel stopper policy must not cross the Linux task ABI")
+        }
         SchedulePolicy::Fifo { priority } | SchedulePolicy::RoundRobin { priority, .. } => {
             priority.get() as i32
         }
@@ -206,6 +216,7 @@ pub(crate) fn fork_schedule_policy(
     }
 
     let child = match parent {
+        SchedulePolicy::KernelStop => return Err(AxError::InvalidInput),
         SchedulePolicy::Fifo { .. }
         | SchedulePolicy::RoundRobin { .. }
         | SchedulePolicy::Deadline(_) => SchedulePolicy::fair(Nice::ZERO, FairMode::Normal),
@@ -281,7 +292,9 @@ pub(crate) fn check_policy_permission(
     }
 
     match requested {
-        SchedulePolicy::Deadline(_) => Err(AxError::OperationNotPermitted),
+        SchedulePolicy::KernelStop | SchedulePolicy::Deadline(_) => {
+            Err(AxError::OperationNotPermitted)
+        }
         SchedulePolicy::Fifo { priority } | SchedulePolicy::RoundRobin { priority, .. } => {
             let same_rt_class = matches!(
                 (current, requested),
@@ -480,6 +493,9 @@ fn linux_schedule_class(policy: u32) -> AxResult<LinuxScheduleClass> {
 
 fn schedule_class(policy: SchedulePolicy) -> LinuxScheduleClass {
     match policy {
+        SchedulePolicy::KernelStop => {
+            panic!("kernel stopper policy must not cross the Linux task ABI")
+        }
         SchedulePolicy::Fair { mode, .. } => LinuxScheduleClass::Fair(mode),
         SchedulePolicy::Fifo { .. } => LinuxScheduleClass::Fifo,
         SchedulePolicy::RoundRobin { .. } => LinuxScheduleClass::RoundRobin,

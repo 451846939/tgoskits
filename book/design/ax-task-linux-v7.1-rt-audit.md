@@ -1197,12 +1197,14 @@ Linux v7.1 的 `yield_task_fair()` 在 `rq->nr_running == 1` 时可以直接返�
 rq 锁内直接迁移。`migration_pending`、`on_rq` 和目标 CPU 的重校验共同保证 Fair 的单实体
 快路径不会让任务永久留在 affinity 已排除的 CPU。
 
-TGOSKits 没有独立 stopper 线程，当前任务的同步 affinity 接口在持有 scheduler baton 时
-发布 `migration_target`，随后通过一次 owner schedule-out 完成迁移。因此 Fair 单实体快
-路径不能只判断本地 rq 为空；它还必须确认 placement 仍是本 CPU 的 `Running + on_cpu`、
-affinity 仍包含 owner，且没有待提交的 migration。该条件收敛为
+当时的 affinity 迁移没有独立 stopper 线程，当前任务的同步 affinity 接口在持有 scheduler
+baton 时发布 `migration_target`，随后通过一次 owner schedule-out 完成迁移。因此 Fair
+单实体快路径不能只判断本地 rq 为空；它还必须确认 placement 仍是本 CPU 的
+`Running + on_cpu`、affinity 仍包含 owner，且没有待提交的 migration。该条件收敛为
 `ThreadPlacementState::can_continue_running_on()`，所有条件满足时才允许 self-dispatch；否则
-进入统一 schedule-out/switch-tail 事务，迁移切换记录为 `SwitchReason::Migrated`。
+进入统一 schedule-out/switch-tail 事务，迁移切换记录为 `SwitchReason::Migrated`。后续为
+Starry `stop_machine` 新增的 per-CPU stopper 是独立的内核停止类，不改变普通 affinity 的
+owner schedule-out 协议。
 
 确定性红测复现了 CI 的最小状态：两 CPU、当前 CPU 上只有一个 Fair 线程，把 affinity
 收窄到另一 CPU 后调用 `yield_current()`。旧实现返回 self-to-self `Yield`，新实现选择本地
@@ -1827,8 +1829,38 @@ generation-bearing doorbell；Linux `RT_PUSH_IPI` 同样以 root-domain irq-work
 LoongArch command 编码现已拆为可在 host 运行的纯值模型。确定性旧红测精确断言 runtime
 command 的 blocking 位原为 0，修复后为 1；目标 `task-ipi` 随后在 4 vCPU LoongArch QEMU
 连续 10/10 正式通过。该修复不改变 scheduler doorbell 的 generation/claim/drain 协议，也
-不把远程 wake 改成同步回调。现有 `ax-ipi` safe boxed callback 仍会在 hard IRQ 执行和析构，
-其 typed hard-IPI 与 task-deferred endpoint 拆分作为独立下一阶段，不能用本次寄存器修复掩盖。
+不把远程 wake 改成同步回调。后续阶段已经删除 `ax-ipi` boxed callback，并按下面的
+hard-call/stopper 分层完成收口。
+
+### 2026-08-05 hard-call 与 CPU stopper 分层
+
+对照 Linux v7.1 `kernel/smp.c` 的 CSD、`include/linux/llist.h`、
+`kernel/stop_machine.c` 和 `kernel/sched/stop_task.c` 后，跨 CPU 工作被拆成四条互不兼容的
+所有权通道：
+
+1. 平台 IPI 只传递物理边沿；
+2. scheduler doorbell 只发布 generation-bearing 的 reschedule/task-work 状态；
+3. `ax-ipi` hard-call 只接受调用方固定地址、同步等待的 raw operation；
+4. 需要闭包、分配、等待或 OS 生命周期的工作进入 task-context worker。
+
+`ax-ipi` 不再提供 `Callback`、`MulticastCallback`、`run_on_cpu()` 或
+`run_on_each_cpu()`。同步请求是调用方栈上 pin 的 `HardCall`，只保存函数指针和借用参数；
+发布后不得超时放弃。producer 使用 Release CAS 发布，只有空到非空的 producer 发送物理
+IPI；目标 CPU 用原子 swap 整批摘链、反转为 FIFO，并最多执行 64 项。超出 budget 的
+owner-only remainder 先于 IRQ 期间的新请求继续执行，并给本 CPU 重新触发 IPI。硬中断因此
+不分配、不析构引用计数对象、不取得远端锁，也不存在逐节点 CAS pop 的 ABA 窗口。
+
+Starry 内核文本更新使用一 CPU 一个的持久 stopper task。命令、完成等待和全局串行化发生在
+任务上下文的 `PiMutex`/`WaitQueue`；所有远端 stopper 都进入 parked 状态后，才在
+`NoPreemptIrqSave` 区间执行本 CPU 同步动作。stopper 使用独立 `KernelStop` 调度类：它高于
+Deadline、POSIX RT、Fair 和 Idle，但不进入 RT priority array、cpupri/cpudl、RT/DL 带宽、
+placement demand 或迁移扫描。每个 rq 只有一个 stopper 槽位，不能把 priority 100 当作
+POSIX RT 兼容实现；Starry 调度 ABI 也不得暴露该内部策略。
+
+当前平台 CPU 集在启动后保持固定，所以 stopper coordinator 以 IRQ framework 的 online
+快照选择目标。若以后启用运行时 CPU hotplug，必须像 Linux `cpus_read_lock()` 一样先增加
+独立 topology read-side lease：撤销 online 前禁用 stopper endpoint，并等待已提交命令、
+hard-call 和 scheduler doorbell 全部 quiesce；不能只在 wait predicate 中重复读取布尔值。
 
 ## 模块化结果
 

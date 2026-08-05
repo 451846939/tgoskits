@@ -6,9 +6,9 @@ pub(crate) unsafe fn run_on_cpu_sync(
     f: unsafe fn(*mut ()),
     arg: *mut (),
 ) -> Result<(), ax_hal::irq::IrqError> {
-    // SAFETY: the caller supplies the callback ABI and lifetime required by
+    // SAFETY: the caller supplies the hard-call ABI and lifetime required by
     // ax-ipi; this adapter only forwards the typed platform hook.
-    unsafe { ax_ipi::run_on_cpu_sync_raw(cpu, f, arg) }
+    unsafe { ax_ipi::call_on_cpu(ax_hal::irq::CpuId(cpu), f, arg) }
 }
 
 #[cfg(any(feature = "ipi", feature = "wake-ipi", test))]
@@ -34,8 +34,14 @@ fn claim_local_scheduler_delivery() -> bool {
 
 #[cfg(all(feature = "irq", feature = "ipi"))]
 pub(crate) fn irq_handler(_ctx: ax_hal::irq::IrqContext) -> ax_hal::irq::IrqReturn {
+    ax_ipi::claim_current_delivery();
     dispatch_shared_ipi(
-        ax_ipi::ipi_handler,
+        || {
+            ax_ipi::drain_hard_calls().unwrap_or_else(|error| {
+                panic!("failed to continue hard-call draining: {error:?}")
+            });
+            ax_ipi::legacy::drain_current_callbacks();
+        },
         || {
             #[cfg(feature = "multitask")]
             {

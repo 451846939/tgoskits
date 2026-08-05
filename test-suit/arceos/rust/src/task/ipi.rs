@@ -13,15 +13,12 @@ use std::{
     println,
     sync::Arc,
     thread,
-    time::Duration,
     vec::Vec,
 };
 
 const MAX_SENDER_CPUS: usize = 3;
 const CALLBACKS_PER_SENDER: usize = 16;
 const TEST_ROUNDS: usize = 2;
-const STALL_POLLS: usize = 200;
-const POLL_INTERVAL_MS: u64 = 1;
 const IDLE_WAKE_POLLS: usize = 100_000;
 
 static TARGET_CPU: AtomicUsize = AtomicUsize::new(0);
@@ -50,7 +47,7 @@ fn pin_current_to_cpu(cpu_id: usize) {
     );
 }
 
-fn counting_callback() {
+unsafe fn counting_callback(_argument: *mut ()) {
     let target_cpu = TARGET_CPU.load(Ordering::Relaxed);
     assert_eq!(
         this_cpu_id(),
@@ -58,15 +55,6 @@ fn counting_callback() {
         "IPI callback ran on the wrong CPU"
     );
     EXECUTED_CALLBACKS.fetch_add(1, Ordering::Relaxed);
-}
-
-fn noop_callback() {
-    let target_cpu = TARGET_CPU.load(Ordering::Relaxed);
-    assert_eq!(
-        this_cpu_id(),
-        target_cpu,
-        "IPI callback ran on the wrong CPU"
-    );
 }
 
 unsafe fn counting_hard_call(argument: *mut ()) {
@@ -79,7 +67,7 @@ unsafe fn counting_hard_call(argument: *mut ()) {
     EXECUTED_HARD_CALLS.fetch_add(1, Ordering::Relaxed);
 }
 
-fn idle_wake_callback() {
+unsafe fn idle_wake_callback(_argument: *mut ()) {
     let target_cpu = TARGET_CPU.load(Ordering::Relaxed);
     assert_eq!(
         this_cpu_id(),
@@ -145,46 +133,21 @@ fn exercise_irq_masked_idle_wake(target_cpu: usize, sender_cpu: usize) {
         while !IDLE_TARGET_MASKED.load(Ordering::Acquire) {
             thread::yield_now();
         }
-        ax_ipi::legacy::run_on_cpu(target_cpu, idle_wake_callback)
-            .expect("failed to send idle-wake IPI");
         IDLE_IPI_PUBLISHED.store(true, Ordering::Release);
+        // SAFETY: the thunk uses only static atomics and is bounded hard-IRQ
+        // work. `call_on_cpu` does not return before it has completed.
+        unsafe {
+            ax_ipi::call_on_cpu(
+                CpuId(target_cpu),
+                idle_wake_callback,
+                core::ptr::null_mut(),
+            )
+        }
+            .expect("idle-wake hard call failed");
     });
 
     sender.join().unwrap();
     target.join().unwrap();
-}
-
-fn wait_for_callbacks_or_stall(expected: usize) -> bool {
-    let mut last_executed = EXECUTED_CALLBACKS.load(Ordering::Relaxed);
-    let mut stalled_polls = 0;
-
-    loop {
-        let executed = EXECUTED_CALLBACKS.load(Ordering::Relaxed);
-        if executed == expected {
-            return true;
-        }
-
-        if executed == last_executed {
-            stalled_polls += 1;
-            if stalled_polls >= STALL_POLLS {
-                return false;
-            }
-        } else {
-            last_executed = executed;
-            stalled_polls = 0;
-        }
-
-        thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
-    }
-}
-
-fn send_recovery_ipi(target_cpu: usize, sender_cpu: usize) {
-    thread::spawn(move || {
-        pin_current_to_cpu(sender_cpu);
-        ax_ipi::legacy::run_on_cpu(target_cpu, noop_callback).expect("failed to send recovery IPI");
-    })
-    .join()
-    .unwrap();
 }
 
 pub fn run() -> crate::TestResult {
@@ -225,8 +188,16 @@ pub fn run() -> crate::TestResult {
 
                 for _ in 0..CALLBACKS_PER_SENDER {
                     SENT_CALLBACKS.fetch_add(1, Ordering::Relaxed);
-                    ax_ipi::legacy::run_on_cpu(target_cpu, counting_callback)
-                        .expect("failed to send callback IPI");
+                    // SAFETY: the thunk uses only static atomics and performs
+                    // bounded hard-IRQ work.
+                    unsafe {
+                        ax_ipi::call_on_cpu(
+                            CpuId(target_cpu),
+                            counting_callback,
+                            core::ptr::null_mut(),
+                        )
+                    }
+                    .expect("counting hard call failed");
                 }
             }));
         }
@@ -242,20 +213,11 @@ pub fn run() -> crate::TestResult {
 
         let expected = sender_cpus.len() * CALLBACKS_PER_SENDER;
         assert_eq!(SENT_CALLBACKS.load(Ordering::Relaxed), expected);
-
-        if !wait_for_callbacks_or_stall(expected) {
-            send_recovery_ipi(target_cpu, sender_cpus[0]);
-            let _ = wait_for_callbacks_or_stall(expected);
-            let executed_after_recovery = EXECUTED_CALLBACKS.load(Ordering::Relaxed);
-            if executed_after_recovery == expected {
-                panic!("IPI callbacks only drained after an extra recovery IPI in round {round}");
-            } else {
-                panic!(
-                    "IPI callbacks stalled at {executed_after_recovery}/{expected} in round \
-                     {round}"
-                );
-            }
-        }
+        assert_eq!(
+            EXECUTED_CALLBACKS.load(Ordering::Relaxed),
+            expected,
+            "all synchronous hard calls must complete in round {round}"
+        );
     }
 
     pin_current_to_cpu(sender_cpus[0]);

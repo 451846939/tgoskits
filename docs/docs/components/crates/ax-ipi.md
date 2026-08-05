@@ -2,132 +2,113 @@
 
 > 路径：`os/arceos/modules/axipi`
 > 类型：库 crate
-> 分层：ArceOS 层 / IPI 运行时基础件
-> 版本：`0.3.0-preview.3`
-> 文档依据：`Cargo.toml`、`README.md`、`src/lib.rs`、`src/event.rs`、`src/queue.rs`
+> 分层：ArceOS 层 / 硬中断跨 CPU 调用基础件
+> 版本：`0.5.29`
+> 文档依据：`Cargo.toml`、`src/lib.rs`、`src/hard_call.rs`
 
-`ax-ipi` 是 ArceOS 的跨核回调分发模块。它基于 `ax-hal` 的 IPI 发送能力，为每个 CPU 维护一个本地事件队列，并向上暴露“在某个 CPU 上运行闭包”或“在所有其他 CPU 上广播闭包”的接口。它属于运行时叶子基础件：负责 IPI 事件排队和派发，不负责 SMP bring-up、调度策略或通用消息总线。
+`ax-ipi` 只提供同步、不可睡眠的跨 CPU hard-call。它对应 Linux
+`smp_call_function_single()` 的 CSD 传输边界，不是通用闭包执行器、任务 work queue、
+scheduler doorbell 或跨核 RPC。
 
 ## 架构设计
-### 设计定位
-`ax-ipi` 的核心目标不是实现一个复杂的多核通信框架，而是提供一条很短的工作链：
 
-1. 把闭包包装成可发送的 IPI 事件。
-2. 放入目标 CPU 的本地队列。
-3. 通过 `ax-hal::irq::send_ipi()` 触发对方 CPU 进入 IPI 中断。
-4. 在 IPI handler 中把队列里的事件逐个取出执行。
+### 职责边界
 
-因此，`ax-ipi` 更像“IPI 回调投递器”，而不是调度器、work queue 或通用 RPC 层。
+一条 hard-call 只包含：
 
-### 模块结构
-- `src/lib.rs`：初始化、单播/广播发送和 IPI handler 主线。
-- `src/event.rs`：回调封装，区分单次消费的 `Callback` 与可克隆广播的 `MulticastCallback`。
-- `src/queue.rs`：基于 `VecDeque` 的 `IpiEventQueue`，以 FIFO 顺序存放待处理事件。
+- 调用方栈上固定地址的 `HardCall` 节点；
+- 一个 `unsafe fn(*mut ())` 函数指针；
+- 一个只借用到同步调用返回的裸参数；
+- 发布状态、单向链指针和完成状态。
 
-### 1.3 关键对象
-- `Callback`：`Box<dyn FnOnce()>` 封装的单播回调。
-- `MulticastCallback`：`Arc<dyn Fn()>` 封装的广播回调，可拆成多个单播回调。
-- `IpiEvent`：记录源 CPU ID 与具体回调。
-- `IpiEventQueue`：每 CPU 一个的待处理事件队列。
-- `IPI_EVENT_QUEUE`：通过 `#[ax_percpu::def_percpu]` 声明的每 CPU 静态 `LazyInit<SpinNoIrq<IpiEventQueue>>`。
+目标 CPU 的硬中断不得取得堆对象所有权，不得分配，不得析构 `Box`/`Arc`，也不得
+运行任意 Rust 闭包。需要睡眠、分配、持有 OS 对象或执行无界工作的请求必须投递给
+任务上下文 worker；scheduler reschedule 则使用 `ax-task` 自己的 generation-bearing
+doorbell，不能借用 hard-call 队列。
 
-### 1.4 发送与处理主线
-发送到单个 CPU 的流程如下：
+### 队列所有权
+
+每个 CPU 有一个固定地址的 `HardCallQueue`：
+
+- 多个 producer 只通过原子 compare-exchange 发布节点；
+- producer 把队列从空变为非空时取得物理 IPI edge 所有权；
+- 唯一 consumer 是目标 CPU 的不可重入 IPI handler；
+- consumer 用一次原子 swap 整批摘链，再反转为 FIFO，等价于 Linux CSD 的
+  `llist_del_all()` + `llist_reverse_order()`；
+- 单次 IRQ 最多处理 64 项；剩余项保存在 owner-only pending 链，并给本 CPU 重新触发
+  IPI，禁止在硬中断中无界 drain。
+
+整批摘链避免逐节点 Treiber pop 的 ABA 窗口。consumer 已摘下的旧请求始终先于 IRQ
+期间新发布的请求执行。
+
+### 同步生命周期
 
 ```mermaid
-flowchart TD
-    A["run_on_cpu(dest, callback)"] --> B{"dest == 当前 CPU ?"}
-    B -- 是 --> C["立即执行 callback"]
-    B -- 否 --> D["取目标 CPU 的 IPI_EVENT_QUEUE"]
-    D --> E["push(src_cpu_id, callback)"]
-    E --> F["ax-hal::irq::send_ipi()"]
-    F --> G["目标 CPU 进入 ipi_handler()"]
-    G --> H["循环 pop_one() 并执行"]
+flowchart LR
+    A["调用方 pin 栈上 HardCall"] --> B["Release 发布到目标 CPU"]
+    B --> C{"空到非空?"}
+    C -- 是 --> D["发送物理 IPI"]
+    C -- 否 --> E["复用已有 edge"]
+    D --> F["目标 IRQ 整批摘链并反转"]
+    E --> F
+    F --> G["有界执行 raw hard-call"]
+    G --> H["Release 标记完成"]
+    H --> I["调用方 Acquire 观察后返回"]
 ```
 
-实现里的重要细节：
+请求一旦发布，`call_on_cpu()` 就不能超时退出或放弃栈节点；它必须等目标 CPU 标记
+完成。否则目标 IRQ 以后解引用该节点会形成 use-after-return。调用方还必须保证目标
+函数终止，且不会等待由调用 CPU 或关闭 IRQ 的 CPU 推进的资源。
 
-- `run_on_cpu()` 遇到目标就是当前 CPU 时不会排队，而是同步立即执行。
-- `run_on_each_cpu()` 会先在当前 CPU 上立刻执行一份，再把 clone 后的回调投给其他 CPU。
-- `ipi_handler()` 会循环 drain 当前 CPU 队列，而不是只处理一个事件。
+## 公开接口
 
-### 1.5 能力边界
-- `ax-ipi` 队列是 FIFO，但不提供优先级、取消、重试或返回值汇总。
-- 回调运行在 IPI 处理上下文里，默认应保持短小且不可阻塞。
-- 这个 crate 没有自己的 feature 门控，但它依赖 `ax-hal` 已开启 `ipi` 能力。
+- `init()`：验证当前 CPU 的固定 per-CPU queue 已可访问。
+- `mark_current_cpu_ready()`：在 IPI handler 安装且本地 IRQ 可用后发布接收能力。
+- `is_cpu_ready()` / `wait_until_cpu_ready()`：为启动期页表同步提供 readiness 边界。
+- `call_on_cpu()`：同步执行一个类型受限的 raw hard-call。
+- `ipi_handler()`：在目标 CPU 硬中断中处理一个有界批次。
 
-## 核心功能
-### 功能概览
-- 初始化每 CPU 的 IPI 队列。
-- 向指定 CPU 投递单次回调。
-- 向所有其他 CPU 广播回调。
-- 在 IPI 中断处理函数里取出并执行待处理事件。
-
-### 使用场景
-- `init()`：由 `ax-runtime/src/mp.rs` 在次核 bring-up 路径中调用，为当前 CPU 建立 IPI 队列。
-- `ipi_handler()`：由 `ax-runtime/src/lib.rs` 的 IRQ 处理路径调用。
-- `run_on_cpu()` / `run_on_each_cpu()`：是这个 crate 的核心公开 API，也是 `ax-api` / `ax-runtime` 暴露 IPI 能力的底层基础。
-
-### 边界说明
-- 它不是 SMP 启动器；启动 CPU 的逻辑在 `ax_runtime::start_secondary_cpus()`。
-- 它不是通用异步执行框架；没有 future、返回值或 work stealing。
-- 它也不是调度器；闭包何时运行只受 IPI 到达和 handler 执行控制。
+旧的 `Callback`、`MulticastCallback`、`run_on_cpu()` 和 `run_on_each_cpu()` 已删除，
+不提供兼容层。需要广播的调用方应在任务上下文逐 CPU 调用明确的 typed operation；
+需要停止所有 CPU 的内核文本修改由 per-CPU stopper task 完成。
 
 ## 依赖关系
+
 ```mermaid
 graph LR
-    ax-hal["ax-hal (ipi)"] --> ax-ipi["ax-ipi"]
-- `ax-runtime`：负责在启动链中初始化队列，并在 IRQ 处理里调用 `ipi_handler()`。
-- `ax-api` / `ax-runtime`：把 IPI 能力向上层 feature 与 API 暴露。
-
-## 开发指南
-### 接入方式
-```toml
-[dependencies]
-ax-ipi = { workspace = true }
+    ax_hal["ax-hal IPI capability"] --> ax_ipi["ax-ipi"]
+    ax_percpu["ax-percpu fixed CPU-local storage"] --> ax_ipi
+    ax_ipi --> ax_runtime["ax-runtime IRQ glue"]
 ```
 
-通常只有在上层 feature 打开 `ipi` 时，最终镜像才会真正把它编进去。
+`ax-ipi` 不依赖 allocator、`ax-kspin` 或 `ax-lazyinit`。队列在 per-CPU 区域中静态
+构造，启动过程只发布 readiness。
 
-### 注意事项
-1. `init()` 是每 CPU 初始化，不是全局初始化；修改时必须同时考虑 BSP 和 AP 路径。
-2. `run_on_each_cpu()` 当前包含“立即执行当前 CPU”这一步，修改时不能无意改变这个语义。
-3. `Callback` / `MulticastCallback` 的封装关系要保持清晰，避免把广播路径退化成共享可变闭包。
-4. 不要把复杂的等待、应答、重传协议塞进 `ax-ipi`；这层应该继续保持单纯。
+## 开发约束
 
-### 4.3 开发建议
-- IPI 回调应尽量短小，只做必要的跨核通知或状态翻转。
-- 若需要可取消定时或异步 work queue，应该另建专门机制，而不是滥用 IPI 队列。
-- 若引入更复杂的 IPI 事件类型，优先扩展事件内容，而不是让 `ax-ipi` 直接理解高层业务语义。
+1. `call_on_cpu()` 的参数生命周期必须覆盖完整同步等待。
+2. hard-call 不能睡眠、分配、fault，也不能取得可能由调用 CPU 持有的锁。
+3. producer 必须先发布 payload，再发送 IPI；handler 必须先取得整批所有权，再遍历。
+4. IRQ budget 不得删除；超过 budget 的 work 必须可靠重新触发，不能依赖下一次偶然 IRQ。
+5. 不得重新引入 boxed callback、引用计数析构或远端 `SpinNoIrq<VecDeque<_>>`。
+6. CPU hotplug 若进入运行时，必须在 readiness 撤销前阻止新发布并等待已发布请求完成。
 
 ## 测试
-### 测试覆盖
-`ax-ipi` 没有独立的 crate 内测试，当前验证主要依赖真实 SMP 路径：
 
-- `ax-runtime` 在启用 `ipi`/`smp`/`irq` 组合下的启动与中断处理；
-- API 层对 IPI 能力的集成；
-- 多核环境下回调能否确实落到目标 CPU。
+host 行为测试覆盖：
 
-### 单元测试
-- `IpiEventQueue` 的 FIFO 行为。
-- `MulticastCallback::into_unicast()` 的语义是否保持“一份广播拆成多份单播”。
-- 当前 CPU 快路径是否绕过排队。
+- 参数不被队列拥有或析构；
+- 有界 drain 保留剩余工作；
+- 批量摘链后保持 FIFO 发布顺序。
 
-### 集成测试
-- QEMU/真实多核环境下的单播与广播是否都能触发。
-- `ipi_handler()` 是否能正确 drain 多个连续事件。
-- 与 `ax-runtime` 的 IRQ 注册/处理中断链是否匹配。
-
-### 覆盖率
-- 对 `ax-ipi`，SMP 集成覆盖比局部行覆盖率更关键。
-- 涉及队列结构或广播语义的改动，都应覆盖“当前 CPU”“远端 CPU”“广播”三条路径。
+SMP QEMU 还需要覆盖 x86_64、AArch64、RISC-V 和 LoongArch 的远端单播、burst、
+启动 readiness 与队列重新触发。LoongArch 的物理发送必须使用 blocking submission，
+该位只等待 IPI transport 接受命令，不等待目标 handler 执行。
 
 ## 跨项目定位
-### ArceOS
-`ax-ipi` 是 ArceOS 在打开 IPI feature 后的跨核通知基础件。它为运行时和 API 层提供最小可用的 IPI 回调能力。
 
-### StarryOS
-StarryOS 当前没有直接把 `ax-ipi` 作为独立系统层来扩展，更多是通过共享的 ArceOS 运行时栈间接受用。因此它在 StarryOS 中仍是叶子基础件，而不是并发主控层。
-
-### Axvisor
-当前仓库里的 Axvisor 没有直接依赖 `ax-ipi` 形成自己的 IPI 子系统；如果未来复用这套能力，也更可能把它当成宿主侧的跨核通知底座，而不是 hypervisor 调度层。
+- ArceOS：为 TLB/cache shootdown 等极短硬操作提供同步 CPU 调用。
+- StarryOS：通过 ax-runtime 间接使用；`stop_machine` 使用 task-context stopper，不直接
+  投递 hard-call 闭包。
+- Axvisor：仅在确实需要 host CPU-local hard operation 时经 HAL capability 使用；设备、
+  vCPU 与 timer 工作仍应进入各自 owner worker。

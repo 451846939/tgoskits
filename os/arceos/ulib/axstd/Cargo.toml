@@ -20,7 +20,6 @@ crate-type = ["rlib", "staticlib"]
 
 [features]
 default = ["alloc", "tls", "fd"]
-host-test = ["ax-runtime/host-test"]
 
 # Baseline required by every ArceOS Rust application. Applications enable this
 # through their own `arceos` feature instead of axbuild completing it at runtime.
@@ -33,7 +32,7 @@ host-test = [
     "ax-kernel-guard/host-test",
     "ax-kspin/host-test",
     "ax-percpu/host-test",
-    "ax-task/host-test",
+    "ax-runtime/host-test",
 ]
 
 # libc compatibility surface used when ax-std is linked as fake libc for Rust std.

@@ -269,10 +269,10 @@ flowchart TB
 | `arceos-httpserver` | 16 | Simple HTTP server. Benchmark with Apache HTTP se… | `ax-std` | — |
 | `ax-input` | 10 | Input device management for ArceOS | `ax-driver` `ax-lazyinit` `ax-sync` | `ax-runtime` `ax-runtime` `starry-kernel` |
 | `ax-io` | 1 | `std::io` for `no_std` environment | `ax-errno` | `ax-api` `ax-fs` `ax-fs-ng` `ax-libc` `ax-net` `ax-net` `ax-posix-api` `ax-std` `starry-kernel` |
-| `ax-ipi` | 7 | ArceOS IPI management module | `ax-hal` `ax-kspin` `ax-lazyinit` `ax-percpu` | `ax-api` `ax-runtime` `ax-runtime` |
+| `ax-ipi` | 7 | ArceOS IPI management module | `ax-hal` `ax-percpu` | `ax-api` `ax-runtime` `ax-runtime` |
 | `ax-kernel-guard` | 1 | RAII wrappers to create a critical section with l… | `ax-crate-interface` | `ax-hal` `ax-kspin` `ax-percpu` `ax-task` `axvisor` `starry-kernel` |
-| `ax-kspin` | 2 | Spinlocks used for kernel space that can disable … | `ax-kernel-guard` | `ax-alloc` `ax-runtime` `ax-fs-ng` `ax-ipi` `ax-log` `ax-mm` `ax-plat` `ax-std` `ax-sync` `ax-task` `axvisor` `starry-kernel` `starry-process` `starry-signal` |
-| `ax-lazyinit` | 0 | Initialize a static value lazily. | — | `ax-cpu` `ax-display` `ax-fs` `ax-input` `ax-ipi` `ax-mm` `ax-net` `ax-std` `ax-task` `axaddrspace` `axvisor` `starry-process` |
+| `ax-kspin` | 2 | Spinlocks used for kernel space that can disable … | `ax-kernel-guard` | `ax-alloc` `ax-runtime` `ax-fs-ng` `ax-log` `ax-mm` `ax-plat` `ax-std` `ax-sync` `ax-task` `axvisor` `starry-kernel` `starry-process` `starry-signal` |
+| `ax-lazyinit` | 0 | Initialize a static value lazily. | — | `ax-cpu` `ax-display` `ax-fs` `ax-input` `ax-mm` `ax-net` `ax-std` `ax-task` `axaddrspace` `axvisor` `starry-process` |
 | `ax-libc` | 15 | ArceOS user program library for C apps | `ax-errno` `ax-runtime` `ax-io` `ax-posix-api` | — |
 | `ax-linked-list-r4l` | 0 | Linked lists that supports arbitrary removal in c… | — | `ax-sched` |
 | `ax-log` | 3 | Macros for multi-level formatted logging used by … | `ax-crate-interface` `ax-kspin` | `ax-api` `ax-runtime` `ax-posix-api` `ax-runtime` `starry-kernel` |

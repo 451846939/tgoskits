@@ -214,7 +214,7 @@ feature 正常启用时会同时启用 IPI 支持，在 SMP 场景下对已经�
 并打开本地 IRQ 的 CPU 发送同步 TLB shootdown。
 
 启动早期需要特别处理：主核在 `ax_task::init_scheduler()` 阶段可能已经创建
-动态任务栈，但此时其他 CPU 还没有初始化 IPI 队列，也不一定已经打开本地 IRQ。
+动态任务栈，但此时其他 CPU 的固定 hard-call endpoint 还没有发布 ready，也不一定已经打开本地 IRQ。
 因此 shootdown 不应盲目发送给所有配置 CPU，而是只发送给 runtime 标记为
 `IPI ready` 的 CPU。CPU 发布 ready 时会先进入 `becoming ready` 状态，做一次
 全局本地 TLB flush，再切换为 `ready`；shootdown 如果看到某个 CPU 正在发布

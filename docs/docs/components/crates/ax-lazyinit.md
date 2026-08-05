@@ -58,7 +58,7 @@ stateDiagram-v2
 - 在初始化后提供低开销的引用访问。
 
 ### 使用场景
-- `LazyInit::new()`：大量平台和模块静态对象都以它声明，如 `ax-task` 的运行队列、`ax-mm` 的内核地址空间、`ax-ipi` 的 IPI 队列。
+- `LazyInit::new()`：大量平台和模块静态对象都以它声明，如 `ax-task` 的全局服务对象和 `ax-mm` 的内核地址空间。
 - `init_once()`：平台 UART、IO APIC、GIC、显示/输入设备等对象初始化时广泛使用。
 - `call_once()`：用于“按需首次构造”的场景，如 `axplat-dyn` 内存区域表、`ax-std` 标准 IO 包装器、`axbacktrace` 的地址范围缓存。
 - `get()` / `Deref`：初始化完成后作为普通全局对象读取。
@@ -73,7 +73,6 @@ stateDiagram-v2
 graph LR
     ax_lazyinit["ax-lazyinit"] --> ax-task["ax-task"]
     ax_lazyinit --> ax-mm["ax-mm"]
-    ax_lazyinit --> ax-ipi["ax-ipi"]
     ax_lazyinit --> ax-fs["ax-fs / ax-fs-ng"]
     ax_lazyinit --> ax-net["ax-net / ax-net"]
     ax_lazyinit --> ax-display["ax-display"]
@@ -87,7 +86,7 @@ graph LR
 `ax-lazyinit` 没有本地 crate 依赖，目的是保持在启动期也能轻量使用。
 
 ### 主要消费者
-- ArceOS 模块：`ax-task`、`ax-mm`、`ax-ipi`、`ax-fs`、`ax-net`、`ax-display`、`ax-input` 等。
+- ArceOS 模块：`ax-task`、`ax-mm`、`ax-fs`、`ax-net`、`ax-display`、`ax-input` 等。
 - 平台层：`axplat-dyn` 和外部自定义平台 glue。
 - Axvisor：如 `vmm/timer.rs` 的 `TimerList`、DTB 缓存等。
 

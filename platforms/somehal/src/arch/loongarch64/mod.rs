@@ -13,8 +13,6 @@ mod liointc;
 mod liointc_cpu_interface;
 mod pch_pic;
 
-use ipi_command::runtime_ipi_send_value;
-
 use crate::irq_routing::{RawIrq, classify_cpu_irq, cpu_local_hwirq_is_runtime_irq};
 
 pub struct Plat;

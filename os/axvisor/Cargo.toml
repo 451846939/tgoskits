@@ -83,7 +83,6 @@ axbacktrace = { workspace = true, optional = true }
 [dev-dependencies]
 axtest.workspace = true
 ax-hal = { workspace = true, features = ["paging", "irq", "smp", "hv"] }
-ax-task = { workspace = true, features = ["axtest"] }
 
 # xtask dependencies (only used on host platforms)
 [target.'cfg(any(windows, all(unix, not(target_env = "musl"))))'.dependencies]

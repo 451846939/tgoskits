@@ -412,6 +412,27 @@ where
         .unwrap_or_else(|error| panic!("failed to spawn affine kernel thread: {error}"))
 }
 
+/// Spawns a fixed per-CPU kernel service with its scheduler policy committed
+/// before first publication.
+pub fn spawn_kernel_thread_with_policy_and_affinity<F>(
+    entry: F,
+    name: String,
+    policy: scheduler::SchedulePolicy,
+    affinity: scheduler::CpuSet,
+) -> scheduler::ThreadHandle
+where
+    F: FnOnce() + Send + 'static,
+{
+    scheduler::spawn_raw_with_policy_and_affinity(
+        entry,
+        name,
+        crate::config::KERNEL_STACK_SIZE,
+        policy,
+        affinity,
+    )
+    .unwrap_or_else(|error| panic!("failed to spawn policy-bound kernel thread: {error}"))
+}
+
 /// Waits for a kernel worker and releases its scheduler-owned resources.
 pub fn join_kernel_thread(thread: scheduler::ThreadHandle) -> i32 {
     scheduler::join_thread(thread)
