@@ -46,6 +46,27 @@ use x86_64 as imp;
 ))]
 compile_error!("cpu-local supports x86_64, AArch64, RISC-V, and LoongArch64 only");
 
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ArchitectureCurrentModel {
+    pub(super) current_source_aliases_kernel_tls: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CurrentThreadSource {
+    Architecture,
+    CpuRuntimeAnchor,
+}
+
+impl ArchitectureCurrentModel {
+    const fn current_thread_source(self, tls_enabled: bool) -> CurrentThreadSource {
+        if tls_enabled && self.current_source_aliases_kernel_tls {
+            CurrentThreadSource::CpuRuntimeAnchor
+        } else {
+            CurrentThreadSource::Architecture
+        }
+    }
+}
+
 /// Reads ordinary preemption nesting from the architecture-selected owner.
 #[doc(hidden)]
 #[inline(always)]
@@ -260,26 +281,25 @@ pub fn current_thread(pin: &CpuPin<'_>) -> Result<NonNull<CurrentThreadHeader>, 
 #[doc(hidden)]
 #[inline(always)]
 pub unsafe fn scheduler_current_thread() -> Result<NonNull<CurrentThreadHeader>, CpuLocalError> {
-    #[cfg(not(feature = "tls"))]
-    {
-        // LinuxCurrent images keep the task pointer in one architecture-owned
-        // source. Reading a CPU area first would race migration because this
-        // function is itself used to construct the preemption guard.
-        let register = unsafe { imp::read_current_thread(0) };
-        scheduler_header_from_raw(register, None)
-    }
-
-    #[cfg(feature = "tls")]
-    loop {
-        // UnikernelTls images keep current in the CPU area's runtime anchor.
-        // Retry if migration changes the base between sampling the area and
-        // loading its slot; the caller cannot be pinned before this lookup.
-        let area = current_area()?;
-        let register = unsafe { imp::read_current_thread(area.base()) };
-        if unsafe { imp::read_cpu_base()? } != area.base() {
-            continue;
+    match imp::CURRENT_MODEL.current_thread_source(cfg!(feature = "tls")) {
+        CurrentThreadSource::Architecture => {
+            // The architecture current source does not require a sampled CPU
+            // area. Reading one first would race migration because this
+            // function is itself used to construct the preemption guard.
+            let register = unsafe { imp::read_current_thread(0) };
+            scheduler_header_from_raw(register, None)
         }
-        return scheduler_header_from_raw(register, Some(area));
+        CurrentThreadSource::CpuRuntimeAnchor => loop {
+            // Architectures whose current source is also the kernel TLS base
+            // keep current in the CPU runtime anchor. Retry if migration
+            // changes the area before the guard can be constructed.
+            let area = current_area()?;
+            let register = unsafe { imp::read_current_thread(area.base()) };
+            if unsafe { imp::read_cpu_base()? } != area.base() {
+                continue;
+            }
+            return scheduler_header_from_raw(register, Some(area));
+        },
     }
 }
 
@@ -337,6 +357,33 @@ mod tests {
     }
 
     #[test]
+    fn aarch64_current_register_is_independent_of_kernel_tls() {
+        let aarch64 = ArchitectureCurrentModel {
+            current_source_aliases_kernel_tls: false,
+        };
+        assert_eq!(
+            aarch64.current_thread_source(true),
+            CurrentThreadSource::Architecture,
+            "Linux AArch64 keeps current in SP_EL0 while TPIDR_EL0 independently owns kernel TLS",
+        );
+    }
+
+    #[test]
+    fn tls_aliased_task_register_uses_the_cpu_anchor() {
+        let tls_aliased = ArchitectureCurrentModel {
+            current_source_aliases_kernel_tls: true,
+        };
+        assert_eq!(
+            tls_aliased.current_thread_source(true),
+            CurrentThreadSource::CpuRuntimeAnchor,
+        );
+        assert_eq!(
+            tls_aliased.current_thread_source(false),
+            CurrentThreadSource::Architecture,
+        );
+    }
+
+    #[test]
     fn scheduler_current_thread_survives_migration_during_bootstrap_read() {
         let first = modeled_area(0);
         let second = modeled_area(1);
@@ -356,17 +403,12 @@ mod tests {
 
     #[test]
     fn scheduler_current_thread_rejects_an_uninstalled_host_area() {
-        #[cfg(feature = "tls")]
-        let expected_error = CpuLocalError::AreaNotInstalled;
-        #[cfg(not(feature = "tls"))]
-        let expected_error = CpuLocalError::CurrentThreadMismatch;
-
         let rejected = std::thread::spawn(move || {
             // SAFETY: the fresh host thread has no installed CPU area, so no
             // scheduler-owned pointer can be returned.
             matches!(
                 unsafe { scheduler_current_thread() },
-                Err(error) if error == expected_error
+                Err(CpuLocalError::CurrentThreadMismatch)
             )
         })
         .join()

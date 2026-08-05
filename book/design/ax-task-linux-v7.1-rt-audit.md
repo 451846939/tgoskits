@@ -60,7 +60,7 @@ Linux 用于核对状态所有权、锁序和发布顺序，不复制其对象�
 3. hard-IRQ/IRQ mask、scheduler baton、runqueue owner 属于 CPU；
 4. 普通 guard 的最后一层只能原子转换为 scheduler baton，不能先暴露可抢占窗口；
 5. 上下文切换尾在清除前一线程物理 `on_cpu` 后，才能迁移或回收资源；
-6. current-task 发布分两阶段：先发布 CPU anchor，再由架构裸切换尾更新任务寄存器。两阶段之间禁止执行可失败或会释放所有权的 Rust 代码。
+6. current-task 发布先提交 CPU anchor；具有独立 current 寄存器的架构再由裸切换尾更新任务寄存器。任务寄存器与 kernel TLS 寄存器重叠的后端以 anchor 为 current 权威。提交与裸切换之间禁止执行可失败或会释放所有权的 Rust 代码。
 
 物理存储由架构后端决定：
 
@@ -68,8 +68,8 @@ Linux 用于核对状态所有权、锁序和发布顺序，不复制其对象�
 | --- | --- | --- | --- |
 | x86_64 | per-CPU `current_task`，通过 GS 访问 | per-CPU `__preempt_count`，倒置的 resched 位折叠在同一字 | `CpuRuntimeAnchor` 的 GS 固定偏移 |
 | AArch64 | `SP_EL0` 指向 current task | `current_thread_info()->preempt`，count 与 need-resched 均跟随任务 | `CurrentThreadHeader`，裸切换尾写 `SP_EL0` |
-| RISC-V | `tp` 指向 current/task thread-info | 通用 task-owned `preempt_count`，resched 使用任务 TIF | `CurrentThreadHeader`，裸切换尾写 `tp` |
-| LoongArch64 | `$tp` 指向 current thread-info | 通用 task-owned `preempt_count`，resched 使用任务 TIF | `CurrentThreadHeader`，裸切换尾写 `$tp` |
+| RISC-V | `tp` 指向 current/task thread-info | 通用 task-owned `preempt_count`，resched 使用任务 TIF | 无 kernel TLS 时裸切换尾写 `tp`；TLS 占用 `tp` 时 CPU anchor 发布同一 `CurrentThreadHeader` |
+| LoongArch64 | `$tp` 指向 current thread-info | 通用 task-owned `preempt_count`，resched 使用任务 TIF | 无 kernel TLS 时裸切换尾写 `$tp`；TLS 占用 `$tp` 时 CPU anchor 发布同一 `CurrentThreadHeader` |
 
 因此不采用“四架构强制同一内存位置”的模型。统一接口为 `scheduler_*preempt*`，后端选择 live word。x86 保留 GS 快路径；其余 load/store 架构让 guard 状态随任务迁移。scheduler baton 和 IRQ owner 在四架构都保持 per-CPU。
 
@@ -78,11 +78,40 @@ Linux 用于核对状态所有权、锁序和发布顺序，不复制其对象�
 `scheduler_current_thread()` 用来在尚未构造 guard 时读取 current，因此不能先依赖普通 `CpuPin`。它必须：
 
 - 拒绝零地址和错误对齐；
-- TLS/CPU-anchor 模式下重读 CPU base，迁移则重试；
-- TLS 模式校验 header 仍绑定到采样的 CPU area；
+- 只有 task/current 寄存器确实与 kernel TLS 重叠的 CPU-anchor 模式才重读 CPU base，迁移则重试；
+- CPU-anchor 模式校验 header 仍绑定到采样的 CPU area；
 - 只返回非逃逸借用，调用方不得跨上下文切换保存裸指针。
 
-`PreparedThreadSwitch::commit()` 只发布 runtime anchor。AArch64/RISC-V/LoongArch 的裸切换尾必须随后写 current-task 寄存器；x86 的 anchor 即 GS current 来源，不需要第二个寄存器写入。漏掉第二阶段会由 `CurrentThreadMismatch` 检出。
+`PreparedThreadSwitch::commit()` 只发布 runtime anchor。AArch64 无论是否启用 TLS 都在裸切换尾写 `SP_EL0`；RISC-V/LoongArch 仅在 task register 未承载 kernel TLS 时写 `tp`；x86 的 GS 直接读取 anchor。具有独立 current 寄存器的后端漏掉第二阶段会由 `CurrentThreadMismatch` 检出。
+
+### AArch64 current、TLS 与抢占状态的根因修复
+
+CI run `31025836159` 的 AArch64 ArceOS QEMU 在并行内存分配完成后进入普通
+preemption guard，因 `CurrentThreadMismatch` panic。相同完整命令在修复前本地也能通过，
+说明 QEMU 结果只能证明低概率窗口存在，不能定位所有权错误。确定性红测
+`aarch64_current_register_is_independent_of_kernel_tls` 则直接验证架构能力：旧实现把
+Cargo `tls` feature 当成全架构 current 模式开关，错误地为 AArch64 选择 CPU anchor，
+而不是与 kernel TLS 独立的架构 current 来源。
+
+Linux v7.1 的对应所有权是：
+
+- `arch/arm64/include/asm/current.h` 始终从 `SP_EL0` 取得 current；
+- `arch/arm64/kernel/entry.S::cpu_switch_to` 在裸切换尾写入下一任务指针；
+- `arch/arm64/include/asm/preempt.h` 从 current thread-info 访问任务自有的
+  `preempt.count/need_resched`；
+- `TPIDR_EL0` 是独立 TLS 寄存器，不改变上述 current 所有权。
+
+因此 `cpu-local` 现在声明的是架构能力 `current_source_aliases_kernel_tls`，而不是由 feature
+选择一套全局 ABI。AArch64 与 x86_64 为 `false`；RISC-V 与 LoongArch64 因 `tp` 同时承担
+kernel TLS 才为 `true`。host 测试按 x86 GS/FS 分离模型运行，不再用 TLS feature 人为切换
+current 来源。AArch64 TLS 裸切换在同一不可失败汇编尾同时恢复 `TPIDR_EL0`、内核栈和
+`SP_EL0`，随后才返回下一任务；CPU anchor 仍由 switch commit 先发布，供 userspace trap
+入口在 `SP_EL0` 暂存用户栈时恢复 current，但不成为第二个可独立更新的 current 权威。
+
+修复后 `cpu-local` 的 host 与 host+TLS 契约测试均通过，`ax-cpu` 四架构 feature clippy
+通过；AArch64 `task-tls` 及连续三次完整 Rust QEMU 均取得正式通过标志。三次完整 Rust
+QEMU case 分别为 4.10、4.74、4.25 秒；这些时间只记录本次稳定性验证，不作为 Linux RT
+性能对比结论。
 
 ### CPU-owner per-CPU 安全边界
 
@@ -180,6 +209,7 @@ USB/vsock 控制器协议属于外围驱动；除非它们违反上述调度交�
 | task deadline | `hrtimer`、`sched/deadline.c` | IRQ 只处理 generation-bearing 值记录；CBS 状态机是唯一期限真值 | Deadline 已改为 class-owned 有序 AVL rq，并在节点内增广最早 CBS 事件；pick/dequeue/rekey 为 O(log n)；CBS 记账与物理入队同属目标 rq 事务；CBS 生命周期改为互斥状态，删除 `base_deadline` 镜像 |
 | clockevent/nohz | `clockevents_program_event()`、`clockevents_shutdown()`、`hrtimer_interrupt()`、`tick_nohz_idle_enter()`、`tick_nohz_stop_tick()`、`tick_nohz_idle_exit()` | 每 CPU 单一物理 owner；CPU 生命周期与 firing 带 epoch；早到/陈旧边不得进入 scheduler；idle 无调度事件时停止 tick；无期限用 `Option` | scheduler tick 建模为 `Running/Stopped`；online/offline 推进 CPU epoch；IRQ 只有在当前 arm 已到期时才能取得 move-only firing token，旧 pending edge 只重编程当前 arm；idle IRQ-off 提交时撤销 tick，只保留 task deadline |
 | switch tail | `finish_task_switch()` | 清 outgoing `on_cpu` 后才能回收；已提交的 raw switch 不可重试 | `on_switch_in` 已移到 current publication、runtime tail、handoff consumption 之后的 move-only completion，并在释放 `CpuLocal` borrow 后执行；task placement 仍镜像 switch-tail 暂态，待收敛到 CPU handoff |
+| 架构 current/preempt | `current.h`、`preempt.h`、`cpu_switch_to`、`finish_task_switch()` | current 与普通 preempt 状态必须由架构唯一来源取得；TLS 只在物理寄存器确实重叠时改变 current 读取路径；裸切换尾不可失败 | AArch64 始终以 `SP_EL0` 为 current、`TPIDR_EL0` 为 TLS；x86 以 GS/FS 分离；RISC-V/LoongArch TLS 模式才从 CPU anchor 取得 current；删除全局 TLS current 模式选择 |
 | PI/锁 | `rtmutex`、`spinlock_rt.c`、`wake_q` | raw rq/IRQ gate、sleeping PI、task-local pin 四层分离；每把锁拥有有序 waiter tree，owner 只接收各锁 top waiter；解锁核心在同一 preempt-disabled 事务内选择 waiter、deboost、发布 ownerless 状态并加入 wake_q，释放元数据锁后由核心完成 wake | `PiMutexCore` 唯一拥有 generation-bearing owner word 与 allocation-free AVL waiter tree；线程预备 lock/owner 两套 linkage，owner donor tree 只保存每把已持有锁的 top waiter；ax-sync 不再保存第二份 owner、selected、waiter 容器或可丢弃 wake handle；registration、release、claim 与 release 后 wake 均由 ax-task 持有完整事务，外层不能遗漏 handoff wake |
 | 阻塞等待 | `do_lock_file_wait()`、`wait_event_interruptible()`、`locks_delete_block()` | wake 只是重试提示；条件与临时阻塞关系由领域层拥有，返回前必须先注销 | scheduler notification 与 nofault access retry 已类型化分离，fcntl/futex 外层负责重试 |
 | IRQ waiter | `__free_irq()`、`synchronize_irq()` | 撤销后 grace，再释放 | token/drain 类型状态与同地址 ABA 防护已实现 |
