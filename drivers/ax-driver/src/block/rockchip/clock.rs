@@ -1,16 +1,17 @@
 #[cfg(feature = "rockchip-dwmmc")]
 use alloc::format;
 
+#[cfg(any(feature = "rockchip-dwmmc", test))]
 use fdt_edit::Node;
 use log::info;
-use rdrive::{
-    probe::{OnProbeError, fdt::ClockRef},
-    register::FdtInfo,
-};
+#[cfg(feature = "rockchip-dwmmc")]
+use rdrive::probe::fdt::ClockRef;
+use rdrive::{probe::OnProbeError, register::FdtInfo};
 
 #[cfg(feature = "rockchip-dwmmc")]
 use crate::soc::scmi;
 
+#[cfg(any(feature = "rockchip-dwmmc", test))]
 fn is_scmi_clock_protocol(node: &Node) -> bool {
     node.name().starts_with("protocol@14")
         && node.get_property("reg").and_then(|prop| prop.get_u32()) == Some(0x14)
