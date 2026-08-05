@@ -1,6 +1,7 @@
 use core::ops::{Deref, DerefMut};
 
 use super::*;
+use crate::RtPriority;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WakePreemptionDecision {
@@ -51,6 +52,27 @@ impl CpuRunQueueState {
 
     pub(crate) fn set_current(&mut self, current: Option<CurrentSchedule>) {
         self.current = current;
+    }
+
+    pub(crate) fn highest_rt_priority_including_current(&self) -> Option<u8> {
+        let current = self
+            .current
+            .and_then(|current| current.schedule_policy().rt_priority())
+            .map(RtPriority::get);
+        match (current, self.highest_rt_priority()) {
+            (Some(current), Some(queued)) => Some(current.max(queued)),
+            (Some(priority), None) | (None, Some(priority)) => Some(priority),
+            (None, None) => None,
+        }
+    }
+
+    pub(crate) fn earliest_deadline_including_current(&self) -> Option<u64> {
+        let current = self.current.and_then(CurrentSchedule::absolute_deadline_ns);
+        match (current, self.earliest_deadline_ns()) {
+            (Some(current), Some(queued)) => Some(current.min(queued)),
+            (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+            (None, None) => None,
+        }
     }
 
     pub(crate) fn deadline_members_are_empty(&self) -> bool {

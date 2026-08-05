@@ -82,6 +82,29 @@ mod scheduler_ipi_tests {
     }
 
     #[test]
+    fn sticky_scheduler_work_coalesces_until_owner_claims_it() {
+        let remote = CpuRemote::create(CpuId::new(1), TaskSystemConfig::new(2));
+        assert!(remote.mark_online());
+        crate::test_runtime::configure_scheduler_ipi(RuntimeStatus::Success);
+
+        assert!(remote.kick_scheduler_work());
+        assert!(remote.kick_scheduler_work());
+        assert_eq!(
+            crate::test_runtime::scheduler_ipi_send_count(),
+            1,
+            "one sticky pending interval may publish only one physical scheduler IPI"
+        );
+
+        remote.scheduler_enter();
+        assert!(remote.kick_scheduler_work());
+        assert_eq!(
+            crate::test_runtime::scheduler_ipi_send_count(),
+            2,
+            "a publication after owner claim must be allowed to ring a fresh doorbell"
+        );
+    }
+
+    #[test]
     fn inactive_cpu_accepts_owner_delivery_but_rejects_new_placement() {
         let remote = CpuRemote::create(CpuId::new(1), TaskSystemConfig::new(2));
         assert!(remote.mark_online());

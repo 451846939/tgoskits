@@ -381,6 +381,10 @@ impl RunQueue {
         self.deadline.earliest_event_ns()
     }
 
+    pub(crate) fn earliest_deadline_ns(&self) -> Option<u64> {
+        self.deadline.earliest_deadline_ns()
+    }
+
     pub(crate) const fn pushable_key(&self) -> Option<SchedulingKey> {
         match self.pushable_summary {
             Some(summary) => Some(summary.key),

@@ -179,6 +179,46 @@ impl TaskSystem {
             .map(|(_, cpu)| cpu)
     }
 
+    pub(super) fn select_priority_cpu(
+        &self,
+        policy: SchedulePolicy,
+        entity: SchedulingEntity,
+        affinity: &CpuSet,
+        preferred: Option<CpuId>,
+        excluded: Option<CpuId>,
+        now_ns: u64,
+    ) -> Option<CpuId> {
+        let accepts = |cpu: CpuId| {
+            Some(cpu) != excluded
+                && self
+                    .cpu_remotes
+                    .get(cpu.as_usize())
+                    .is_some_and(|remote| remote.accepts_placement())
+        };
+        let indexed = match policy {
+            SchedulePolicy::Fifo { priority } | SchedulePolicy::RoundRobin { priority, .. } => self
+                .priority_index
+                .find_lowest_rt_cpu(priority, affinity, preferred, accepts),
+            SchedulePolicy::Deadline(deadline_policy) => {
+                let absolute_deadline_ns = entity
+                    .deadline()
+                    .map(DeadlineEntity::absolute_deadline_ns)
+                    .filter(|deadline| *deadline != 0)
+                    .unwrap_or_else(|| now_ns.saturating_add(deadline_policy.deadline_ns()));
+                self.priority_index.find_later_deadline_cpu(
+                    absolute_deadline_ns,
+                    affinity,
+                    preferred,
+                    accepts,
+                )
+            }
+            SchedulePolicy::Fair { .. } => None,
+        };
+        indexed
+            .or_else(|| preferred.filter(|cpu| affinity.contains(*cpu) && accepts(*cpu)))
+            .or_else(|| self.select_allowed_active_cpu(affinity, excluded))
+    }
+
     fn validate_owner_next(
         sched: &ThreadSchedState,
         next: ThreadId,

@@ -43,7 +43,11 @@ fn coalesced_idle_requests_leave_final_selection_to_the_source_owner() {
 
     assert!(system.request_idle_pull(cpu1.as_ref()).unwrap());
     assert!(system.request_idle_pull(cpu1.as_ref()).unwrap());
-    assert_eq!(support::ipi_count(0), 1);
+    assert_eq!(
+        support::ipi_count(0),
+        0,
+        "the already-pending owner push callback must carry the coalesced pull without another IPI"
+    );
     system
         .set_affinity(low.id(), singleton_affinity(2, 0))
         .unwrap();

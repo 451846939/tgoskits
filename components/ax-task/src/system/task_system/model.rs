@@ -108,6 +108,11 @@ pub struct TaskSystem {
     // Wake and placement hot paths lock thread state before the target runqueue.
     pub(super) state: PreemptTicketLock<TaskSystemState>,
     pub(super) root_domain: PreemptTicketLock<RootDomainState>,
+    /// Lockless RT cpupri buckets plus the serialized Deadline cpudl heap.
+    ///
+    /// Runqueues remain authoritative. This is a root-domain derived index
+    /// published in the same transaction as each remotely visible rq summary.
+    pub(super) priority_index: RootDomainPriorityIndex,
     pub(super) deferred_coroutine_reclaims: SchedulerInbox,
     pub(super) deferred_deadline_callbacks: SchedulerInbox,
     pub(super) deferred_scheduler_ticks: SchedulerInbox,

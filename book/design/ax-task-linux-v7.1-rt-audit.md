@@ -260,6 +260,42 @@ v7.1 PREEMPT_RT。此次不再把“已有枚举/guard/缓存”当作完成标�
 - Fair/Idle class 继续由各自增广 EEVDF AVL 拥有，顶层固定按
   `Deadline > RT > Fair > Idle` 调用 class pick。
 
+### root-domain cpupri 与 cpudl 索引
+
+仅有 owner-local priority array/Deadline tree 还不足以实现 Linux RT 的跨 CPU 选核。
+旧实现虽然在 `CpuLoadSummary` 发布了 `current_key` 和 `pushable_key`，但 RT/Deadline 的
+`wake_thread_direct` 与 `place_ready` 最终仍按 runnable count 选择 CPU；负载与优先级是
+正交维度，因此较高优先级的 RT wake 可能被放到正在执行更高优先级 RT 工作的 CPU。
+
+当前实现增加由 root domain 持有、由 runqueue 派生的两类索引：
+
+- RT 使用 100 级 cpupri bitmap：0 表示没有 RT runnable，1..99 表示该 CPU 当前与队列中
+  最高的 POSIX RT priority。rq 发布先加入新桶，再以 Release 发布 per-CPU level，最后从
+  旧桶删除；读取者观察桶位后以 Acquire 重验 level，既不会把 CPU 从所有桶中短暂漏掉，也
+  不会把升优先级过程中遗留的旧桶位当成有效目标。选核只扫描低于 wakee priority 的桶，
+  同一桶优先 cache-hot CPU，再按 CPU ID 确定性选择；找不到更低优先级目标时才回退到原 CPU
+  与普通可用 CPU 选择。
+- Deadline 使用 cpudl 风格的 free-CPU set、per-CPU heap index 和以最晚 absolute deadline
+  为根的 max-heap。初始 Ready placement 先选没有 DL runnable 的允许 CPU，否则像 Linux
+  `cpudl_find()` 一样只读取 heap root，并且仅当该 CPU 允许且其最早 runnable deadline 晚于
+  新实体 absolute deadline 时采用，非空 CPU 查询不会退化成全 CPU 线性扫描。CPU online/offline 与 rq
+  summary 发布同步更新索引，索引永远只是提示；线程状态与物理 membership 仍由目标 rq
+  事务最终确认。
+- RT/DL enqueue 在发布摘要后若形成 overloaded pushable rq，会像 Linux
+  `rt_queue_push_tasks()`/balance callback 一样立即发布 sticky owner work 和 doorbell。
+  waker 不持源 rq 去获取目标 rq；owner 在锁外重新选择、重新获取线程状态并验证 queued、
+  affinity、on_cpu 和 migration generation 后才提交迁移，从而避免跨 rq 锁序反转。
+
+三条确定性红测分别证明：宽 affinity RT wake 不再按 load/cache hint 落到更紧急的 CPU；
+新 DL Ready 实体选择最晚 deadline CPU；低优先级 wake 即使不触发当前任务抢占，也会为已
+overloaded 的 RT rq 发布一次 owner balance doorbell。旧实现三条均稳定失败。
+
+当前 DL CBS/GRUB bandwidth 和 zero-lag timer 仍归原 per-rq owner。已有 bandwidth owner 的
+阻塞 DL 线程不能仅凭 cpudl hint 直接换 rq，否则目标 rq 会激活属于旧 CPU 的 CBS 事实，且
+旧 CPU 的 zero-lag timer 生命周期尚未撤销。因此这类 wake 暂时固定到 bandwidth owner；
+后续必须先建立独立 root-domain bandwidth owner，再开放 blocked DL 的直接跨 CPU wake。
+这不是兼容路径，而是 B1 所要求的所有权前置条件。
+
 RT bandwidth 仍按 Linux `struct rt_rq` 保持 per-CPU 事实源；Linux 的共享
 `rt_bandwidth` 负责 period timer 和 runtime balancing，并不意味着所有 CPU 共用一份
 `rt_time`。因此本轮没有把 per-CPU consumed runtime 错误合并成全局计数。后续若实现

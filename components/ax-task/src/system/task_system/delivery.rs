@@ -55,8 +55,9 @@ impl TaskSystem {
                 return Err(TaskError::AlreadyQueued);
             }
             let affinity = &sched.placement.affinity;
+            let policy = sched.policy.effective;
             let load_aware = matches!(
-                sched.policy.effective,
+                policy,
                 SchedulePolicy::Fair {
                     mode: FairMode::Normal | FairMode::Batch,
                     ..
@@ -64,6 +65,20 @@ impl TaskSystem {
             );
             let target = if load_aware {
                 state.select_initial_fair_cpu(affinity, owner)
+            } else if matches!(
+                policy,
+                SchedulePolicy::Fifo { .. }
+                    | SchedulePolicy::RoundRobin { .. }
+                    | SchedulePolicy::Deadline(_)
+            ) {
+                self.select_priority_cpu(
+                    policy,
+                    sched.policy.effective_entity,
+                    affinity,
+                    Some(owner),
+                    None,
+                    now_ns,
+                )
             } else if affinity.contains(owner) {
                 Some(owner)
             } else {

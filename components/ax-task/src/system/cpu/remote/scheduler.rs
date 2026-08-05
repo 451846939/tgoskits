@@ -7,6 +7,7 @@ const DEFERRED_SCHEDULER_WORK_OFFLINE_INVARIANT: u32 = 0x4453_574f;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SchedulerWorkPublication {
     PollingOwner,
+    AlreadyPending,
     DoorbellRequired,
 }
 
@@ -78,7 +79,9 @@ impl CpuRemote {
             .scheduler
             .flags
             .fetch_or(SCHEDULER_WORK_PENDING, Ordering::AcqRel);
-        if previous & SCHEDULER_IDLE_POLLING != 0 {
+        if previous & SCHEDULER_WORK_PENDING != 0 {
+            SchedulerWorkPublication::AlreadyPending
+        } else if previous & SCHEDULER_IDLE_POLLING != 0 {
             SchedulerWorkPublication::PollingOwner
         } else {
             SchedulerWorkPublication::DoorbellRequired
@@ -150,7 +153,7 @@ impl CpuRemote {
         &self,
         publication: SchedulerWorkPublication,
     ) -> bool {
-        if publication == SchedulerWorkPublication::PollingOwner
+        if publication != SchedulerWorkPublication::DoorbellRequired
             || self.current_cpu_will_service_local_work()
         {
             return true;

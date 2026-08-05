@@ -268,7 +268,7 @@ fn affinity_rejects_enqueue_on_a_disallowed_cpu() {
 }
 
 #[test]
-fn repeated_smp_wake_keeps_one_runnable_entry_and_one_preemption_edge() {
+fn repeated_smp_wake_distributes_rt_threads_without_duplicate_entries() {
     support::clear_handles();
     let system = Box::pin(TaskSystem::new(TaskSystemConfig::new(2)).unwrap());
     let mut cpu0 = system.create_cpu_local(CpuId::new(0)).unwrap();
@@ -312,7 +312,8 @@ fn repeated_smp_wake_keeps_one_runnable_entry_and_one_preemption_edge() {
     assert!(support::consume_ipi(1));
     assert_eq!(first.state(), ThreadState::Ready);
     assert_eq!(second.state(), ThreadState::Ready);
-    assert_eq!(cpu1.try_runnable_summary(), Some(2));
+    assert_eq!(cpu0.try_runnable_summary(), Some(1));
+    assert_eq!(cpu1.try_runnable_summary(), Some(1));
     support::clear_handles();
 }
 

@@ -74,6 +74,17 @@ impl CurrentSchedule {
         self.thread
     }
 
+    pub(crate) const fn schedule_policy(self) -> SchedulePolicy {
+        self.policy
+    }
+
+    pub(crate) const fn absolute_deadline_ns(self) -> Option<u64> {
+        match self.entity.deadline() {
+            Some(deadline) => Some(deadline.absolute_deadline_ns()),
+            None => None,
+        }
+    }
+
     pub(crate) const fn fair_entity(self) -> Option<crate::FairEntity> {
         self.entity.fair()
     }

@@ -192,6 +192,11 @@ impl DeadlineRunQueue {
         link_min_event(&self.root)
     }
 
+    pub(super) fn earliest_deadline_ns(&self) -> Option<u64> {
+        self.first()
+            .map(|thread| deadline_entity(thread).absolute_deadline_ns())
+    }
+
     fn return_removed(mut removed: Box<DeadlineNode>) -> QueuedThread {
         let thread = removed
             .thread

@@ -84,16 +84,30 @@ impl TaskSystem {
         let preferred = preferred
             .or_else(|| sched.placement.assigned_cpu())
             .or_else(|| core.wake_cpu_hint());
+        let policy = sched.policy.effective;
+        let mut queued_entity = sched.policy.effective_entity;
         #[cfg(test)]
         WAKE_TARGET_SELECTIONS.set(WAKE_TARGET_SELECTIONS.get().saturating_add(1));
-        let target = preferred
-            .filter(|preferred| sched.placement.affinity.contains(*preferred))
-            .filter(|preferred| {
+        let target = sched
+            .deadline
+            .bandwidth_cpu
+            .filter(|_| matches!(policy, SchedulePolicy::Deadline(_)))
+            .filter(|cpu| sched.placement.affinity.contains(*cpu))
+            .filter(|cpu| {
                 self.cpu_remotes
-                    .get(preferred.as_usize())
+                    .get(cpu.as_usize())
                     .is_some_and(|remote| remote.accepts_placement())
             })
-            .or_else(|| self.select_allowed_active_cpu(&sched.placement.affinity, None));
+            .or_else(|| {
+                self.select_priority_cpu(
+                    policy,
+                    queued_entity,
+                    &sched.placement.affinity,
+                    preferred,
+                    None,
+                    now_ns,
+                )
+            });
         let Some(target) = target else {
             core.discard_failed_wake();
             return WakeResult::Unavailable;
@@ -112,8 +126,6 @@ impl TaskSystem {
         #[cfg(feature = "qperf-metrics")]
         crate::metrics::record_direct_wake_activation();
 
-        let policy = sched.policy.effective;
-        let mut queued_entity = sched.policy.effective_entity;
         let deadline_wake = matches!(policy, SchedulePolicy::Deadline(_)) && !sched.is_pi_boosted();
         if deadline_wake {
             queued_entity.activate_deadline(now_ns);
@@ -184,7 +196,8 @@ impl TaskSystem {
             task_runtime::fatal_invariant(0x574b_0200, core.id().as_u64() as usize);
         }
         core.set_wake_cpu_hint(target);
-        remote.publish_run_queue_load_summary(&run_queue);
+        self.publish_run_queue_summary(remote, &run_queue);
+        let rt_deadline_push_pending = self.rt_deadline_push_pending(remote);
         let deadline_generation = sched.pi.deadline_cbs_generation;
         drop(run_queue);
         drop(sched);
@@ -220,6 +233,12 @@ impl TaskSystem {
             if preempts_current {
                 remote.request_remote_reschedule();
             }
+        }
+        if rt_deadline_push_pending && !preempts_current {
+            // Linux queues the RT/DL push balance callback in the enqueue
+            // transaction. The target owner performs migration after dropping
+            // the wakee's rq lock and revalidates the pushable candidate.
+            remote.kick_scheduler_work();
         }
         WakeResult::Notified
     }
@@ -338,6 +357,9 @@ impl TaskSystem {
             cpu.request_reschedule();
         }
         self.publish_owner_cpu_load_summary(cpu.as_mut());
+        if !preempts_current && self.rt_deadline_push_pending(cpu.remote()) {
+            cpu.remote().kick_scheduler_work();
+        }
     }
 
     pub(super) fn activate_owner_deadline_bandwidth(

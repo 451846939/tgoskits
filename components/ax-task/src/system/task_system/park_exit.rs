@@ -6,6 +6,12 @@ use super::*;
 static PARK_COMMIT_WAKE_RACE_ARMED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 #[cfg(test)]
+static PARK_COMMIT_WAKE_RACE_SYSTEM: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static PARK_COMMIT_WAKE_RACE_THREAD: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
 static PARK_COMMIT_WAKE_RACE_ENTERED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 #[cfg(test)]
@@ -13,13 +19,18 @@ static PARK_COMMIT_WAKE_RACE_COMPLETED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
 #[cfg(test)]
-pub(super) fn arm_park_commit_wake_race() {
+pub(super) fn arm_park_commit_wake_race(system: &TaskSystem, thread: ThreadId) {
     PARK_COMMIT_WAKE_RACE_ENTERED.store(false, Ordering::Release);
     PARK_COMMIT_WAKE_RACE_COMPLETED.store(false, Ordering::Release);
     assert!(
         !PARK_COMMIT_WAKE_RACE_ARMED.swap(true, Ordering::AcqRel),
         "only one deterministic park race may be armed"
     );
+    PARK_COMMIT_WAKE_RACE_SYSTEM.store(
+        (system as *const TaskSystem).expose_provenance(),
+        Ordering::Release,
+    );
+    PARK_COMMIT_WAKE_RACE_THREAD.store(thread.as_u64(), Ordering::Release);
 }
 
 #[cfg(test)]
@@ -33,7 +44,13 @@ pub(super) fn complete_park_commit_wake_race() {
 }
 
 #[cfg(test)]
-fn park_commit_wake_race_hook() {
+fn park_commit_wake_race_hook(system: &TaskSystem, thread: ThreadId) {
+    if PARK_COMMIT_WAKE_RACE_SYSTEM.load(Ordering::Acquire)
+        != (system as *const TaskSystem).expose_provenance()
+        || PARK_COMMIT_WAKE_RACE_THREAD.load(Ordering::Acquire) != thread.as_u64()
+    {
+        return;
+    }
     if !PARK_COMMIT_WAKE_RACE_ARMED.swap(false, Ordering::AcqRel) {
         return;
     }
@@ -117,7 +134,7 @@ impl TaskSystem {
         cpu.defer_park_preemption(scheduler_requested);
         self.commit_owner_current_dispatch(cpu.as_mut(), now_ns)?;
         #[cfg(test)]
-        park_commit_wake_race_hook();
+        park_commit_wake_race_hook(self, previous_core.id());
         let resumed_dispatch = {
             let mut sched = previous_core.sched().lock();
             // This is the serialization edge shared with wake_thread_direct.

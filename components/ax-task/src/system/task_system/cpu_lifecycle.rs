@@ -150,6 +150,10 @@ impl TaskSystem {
         );
         state.deadline_admission.set_online_cpus(online_count);
         self.online_count.store(online_count, Ordering::Release);
+        {
+            let run_queue = cpu.lock_run_queue();
+            self.priority_index.publish_run_queue(id, &run_queue, true);
+        }
         assert!(
             cpu.as_ref().get_ref().remote().mark_online(),
             "validated offline CPU must accept final publication"
@@ -212,6 +216,7 @@ impl TaskSystem {
             state.deadline_admission.set_online_cpus(online_count);
             self.online_count.store(online_count, Ordering::Release);
             remote.finish_offline();
+            self.priority_index.publish_offline(id);
             Ok(())
         };
         self.topology_sequence.write_end();

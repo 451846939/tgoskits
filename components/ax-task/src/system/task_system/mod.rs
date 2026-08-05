@@ -13,6 +13,7 @@ mod outcome;
 mod park_exit;
 mod pi;
 mod placement;
+mod priority_index;
 mod registry;
 mod scheduling;
 mod switch;
@@ -41,6 +42,7 @@ pub use outcome::{
 };
 pub(crate) use park_exit::CurrentExitPermit;
 pub use pi::PiMutexLockResult;
+use priority_index::RootDomainPriorityIndex;
 use registry::{
     CpuRegistration, DeadlineCallbackClaim, DetachedThreadRecord, PiWaitRegistration,
     TaskSystemState, ThreadRecord, ThreadSlot,
@@ -62,7 +64,7 @@ use crate::{
     ThreadResources, ThreadRuntimeSnapshot, ThreadSpec, ThreadState, WakeResult,
     executor::CoroutineHeader,
     inbox::{InboxKind, InboxMessage, InboxOperation, PublishResult, SchedulerInbox},
-    lock::{IrqScope, PreemptTicketLock, SequenceCounter},
+    lock::{IrqScope, IrqTicketLock, PreemptTicketLock, SequenceCounter},
     runtime::{
         AddressSpaceDestroyOutcome, AddressSpaceReclaimArmOutcome, ContextThreadBinding,
         CpuRemoteHandle, CurrentThreadPublication, RuntimeCpuId, RuntimeStatus, task_runtime,
@@ -177,6 +179,7 @@ impl TaskSystem {
             root_domain: PreemptTicketLock::new(RootDomainState {
                 online: CpuSet::empty(config.cpu_count()),
             }),
+            priority_index: RootDomainPriorityIndex::new(config.cpu_count()),
             deferred_coroutine_reclaims: SchedulerInbox::new(InboxKind::Reclaim),
             deferred_deadline_callbacks: SchedulerInbox::new(InboxKind::TaskWork),
             deferred_scheduler_ticks: SchedulerInbox::new(InboxKind::TaskWork),

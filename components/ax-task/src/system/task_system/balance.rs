@@ -124,7 +124,38 @@ impl TaskSystem {
         // guard. Like Linux's rq clock/load update under rq ownership, this
         // nested publication needs no second IRQ-state transaction.
         let run_queue = cpu.lock_run_queue();
-        cpu.remote().publish_run_queue_load_summary(&run_queue);
+        self.publish_run_queue_summary(cpu.remote(), &run_queue);
+    }
+
+    pub(super) fn publish_run_queue_summary(
+        &self,
+        remote: &CpuRemote,
+        run_queue: &CpuRunQueueState,
+    ) {
+        remote.publish_run_queue_load_summary(run_queue);
+        self.priority_index.publish_run_queue(
+            remote.owner(),
+            run_queue,
+            remote.accepts_placement(),
+        );
+    }
+
+    pub(super) fn rt_deadline_push_pending(&self, remote: &CpuRemote) -> bool {
+        // A push callback cannot make progress without a second online CPU.
+        // Read the published count directly here instead of taking a stable
+        // topology snapshot: callers may hold this CPU's runqueue lock while
+        // CPU hotplug owns the topology sequence and waits for that runqueue.
+        // A concurrent hotplug can only make this observation conservative;
+        // the owner-side balance pass revalidates the topology before moving a
+        // thread.
+        self.online_count.load(Ordering::Acquire) > 1
+            && remote.try_load_summary().is_some_and(|summary| {
+                summary.is_overloaded()
+                    && matches!(
+                        summary.pushable_class(),
+                        Some(SchedulingClass::Deadline | SchedulingClass::Realtime)
+                    )
+            })
     }
 
     fn select_owner_balance_transfer_by(

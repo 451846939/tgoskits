@@ -648,12 +648,13 @@ fn remote_fifo_wake_fixture(
 }
 
 #[test]
-fn lower_priority_remote_wake_does_not_send_a_reschedule_ipi() {
+fn lower_priority_remote_wake_uses_lower_priority_cpu_with_one_doorbell() {
     crate::test_runtime::reset_irq_state();
     let (system, mut cpu0, cpu1, sleeper) = remote_fifo_wake_fixture(10, 1);
+    let local_runnable_before = cpu0.lock_run_queue().len();
+    let remote_runnable_before = cpu1.lock_run_queue().len();
     let _runtime_handles = InstalledTaskHandles::new(system.as_ref(), cpu0.as_mut());
     crate::test_runtime::configure_scheduler_ipi(RuntimeStatus::Success);
-    let runnable_before = cpu1.lock_run_queue().len();
 
     assert_eq!(sleeper.wake_handle().wake(), crate::WakeResult::Notified);
 
@@ -661,11 +662,12 @@ fn lower_priority_remote_wake_does_not_send_a_reschedule_ipi() {
         system.thread_state(sleeper.id()).unwrap(),
         ThreadState::Ready
     );
-    assert_eq!(cpu1.lock_run_queue().len(), runnable_before + 1);
+    assert_eq!(cpu0.lock_run_queue().len(), local_runnable_before + 1);
+    assert_eq!(cpu1.lock_run_queue().len(), remote_runnable_before);
     assert_eq!(
         crate::test_runtime::scheduler_ipi_send_count(),
-        0,
-        "a direct wake below the target current priority must not disturb the remote CPU"
+        1,
+        "wake preemption and the implied push callback must share one scheduler doorbell"
     );
 }
 
@@ -673,6 +675,9 @@ fn lower_priority_remote_wake_does_not_send_a_reschedule_ipi() {
 fn higher_priority_remote_wake_sends_one_reschedule_ipi() {
     crate::test_runtime::reset_irq_state();
     let (system, mut cpu0, cpu1, sleeper) = remote_fifo_wake_fixture(1, 10);
+    let mut cpu1_only = CpuSet::empty(2);
+    assert!(cpu1_only.insert(CpuId::new(1)));
+    system.set_affinity(sleeper.id(), cpu1_only).unwrap();
     let _runtime_handles = InstalledTaskHandles::new(system.as_ref(), cpu0.as_mut());
     crate::test_runtime::configure_scheduler_ipi(RuntimeStatus::Success);
     let runnable_before = cpu1.lock_run_queue().len();
@@ -688,6 +693,170 @@ fn higher_priority_remote_wake_sends_one_reschedule_ipi() {
         crate::test_runtime::scheduler_ipi_send_count(),
         1,
         "a direct wake above the target current priority must publish one reschedule edge"
+    );
+}
+
+fn install_running_fifo(
+    system: &TaskSystem,
+    cpu: Pin<&mut CpuLocal>,
+    priority: u8,
+    now_ns: u64,
+) -> ThreadHandle {
+    let thread = system
+        .create_thread(ThreadSpec::new(SchedulePolicy::fifo(
+            RtPriority::new(priority).unwrap(),
+        )))
+        .unwrap();
+    system.make_ready(thread.id()).unwrap();
+    system.enqueue(cpu, thread.id(), now_ns).unwrap();
+    thread
+}
+
+#[test]
+fn wide_affinity_rt_wake_uses_cpu_priority_instead_of_load() {
+    let system = TaskSystem::new(TaskSystemConfig::new(2)).unwrap();
+    let mut cpu0 = system.create_cpu_local(CpuId::new(0)).unwrap();
+    let mut cpu1 = system.create_cpu_local(CpuId::new(1)).unwrap();
+    for cpu in [&mut cpu0, &mut cpu1] {
+        system
+            .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
+            .unwrap();
+        system.bring_cpu_online(cpu.as_mut()).unwrap();
+    }
+
+    let sleeper = install_running_fifo(&system, cpu0.as_mut(), 50, 1);
+    assert_eq!(
+        system.schedule(cpu0.as_mut(), 1).unwrap().next(),
+        sleeper.id()
+    );
+    system.complete_context_switch(cpu0.as_mut()).unwrap();
+    system.block_current(cpu0.as_mut(), 2).unwrap();
+    system.complete_context_switch(cpu0.as_mut()).unwrap();
+
+    let high = install_running_fifo(&system, cpu0.as_mut(), 90, 3);
+    assert_eq!(system.schedule(cpu0.as_mut(), 3).unwrap().next(), high.id());
+    system.complete_context_switch(cpu0.as_mut()).unwrap();
+    let low = install_running_fifo(&system, cpu1.as_mut(), 10, 3);
+    assert_eq!(system.schedule(cpu1.as_mut(), 3).unwrap().next(), low.id());
+    system.complete_context_switch(cpu1.as_mut()).unwrap();
+
+    assert_eq!(
+        system.wake_thread_direct(Arc::clone(&sleeper.core), None, 4),
+        crate::WakeResult::Notified
+    );
+    assert_eq!(
+        sleeper.core.sched().lock().placement.queued_cpu(),
+        Some(CpuId::new(1)),
+        "an RT wake must choose the CPU running the least urgent RT work, even when its previous \
+         CPU is cache-hot"
+    );
+}
+
+#[test]
+fn wide_affinity_deadline_placement_uses_latest_cpu_deadline() {
+    let system = TaskSystem::new(TaskSystemConfig::new(2)).unwrap();
+    let mut cpu0 = system.create_cpu_local(CpuId::new(0)).unwrap();
+    let mut cpu1 = system.create_cpu_local(CpuId::new(1)).unwrap();
+    for cpu in [&mut cpu0, &mut cpu1] {
+        system
+            .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
+            .unwrap();
+        system.bring_cpu_online(cpu.as_mut()).unwrap();
+    }
+
+    let early = system
+        .create_thread(ThreadSpec::new(SchedulePolicy::deadline(
+            DeadlinePolicy::new(10, 100, 1_000, DeadlineFlags::NONE).unwrap(),
+        )))
+        .unwrap();
+    system.make_ready(early.id()).unwrap();
+    system.enqueue(cpu0.as_mut(), early.id(), 3).unwrap();
+    assert_eq!(
+        system.schedule(cpu0.as_mut(), 3).unwrap().next(),
+        early.id()
+    );
+    system.complete_context_switch(cpu0.as_mut()).unwrap();
+
+    let late = system
+        .create_thread(ThreadSpec::new(SchedulePolicy::deadline(
+            DeadlinePolicy::new(10, 400, 1_000, DeadlineFlags::NONE).unwrap(),
+        )))
+        .unwrap();
+    system.make_ready(late.id()).unwrap();
+    system.enqueue(cpu1.as_mut(), late.id(), 3).unwrap();
+    assert_eq!(system.schedule(cpu1.as_mut(), 3).unwrap().next(), late.id());
+    system.complete_context_switch(cpu1.as_mut()).unwrap();
+
+    let contender = system
+        .create_thread(ThreadSpec::new(SchedulePolicy::deadline(
+            DeadlinePolicy::new(100, 200, 1_000, DeadlineFlags::NONE).unwrap(),
+        )))
+        .unwrap();
+    system.make_ready(contender.id()).unwrap();
+    system
+        .place_ready(cpu0.as_mut(), contender.id(), 4)
+        .unwrap();
+    assert_eq!(
+        contender.core.sched().lock().placement.migration_target(),
+        Some(CpuId::new(1)),
+        "Deadline placement must choose the allowed CPU whose earliest runnable deadline is latest"
+    );
+}
+
+#[test]
+fn nonpreempting_rt_wake_kicks_overloaded_owner_balance() {
+    crate::test_runtime::reset_irq_state();
+    let system = Box::pin(TaskSystem::new(TaskSystemConfig::new(2)).unwrap());
+    let mut cpu0 = system.create_cpu_local(CpuId::new(0)).unwrap();
+    let mut cpu1 = system.create_cpu_local(CpuId::new(1)).unwrap();
+    for cpu in [&mut cpu0, &mut cpu1] {
+        system
+            .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
+            .unwrap();
+        system.bring_cpu_online(cpu.as_mut()).unwrap();
+    }
+
+    let mut cpu0_only = CpuSet::empty(2);
+    assert!(cpu0_only.insert(CpuId::new(0)));
+    let sleeper = system
+        .create_thread(
+            ThreadSpec::new(SchedulePolicy::fifo(RtPriority::new(5).unwrap()))
+                .with_affinity(cpu0_only),
+        )
+        .unwrap();
+    system.make_ready(sleeper.id()).unwrap();
+    system.enqueue(cpu0.as_mut(), sleeper.id(), 1).unwrap();
+    assert_eq!(
+        system.schedule(cpu0.as_mut(), 1).unwrap().next(),
+        sleeper.id()
+    );
+    system.complete_context_switch(cpu0.as_mut()).unwrap();
+    system.block_current(cpu0.as_mut(), 2).unwrap();
+    system.complete_context_switch(cpu0.as_mut()).unwrap();
+
+    let high = install_running_fifo(&system, cpu0.as_mut(), 90, 3);
+    assert_eq!(system.schedule(cpu0.as_mut(), 3).unwrap().next(), high.id());
+    system.complete_context_switch(cpu0.as_mut()).unwrap();
+    let pushable = system
+        .create_thread(ThreadSpec::new(SchedulePolicy::fifo(
+            RtPriority::new(10).unwrap(),
+        )))
+        .unwrap();
+    system.make_ready(pushable.id()).unwrap();
+    system.enqueue(cpu0.as_mut(), pushable.id(), 4).unwrap();
+    cpu0.remote().scheduler_enter();
+
+    let _runtime_handles = InstalledTaskHandles::new(system.as_ref(), cpu1.as_mut());
+    crate::test_runtime::configure_scheduler_ipi(RuntimeStatus::Success);
+    assert_eq!(
+        sleeper.wake_handle().wake_from_task(),
+        crate::WakeResult::Notified
+    );
+    assert_eq!(
+        crate::test_runtime::scheduler_ipi_send_count(),
+        1,
+        "an RT enqueue on an overloaded remote runqueue must queue owner-side push work even when \
+         the wakee cannot preempt"
     );
 }
 
@@ -4607,7 +4776,7 @@ fn wake_between_park_check_and_block_transition_cancels_schedule_out() {
         panic!("fresh park must publish PARKING");
     };
 
-    park_exit::arm_park_commit_wake_race();
+    park_exit::arm_park_commit_wake_race(system.as_ref().get_ref(), running.id());
     let wake_system = Pin::clone(&system);
     let wake_core = Arc::clone(&running.core);
     let waker = std::thread::spawn(move || {
