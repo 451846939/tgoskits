@@ -6,6 +6,23 @@ use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use super::*;
 use crate::RtPriority;
 
+#[cfg(test)]
+std::thread_local! {
+    static PRIORITY_INDEX_LOOKUPS: core::cell::Cell<usize> = const {
+        core::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+pub(super) fn reset_priority_index_lookups() {
+    PRIORITY_INDEX_LOOKUPS.set(0);
+}
+
+#[cfg(test)]
+pub(super) fn priority_index_lookups() -> usize {
+    PRIORITY_INDEX_LOOKUPS.get()
+}
+
 const RT_NORMAL_LEVEL: u8 = 0;
 // Linux CPUPRI_HIGHER: CPUs with runnable DL work are never RT wake targets.
 const RT_HIGHER_LEVEL: u8 = 100;
@@ -56,6 +73,8 @@ impl RootDomainPriorityIndex {
         preferred: Option<CpuId>,
         mut accepts: impl FnMut(CpuId) -> bool,
     ) -> Option<CpuId> {
+        #[cfg(test)]
+        PRIORITY_INDEX_LOOKUPS.set(PRIORITY_INDEX_LOOKUPS.get().saturating_add(1));
         self.rt
             .find_lower(priority.get(), affinity, preferred, &mut accepts)
     }
@@ -67,6 +86,8 @@ impl RootDomainPriorityIndex {
         preferred: Option<CpuId>,
         accepts: impl FnMut(CpuId) -> bool,
     ) -> Option<CpuId> {
+        #[cfg(test)]
+        PRIORITY_INDEX_LOOKUPS.set(PRIORITY_INDEX_LOOKUPS.get().saturating_add(1));
         self.deadline
             .lock()
             .find_later(absolute_deadline_ns, affinity, preferred, accepts)

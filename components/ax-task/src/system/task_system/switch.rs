@@ -254,6 +254,12 @@ impl TaskSystem {
                     .get(cpu.as_usize())
                     .is_some_and(|remote| remote.accepts_placement())
         };
+        // Linux find_lowest_rq()/find_later_rq() never enter cpupri/cpudl
+        // when nr_cpus_allowed is one. The affinity owner is authoritative in
+        // that case: priority indexes cannot discover a different target.
+        if let Some(cpu) = affinity.sole_cpu() {
+            return (Some(cpu) != excluded && accepts(cpu)).then_some(cpu);
+        }
         let indexed = match policy {
             SchedulePolicy::KernelStop => None,
             SchedulePolicy::Fifo { priority } | SchedulePolicy::RoundRobin { priority, .. } => self

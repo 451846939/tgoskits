@@ -995,6 +995,47 @@ fn higher_priority_remote_wake_sends_one_reschedule_ipi() {
     );
 }
 
+#[test]
+fn singleton_rt_wake_bypasses_root_domain_priority_indexes() {
+    crate::test_runtime::reset_irq_state();
+    let system = Box::pin(TaskSystem::new(TaskSystemConfig::new(2)).unwrap());
+    let mut cpu0 = system.create_cpu_local(CpuId::new(0)).unwrap();
+    let mut cpu1 = system.create_cpu_local(CpuId::new(1)).unwrap();
+    for cpu in [&mut cpu0, &mut cpu1] {
+        system
+            .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
+            .unwrap();
+        system.bring_cpu_online(cpu.as_mut()).unwrap();
+    }
+
+    let mut cpu0_only = CpuSet::empty(2);
+    assert!(cpu0_only.insert(CpuId::new(0)));
+    let sleeper = system
+        .create_thread(
+            ThreadSpec::new(SchedulePolicy::fifo(RtPriority::new(80).unwrap()))
+                .with_affinity(cpu0_only),
+        )
+        .unwrap();
+    system.make_ready(sleeper.id()).unwrap();
+    system.enqueue_at(cpu0.as_mut(), sleeper.id(), 1).unwrap();
+    assert_eq!(
+        system.schedule_at(cpu0.as_mut(), 1).unwrap().next(),
+        sleeper.id()
+    );
+    system.complete_context_switch(cpu0.as_mut()).unwrap();
+    system.block_current_at(cpu0.as_mut(), 2).unwrap();
+    system.complete_context_switch(cpu0.as_mut()).unwrap();
+
+    let _runtime_handles = InstalledTaskHandles::new(system.as_ref(), cpu1.as_mut());
+    priority_index::reset_priority_index_lookups();
+    assert_eq!(sleeper.wake_handle().wake(), crate::WakeResult::Notified);
+    assert_eq!(
+        priority_index::priority_index_lookups(),
+        0,
+        "Linux RT never enters cpupri when nr_cpus_allowed is one"
+    );
+}
+
 fn install_running_fifo(
     system: &TaskSystem,
     cpu: Pin<&mut CpuLocal>,

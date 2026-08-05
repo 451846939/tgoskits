@@ -131,6 +131,9 @@ pub enum SwitchReason {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CpuSet {
     allowed: Vec<bool>,
+    // Mirrors Linux task_struct::nr_cpus_allowed so scheduler class decisions
+    // do not repeatedly derive affinity cardinality from the mask.
+    allowed_count: usize,
 }
 
 impl CpuSet {
@@ -138,6 +141,7 @@ impl CpuSet {
     pub fn all(cpu_count: usize) -> Self {
         Self {
             allowed: vec![true; cpu_count],
+            allowed_count: cpu_count,
         }
     }
 
@@ -145,6 +149,7 @@ impl CpuSet {
     pub fn empty(cpu_count: usize) -> Self {
         Self {
             allowed: vec![false; cpu_count],
+            allowed_count: 0,
         }
     }
 
@@ -154,6 +159,9 @@ impl CpuSet {
             Some(allowed) => {
                 let changed = !*allowed;
                 *allowed = true;
+                if changed {
+                    self.allowed_count += 1;
+                }
                 changed
             }
             None => false,
@@ -166,6 +174,9 @@ impl CpuSet {
             Some(allowed) => {
                 let changed = *allowed;
                 *allowed = false;
+                if changed {
+                    self.allowed_count -= 1;
+                }
                 changed
             }
             None => false,
@@ -184,17 +195,23 @@ impl CpuSet {
 
     /// Returns the number of CPUs selected by this set.
     pub(crate) fn count(&self) -> usize {
-        self.allowed.iter().filter(|allowed| **allowed).count()
+        self.allowed_count
+    }
+
+    /// Returns the only allowed CPU when migration is impossible.
+    pub(crate) fn sole_cpu(&self) -> Option<CpuId> {
+        if self.allowed_count != 1 {
+            return None;
+        }
+        self.allowed
+            .iter()
+            .position(|allowed| *allowed)
+            .map(|index| CpuId::new(index as u32))
     }
 
     /// Returns whether a runnable thread can leave its current allowed CPU.
     pub(crate) fn is_migration_capable(&self) -> bool {
-        self.allowed
-            .iter()
-            .filter(|allowed| **allowed)
-            .take(2)
-            .count()
-            == 2
+        self.allowed_count > 1
     }
 
     /// Returns whether this set permits every CPU selected by `required`.
@@ -212,6 +229,7 @@ impl CpuSet {
             return Err(TaskError::InvalidConfiguration);
         }
         self.allowed.copy_from_slice(&source.allowed);
+        self.allowed_count = source.allowed_count;
         Ok(())
     }
 }

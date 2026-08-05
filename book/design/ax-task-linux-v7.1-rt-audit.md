@@ -2233,6 +2233,37 @@ ax-runtime 分阶段发布，不能被平台 alive 状态替代。
 同步点之后进入 ax-runtime，并完成 CPU1/2/3 的运行时初始化，因而验证覆盖的不只是固件接受
 启动请求，还包括最终栈、页表、CPU-local 绑定和 OS secondary entry。
 
+### 2026-08-06 单 CPU affinity 的调度类选核边界
+
+FIFO 同 CPU futex 的精确 qperf 窗口显示，旧实现的
+`RtCpuPriorityIndex::find_lower()` 占 99/1966 个 workload 样本（5.04%）。该场景的 sender 与
+receiver 都固定在 CPU0；唤醒时 CPU0 正运行相同优先级的 FIFO task，旧代码仍从 normal 桶开始
+扫描到 FIFO:80，最终才通过 preferred CPU 回退到唯一允许的 CPU。cpupri 的位图结构本身没有错，
+错误在于调度类入口没有先应用 affinity cardinality 这一更强的约束。
+
+修改前重新核对 Linux v7.1 `kernel/sched/rt.c::select_task_rq_rt()`、
+`find_lowest_rq()`、`kernel/sched/deadline.c::find_later_rq()` 与
+`include/linux/sched.h::task_struct`：RT 和 DL 都在 `nr_cpus_allowed == 1` 时完全跳过
+cpupri/cpudl，`task_struct` 还独立维护 `nr_cpus_allowed`，不在每次 wake 时遍历 cpumask。这个
+短路不是失败后的 fallback，而是“只有一个合法 owner 时，优先级索引不可能产生另一个目标”的
+调度类前置条件。
+
+当前 `CpuSet` 因此与 Linux 同样维护 authoritative `allowed_count`，所有 insert、remove 和
+copy 事务同步更新 mask 与 cardinality；`is_migration_capable()` 不再重复扫描整个 topology。
+`select_priority_cpu()` 在 RT、RR、DL 共用入口先解析唯一 allowed CPU，并只校验 online/excluded
+条件；只有 affinity 允许迁移时才读取 root-domain cpupri/cpudl。没有增加缓存、超时、重试或
+第二选核路径。
+
+确定性回归 `singleton_rt_wake_bypasses_root_domain_priority_indexes` 在旧实现上稳定得到 lookup
+次数 1，新实现为 0。相同 2 vCPU、Q35/TCG、leaf-callchain qperf 复测中，`find_lower` 降为
+0/2028 个样本。两次 workload 窗口为 19.93 秒和 20.57 秒，约 3% 的单轮波动不足以形成整体
+延迟改善结论；该阶段只确认错误扫描已经从正式 FIFO 同核调用链消失，端到端 p50 继续用无
+采样完整 benchmark 验收。无采样复测的 raw clock-pair 为 17.762 微秒，FIFO 同核 p50 为
+122.770 微秒，QEMU workload 为 91.20 秒；上一检查点对应值为 17.708 微秒、117.069 微秒和
+89.05 秒。其余场景有升有降，当前单轮结果不支持整体性能改善声明，也不回退已经由 Linux
+语义和确定性红绿测试证明正确的 affinity 边界；后续继续从新的 PI handoff、guard 和 current
+identity 热点收敛固定成本。
+
 ## 模块化结果
 
 - `TaskSystem` orchestration 只负责编排，registry/reap、placement、owner scheduling、deadline、PI、balance、deferred work 分模块；
