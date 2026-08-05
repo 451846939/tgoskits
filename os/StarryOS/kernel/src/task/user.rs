@@ -125,25 +125,27 @@ pub fn new_user_task(name: &str, mut uctx: UserContext, set_child_tid: usize) ->
                 let saved_sysno = uctx.sysno();
                 let is_syscall = matches!(reason, ReturnReason::Syscall);
 
+                if stop_for_pending_ptrace_event(thr, &mut uctx) {
+                    continue;
+                }
+
                 match reason {
                     ReturnReason::Syscall => {
-                        let tid = thr.tid();
-                        let trace_state = thr.proc_data.take_ptrace_syscall_trace_for(tid);
+                        let trace_state = thr.proc_data.ptrace_syscall_trace_state_for(tid);
                         if matches!(trace_state, SyscallTraceState::Entry)
-                            && ptrace_syscall_stop_current(thr, Signo::SIGTRAP, &mut uctx).is_some()
+                            && let Some(resume_signo) = ptrace_syscall_stop_current(
+                                thr,
+                                Signo::SIGTRAP,
+                                &mut uctx,
+                                saved_sysno,
+                            )
                         {
-                            match thr.proc_data.take_ptrace_syscall_trace_for(tid) {
-                                SyscallTraceState::Entry | SyscallTraceState::Exit => {
-                                    thr.proc_data.set_ptrace_syscall_trace_state_for(
-                                        tid,
-                                        SyscallTraceState::Exit,
-                                    )
-                                }
-                                SyscallTraceState::None => {}
-                            }
+                            enqueue_ptrace_syscall_resume_signal(thr, resume_signo);
                         }
 
-                        if let Some(exit_code) = ptrace_exit_event_code(saved_sysno, saved_a0)
+                        let syscall_no = uctx.sysno();
+                        let syscall_arg0 = uctx.arg0();
+                        if let Some(exit_code) = ptrace_exit_event_code(syscall_no, syscall_arg0)
                             && crate::syscall::ptrace_notify_exit(
                                 thr.proc_data.proc.pid(),
                                 exit_code,
@@ -153,17 +155,8 @@ pub fn new_user_task(name: &str, mut uctx: UserContext, set_child_tid: usize) ->
                         }
 
                         handle_syscall(&mut uctx);
-                        if thr.proc_data.has_ptrace_pending_event_for(tid)
-                            && let Some(_resume_sig) =
-                                ptrace_stop_current(thr, Signo::SIGTRAP, &mut uctx)
-                        {
+                        if stop_for_pending_ptrace_event(thr, &mut uctx) {
                             continue;
-                        }
-                        if matches!(
-                            thr.proc_data.take_ptrace_syscall_trace_for(tid),
-                            SyscallTraceState::Exit
-                        ) {
-                            let _ = ptrace_syscall_stop_current(thr, Signo::SIGTRAP, &mut uctx);
                         }
                         if thr.proc_data.take_ptrace_exec_stop_pending() {
                             let _is_event =
@@ -173,6 +166,18 @@ pub fn new_user_task(name: &str, mut uctx: UserContext, set_child_tid: usize) ->
                             {
                                 continue;
                             }
+                        }
+                        if matches!(
+                            thr.proc_data.ptrace_syscall_trace_state_for(tid),
+                            SyscallTraceState::Exit
+                        ) {
+                            let resume_signo = ptrace_syscall_stop_current(
+                                thr,
+                                Signo::SIGTRAP,
+                                &mut uctx,
+                                syscall_no,
+                            );
+                            enqueue_ptrace_syscall_resume_signal(thr, resume_signo.flatten());
                         }
                     }
                     ReturnReason::PageFault(addr, flags) => {
@@ -383,4 +388,20 @@ fn ptrace_exit_event_code(sysno: usize, arg0: usize) -> Option<i32> {
         Some(Sysno::exit | Sysno::exit_group) => Some((arg0 as i32) << 8),
         _ => None,
     }
+}
+
+fn stop_for_pending_ptrace_event(thr: &super::Thread, uctx: &mut UserContext) -> bool {
+    thr.proc_data.has_ptrace_pending_event_for(thr.tid())
+        && ptrace_stop_current(thr, Signo::SIGTRAP, uctx).is_some()
+}
+
+fn enqueue_ptrace_syscall_resume_signal(thr: &super::Thread, resume_signo: Option<Signo>) {
+    let Some(signo) = resume_signo else {
+        return;
+    };
+
+    // A PTRACE_SYSCALL resume signal is delivered after the matching syscall
+    // exit stop. Do not arm the ptrace bypass: the tracer must observe its
+    // subsequent signal-delivery stop.
+    let _ = thr.signal.send_signal(SignalInfo::new_kernel(signo));
 }
