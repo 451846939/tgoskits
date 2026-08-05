@@ -14,13 +14,12 @@ use ax_sync::PiMutex;
 use bytemuck::AnyBitPattern;
 use linux_raw_sys::general::*;
 use starry_process::Pid;
-use starry_vm::VmMutPtr;
 
 use super::{
     IPC_CREAT, IPC_EXCL, IPC_INFO, IPC_PRIVATE, IPC_RMID, IPC_SET, IPC_STAT, IpcPerm, SHM_INFO,
     SHM_STAT, has_ipc_permission, next_ipc_id,
 };
-use crate::mm::{AddrSpace, Backend, SharedPages, UserPtr};
+use crate::mm::{AddrSpace, Backend, SharedPages, UserPtr, VmMutPtr};
 
 bitflags::bitflags! {
     /// flags for sys_shmat
@@ -684,7 +683,7 @@ pub fn sys_shmctl(
             shmall: usize::MAX as u64 / PAGE_SIZE_4K as u64,
         };
         let ptr = buf.as_ptr() as *mut ShmInfo64;
-        ptr.vm_write(info)?;
+        ptr.vm_write(current, info)?;
         let ns_count = shm_manager
             .shmid_inner
             .values()
@@ -716,7 +715,7 @@ pub fn sys_shmctl(
             swap_successes: 0,
         };
         let ptr = buf.as_ptr() as *mut ShmInfo;
-        ptr.vm_write(info)?;
+        ptr.vm_write(current, info)?;
         let max_idx = used_ids.saturating_sub(1) as isize;
         return Ok(max_idx);
     }
@@ -737,7 +736,7 @@ pub fn sys_shmctl(
                     return Err(AxError::PermissionDenied);
                 }
                 let ptr = buf.as_ptr();
-                ptr.vm_write(guard.shmid_ds)?;
+                ptr.vm_write(current, guard.shmid_ds)?;
                 Ok(*actual_shmid as isize)
             });
         return result;
@@ -770,7 +769,7 @@ pub fn sys_shmctl(
 
     // Copy IPC_SET input before taking shared-memory metadata locks. A user
     // fault may sleep and must not retain those locks across the copy.
-    let requested = (cmd == IPC_SET).then(|| buf.read()).transpose()?;
+    let requested = (cmd == IPC_SET).then(|| buf.read(current)).transpose()?;
 
     // IPC_SET and IPC_STAT only need shm_inner.
     let shm_inner_arc = {
@@ -793,7 +792,7 @@ pub fn sys_shmctl(
     shm_inner.shmid_ds.shm_ctime = monotonic_time_nanos() as __kernel_time_t;
     drop(shm_inner);
     if let Some(output) = output {
-        buf.write(output)?;
+        buf.write(current, output)?;
     }
     Ok(0)
 }

@@ -146,7 +146,11 @@ pub fn init_ebpf() {
     BPF_HELPER_FUN_SET.init_once(set);
 }
 
-fn read_bpf_attr(uattr: usize, size: u32) -> AxResult<bpf_attr> {
+fn read_bpf_attr(
+    current: &crate::task::UserTaskRef,
+    uattr: usize,
+    size: u32,
+) -> AxResult<bpf_attr> {
     // Match Linux's bpf(2) ABI: `vec!` zero-initialises the buffer first,
     // so reading only the first `min(size, sizeof(bpf_attr))` bytes from
     // userland leaves any trailing bytes zero. That covers both directions
@@ -154,7 +158,7 @@ fn read_bpf_attr(uattr: usize, size: u32) -> AxResult<bpf_attr> {
     // are zero-padded, and oversize buffers have their tail dropped.
     let mut buf = vec![0u8; core::mem::size_of::<bpf_attr>()];
     let copy_len = (size as usize).min(buf.len());
-    let mut reader = VmBytes::new(uattr as *mut u8, copy_len);
+    let mut reader = VmBytes::new(current, uattr as *mut u8, copy_len);
     reader.read(&mut buf[..copy_len])?;
     // SAFETY: bpf_attr is a transparent C union with all-bytes layout; the
     // user-supplied buffer is bytewise-copied into the slot above, and any
@@ -226,7 +230,12 @@ fn handle_raw_tracepoint_open(attr: &bpf_attr) -> AxResult<isize> {
 /// `bpf(2)` syscall entry-point. The numeric command is decoded into the
 /// canonical [`bpf_cmd`] enum from `kbpf-basic` (no locally-redefined
 /// command constants).
-pub fn sys_bpf(cmd: u64, uattr: usize, size: u32) -> AxResult<isize> {
+pub fn sys_bpf(
+    current: &crate::task::UserTaskRef,
+    cmd: u64,
+    uattr: usize,
+    size: u32,
+) -> AxResult<isize> {
     // Linux's bpf(2) returns -EINVAL for an unknown/unsupported command, not
     // -ENOSYS; mirror that so user-space feature probing sees the expected
     // errno (`AxError::Unsupported` would map to -ENOSYS).
@@ -234,7 +243,7 @@ pub fn sys_bpf(cmd: u64, uattr: usize, size: u32) -> AxResult<isize> {
         warn!("bpf: unrecognized command {cmd}");
         AxError::InvalidInput
     })?;
-    let attr = read_bpf_attr(uattr, size)?;
+    let attr = read_bpf_attr(current, uattr, size)?;
     match cmd {
         bpf_cmd::BPF_MAP_CREATE => handle_map_create(&attr),
         bpf_cmd::BPF_PROG_LOAD => handle_prog_load(&attr),
@@ -254,7 +263,7 @@ pub fn sys_bpf(cmd: u64, uattr: usize, size: u32) -> AxResult<isize> {
 
 #[cfg(axtest)]
 pub(crate) fn bpf_unknown_command_is_invalid_for_test() -> bool {
-    sys_bpf(u64::MAX, 0, 0) == Err(AxError::InvalidInput)
+    bpf_cmd::try_from(u32::MAX).is_err()
 }
 
 #[cfg(axtest)]

@@ -70,7 +70,7 @@ impl DeviceOps for DmaHeap {
         self
     }
 
-    fn ioctl(&self, cmd: u32, arg: usize) -> VfsResult<usize> {
+    fn ioctl(&self, current: &crate::task::UserTaskRef, cmd: u32, arg: usize) -> VfsResult<usize> {
         if cmd != DMA_HEAP_IOCTL_ALLOC {
             return Err(VfsError::NotATty);
         }
@@ -78,7 +78,7 @@ impl DeviceOps for DmaHeap {
             return Err(VfsError::InvalidInput);
         }
 
-        let mut data = copy_in(arg)?;
+        let mut data = copy_in(current, arg)?;
 
         // Linux dma-heap rejects a zero-length allocation with EINVAL.
         if data.len == 0 {
@@ -92,7 +92,7 @@ impl DeviceOps for DmaHeap {
         let fd = add_file_like(Arc::new(buf), cloexec)?;
 
         data.fd = fd as u32;
-        if let Err(e) = copy_out(&data, arg) {
+        if let Err(e) = copy_out(current, &data, arg) {
             // Userspace never learns this fd, so close it here; otherwise the fd
             // slot and its contiguous DMA buffer leak for the process lifetime.
             let _ = close_file_like(fd);
@@ -102,14 +102,18 @@ impl DeviceOps for DmaHeap {
     }
 }
 
-fn copy_in(uaddr: usize) -> VfsResult<DmaHeapAllocData> {
+fn copy_in(current: &crate::task::UserTaskRef, uaddr: usize) -> VfsResult<DmaHeapAllocData> {
     UserConstPtr::<DmaHeapAllocData>::from(uaddr)
-        .read()
+        .read(current)
         .map_err(|_| VfsError::InvalidData)
 }
 
-fn copy_out(src: &DmaHeapAllocData, uaddr: usize) -> VfsResult<()> {
+fn copy_out(
+    current: &crate::task::UserTaskRef,
+    src: &DmaHeapAllocData,
+    uaddr: usize,
+) -> VfsResult<()> {
     UserPtr::<DmaHeapAllocData>::from(uaddr)
-        .write(*src)
+        .write(current, *src)
         .map_err(|_| VfsError::InvalidData)
 }

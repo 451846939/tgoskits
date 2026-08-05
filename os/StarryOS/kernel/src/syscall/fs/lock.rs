@@ -579,7 +579,7 @@ pub fn fcntl_setlk(
 ) -> AxResult<isize> {
     // SAFETY: `flock64` contains only integer ABI fields, so every copied bit
     // pattern is a valid Rust value before semantic validation below.
-    let fl = unsafe { UserPtr::<flock64>::from(arg).read_abi()? };
+    let fl = unsafe { UserPtr::<flock64>::from(arg).read_abi(current)? };
     // POSIX.1-2024 / Linux: F_OFD_SETLK{,W} require l_pid to be 0.
     if ofd && fl.l_pid != 0 {
         return Err(AxError::InvalidInput);
@@ -686,7 +686,7 @@ pub fn fcntl_getlk(
     let user_fl = UserPtr::<flock64>::from(arg);
     // SAFETY: `flock64` contains only integer ABI fields, so every copied bit
     // pattern is a valid Rust value before semantic validation below.
-    let mut fl = unsafe { user_fl.read_abi()? };
+    let mut fl = unsafe { user_fl.read_abi(current)? };
     // POSIX.1-2024 / Linux: F_OFD_GETLK requires l_pid to be 0.
     if ofd && fl.l_pid != 0 {
         return Err(AxError::InvalidInput);
@@ -746,17 +746,24 @@ pub fn fcntl_getlk(
     } else {
         fl.l_type = F_UNLCK as i16;
     }
-    write_flock64_outputs(user_fl, &fl)?;
+    write_flock64_outputs(current, user_fl, &fl)?;
     Ok(0)
 }
 
-fn write_flock64_outputs(user_fl: UserPtr<flock64>, fl: &flock64) -> AxResult<()> {
+fn write_flock64_outputs(
+    current: &crate::task::UserTaskRef,
+    user_fl: UserPtr<flock64>,
+    fl: &flock64,
+) -> AxResult<()> {
     let base = user_fl.address().as_usize();
-    UserPtr::<i16>::from(base + core::mem::offset_of!(flock64, l_type)).write(fl.l_type)?;
-    UserPtr::<i16>::from(base + core::mem::offset_of!(flock64, l_whence)).write(fl.l_whence)?;
-    UserPtr::<i64>::from(base + core::mem::offset_of!(flock64, l_start)).write(fl.l_start)?;
-    UserPtr::<i64>::from(base + core::mem::offset_of!(flock64, l_len)).write(fl.l_len)?;
-    UserPtr::<i32>::from(base + core::mem::offset_of!(flock64, l_pid)).write(fl.l_pid)
+    UserPtr::<i16>::from(base + core::mem::offset_of!(flock64, l_type))
+        .write(current, fl.l_type)?;
+    UserPtr::<i16>::from(base + core::mem::offset_of!(flock64, l_whence))
+        .write(current, fl.l_whence)?;
+    UserPtr::<i64>::from(base + core::mem::offset_of!(flock64, l_start))
+        .write(current, fl.l_start)?;
+    UserPtr::<i64>::from(base + core::mem::offset_of!(flock64, l_len)).write(current, fl.l_len)?;
+    UserPtr::<i32>::from(base + core::mem::offset_of!(flock64, l_pid)).write(current, fl.l_pid)
 }
 
 /// Top-level dispatch from `sys_fcntl`. Returns `Some(result)` if `cmd`

@@ -143,8 +143,8 @@ pub fn futex_keys_follow_mm_and_backing_identity() -> bool {
     super::task::futex_keys_follow_mm_and_backing_identity_for_test()
 }
 
-pub fn futex_false_wait_condition_avoids_waiter_allocation() -> bool {
-    super::task::false_wait_condition_allocations_for_test() == 0
+pub fn futex_false_wait_condition_short_circuits_before_task_clone() -> bool {
+    super::task::false_wait_condition_short_circuits_for_test()
 }
 
 pub fn futex_queued_waiter_avoids_state_allocation() -> bool {

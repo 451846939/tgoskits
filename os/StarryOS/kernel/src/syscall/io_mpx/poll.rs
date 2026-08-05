@@ -10,12 +10,11 @@ use ax_runtime::hal::time::TimeValue;
 use axpoll::{IoEvents, Pollable};
 use linux_raw_sys::general::{POLLNVAL, RLIMIT_NOFILE, pollfd, timespec};
 use starry_signal::SignalSet;
-use starry_vm::{vm_read_slice, vm_write_slice};
 
 use super::FdPollSet;
 use crate::{
     file::get_file_like,
-    mm::{UserConstPtr, UserPtr},
+    mm::{UserConstPtr, UserPtr, vm_read_slice, vm_write_slice},
     syscall::signal::check_sigset_size,
     task::{
         future::{UserWaitOutcome, block_on_user_timeout},
@@ -45,21 +44,29 @@ fn read_poll_fds(
 
     let mut buf = Vec::with_capacity(nfds);
     buf.resize_with(nfds, MaybeUninit::uninit);
-    vm_read_slice(fds.as_ptr(), &mut buf)?;
+    vm_read_slice(current, fds.as_ptr(), &mut buf)?;
     Ok(buf
         .into_iter()
         .map(|fd| unsafe { fd.assume_init() })
         .collect())
 }
 
-fn write_poll_revents(fds: UserPtr<pollfd>, poll_fds: &[pollfd]) -> AxResult<()> {
+fn write_poll_revents(
+    current: &crate::task::UserTaskRef,
+    fds: UserPtr<pollfd>,
+    poll_fds: &[pollfd],
+) -> AxResult<()> {
     let revents_offset = offset_of!(pollfd, revents);
 
     for (index, poll_fd) in poll_fds.iter().enumerate() {
         let revents_ptr = (fds.as_ptr().wrapping_add(index) as *mut u8)
             .wrapping_add(revents_offset)
             .cast::<_>();
-        vm_write_slice(revents_ptr, core::slice::from_ref(&poll_fd.revents))?;
+        vm_write_slice(
+            current,
+            revents_ptr,
+            core::slice::from_ref(&poll_fd.revents),
+        )?;
     }
 
     Ok(())
@@ -174,7 +181,7 @@ pub fn sys_poll(
     };
     let res = do_poll(current, &mut poll_fds, timeout, None)?;
     if nfds > 0 {
-        write_poll_revents(fds, &poll_fds)?;
+        write_poll_revents(current, fds, &poll_fds)?;
     }
     Ok(res)
 }
@@ -197,7 +204,7 @@ pub fn sys_ppoll(
     } else {
         // SAFETY: timespec contains only signed integer fields; semantic
         // range validation is performed by try_into_time_value below.
-        Some(unsafe { timeout.read_abi()? })
+        Some(unsafe { timeout.read_abi(current)? })
     })
     .map(|ts| ts.try_into_time_value())
     .transpose()?;
@@ -206,11 +213,11 @@ pub fn sys_ppoll(
     } else {
         // SAFETY: SignalSet is a transparent signal-bit mask; every bit
         // pattern is valid and unsupported bits are handled by signal logic.
-        Some(unsafe { sigmask.read_abi()? })
+        Some(unsafe { sigmask.read_abi(current)? })
     };
     let res = do_poll(current, &mut poll_fds, timeout, sigmask)?;
     if nfds > 0 {
-        write_poll_revents(fds, &poll_fds)?;
+        write_poll_revents(current, fds, &poll_fds)?;
     }
     Ok(res)
 }

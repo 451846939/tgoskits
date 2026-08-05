@@ -73,7 +73,7 @@ impl DeviceOps for MppService {
         self
     }
 
-    fn ioctl(&self, cmd: u32, arg: usize) -> VfsResult<usize> {
+    fn ioctl(&self, current: &crate::task::UserTaskRef, cmd: u32, arg: usize) -> VfsResult<usize> {
         // Only the V1 request layout is implemented; V2 uses a different record
         // and must not be parsed as V1.
         if cmd != mpp::MPP_IOC_CFG_V1 {
@@ -86,8 +86,8 @@ impl DeviceOps for MppService {
         let mut state = self.state.lock();
         // Walk the chained request records (MULTI_MSG ... LAST_MSG).
         for i in 0..mpp::MAX_MSG_NUM {
-            let req = read_request(arg + i * size_of::<mpp::MppRequest>())?;
-            handle_request(&mut state, &req)?;
+            let req = read_request(current, arg + i * size_of::<mpp::MppRequest>())?;
+            handle_request(current, &mut state, &req)?;
             if req.flag & mpp::flags::LAST_MSG != 0 || req.flag & mpp::flags::MULTI_MSG == 0 {
                 break;
             }
@@ -96,37 +96,45 @@ impl DeviceOps for MppService {
     }
 }
 
-fn read_request(uaddr: usize) -> VfsResult<mpp::MppRequest> {
+fn read_request(current: &crate::task::UserTaskRef, uaddr: usize) -> VfsResult<mpp::MppRequest> {
     // SAFETY: `MppRequest` is a `repr(C)` aggregate of integer fields with no
     // padding, so every possible userspace byte pattern is a valid value.
-    unsafe { UserConstPtr::<mpp::MppRequest>::from(uaddr).read_abi() }
+    unsafe { UserConstPtr::<mpp::MppRequest>::from(uaddr).read_abi(current) }
         .map_err(|_| VfsError::InvalidData)
 }
 
-fn write_u32_to_user(uaddr: usize, value: u32) -> VfsResult<()> {
+fn write_u32_to_user(
+    current: &crate::task::UserTaskRef,
+    uaddr: usize,
+    value: u32,
+) -> VfsResult<()> {
     UserPtr::<u32>::from(uaddr)
-        .write(value)
+        .write(current, value)
         .map_err(|_| VfsError::InvalidData)
 }
 
-fn handle_request(state: &mut TaskState, req: &mpp::MppRequest) -> VfsResult<()> {
+fn handle_request(
+    current: &crate::task::UserTaskRef,
+    state: &mut TaskState,
+    req: &mpp::MppRequest,
+) -> VfsResult<()> {
     let data = req.data_ptr as usize;
     match req.cmd {
         mpp::cmd::PROBE_HW_SUPPORT => {
-            write_u32_to_user(data, mpp::HW_SUPPORT_JPEG_DEC)?;
+            write_u32_to_user(current, data, mpp::HW_SUPPORT_JPEG_DEC)?;
         }
         mpp::cmd::QUERY_HW_ID => {
-            write_u32_to_user(data, jpeg::read_id().unwrap_or(0))?;
+            write_u32_to_user(current, data, jpeg::read_id().unwrap_or(0))?;
         }
         mpp::cmd::QUERY_CMD_SUPPORT => {
             // No command-support table is offered; write back 0 (rather than
             // leaving the user buffer untouched) so MPP's capability probe reads a
             // defined value and falls back to the old-kernel command path.
-            write_u32_to_user(data, 0)?;
+            write_u32_to_user(current, data, 0)?;
         }
         mpp::cmd::INIT_CLIENT_TYPE => {
             let client = UserConstPtr::<u32>::from(data)
-                .read()
+                .read(current)
                 .map_err(|_| VfsError::InvalidData)?;
             state
                 .session
@@ -136,7 +144,7 @@ fn handle_request(state: &mut TaskState, req: &mpp::MppRequest) -> VfsResult<()>
         mpp::cmd::SET_REG_WRITE => {
             let n = (req.size as usize / 4).min(registers::REG_COUNT);
             let words = UserConstPtr::<u32>::from(data)
-                .read_slice(n)
+                .read_slice(current, n)
                 .map_err(|_| VfsError::InvalidData)?;
             state.session.set_reg_write(&words);
         }
@@ -149,15 +157,16 @@ fn handle_request(state: &mut TaskState, req: &mpp::MppRequest) -> VfsResult<()>
             let cnt = (req.size as usize / elem).min(mpp::MAX_REG_OFFSETS);
             // SAFETY: `RegOffset` is `repr(C)` with exactly two `u32` fields,
             // so every possible userspace byte pattern is a valid value.
-            let elems = unsafe { UserConstPtr::<mpp::RegOffset>::from(data).read_abi_slice(cnt) }
-                .map_err(|_| VfsError::InvalidData)?;
+            let elems =
+                unsafe { UserConstPtr::<mpp::RegOffset>::from(data).read_abi_slice(current, cnt) }
+                    .map_err(|_| VfsError::InvalidData)?;
             state
                 .session
                 .add_reg_offsets(&elems)
                 .map_err(|_| VfsError::InvalidInput)?;
         }
         mpp::cmd::POLL_HW_FINISH | mpp::cmd::POLL_HW_IRQ => {
-            run_decode(state)?;
+            run_decode(current, state)?;
         }
         mpp::cmd::RESET_SESSION => {
             state.session.reset();
@@ -170,7 +179,7 @@ fn handle_request(state: &mut TaskState, req: &mpp::MppRequest) -> VfsResult<()>
     Ok(())
 }
 
-fn run_decode(state: &mut TaskState) -> VfsResult<()> {
+fn run_decode(current: &crate::task::UserTaskRef, state: &mut TaskState) -> VfsResult<()> {
     state
         .session
         .resolve_addresses(resolve_fd)
@@ -184,7 +193,7 @@ fn run_decode(state: &mut TaskState) -> VfsResult<()> {
     if state.read_dst != 0 && count > 0 && first < registers::REG_COUNT {
         let count = count.min(registers::REG_COUNT - first);
         UserPtr::<u32>::from(state.read_dst)
-            .write_slice(&readback[first..first + count])
+            .write_slice(current, &readback[first..first + count])
             .map_err(|_| VfsError::InvalidData)?;
     }
 

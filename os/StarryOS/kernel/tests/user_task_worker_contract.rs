@@ -121,12 +121,15 @@ fn weak_user_reference_treats_a_live_foreign_extension_as_absent() {
 fn published_user_thread_cannot_be_reported_as_a_recoverable_spawn_failure() {
     let spawn = function_body(SCHEDULER_TASK, "fn spawn_user_thread_inner<");
     let publish = function_body(SCHEDULER_TASK, "pub fn publish(");
+    let activate = function_body(SCHEDULER_TASK, "pub fn activate(");
 
     assert!(spawn.contains(
         "prepare_user_thread_inner(entry, name, stack_size, thread, context_state)?.publish()"
     ));
-    assert!(publish.contains("finish_published_user_thread(handle)"));
+    assert!(publish.contains("Ok(self.stage()?.activate())"));
     assert!(!publish.contains("try_from_scheduler(handle)?"));
+    assert!(activate.contains("finish_published_user_thread(self.scheduler.activate())"));
+    assert!(!activate.contains("try_from_scheduler"));
 }
 
 #[test]
@@ -345,24 +348,26 @@ fn starry_device_ioctls_never_borrow_user_memory_directly() {
 #[test]
 fn safe_vm_copyout_requires_initialized_object_bytes() {
     assert!(
-        STARRY_VM_LIB.contains("pub fn vm_write_slice<T: NoUninit>"),
+        STARRY_VM_LIB.contains("pub fn vm_write_slice<I: VmIo, T: NoUninit>"),
         "vm_write_slice must reject values with potentially uninitialized padding"
     );
     assert!(
         STARRY_VM_THIN.contains("Self::Target: NoUninit"),
         "VmMutPtr::vm_write must require an initialized object representation"
     );
+    assert!(MM_ACCESS.contains(
+        "pub fn write(self, task: &UserTaskRef, value: T) -> AxResult<()>\n    where\n        T: \
+         NoUninit"
+    ));
     assert!(
         MM_ACCESS.contains(
-            "pub fn write(self, value: T) -> AxResult<()>\n    where\n        T: NoUninit"
+            "pub fn write_slice(self, task: &UserTaskRef, values: &[T]) -> AxResult<()>\n    \
+             where\n        T: NoUninit"
         )
     );
     assert!(MM_ACCESS.contains(
-        "pub fn write_slice(self, values: &[T]) -> AxResult<()>\n    where\n        T: NoUninit"
-    ));
-    assert!(MM_ACCESS.contains(
-        "pub fn write_field<U>(self, offset: usize, value: U) -> AxResult<()>\n    where\n        \
-         U: NoUninit"
+        "pub fn write_field<U>(self, task: &UserTaskRef, offset: usize, value: U) -> \
+         AxResult<()>\n    where\n        U: NoUninit"
     ));
     assert!(
         STARRY_SIGNAL_TYPES.contains("pub struct SignalInfo(siginfo_t);"),
@@ -418,32 +423,6 @@ fn kernel_user_page_fault_requires_an_active_user_access_scope() {
     assert!(hard_irq < identity_lookup && identity_lookup < active_scope && active_scope < sleep);
     assert!(!handler.contains("debug!("));
     assert!(!handler.contains("warn!("));
-}
-
-#[test]
-fn proactive_user_copy_fails_closed_before_sleepable_mm_work_in_hard_irq() {
-    let prepare = function_body(MM_ACCESS, "fn prepare_user_memory(");
-    let hard_irq = prepare
-        .find("in_irq_context()")
-        .expect("user-copy preparation must reject hard IRQ context");
-    let identity = prepare
-        .find("user_task_for_memory_access")
-        .expect("task identity must be resolved only after the IRQ check");
-    let aspace_lock = prepare
-        .find("aspace_arc.lock()")
-        .expect("faultable copy preparation must populate through the address space");
-    let populate = prepare
-        .find("populate_area")
-        .expect("faultable copy preparation must populate user pages");
-
-    assert!(hard_irq < identity && hard_irq < aspace_lock && hard_irq < populate);
-}
-
-#[test]
-fn user_memory_access_does_not_treat_identity_corruption_as_no_user_task() {
-    let lookup = function_body(MM_ACCESS, "fn user_task_for_memory_access(");
-    assert!(lookup.contains("USER_MEMORY_IDENTITY_FAILURES.fetch_add"));
-    assert!(!lookup.contains("Ok(None) | Err(_)"));
 }
 
 #[test]

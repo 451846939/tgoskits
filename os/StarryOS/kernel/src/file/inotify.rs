@@ -22,10 +22,10 @@ use linux_raw_sys::{
     ioctl::FIONREAD,
 };
 use spin::LazyLock;
-use starry_vm::VmMutPtr;
 
 use crate::{
     file::{FileLike, IoDst, IoSrc},
+    mm::VmMutPtr,
     task::{
         current_user_task,
         future::{block_on_user, poll_io},
@@ -238,7 +238,7 @@ impl FileLike for Inotify {
         "anon_inode:[inotify]".into()
     }
 
-    fn ioctl(&self, cmd: u32, arg: usize) -> AxResult<usize> {
+    fn ioctl(&self, current: &crate::task::UserTaskRef, cmd: u32, arg: usize) -> AxResult<usize> {
         match cmd {
             FIONREAD => {
                 let pending = self
@@ -249,7 +249,7 @@ impl FileLike for Inotify {
                     .map(Vec::len)
                     .sum::<usize>()
                     .min(u32::MAX as usize) as u32;
-                (arg as *mut u32).vm_write(pending)?;
+                (arg as *mut u32).vm_write(current, pending)?;
                 Ok(0)
             }
             _ => Err(AxError::NotATty),

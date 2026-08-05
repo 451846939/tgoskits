@@ -14,7 +14,6 @@ use bytemuck::AnyBitPattern;
 use linux_raw_sys::general::ROBUST_LIST_LIMIT;
 use starry_process::{Pid, ProcessCpuTime, ProcessGroup, Session, ThreadExit};
 use starry_signal::{SignalInfo, Signo};
-use starry_vm::{VmMutPtr, VmPtr};
 use weak_map::WeakMap;
 
 use super::{
@@ -26,6 +25,7 @@ use super::{
     release_thread_pid, resolve_futex_for_process_teardown, send_signal_to_process,
     send_signal_to_thread, unregister_prepared_process_identity, wait_for_victims,
 };
+use crate::mm::{VmMutPtr, VmPtr};
 
 const FUTEX_OWNER_DIED: u32 = 0x40000000;
 const FUTEX_TID_MASK: u32 = 0x3fffffff;
@@ -402,6 +402,7 @@ fn wake_robust_futex(proc_data: &ProcessData, address: usize) {
 }
 
 fn handle_futex_death(
+    current: &UserTaskRef,
     thr: &Thread,
     entry: *mut RobustList,
     offset: i64,
@@ -414,7 +415,7 @@ fn handle_futex_death(
     // After non-leader execve, that value is Thread::tid(), not the scheduler
     // task id.
     let owner_tid = thr.tid() & FUTEX_TID_MASK;
-    let value = futex_word.vm_read()?;
+    let value = futex_word.vm_read(current)?;
     let owner = value & FUTEX_TID_MASK;
 
     if pending && owner == 0 {
@@ -425,7 +426,7 @@ fn handle_futex_death(
     if owner != owner_tid {
         return Ok(());
     }
-    futex_word.vm_write((value & FUTEX_WAITERS) | FUTEX_OWNER_DIED)?;
+    futex_word.vm_write(current, (value & FUTEX_WAITERS) | FUTEX_OWNER_DIED)?;
 
     if value & FUTEX_WAITERS != 0 {
         wake_robust_futex(&thr.proc_data, address);
@@ -433,13 +434,17 @@ fn handle_futex_death(
     Ok(())
 }
 
-pub fn exit_robust_list(thr: &Thread, head: *const RobustListHead) -> AxResult<()> {
+pub fn exit_robust_list(
+    current: &UserTaskRef,
+    thr: &Thread,
+    head: *const RobustListHead,
+) -> AxResult<()> {
     // Reference: https://elixir.bootlin.com/linux/v6.13.6/source/kernel/futex/core.c#L777
 
     let mut limit = ROBUST_LIST_LIMIT;
 
     let end_ptr = head.cast::<RobustList>() as *mut RobustList;
-    let head = head.vm_read()?;
+    let head = head.vm_read(current)?;
     let mut entry = head.list.next;
     let offset = head.futex_offset;
     // Bit 0 marks PI futexes in Linux's robust-list ABI.  Starry handles only
@@ -450,13 +455,13 @@ pub fn exit_robust_list(thr: &Thread, head: *const RobustListHead) -> AxResult<(
         if entry.is_null() {
             break;
         }
-        let Ok(node) = entry.vm_read() else {
+        let Ok(node) = entry.vm_read(current) else {
             debug!("robust list: failed to read entry {entry:?}");
             break;
         };
         let next_entry = node.next;
         if entry != pending {
-            handle_futex_death(thr, entry, offset, false).unwrap_or_else(|err| {
+            handle_futex_death(current, thr, entry, offset, false).unwrap_or_else(|err| {
                 debug!("robust list: failed to clean entry {entry:?}: {err:?}");
             });
         }
@@ -472,7 +477,7 @@ pub fn exit_robust_list(thr: &Thread, head: *const RobustListHead) -> AxResult<(
 
     // Process the pending entry that was skipped in the loop
     if !pending.is_null() && !core::ptr::eq(pending, end_ptr) {
-        handle_futex_death(thr, pending, offset, true).unwrap_or_else(|err| {
+        handle_futex_death(current, thr, pending, offset, true).unwrap_or_else(|err| {
             debug!("robust list: failed to clean pending entry {pending:?}: {err:?}");
         });
     }
@@ -572,13 +577,13 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
     // OWNER_DIED handoff has been written.
     let head = thr.robust_list_head() as *const RobustListHead;
     if !head.is_null()
-        && let Err(err) = exit_robust_list(thr, head)
+        && let Err(err) = exit_robust_list(&curr, thr, head)
     {
         warn!("exit robust list failed: {err:?}");
     }
 
     let clear_child_tid = thr.clear_child_tid() as *mut u32;
-    if clear_child_tid.vm_write(0).is_ok() {
+    if clear_child_tid.vm_write(&curr, 0).is_ok() {
         resolve_futex_for_process_teardown(&thr.proc_data, clear_child_tid as usize)
             .wake(1, u32::MAX);
         let _decision = yield_current_cpu();

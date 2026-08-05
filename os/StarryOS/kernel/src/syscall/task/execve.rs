@@ -19,12 +19,13 @@ use axfs_ng_vfs::Location;
 use kernel_elf_parser::AuxType;
 use linux_raw_sys::general::{AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW};
 use starry_process::Pid;
-use starry_vm::vm_load_until_nul;
 
 use crate::{
     config::USER_HEAP_BASE,
     file::{ResolveAtResult, current_fd_table, memfd::Memfd, resolve_at},
-    mm::{copy_from_kernel, load_user_app, new_user_aspace_empty, vm_load_string},
+    mm::{
+        copy_from_kernel, load_user_app, new_user_aspace_empty, vm_load_string, vm_load_until_nul,
+    },
     task::{future::block_on, rebind_task_tid, release_thread_pid, yield_now, zap_thread},
 };
 
@@ -45,7 +46,7 @@ pub fn sys_execve(
     argv: *const *const c_char,
     envp: *const *const c_char,
 ) -> AxResult<isize> {
-    let path = vm_load_string(path)?;
+    let path = vm_load_string(current, path)?;
     let loc = current_fs_context().lock().resolve(&path)?;
     do_execve(current, uctx, loc, path, argv, envp)
 }
@@ -66,7 +67,7 @@ pub fn sys_execveat(
         return Err(AxError::InvalidInput);
     }
 
-    let path = vm_load_string(path)?;
+    let path = vm_load_string(current, path)?;
 
     // Resolve dirfd + path to the `Location` the loader reads from. A regular
     // file yields its filesystem path as the display name; an anonymous memfd
@@ -118,9 +119,9 @@ fn do_execve(
         if ptr.is_null() {
             Ok(Vec::new())
         } else {
-            vm_load_until_nul(ptr)?
+            vm_load_until_nul(current, ptr)?
                 .into_iter()
-                .map(vm_load_string)
+                .map(|string| vm_load_string(current, string))
                 .collect::<Result<Vec<_>, _>>()
         }
     };

@@ -32,12 +32,12 @@ pub fn sys_init_module(
     param_ptr: *const u8,
 ) -> AxResult<isize> {
     require_module_privilege(current)?;
-    let mut module_buf = VmBytes::new(module_ptr as *mut u8, len);
+    let mut module_buf = VmBytes::new(current, module_ptr as *mut u8, len);
     let mut module_data = vec![0u8; len];
     module_buf.read(&mut module_data)?;
 
     let param_buf = if !param_ptr.is_null() {
-        Some(vm_load_string(param_ptr as _)?)
+        Some(vm_load_string(current, param_ptr as _)?)
     } else {
         None
     };
@@ -78,7 +78,7 @@ pub fn sys_finit_module(
     }
 
     let param_buf = if !param_ptr.is_null() {
-        Some(vm_load_string(param_ptr as _)?)
+        Some(vm_load_string(current, param_ptr as _)?)
     } else {
         None
     };
@@ -99,7 +99,7 @@ pub fn sys_delete_module(
     _flags: u32,
 ) -> AxResult<isize> {
     require_module_privilege(current)?;
-    let name = vm_load_string(name_ptr as _)?;
+    let name = vm_load_string(current, name_ptr as _)?;
     warn!("[sys_delete_module]: name={}", name);
     crate::kmod::delete_module(&name)?;
     Ok(0)

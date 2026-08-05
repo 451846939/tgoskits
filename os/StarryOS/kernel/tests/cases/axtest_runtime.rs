@@ -102,8 +102,8 @@ fn futex_keys_follow_mm_and_backing_identity() {
 }
 
 #[axtest]
-fn futex_false_wait_condition_avoids_waiter_allocation() {
-    ax_assert!(axtest_exports::futex_false_wait_condition_avoids_waiter_allocation());
+fn futex_false_wait_condition_short_circuits_before_task_clone() {
+    ax_assert!(axtest_exports::futex_false_wait_condition_short_circuits_before_task_clone());
 }
 
 #[axtest]

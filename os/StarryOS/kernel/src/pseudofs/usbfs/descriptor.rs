@@ -14,7 +14,8 @@ use crab_usb::{
 use linux_raw_sys::general::{
     _IOC_DIRSHIFT, _IOC_NRSHIFT, _IOC_READ, _IOC_SIZESHIFT, _IOC_TYPESHIFT, _IOC_WRITE,
 };
-use starry_vm::VmPtr;
+
+use crate::mm::VmPtr;
 
 pub(super) const USBFS_MAGIC: u32 = 0x9fa2;
 const USB_MAJOR: u32 = 189;
@@ -166,36 +167,53 @@ pub(super) fn root_hub_snapshot(bus_num: u8, speed: Speed) -> UsbDeviceSnapshot 
     }
 }
 
-pub(super) fn read_usbdevfs_ctrltransfer(arg: usize) -> VfsResult<UsbdevfsCtrlTransfer> {
+pub(super) fn read_usbdevfs_ctrltransfer(
+    current: &crate::task::UserTaskRef,
+    arg: usize,
+) -> VfsResult<UsbdevfsCtrlTransfer> {
     (arg as *const UsbdevfsCtrlTransfer)
-        .vm_read()
+        .vm_read(current)
         .map_err(Into::into)
 }
 
-pub(super) fn read_usbdevfs_bulktransfer(arg: usize) -> VfsResult<UsbdevfsBulkTransfer> {
+pub(super) fn read_usbdevfs_bulktransfer(
+    current: &crate::task::UserTaskRef,
+    arg: usize,
+) -> VfsResult<UsbdevfsBulkTransfer> {
     (arg as *const UsbdevfsBulkTransfer)
-        .vm_read()
+        .vm_read(current)
         .map_err(Into::into)
 }
 
-pub(super) fn read_usbdevfs_setinterface(arg: usize) -> VfsResult<UsbdevfsSetInterface> {
+pub(super) fn read_usbdevfs_setinterface(
+    current: &crate::task::UserTaskRef,
+    arg: usize,
+) -> VfsResult<UsbdevfsSetInterface> {
     (arg as *const UsbdevfsSetInterface)
-        .vm_read()
+        .vm_read(current)
         .map_err(Into::into)
 }
 
-pub(super) fn read_usbdevfs_ioctl(arg: usize) -> VfsResult<UsbdevfsIoctl> {
-    (arg as *const UsbdevfsIoctl).vm_read().map_err(Into::into)
+pub(super) fn read_usbdevfs_ioctl(
+    current: &crate::task::UserTaskRef,
+    arg: usize,
+) -> VfsResult<UsbdevfsIoctl> {
+    (arg as *const UsbdevfsIoctl)
+        .vm_read(current)
+        .map_err(Into::into)
 }
 
-pub(super) fn read_usbdevfs_disconnect_claim(arg: usize) -> VfsResult<UsbdevfsDisconnectClaim> {
+pub(super) fn read_usbdevfs_disconnect_claim(
+    current: &crate::task::UserTaskRef,
+    arg: usize,
+) -> VfsResult<UsbdevfsDisconnectClaim> {
     (arg as *const UsbdevfsDisconnectClaim)
-        .vm_read()
+        .vm_read(current)
         .map_err(Into::into)
 }
 
-pub(super) fn read_usbdevfs_u32(arg: usize) -> VfsResult<u32> {
-    (arg as *const u32).vm_read().map_err(Into::into)
+pub(super) fn read_usbdevfs_u32(current: &crate::task::UserTaskRef, arg: usize) -> VfsResult<u32> {
+    (arg as *const u32).vm_read(current).map_err(Into::into)
 }
 
 pub(super) fn snapshot_probed_device(

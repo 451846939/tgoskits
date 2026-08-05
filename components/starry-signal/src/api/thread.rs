@@ -9,7 +9,7 @@ use core::{
 use ax_cpu::uspace::UserContext;
 use ax_errno::AxResult;
 use ax_kspin::SpinNoIrq;
-use starry_vm::{VmMutPtr, VmPtr};
+use starry_vm::{VmIo, VmMutPtr, VmPtr};
 
 use super::ProcessSignalManager;
 use crate::{
@@ -272,8 +272,9 @@ impl ThreadSignalManager {
         }
     }
 
-    fn install_signal_handler(
+    fn install_signal_handler<I: VmIo>(
         &self,
+        vm: &mut I,
         uctx: &mut UserContext,
         prepared: PreparedSignalHandler,
     ) -> SignalOSAction {
@@ -296,13 +297,16 @@ impl ThreadSignalManager {
         let aligned_sp = (sp - layout.size()) & !(layout.align() - 1);
         let frame_ptr = aligned_sp as *mut SignalFrame;
         if frame_ptr
-            .vm_write(SignalFrame {
-                ucontext: UContext::new(uctx, prepared.restore_blocked),
-                siginfo: prepared.siginfo,
-                uctx: *uctx,
-                used_sigaltstack: u8::from(uses_sigaltstack),
-                _padding: [0; 15],
-            })
+            .vm_write(
+                vm,
+                SignalFrame {
+                    ucontext: UContext::new(uctx, prepared.restore_blocked),
+                    siginfo: prepared.siginfo,
+                    uctx: *uctx,
+                    used_sigaltstack: u8::from(uses_sigaltstack),
+                    _padding: [0; 15],
+                },
+            )
             .is_err()
         {
             return SignalOSAction::CoreDump;
@@ -317,7 +321,10 @@ impl ThreadSignalManager {
         #[cfg(target_arch = "x86_64")]
         {
             let new_sp = uctx.sp() - 8;
-            if (new_sp as *mut usize).vm_write(prepared.restorer).is_err() {
+            if (new_sp as *mut usize)
+                .vm_write(vm, prepared.restorer)
+                .is_err()
+            {
                 return SignalOSAction::CoreDump;
             }
             uctx.set_sp(new_sp);
@@ -333,8 +340,9 @@ impl ThreadSignalManager {
     }
 
     #[cold]
-    fn check_signals_slow_with<F>(
+    fn check_signals_slow_with<I: VmIo, F>(
         &self,
+        vm: &mut I,
         uctx: &mut UserContext,
         restore_blocked: Option<SignalSet>,
         before_deliver: &mut F,
@@ -358,7 +366,7 @@ impl ThreadSignalManager {
                 }
                 PreparedSignal::Handler(prepared) => {
                     before_deliver(uctx, &sig, restartable);
-                    let os_action = self.install_signal_handler(uctx, prepared);
+                    let os_action = self.install_signal_handler(vm, uctx, prepared);
                     break Some((sig, os_action));
                 }
             }
@@ -370,8 +378,9 @@ impl ThreadSignalManager {
     /// Calls `before_deliver` immediately before the selected signal is
     /// delivered. The callback receives the user context, the delivered signal,
     /// and whether its disposition is restartable.
-    pub fn check_signals_with<F>(
+    pub fn check_signals_with<I: VmIo, F>(
         &self,
+        vm: &mut I,
         uctx: &mut UserContext,
         restore_blocked: Option<SignalSet>,
         mut before_deliver: F,
@@ -385,25 +394,26 @@ impl ThreadSignalManager {
         {
             return None;
         }
-        self.check_signals_slow_with(uctx, restore_blocked, &mut before_deliver)
+        self.check_signals_slow_with(vm, uctx, restore_blocked, &mut before_deliver)
     }
 
     /// Checks pending signals and delivers one if possible.
     ///
     /// Returns the delivered signal and its delivery result, if any.
-    pub fn check_signals(
+    pub fn check_signals<I: VmIo>(
         &self,
+        vm: &mut I,
         uctx: &mut UserContext,
         restore_blocked: Option<SignalSet>,
     ) -> Option<(SignalInfo, SignalOSAction)> {
-        self.check_signals_with(uctx, restore_blocked, |_, _, _| {})
+        self.check_signals_with(vm, uctx, restore_blocked, |_, _, _| {})
     }
 
     /// Restores the signal frame. Called by `sigreturn`.
-    pub fn restore(&self, uctx: &mut UserContext) -> AxResult<isize> {
+    pub fn restore<I: VmIo>(&self, vm: &mut I, uctx: &mut UserContext) -> AxResult<isize> {
         let frame_ptr = uctx.sp() as *const SignalFrame;
         // copy the saved frame back from uspace
-        let frame: SignalFrame = unsafe { frame_ptr.vm_read_uninit()?.assume_init() };
+        let frame: SignalFrame = unsafe { frame_ptr.vm_read_uninit(vm)?.assume_init() };
 
         *uctx = frame.uctx;
         frame.ucontext.mcontext.restore(uctx);

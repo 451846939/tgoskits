@@ -86,14 +86,17 @@ enum DevPtsInstanceKind {
     New,
 }
 
-fn parse_devpts_options(data: *const c_void) -> AxResult<DevPtsMount> {
+fn parse_devpts_options(
+    current: &crate::task::UserTaskRef,
+    data: *const c_void,
+) -> AxResult<DevPtsMount> {
     let mut options = DevPtsOptions::mounted();
     let mut instance = DevPtsInstanceKind::Legacy;
     if data.is_null() {
         return Ok(DevPtsMount::Legacy(options));
     }
 
-    for item in vm_load_string(data.cast())?.split(',') {
+    for item in vm_load_string(current, data.cast())?.split(',') {
         if item.is_empty() {
             continue;
         }
@@ -118,12 +121,13 @@ fn parse_devpts_options(data: *const c_void) -> AxResult<DevPtsMount> {
 }
 
 fn parse_overlay_options(
+    current: &crate::task::UserTaskRef,
     data: *const c_void,
 ) -> AxResult<(Vec<String>, Option<String>, Option<String>)> {
     if data.is_null() {
         return Err(AxError::InvalidInput);
     }
-    let data = vm_load_string(data.cast())?;
+    let data = vm_load_string(current, data.cast())?;
     let mut lowerdir = None;
     let mut upperdir = None;
     let mut workdir = None;
@@ -597,13 +601,13 @@ pub fn sys_mount(
     let source = if source.is_null() {
         String::new()
     } else {
-        vm_load_string(source)?
+        vm_load_string(current, source)?
     };
-    let target = vm_load_string(target)?;
+    let target = vm_load_string(current, target)?;
     let fs_type = if fs_type.is_null() {
         String::new()
     } else {
-        vm_load_string(fs_type)?
+        vm_load_string(current, fs_type)?
     };
     debug!("sys_mount <= source: {source:?}, target: {target:?}, fs_type: {fs_type:?}");
 
@@ -706,7 +710,7 @@ pub fn sys_mount(
             mp.set_mount_flags((flags & MOUNT_OPTION_FLAGS) as u32);
         }
         "devpts" => {
-            let fs = new_devptsfs(parse_devpts_options(data)?);
+            let fs = new_devptsfs(parse_devpts_options(current, data)?);
             let target = ax_fs_ng::vfs::current_fs_context().lock().resolve(target)?;
             let mp = target.mount(&fs)?;
             if (flags & MS_RDONLY) != 0 {
@@ -735,7 +739,7 @@ pub fn sys_mount(
             mount_ext4(&source, &target, (flags & MS_RDONLY) != 0)?;
         }
         "overlay" => {
-            let (lower_paths, upper_path, work_path) = parse_overlay_options(data)?;
+            let (lower_paths, upper_path, work_path) = parse_overlay_options(current, data)?;
             let fs_context = ax_fs_ng::vfs::current_fs_context();
             let ctx = fs_context.lock();
             let mut lower_dirs = Vec::new();
@@ -789,7 +793,7 @@ pub fn sys_umount2(
 ) -> AxResult<isize> {
     use alloc::boxed::Box;
 
-    let target = vm_load_string(target)?;
+    let target = vm_load_string(current, target)?;
     debug!("sys_umount2 <= target: {target:?}, flags: {flags:#x}");
 
     if (flags & !VALID_UMOUNT_FLAGS) != 0 {
@@ -874,8 +878,8 @@ pub fn sys_pivot_root(
     new_root: *const c_char,
     put_old: *const c_char,
 ) -> AxResult<isize> {
-    let new_root = vm_load_string(new_root)?;
-    let put_old = vm_load_string(put_old)?;
+    let new_root = vm_load_string(current, new_root)?;
+    let put_old = vm_load_string(current, put_old)?;
     debug!(
         "sys_pivot_root <= new_root: {:?}, put_old: {:?}",
         new_root, put_old

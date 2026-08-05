@@ -20,7 +20,6 @@ use crab_usb::{
 };
 use event_listener::Event as NotifyEvent;
 use rdrive::DeviceId as RDriveDeviceId;
-use starry_vm::{VmMutPtr, vm_load, vm_write_slice};
 
 use super::{
     descriptor::{
@@ -34,7 +33,10 @@ use super::{
     irq::{self, PendingUsbIrqSlot},
     refresh::{HostRefreshCursor, HostRefreshState, RefreshRetryBackoff},
 };
-use crate::task::future::IrqNotify;
+use crate::{
+    mm::{VmMutPtr, vm_load, vm_write_slice},
+    task::future::IrqNotify,
+};
 
 const ROOT_HUB_STABLE_DEVICE_ID: usize = usize::MAX;
 const USB_REQ_GET_DESCRIPTOR: u8 = 0x06;
@@ -266,8 +268,14 @@ pub(super) struct UsbDeviceLease {
 }
 
 impl UsbDeviceLease {
-    pub(super) fn ioctl(&self, cmd: u32, arg: usize) -> AxResult<usize> {
-        self.manager.opened_device_ioctl(self.stable_id, cmd, arg)
+    pub(super) fn ioctl(
+        &self,
+        current: &crate::task::UserTaskRef,
+        cmd: u32,
+        arg: usize,
+    ) -> AxResult<usize> {
+        self.manager
+            .opened_device_ioctl(current, self.stable_id, cmd, arg)
     }
 
     pub(super) fn claim_interface(&self, interface: u8, alternate: u8) -> AxResult<()> {
@@ -702,32 +710,41 @@ impl UsbFsManager {
         })
     }
 
-    fn opened_device_ioctl(&self, stable_id: UsbStableId, cmd: u32, arg: usize) -> AxResult<usize> {
+    fn opened_device_ioctl(
+        &self,
+        current: &crate::task::UserTaskRef,
+        stable_id: UsbStableId,
+        cmd: u32,
+        arg: usize,
+    ) -> AxResult<usize> {
         match cmd {
-            USBDEVFS_CONTROL => self.handle_control(stable_id, arg),
+            USBDEVFS_CONTROL => self.handle_control(current, stable_id, arg),
             USBDEVFS_CONNECTINFO => {
                 let snapshot = self.snapshot_by_id(stable_id)?;
-                (arg as *mut UsbdevfsConnectInfo).vm_write(UsbdevfsConnectInfo {
-                    devnum: snapshot.device_num as u32,
-                    slow: 0,
-                    _padding: [0; 3],
-                })?;
+                (arg as *mut UsbdevfsConnectInfo).vm_write(
+                    current,
+                    UsbdevfsConnectInfo {
+                        devnum: snapshot.device_num as u32,
+                        slow: 0,
+                        _padding: [0; 3],
+                    },
+                )?;
                 Ok(0)
             }
             USBDEVFS_GET_CAPABILITIES => {
-                (arg as *mut u32).vm_write(USBDEVFS_CAP_BULK_CONTINUATION)?;
+                (arg as *mut u32).vm_write(current, USBDEVFS_CAP_BULK_CONTINUATION)?;
                 Ok(0)
             }
             USBDEVFS_CLAIMINTERFACE | USBDEVFS_RELEASEINTERFACE => {
-                let _ = read_usbdevfs_u32(arg)?;
+                let _ = read_usbdevfs_u32(current, arg)?;
                 Err(AxError::Unsupported)
             }
             USBDEVFS_SETINTERFACE => {
-                let _ = read_usbdevfs_setinterface(arg)?;
+                let _ = read_usbdevfs_setinterface(current, arg)?;
                 Err(AxError::Unsupported)
             }
             USBDEVFS_BULK => {
-                let bulk = read_usbdevfs_bulktransfer(arg)?;
+                let bulk = read_usbdevfs_bulktransfer(current, arg)?;
                 let len = bulk.len as usize;
                 if len > 0 {
                     crate::mm::check_access(bulk.data as usize, len)?;
@@ -735,7 +752,7 @@ impl UsbFsManager {
                 Err(AxError::Unsupported)
             }
             USBDEVFS_SETCONFIGURATION | USBDEVFS_CLEAR_HALT => {
-                let _ = read_usbdevfs_u32(arg)?;
+                let _ = read_usbdevfs_u32(current, arg)?;
                 Err(AxError::Unsupported)
             }
             USBDEVFS_RESET => Err(AxError::Unsupported),
@@ -745,6 +762,7 @@ impl UsbFsManager {
 
     pub(super) fn snapshot_device_ioctl(
         &self,
+        current: &crate::task::UserTaskRef,
         bus_num: u8,
         device_num: u8,
         cmd: u32,
@@ -754,17 +772,20 @@ impl UsbFsManager {
             .device_snapshot(bus_num, device_num)
             .ok_or(AxError::NotFound)?;
         match cmd {
-            USBDEVFS_CONTROL => snapshot_control_ioctl(&snapshot, arg),
+            USBDEVFS_CONTROL => snapshot_control_ioctl(current, &snapshot, arg),
             USBDEVFS_CONNECTINFO => {
-                (arg as *mut UsbdevfsConnectInfo).vm_write(UsbdevfsConnectInfo {
-                    devnum: snapshot.device_num as u32,
-                    slow: 0,
-                    _padding: [0; 3],
-                })?;
+                (arg as *mut UsbdevfsConnectInfo).vm_write(
+                    current,
+                    UsbdevfsConnectInfo {
+                        devnum: snapshot.device_num as u32,
+                        slow: 0,
+                        _padding: [0; 3],
+                    },
+                )?;
                 Ok(0)
             }
             USBDEVFS_GET_CAPABILITIES => {
-                (arg as *mut u32).vm_write(USBDEVFS_CAP_BULK_CONTINUATION)?;
+                (arg as *mut u32).vm_write(current, USBDEVFS_CAP_BULK_CONTINUATION)?;
                 Ok(0)
             }
             _ => Err(AxError::Unsupported),
@@ -1223,8 +1244,13 @@ impl UsbFsManager {
         Ok(())
     }
 
-    fn handle_control(&self, stable_id: UsbStableId, arg: usize) -> AxResult<usize> {
-        let ctrl = read_usbdevfs_ctrltransfer(arg)?;
+    fn handle_control(
+        &self,
+        current: &crate::task::UserTaskRef,
+        stable_id: UsbStableId,
+        arg: usize,
+    ) -> AxResult<usize> {
+        let ctrl = read_usbdevfs_ctrltransfer(current, arg)?;
         match direction_from_raw(ctrl.b_request_type) {
             Direction::In => {
                 let mut data = vec![0; ctrl.w_length as usize];
@@ -1236,11 +1262,11 @@ impl UsbFsManager {
                     ctrl.w_index,
                     &mut data,
                 )?;
-                vm_write_slice(ctrl.data, &data[..actual])?;
+                vm_write_slice(current, ctrl.data, &data[..actual])?;
                 Ok(actual)
             }
             Direction::Out => {
-                let mut data = vm_load(ctrl.data as *const u8, ctrl.w_length as usize)?;
+                let mut data = vm_load(current, ctrl.data as *const u8, ctrl.w_length as usize)?;
                 self.live_control_transfer(
                     stable_id,
                     ctrl.b_request_type,
@@ -1276,8 +1302,11 @@ impl UsbFsManager {
     }
 }
 
-pub(super) fn is_snapshot_control_ioctl(arg: usize) -> AxResult<bool> {
-    let ctrl = read_usbdevfs_ctrltransfer(arg)?;
+pub(super) fn is_snapshot_control_ioctl(
+    current: &crate::task::UserTaskRef,
+    arg: usize,
+) -> AxResult<bool> {
+    let ctrl = read_usbdevfs_ctrltransfer(current, arg)?;
     Ok(matches!(
         (ctrl.b_request_type, ctrl.b_request, ctrl.w_value >> 8),
         (0x80, USB_REQ_GET_DESCRIPTOR, USB_DT_DEVICE)
@@ -1286,37 +1315,46 @@ pub(super) fn is_snapshot_control_ioctl(arg: usize) -> AxResult<bool> {
     ))
 }
 
-fn snapshot_control_ioctl(snapshot: &UsbDeviceSnapshot, arg: usize) -> AxResult<usize> {
-    let ctrl = read_usbdevfs_ctrltransfer(arg)?;
+fn snapshot_control_ioctl(
+    current: &crate::task::UserTaskRef,
+    snapshot: &UsbDeviceSnapshot,
+    arg: usize,
+) -> AxResult<usize> {
+    let ctrl = read_usbdevfs_ctrltransfer(current, arg)?;
     match (ctrl.b_request_type, ctrl.b_request, ctrl.w_value >> 8) {
         (0x80, USB_REQ_GET_DESCRIPTOR, USB_DT_DEVICE) => {
             let descriptor = &snapshot.descriptor_blob[..snapshot.descriptor_blob.len().min(18)];
-            write_control_data(ctrl.data, ctrl.w_length as usize, descriptor)
+            write_control_data(current, ctrl.data, ctrl.w_length as usize, descriptor)
         }
         (0x80, USB_REQ_GET_DESCRIPTOR, USB_DT_CONFIG) => {
             let config_index = (ctrl.w_value & 0xff) as usize;
             let config =
                 snapshot_config_blob(snapshot, config_index).ok_or(AxError::Unsupported)?;
-            write_control_data(ctrl.data, ctrl.w_length as usize, config)
+            write_control_data(current, ctrl.data, ctrl.w_length as usize, config)
         }
         (0x80, USB_REQ_GET_CONFIGURATION, _) => {
             if ctrl.w_length == 0 {
                 return Ok(0);
             }
             ctrl.data
-                .vm_write(snapshot_active_configuration(snapshot))?;
+                .vm_write(current, snapshot_active_configuration(snapshot))?;
             Ok(1)
         }
         _ => Err(AxError::Unsupported),
     }
 }
 
-fn write_control_data(data: *mut u8, requested_len: usize, source: &[u8]) -> AxResult<usize> {
+fn write_control_data(
+    current: &crate::task::UserTaskRef,
+    data: *mut u8,
+    requested_len: usize,
+    source: &[u8],
+) -> AxResult<usize> {
     let len = source.len().min(requested_len);
     if len == 0 {
         return Ok(0);
     }
-    vm_write_slice(data, &source[..len])?;
+    vm_write_slice(current, data, &source[..len])?;
     Ok(len)
 }
 

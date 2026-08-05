@@ -54,7 +54,7 @@ pub fn sys_memfd_create(
     let allow_sealing = flags & MFD_ALLOW_SEALING != 0;
 
     // Load the name argument. Linux rejects overlong names.
-    let name_str: String = vm_load_string(name)?;
+    let name_str: String = vm_load_string(current, name)?;
     if name_str.len() > MEMFD_NAME_MAX {
         return Err(AxError::InvalidInput);
     }

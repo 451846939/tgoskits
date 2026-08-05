@@ -12,10 +12,9 @@ use core::{
 
 use ax_errno::{AxError, AxResult};
 use linux_raw_sys::general::{__user_cap_data_struct, __user_cap_header_struct, CAP_LAST_CAP};
-use starry_vm::{VmMutPtr, VmPtr, vm_write_slice};
 
 use crate::{
-    mm::{UserPtr, vm_load_string},
+    mm::{UserPtr, VmMutPtr, VmPtr, vm_load_string, vm_write_slice},
     task::{Cred, get_process_data, get_task},
 };
 
@@ -60,20 +59,40 @@ fn parse_mempolicy_mode(mode: i32) -> AxResult<i32> {
 }
 
 /// Validate a user nodemask pointer when a policy consumes it.
-fn check_nodemask(nodemask: *const usize, maxnode: usize) -> AxResult<()> {
-    if !nodemask.is_null() && maxnode > 0 {
-        nodemask.vm_read()?;
+fn nodemask_requires_access(nodemask: *const usize, maxnode: usize) -> bool {
+    !nodemask.is_null() && maxnode > 0
+}
+
+fn check_nodemask(
+    current: &crate::task::UserTaskRef,
+    nodemask: *const usize,
+    maxnode: usize,
+) -> AxResult<()> {
+    if nodemask_requires_access(nodemask, maxnode) {
+        nodemask.vm_read(current)?;
     }
     Ok(())
 }
 
+fn validate_mbind_request(addr: usize, len: usize, mode: i32, flags: u32) -> AxResult<i32> {
+    let policy = parse_mempolicy_mode(mode)?;
+    if addr & 0xfff != 0 || len == 0 || flags & !MPOL_MF_VALID != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(policy)
+}
+
 /// Validate the cap header and return the target pid (0 means self).
-fn validate_cap_header(header_ptr: *mut __user_cap_header_struct) -> AxResult<u32> {
+fn validate_cap_header(
+    current: &crate::task::UserTaskRef,
+    header_ptr: *mut __user_cap_header_struct,
+) -> AxResult<u32> {
     // FIXME: AnyBitPattern
-    let mut header = unsafe { header_ptr.vm_read_uninit()?.assume_init() };
+    let mut header = unsafe { header_ptr.vm_read_uninit(current)?.assume_init() };
     if header.version != CAPABILITY_VERSION_3 {
         header.version = CAPABILITY_VERSION_3;
         UserPtr::<__user_cap_header_struct>::from(header_ptr).write_field(
+            current,
             offset_of!(__user_cap_header_struct, version),
             header.version,
         )?;
@@ -130,18 +149,22 @@ fn cap_data_from_cred(cred: &Cred) -> [__user_cap_data_struct; CAP_U32S_3] {
 }
 
 fn write_cap_data(
+    current: &crate::task::UserTaskRef,
     user: UserPtr<__user_cap_data_struct>,
     value: __user_cap_data_struct,
 ) -> AxResult<()> {
     user.write_field(
+        current,
         offset_of!(__user_cap_data_struct, effective),
         value.effective,
     )?;
     user.write_field(
+        current,
         offset_of!(__user_cap_data_struct, permitted),
         value.permitted,
     )?;
     user.write_field(
+        current,
         offset_of!(__user_cap_data_struct, inheritable),
         value.inheritable,
     )
@@ -158,7 +181,7 @@ pub fn sys_capget(
     header: *mut __user_cap_header_struct,
     data: *mut __user_cap_data_struct,
 ) -> AxResult<isize> {
-    let pid = validate_cap_header(header)?;
+    let pid = validate_cap_header(current, header)?;
 
     if data.is_null() {
         return Ok(0);
@@ -171,8 +194,8 @@ pub fn sys_capget(
         .addr()
         .checked_add(size_of::<__user_cap_data_struct>())
         .ok_or(AxError::BadAddress)?;
-    write_cap_data(first, cap_data[0])?;
-    write_cap_data(UserPtr::from(second_address), cap_data[1])?;
+    write_cap_data(current, first, cap_data[0])?;
+    write_cap_data(current, UserPtr::from(second_address), cap_data[1])?;
     Ok(0)
 }
 
@@ -187,7 +210,7 @@ pub fn sys_capset(
     header: *mut __user_cap_header_struct,
     data: *mut __user_cap_data_struct,
 ) -> AxResult<isize> {
-    let pid = validate_cap_header(header)?;
+    let pid = validate_cap_header(current, header)?;
     if data.is_null() {
         return Err(AxError::BadAddress);
     }
@@ -200,8 +223,8 @@ pub fn sys_capset(
 
     let requested = unsafe {
         [
-            data.vm_read_uninit()?.assume_init(),
-            data.add(1).vm_read_uninit()?.assume_init(),
+            data.vm_read_uninit(current)?.assume_init(),
+            data.add(1).vm_read_uninit(current)?.assume_init(),
         ]
     };
     let old = thread.cred();
@@ -267,6 +290,7 @@ pub fn sys_personality(current: &crate::task::UserTaskRef, persona: usize) -> Ax
 ///
 /// Returns 0 on success, or -errno on error.
 pub fn sys_get_mempolicy(
+    current: &crate::task::UserTaskRef,
     policy: *mut i32,
     nodemask: *mut usize,
     maxnode: usize,
@@ -291,24 +315,24 @@ pub fn sys_get_mempolicy(
     // StarryOS models one NUMA node, so every query resolves to node 0.
     if flags & MPOL_F_MEMS_ALLOWED != 0 {
         if !nodemask.is_null() && maxnode > 0 {
-            nodemask.vm_write(1usize)?;
+            nodemask.vm_write(current, 1usize)?;
         }
         return Ok(0);
     }
 
     if flags & MPOL_F_NODE != 0 {
         if !policy.is_null() {
-            policy.vm_write(0i32)?;
+            policy.vm_write(current, 0i32)?;
         }
         return Ok(0);
     }
 
     if !policy.is_null() {
-        policy.vm_write(MPOL_DEFAULT)?;
+        policy.vm_write(current, MPOL_DEFAULT)?;
     }
 
     if !nodemask.is_null() && maxnode > 0 {
-        nodemask.vm_write(1usize)?;
+        nodemask.vm_write(current, 1usize)?;
     }
 
     Ok(0)
@@ -324,12 +348,17 @@ pub fn sys_get_mempolicy(
 /// - maxnode: size of nodemask bitmap in bits
 ///
 /// Returns 0 on success.
-pub fn sys_set_mempolicy(mode: i32, nodemask: *const usize, maxnode: usize) -> AxResult<isize> {
+pub fn sys_set_mempolicy(
+    current: &crate::task::UserTaskRef,
+    mode: i32,
+    nodemask: *const usize,
+    maxnode: usize,
+) -> AxResult<isize> {
     debug!("sys_set_mempolicy <= mode: {}", mode);
 
     let policy = parse_mempolicy_mode(mode)?;
     if policy != MPOL_DEFAULT {
-        check_nodemask(nodemask, maxnode)?;
+        check_nodemask(current, nodemask, maxnode)?;
     }
 
     // Single-node system: accept valid policies and ignore placement.
@@ -350,6 +379,7 @@ pub fn sys_set_mempolicy(mode: i32, nodemask: *const usize, maxnode: usize) -> A
 ///
 /// Returns 0 on success.
 pub fn sys_mbind(
+    current: &crate::task::UserTaskRef,
     addr: usize,
     len: usize,
     mode: i32,
@@ -359,12 +389,9 @@ pub fn sys_mbind(
 ) -> AxResult<isize> {
     debug!("sys_mbind <= mode: {}", mode);
 
-    let policy = parse_mempolicy_mode(mode)?;
-    if addr & 0xfff != 0 || len == 0 || flags & !MPOL_MF_VALID != 0 {
-        return Err(AxError::InvalidInput);
-    }
+    let policy = validate_mbind_request(addr, len, mode, flags)?;
     if policy != MPOL_DEFAULT {
-        check_nodemask(nodemask, maxnode)?;
+        check_nodemask(current, nodemask, maxnode)?;
     }
 
     // Single-node system: accept valid bindings and ignore placement.
@@ -394,7 +421,7 @@ pub fn sys_prctl(
 
     match option {
         PR_SET_NAME => {
-            let s = vm_load_string(arg2 as *const c_char)?;
+            let s = vm_load_string(current, arg2 as *const c_char)?;
             current.set_name(&s);
         }
         PR_GET_NAME => {
@@ -402,7 +429,7 @@ pub fn sys_prctl(
             let len = name.len().min(15);
             let mut buf = [0; 16];
             buf[..len].copy_from_slice(&name.as_bytes()[..len]);
-            vm_write_slice(arg2 as _, &buf)?;
+            vm_write_slice(current, arg2 as _, &buf)?;
         }
         PR_SET_PDEATHSIG => {
             let sig = arg2 as u32;
@@ -413,7 +440,7 @@ pub fn sys_prctl(
         }
         PR_GET_PDEATHSIG => {
             let sig = current.as_thread().pdeathsig() as i32;
-            (arg2 as *mut i32).vm_write(sig)?;
+            (arg2 as *mut i32).vm_write(current, sig)?;
         }
         PR_SET_CHILD_SUBREAPER => {
             current
@@ -428,7 +455,7 @@ pub fn sys_prctl(
             } else {
                 0
             };
-            (arg2 as *mut i32).vm_write(enabled)?;
+            (arg2 as *mut i32).vm_write(current, enabled)?;
         }
         PR_CAPBSET_READ => {
             // Query whether a capability is still present in the bounding set.
@@ -606,30 +633,24 @@ pub(crate) fn mempolicy_validation_rules_hold_for_test() -> bool {
         && parse_mempolicy_mode(MPOL_PREFERRED | MPOL_F_RELATIVE_NODES) == Ok(MPOL_PREFERRED)
         // MPOL mode 7 (between WEIGHTED_INTERLEAVE and the next valid mode) is rejected.
         && parse_mempolicy_mode(7).is_err()
-        // check_nodemask is a no-op for null nodemask or zero maxnode.
-        && check_nodemask(core::ptr::null(), 0).is_ok()
-        && check_nodemask(core::ptr::null(), 64).is_ok()
-        && sys_set_mempolicy(MPOL_DEFAULT, core::ptr::null(), 0) == Ok(0)
-        && sys_set_mempolicy(-1, core::ptr::null(), 0).is_err()
+        // A null nodemask or zero maxnode does not authorize a user-memory access.
+        && !nodemask_requires_access(core::ptr::null(), 0)
+        && !nodemask_requires_access(core::ptr::null(), 64)
+        && !nodemask_requires_access(core::ptr::dangling(), 0)
         // set_mbind / set_mempolicy rejection of negative modes is exercised above.
-        && sys_mbind(0x1000, 4096, MPOL_DEFAULT, core::ptr::null(), 0, 0) == Ok(0)
-        && sys_mbind(0x1001, 4096, MPOL_DEFAULT, core::ptr::null(), 0, 0).is_err()
-        && sys_mbind(0x1000, 0, MPOL_DEFAULT, core::ptr::null(), 0, 0).is_err()
-        && sys_mbind(
-            0x1000,
-            4096,
-            MPOL_DEFAULT,
-            core::ptr::null(),
-            0,
-            !MPOL_MF_VALID,
-        )
-        .is_err()
+        && validate_mbind_request(0x1000, 4096, MPOL_DEFAULT, 0) == Ok(MPOL_DEFAULT)
+        && validate_mbind_request(0x1001, 4096, MPOL_DEFAULT, 0).is_err()
+        && validate_mbind_request(0x1000, 0, MPOL_DEFAULT, 0).is_err()
+        && validate_mbind_request(0x1000, 4096, MPOL_DEFAULT, !MPOL_MF_VALID).is_err()
         // mbind accepts each individual MPOL_MF flag bit in isolation.
-        && sys_mbind(0x1000, 4096, MPOL_DEFAULT, core::ptr::null(), 0, MPOL_MF_STRICT) == Ok(0)
-        && sys_mbind(0x1000, 4096, MPOL_DEFAULT, core::ptr::null(), 0, MPOL_MF_MOVE) == Ok(0)
-        && sys_mbind(0x1000, 4096, MPOL_DEFAULT, core::ptr::null(), 0, MPOL_MF_MOVE_ALL) == Ok(0)
+        && validate_mbind_request(0x1000, 4096, MPOL_DEFAULT, MPOL_MF_STRICT)
+            == Ok(MPOL_DEFAULT)
+        && validate_mbind_request(0x1000, 4096, MPOL_DEFAULT, MPOL_MF_MOVE)
+            == Ok(MPOL_DEFAULT)
+        && validate_mbind_request(0x1000, 4096, MPOL_DEFAULT, MPOL_MF_MOVE_ALL)
+            == Ok(MPOL_DEFAULT)
         // mbind rejects out-of-range mode.
-        && sys_mbind(0x1000, 4096, 99, core::ptr::null(), 0, 0).is_err()
+        && validate_mbind_request(0x1000, 4096, 99, 0).is_err()
 }
 
 #[cfg(axtest)]

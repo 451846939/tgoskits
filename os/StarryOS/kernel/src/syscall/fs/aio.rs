@@ -27,11 +27,10 @@ use axpoll::{IoEvents, PollSet};
 use linux_raw_sys::general::timespec;
 use starry_process::Pid;
 use starry_signal::SignalSet;
-use starry_vm::{VmMutPtr, VmPtr};
 
 use crate::{
     file::{Directory, File, FileLike, event::EventFd, get_file_like, memfd::Memfd},
-    mm::{AddrSpace, Backend, IoVec},
+    mm::{AddrSpace, Backend, IoVec, VmMutPtr, VmPtr},
     syscall::signal::check_sigset_size,
     task::{
         future::{UserWaitOutcome, block_on, block_on_user_until_wall},
@@ -329,10 +328,10 @@ fn typed_as_bytes_mut<T>(value: &mut MaybeUninit<T>) -> &mut [u8] {
 }
 
 // Read the ring header through the caller's user pointer.
-fn read_ring_user(ctx: AioContextId) -> AxResult<AioRing> {
+fn read_ring_user(current: &crate::task::UserTaskRef, ctx: AioContextId) -> AxResult<AioRing> {
     let ring = ring_ptr(ctx)
         .cast_const()
-        .vm_read_uninit()
+        .vm_read_uninit(current)
         .map_err(|_| invalid_context())?;
     Ok(unsafe { ring.assume_init() })
 }
@@ -387,7 +386,7 @@ fn lookup_context(
     ctx: AioContextId,
 ) -> AxResult<Arc<AioContext>> {
     let owner = current_pid(current);
-    let ring = read_ring_user(ctx)?;
+    let ring = read_ring_user(current, ctx)?;
     let contexts = AIO_CONTEXTS.read();
     let ctx_id = ring.id as usize;
     match contexts.get(&ctx_id) {
@@ -485,13 +484,17 @@ fn user_buffer_from_linear(
 }
 
 // Read an iovec array and normalize zero-length entries away.
-fn read_iov(iov: *const IoVec, iovcnt: usize) -> AxResult<Vec<UserSegment>> {
+fn read_iov(
+    current: &crate::task::UserTaskRef,
+    iov: *const IoVec,
+    iovcnt: usize,
+) -> AxResult<Vec<UserSegment>> {
     if iovcnt > 1024 {
         return Err(AxError::InvalidInput);
     }
     let mut segments = Vec::with_capacity(iovcnt);
     for i in 0..iovcnt {
-        let iov = iov.wrapping_add(i).vm_read()?;
+        let iov = iov.wrapping_add(i).vm_read(current)?;
         if iov.iov_len < 0 {
             return Err(AxError::InvalidInput);
         }
@@ -508,12 +511,13 @@ fn read_iov(iov: *const IoVec, iovcnt: usize) -> AxResult<Vec<UserSegment>> {
 
 // Build a multi-segment user buffer from an iovec array.
 fn user_buffer_from_iov(
+    current: &crate::task::UserTaskRef,
     aspace: &Arc<PiMutex<AddrSpace>>,
     iov: *const IoVec,
     iovcnt: usize,
     flags: MappingFlags,
 ) -> AxResult<UserBuffer> {
-    let segments = read_iov(iov, iovcnt)?;
+    let segments = read_iov(current, iov, iovcnt)?;
     let mut total = 0usize;
     for segment in &segments {
         prepare_user_region(aspace, segment.start, segment.len, flags)?;
@@ -634,6 +638,7 @@ fn validate_iocb_common(cb: &Iocb) -> AxResult<()> {
 
 // Translate a userspace iocb into an owned request for worker execution.
 fn prepare_request(
+    current: &crate::task::UserTaskRef,
     context: &Arc<AioContext>,
     cb: &Iocb,
     cb_ptr: *const Iocb,
@@ -698,6 +703,7 @@ fn prepare_request(
                 file: read_file_from_fd(fd)?,
                 offset: u64_to_offset(cb.offset)?,
                 dst: user_buffer_from_iov(
+                    current,
                     &context.aspace,
                     cb.buf as *const IoVec,
                     u64_to_usize(cb.nbytes)?,
@@ -710,6 +716,7 @@ fn prepare_request(
                 return Err(AxError::OperationNotSupported);
             }
             let src = user_buffer_from_iov(
+                current,
                 &context.aspace,
                 cb.buf as *const IoVec,
                 u64_to_usize(cb.nbytes)?,
@@ -1136,16 +1143,21 @@ fn wait_for_inflight_drain(context: &AioContext) {
 }
 
 // Read an optional relative timeout from userspace.
-fn read_timeout(timeout: *const timespec) -> AxResult<Option<core::time::Duration>> {
+fn read_timeout(
+    current: &crate::task::UserTaskRef,
+    timeout: *const timespec,
+) -> AxResult<Option<core::time::Duration>> {
     if timeout.is_null() {
         return Ok(None);
     }
-    let timeout = unsafe { timeout.vm_read_uninit()?.assume_init() }.try_into_time_value()?;
+    let timeout =
+        unsafe { timeout.vm_read_uninit(current)?.assume_init() }.try_into_time_value()?;
     Ok(Some(timeout))
 }
 
 // Drain completion events from the ring into the userspace output array.
 fn copy_completed_events(
+    current: &crate::task::UserTaskRef,
     context: &AioContext,
     max: usize,
     events: *mut IoEvent,
@@ -1162,7 +1174,7 @@ fn copy_completed_events(
         // If a later copy fails, keep the events already delivered visible.
         if let Err(err) = events
             .wrapping_add(completed_offset + copied)
-            .vm_write(event)
+            .vm_write(current, event)
         {
             if copied > 0 {
                 write_ring_head_context(context, head)?;
@@ -1208,12 +1220,13 @@ fn do_io_getevents(
 
     let min_nr = min_nr as usize;
     let nr = nr as usize;
-    let deadline = read_timeout(timeout)?.and_then(|duration| wall_time().checked_add(duration));
+    let deadline =
+        read_timeout(current, timeout)?.and_then(|duration| wall_time().checked_add(duration));
     let mut completed = 0usize;
 
     loop {
         // First drain everything already ready before sleeping.
-        let copied = copy_completed_events(&context, nr - completed, events, completed)?;
+        let copied = copy_completed_events(current, &context, nr - completed, events, completed)?;
         completed += copied;
         if completed >= min_nr || completed == nr || min_nr == 0 {
             return Ok(completed as isize);
@@ -1245,7 +1258,7 @@ pub fn sys_io_setup(
     if nr_events == 0 {
         return Err(AxError::InvalidInput);
     }
-    if ctxp.cast_const().vm_read()? != 0 {
+    if ctxp.cast_const().vm_read(current)? != 0 {
         return Err(AxError::InvalidInput);
     }
 
@@ -1276,7 +1289,7 @@ pub fn sys_io_setup(
 
     // If writing ctxp fails, roll back both the global entry and mapping.
     let ctx_value = ring_vaddr.as_usize();
-    if let Err(err) = ctxp.vm_write(ctx_value) {
+    if let Err(err) = ctxp.vm_write(current, ctx_value) {
         AIO_CONTEXTS.write().remove(&ctx_id);
         let _ = aspace.lock().unmap(ring_vaddr, ring_size);
         return Err(err.into());
@@ -1379,12 +1392,12 @@ pub fn sys_io_submit(
     let mut submitted = 0isize;
     for i in 0..nr as usize {
         // Linux returns a partial count once at least one request was queued.
-        let cb_ptr = match iocbpp.wrapping_add(i).vm_read() {
+        let cb_ptr = match iocbpp.wrapping_add(i).vm_read(current) {
             Ok(ptr) => ptr,
             Err(_) if submitted > 0 => return Ok(submitted),
             Err(err) => return Err(err.into()),
         };
-        let cb = match cb_ptr.vm_read_uninit() {
+        let cb = match cb_ptr.vm_read_uninit(current) {
             Ok(cb) => unsafe { cb.assume_init() },
             Err(_) if submitted > 0 => return Ok(submitted),
             Err(err) => return Err(err.into()),
@@ -1393,7 +1406,7 @@ pub fn sys_io_submit(
             "sys_io_submit: opcode={}, fd={}, offset={}, nbytes={}",
             cb.lio_opcode, cb.fildes, cb.offset, cb.nbytes
         );
-        let request = match prepare_request(&context, &cb, cb_ptr) {
+        let request = match prepare_request(current, &context, &cb, cb_ptr) {
             Ok(request) => request,
             Err(_) if submitted > 0 => return Ok(submitted),
             Err(err) => return Err(err),
@@ -1444,7 +1457,7 @@ pub fn sys_io_pgetevents(
 
     let sigset = unsafe {
         (sigmask as *const AioSigSet)
-            .vm_read_uninit()?
+            .vm_read_uninit(current)?
             .assume_init()
     };
     check_sigset_size(sigset.sigsetsize)?;
@@ -1452,7 +1465,7 @@ pub fn sys_io_pgetevents(
     let blocked = if sigset.sigmask.is_null() {
         None
     } else {
-        Some(unsafe { sigset.sigmask.vm_read_uninit()?.assume_init() })
+        Some(unsafe { sigset.sigmask.vm_read_uninit(current)?.assume_init() })
     };
     with_blocked_signals(blocked, || {
         do_io_getevents(current, context, min_nr, nr, events, timeout)
@@ -1501,7 +1514,7 @@ pub fn sys_io_cancel(
         }
     };
 
-    result.vm_write(event)?;
+    result.vm_write(current, event)?;
     context.inflight_wq.notify_all();
     context.work_wq.notify_one();
     // Cancellation/accounting state is published before waking waiters.

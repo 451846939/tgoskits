@@ -12,7 +12,7 @@ use core::{
 use ax_errno::AxResult;
 use ax_kspin::SpinNoIrq;
 use linux_raw_sys::general::kernel_sigaction;
-use starry_vm::{VmPtr, vm_write_slice};
+use starry_vm::{VmIo, VmPtr, vm_write_slice};
 
 use crate::{PendingSignals, SignalAction, SignalInfo, SignalSet, Signo, api::ThreadSignalManager};
 
@@ -300,14 +300,15 @@ impl ProcessSignalManager {
     }
 
     /// Registers a new action and returns the old one.
-    pub fn set_action(
+    pub fn set_action<I: VmIo>(
         &self,
+        vm: &mut I,
         signo: Signo,
         act: *const kernel_sigaction,
         oldact: *mut kernel_sigaction,
     ) -> AxResult<isize> {
         let new_action = if let Some(act) = act.nullable() {
-            let act = unsafe { act.vm_read_uninit()?.assume_init() }.into();
+            let act = unsafe { act.vm_read_uninit(vm)?.assume_init() }.into();
             debug!("sys_rt_sigaction <= signo: {signo:?}, act: {act:?}");
             Some(act)
         } else {
@@ -325,15 +326,19 @@ impl ProcessSignalManager {
         };
 
         if let Some(oldact) = oldact.nullable() {
-            write_kernel_sigaction(oldact, old_action)?;
+            write_kernel_sigaction(vm, oldact, old_action)?;
         }
         Ok(0)
     }
 }
 
-fn write_kernel_sigaction(oldact: *mut kernel_sigaction, action: SignalAction) -> AxResult<()> {
+fn write_kernel_sigaction<I: VmIo>(
+    vm: &mut I,
+    oldact: *mut kernel_sigaction,
+    action: SignalAction,
+) -> AxResult<()> {
     let action: kernel_sigaction = action.into();
-    vm_write_slice(oldact.cast::<usize>(), &kernel_sigaction_words(action))?;
+    vm_write_slice(vm, oldact.cast::<usize>(), &kernel_sigaction_words(action))?;
     Ok(())
 }
 

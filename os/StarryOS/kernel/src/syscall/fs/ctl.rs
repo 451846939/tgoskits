@@ -18,11 +18,10 @@ use linux_raw_sys::{
     general::*,
     ioctl::{FIOASYNC, FIONBIO},
 };
-use starry_vm::{VmPtr, vm_write_slice};
 
 use crate::{
     file::{Directory, FileLike, current_fd_table, fd_is_path, get_file_like, resolve_at, with_fs},
-    mm::{vm_load_path_string, vm_load_string},
+    mm::{VmPtr, vm_load_path_string, vm_load_string, vm_write_slice},
     time::TimeValueLike,
 };
 
@@ -56,16 +55,21 @@ fn path_info_at(dirfd: i32, path: &str) -> AxResult<(String, bool)> {
 
 /// The ioctl() system call manipulates the underlying device parameters
 /// of special files.
-pub fn sys_ioctl(fd: i32, cmd: u32, arg: usize) -> AxResult<isize> {
+pub fn sys_ioctl(
+    current: &crate::task::UserTaskRef,
+    fd: i32,
+    cmd: u32,
+    arg: usize,
+) -> AxResult<isize> {
     debug!("sys_ioctl <= fd: {fd}, cmd: {cmd}, arg: {arg}");
     let f = get_file_like(fd)?;
     if cmd == FIONBIO {
-        let val: i32 = (arg as *const i32).vm_read()?;
+        let val: i32 = (arg as *const i32).vm_read(current)?;
         f.set_nonblocking(val != 0)?;
         return Ok(0);
     }
     if cmd == FIOASYNC {
-        let val: i32 = (arg as *const i32).vm_read()?;
+        let val: i32 = (arg as *const i32).vm_read(current)?;
         f.set_async_mode(val != 0)?;
         return Ok(0);
     }
@@ -80,7 +84,7 @@ pub fn sys_ioctl(fd: i32, cmd: u32, arg: usize) -> AxResult<isize> {
             .cloexec = cmd == FIOCLEX;
         return Ok(0);
     }
-    f.ioctl(cmd, arg)
+    f.ioctl(current, cmd, arg)
         .map(|result| result as isize)
         .inspect_err(|err| {
             if *err == AxError::NotATty {
@@ -96,7 +100,7 @@ pub fn sys_ioctl(fd: i32, cmd: u32, arg: usize) -> AxResult<isize> {
 
 #[ddebug::named]
 pub fn sys_chdir(current: &crate::task::UserTaskRef, path: *const c_char) -> AxResult<isize> {
-    let path = vm_load_path_string(path)?;
+    let path = vm_load_path_string(current, path)?;
     debug_fn!("sys_chdir <= path: {path}");
 
     let fs_context = current_fs_context();
@@ -136,7 +140,7 @@ pub fn sys_mknod(
 }
 
 pub fn sys_chroot(current: &crate::task::UserTaskRef, path: *const c_char) -> AxResult<isize> {
-    let path = vm_load_path_string(path)?;
+    let path = vm_load_path_string(current, path)?;
     debug!("sys_chroot <= path: {path}");
 
     let fs_context = current_fs_context();
@@ -195,7 +199,7 @@ pub fn sys_mkdirat(
 ) -> AxResult<isize> {
     let curr = current;
     let thread = curr.as_thread();
-    let path = vm_load_path_string(path)?;
+    let path = vm_load_path_string(current, path)?;
     debug!("sys_mkdirat <= dirfd: {dirfd}, path: {path}, mode: {mode}");
 
     let mode = mode & !thread.proc_data.umask();
@@ -234,7 +238,7 @@ pub fn sys_mknodat(
 ) -> Result<isize, AxError> {
     let curr = current;
     let thread = curr.as_thread();
-    let path = vm_load_path_string(path)?;
+    let path = vm_load_path_string(current, path)?;
     debug!(
         "sys_mknodat <= dirfd: {}, path: {:?}, mode: {}, dev: {}",
         dirfd, path, mode, dev
@@ -332,7 +336,12 @@ impl DirBuffer {
     }
 }
 
-pub fn sys_getdents64(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
+pub fn sys_getdents64(
+    current: &crate::task::UserTaskRef,
+    fd: i32,
+    buf: *mut u8,
+    len: usize,
+) -> AxResult<isize> {
     debug!("sys_getdents64 <= fd: {fd}, buf: {buf:?}, len: {len}");
 
     let mut buffer = DirBuffer::new(len);
@@ -356,7 +365,7 @@ pub fn sys_getdents64(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
         return Err(AxError::InvalidInput);
     }
 
-    vm_write_slice(buf, &buffer.buf)?;
+    vm_write_slice(current, buf, &buffer.buf)?;
 
     Ok(buffer.offset as _)
 }
@@ -367,6 +376,7 @@ pub fn sys_getdents64(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
 /// flags: link flags
 /// return value: return 0 when success, else return -1.
 pub fn sys_linkat(
+    current: &crate::task::UserTaskRef,
     old_dirfd: c_int,
     old_path: *const c_char,
     new_dirfd: c_int,
@@ -378,8 +388,11 @@ pub fn sys_linkat(
         return Err(AxError::InvalidInput);
     }
 
-    let old_path = old_path.nullable().map(vm_load_path_string).transpose()?;
-    let new_path = vm_load_path_string(new_path)?;
+    let old_path = old_path
+        .nullable()
+        .map(|path| vm_load_path_string(current, path))
+        .transpose()?;
+    let new_path = vm_load_path_string(current, new_path)?;
     debug!(
         "sys_linkat <= old_dirfd: {old_dirfd}, old_path: {old_path:?}, new_dirfd: {new_dirfd}, \
          new_path: {new_path}, flags: {flags}"
@@ -407,8 +420,12 @@ pub fn sys_linkat(
 }
 
 #[cfg(target_arch = "x86_64")]
-pub fn sys_link(old_path: *const c_char, new_path: *const c_char) -> AxResult<isize> {
-    sys_linkat(AT_FDCWD, old_path, AT_FDCWD, new_path, 0)
+pub fn sys_link(
+    current: &crate::task::UserTaskRef,
+    old_path: *const c_char,
+    new_path: *const c_char,
+) -> AxResult<isize> {
+    sys_linkat(current, AT_FDCWD, old_path, AT_FDCWD, new_path, 0)
 }
 
 /// remove link of specific file (can be used to delete file)
@@ -416,8 +433,13 @@ pub fn sys_link(old_path: *const c_char, new_path: *const c_char) -> AxResult<is
 /// path: the name of link to be removed
 /// flags: can be 0 or AT_REMOVEDIR
 /// return 0 when success, else return -1
-pub fn sys_unlinkat(dirfd: i32, path: *const c_char, flags: usize) -> AxResult<isize> {
-    let path = vm_load_path_string(path)?;
+pub fn sys_unlinkat(
+    current: &crate::task::UserTaskRef,
+    dirfd: i32,
+    path: *const c_char,
+    flags: usize,
+) -> AxResult<isize> {
+    let path = vm_load_path_string(current, path)?;
 
     debug!("sys_unlinkat <= dirfd: {dirfd}, path: {path:?}, flags: {flags}");
 
@@ -447,16 +469,20 @@ pub fn sys_unlinkat(dirfd: i32, path: *const c_char, flags: usize) -> AxResult<i
 }
 
 #[cfg(target_arch = "x86_64")]
-pub fn sys_rmdir(path: *const c_char) -> AxResult<isize> {
-    sys_unlinkat(AT_FDCWD, path, AT_REMOVEDIR as _)
+pub fn sys_rmdir(current: &crate::task::UserTaskRef, path: *const c_char) -> AxResult<isize> {
+    sys_unlinkat(current, AT_FDCWD, path, AT_REMOVEDIR as _)
 }
 
 #[cfg(target_arch = "x86_64")]
-pub fn sys_unlink(path: *const c_char) -> AxResult<isize> {
-    sys_unlinkat(AT_FDCWD, path, 0)
+pub fn sys_unlink(current: &crate::task::UserTaskRef, path: *const c_char) -> AxResult<isize> {
+    sys_unlinkat(current, AT_FDCWD, path, 0)
 }
 
-pub fn sys_getcwd(buf: *mut u8, size: isize) -> AxResult<isize> {
+pub fn sys_getcwd(
+    current: &crate::task::UserTaskRef,
+    buf: *mut u8,
+    size: isize,
+) -> AxResult<isize> {
     let size: usize = size.try_into().map_err(|_| AxError::BadAddress)?;
 
     let cwd = current_fs_context().lock().current_dir().absolute_path()?;
@@ -466,7 +492,7 @@ pub fn sys_getcwd(buf: *mut u8, size: isize) -> AxResult<isize> {
     let cwd = cwd.as_bytes_with_nul();
 
     if cwd.len() <= size {
-        vm_write_slice(buf, cwd)?;
+        vm_write_slice(current, buf, cwd)?;
         Ok(cwd.len() as _)
     } else {
         Err(AxError::OutOfRange)
@@ -488,8 +514,8 @@ pub fn sys_symlinkat(
     new_dirfd: i32,
     linkpath: *const c_char,
 ) -> AxResult<isize> {
-    let target = vm_load_string(target)?;
-    let linkpath = vm_load_path_string(linkpath)?;
+    let target = vm_load_string(current, target)?;
+    let linkpath = vm_load_path_string(current, linkpath)?;
     debug!("sys_symlinkat <= target: {target:?}, new_dirfd: {new_dirfd}, linkpath: {linkpath:?}");
 
     let cred = current.as_thread().cred();
@@ -524,11 +550,17 @@ pub fn sys_symlinkat(
 }
 
 #[cfg(target_arch = "x86_64")]
-pub fn sys_readlink(path: *const c_char, buf: *mut u8, size: usize) -> AxResult<isize> {
-    sys_readlinkat(AT_FDCWD, path, buf, size)
+pub fn sys_readlink(
+    current: &crate::task::UserTaskRef,
+    path: *const c_char,
+    buf: *mut u8,
+    size: usize,
+) -> AxResult<isize> {
+    sys_readlinkat(current, AT_FDCWD, path, buf, size)
 }
 
 pub fn sys_readlinkat(
+    current: &crate::task::UserTaskRef,
     dirfd: i32,
     path: *const c_char,
     buf: *mut u8,
@@ -538,7 +570,7 @@ pub fn sys_readlinkat(
         return Err(AxError::InvalidInput);
     }
 
-    let path = vm_load_path_string(path)?;
+    let path = vm_load_path_string(current, path)?;
 
     debug!("sys_readlinkat <= dirfd: {dirfd}, path: {path:?}");
 
@@ -546,7 +578,7 @@ pub fn sys_readlinkat(
         let entry = fs.resolve_no_follow(path)?;
         let link = entry.read_link()?;
         let read = size.min(link.len());
-        vm_write_slice(buf, &link.as_bytes()[..read])?;
+        vm_write_slice(current, buf, &link.as_bytes()[..read])?;
         Ok(read as isize)
     })
 }
@@ -594,7 +626,10 @@ pub fn sys_fchownat(
         return Err(AxError::InvalidInput);
     }
 
-    let path = path.nullable().map(vm_load_path_string).transpose()?;
+    let path = path
+        .nullable()
+        .map(|path| vm_load_path_string(current, path))
+        .transpose()?;
     let loc = resolve_at(dirfd, path.as_deref(), flags)?
         .into_file()
         .ok_or(AxError::BadFileDescriptor)?;
@@ -678,7 +713,10 @@ pub fn sys_fchmodat(
         return Err(AxError::InvalidInput);
     }
 
-    let path = path.nullable().map(vm_load_path_string).transpose()?;
+    let path = path
+        .nullable()
+        .map(|path| vm_load_path_string(current, path))
+        .transpose()?;
 
     // man 2 open §"O_PATH": "other file operations (e.g., read(2), write(2),
     // fchmod(2), fchown(2), fgetxattr(2), ioctl(2), mmap(2)) fail with the
@@ -726,13 +764,17 @@ pub fn sys_fchmodat(
 
 #[cfg(target_arch = "x86_64")]
 fn update_times(
+    current: &crate::task::UserTaskRef,
     dirfd: i32,
     path: *const c_char,
     atime: Option<Duration>,
     mtime: Option<Duration>,
     flags: u32,
 ) -> AxResult<()> {
-    let path = path.nullable().map(vm_load_string).transpose()?;
+    let path = path
+        .nullable()
+        .map(|path| vm_load_string(current, path))
+        .transpose()?;
     resolve_at(dirfd, path.as_deref(), flags)?
         .into_file()
         .ok_or(AxError::BadFileDescriptor)?
@@ -754,11 +796,15 @@ pub struct utimbuf {
 }
 
 #[cfg(target_arch = "x86_64")]
-pub fn sys_utime(path: *const c_char, times: *const utimbuf) -> AxResult<isize> {
+pub fn sys_utime(
+    current: &crate::task::UserTaskRef,
+    path: *const c_char,
+    times: *const utimbuf,
+) -> AxResult<isize> {
     let (atime, mtime) = if let Some(times) = times.nullable() {
         // SAFETY: `utimbuf` is #[repr(C)] with only integer fields;
         // any bit pattern is a valid value.
-        let times = unsafe { times.vm_read_uninit()?.assume_init() };
+        let times = unsafe { times.vm_read_uninit(current)?.assume_init() };
         (
             Duration::from_secs(times.actime as _),
             Duration::from_secs(times.modtime as _),
@@ -767,25 +813,26 @@ pub fn sys_utime(path: *const c_char, times: *const utimbuf) -> AxResult<isize> 
         let time = wall_time();
         (time, time)
     };
-    update_times(AT_FDCWD, path, Some(atime), Some(mtime), 0)?;
+    update_times(current, AT_FDCWD, path, Some(atime), Some(mtime), 0)?;
     Ok(0)
 }
 
 #[cfg(target_arch = "x86_64")]
 pub fn sys_utimes(
+    current: &crate::task::UserTaskRef,
     path: *const c_char,
     times: *const [linux_raw_sys::general::timeval; 2],
 ) -> AxResult<isize> {
     let (atime, mtime) = if let Some(times) = times.nullable() {
         // SAFETY: `timeval` is #[repr(C)] with only integer fields;
         // any bit pattern is a valid value.
-        let [atime, mtime] = unsafe { times.vm_read_uninit()?.assume_init() };
+        let [atime, mtime] = unsafe { times.vm_read_uninit(current)?.assume_init() };
         (atime.try_into_time_value()?, mtime.try_into_time_value()?)
     } else {
         let time = wall_time();
         (time, time)
     };
-    update_times(AT_FDCWD, path, Some(atime), Some(mtime), 0)?;
+    update_times(current, AT_FDCWD, path, Some(atime), Some(mtime), 0)?;
     Ok(0)
 }
 
@@ -814,7 +861,7 @@ pub fn sys_utimensat(
     let (atime, mtime, write_permission_suffices) = if let Some(times) = times.nullable() {
         // SAFETY: `timespec` is #[repr(C)] with only integer fields;
         // any bit pattern is a valid value.
-        let [atime, mtime] = unsafe { times.vm_read_uninit()?.assume_init() };
+        let [atime, mtime] = unsafe { times.vm_read_uninit(current)?.assume_init() };
         let write_permission_suffices =
             atime.tv_nsec == UTIME_NOW as _ && mtime.tv_nsec == UTIME_NOW as _;
         (
@@ -831,7 +878,10 @@ pub fn sys_utimensat(
     }
 
     // Resolve file and check permissions.
-    let path = path.nullable().map(vm_load_path_string).transpose()?;
+    let path = path
+        .nullable()
+        .map(|path| vm_load_path_string(current, path))
+        .transpose()?;
     let loc = resolve_at(dirfd, path.as_deref(), flags)?
         .into_file()
         .ok_or(AxError::BadFileDescriptor)?;
@@ -865,22 +915,28 @@ pub fn sys_utimensat(
 }
 
 #[cfg(target_arch = "x86_64")]
-pub fn sys_rename(old_path: *const c_char, new_path: *const c_char) -> AxResult<isize> {
-    sys_renameat(AT_FDCWD, old_path, AT_FDCWD, new_path)
+pub fn sys_rename(
+    current: &crate::task::UserTaskRef,
+    old_path: *const c_char,
+    new_path: *const c_char,
+) -> AxResult<isize> {
+    sys_renameat(current, AT_FDCWD, old_path, AT_FDCWD, new_path)
 }
 
 #[cfg(not(target_arch = "riscv64"))]
 pub fn sys_renameat(
+    current: &crate::task::UserTaskRef,
     old_dirfd: i32,
     old_path: *const c_char,
     new_dirfd: i32,
     new_path: *const c_char,
 ) -> AxResult<isize> {
-    sys_renameat2(old_dirfd, old_path, new_dirfd, new_path, 0)
+    sys_renameat2(current, old_dirfd, old_path, new_dirfd, new_path, 0)
 }
 
 // Rename a path, currently supporting Linux RENAME_NOREPLACE.
 pub fn sys_renameat2(
+    current: &crate::task::UserTaskRef,
     old_dirfd: i32,
     old_path: *const c_char,
     new_dirfd: i32,
@@ -892,8 +948,8 @@ pub fn sys_renameat2(
         return Err(AxError::InvalidInput);
     }
 
-    let old_path = vm_load_path_string(old_path)?;
-    let new_path = vm_load_path_string(new_path)?;
+    let old_path = vm_load_path_string(current, old_path)?;
+    let new_path = vm_load_path_string(current, new_path)?;
     debug!(
         "sys_renameat2 <= old_dirfd: {old_dirfd}, old_path: {old_path:?}, new_dirfd: {new_dirfd}, \
          new_path: {new_path}, flags: {flags}"

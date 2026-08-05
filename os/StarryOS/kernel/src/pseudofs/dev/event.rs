@@ -209,9 +209,15 @@ impl EventDev {
         self.abs_bits[bit / 8] & (1 << (bit % 8)) != 0
     }
 
-    fn get_event_bits(&self, arg: usize, size: usize, ty: u8) -> AxResult<usize> {
+    fn get_event_bits(
+        &self,
+        current: &crate::task::UserTaskRef,
+        arg: usize,
+        size: usize,
+        ty: u8,
+    ) -> AxResult<usize> {
         if ty == 0 {
-            write_user_bytes(arg, size, self.ev_bits.as_bytes())
+            write_user_bytes(current, arg, size, self.ev_bits.as_bytes())
         } else {
             let ty = EventType::from_repr(ty).ok_or(AxError::InvalidInput)?;
             let mut kernel_bits = vec![0; size];
@@ -228,7 +234,7 @@ impl EventDev {
                 }
             }
             let bytes = size.min(ty.bits_count().div_ceil(8));
-            UserPtr::<u8>::from(arg).write_slice(&kernel_bits[..bytes])?;
+            UserPtr::<u8>::from(arg).write_slice(current, &kernel_bits[..bytes])?;
             Ok(bytes)
         }
     }
@@ -356,14 +362,24 @@ impl EventIrqWaiter {
     }
 }
 
-fn write_user_bytes(arg: usize, capacity: usize, source: &[u8]) -> AxResult<usize> {
+fn write_user_bytes(
+    current: &crate::task::UserTaskRef,
+    arg: usize,
+    capacity: usize,
+    source: &[u8],
+) -> AxResult<usize> {
     let len = source.len().min(capacity);
-    UserPtr::<u8>::from(arg).write_slice(&source[..len])?;
+    UserPtr::<u8>::from(arg).write_slice(current, &source[..len])?;
     Ok(len)
 }
 
-fn return_str(arg: usize, size: usize, s: &str) -> AxResult<usize> {
-    write_user_bytes(arg, size, s.as_bytes())
+fn return_str(
+    current: &crate::task::UserTaskRef,
+    arg: usize,
+    size: usize,
+    s: &str,
+) -> AxResult<usize> {
+    write_user_bytes(current, arg, size, s.as_bytes())
 }
 
 fn input_error_to_ax_error(err: InputError) -> AxError {
@@ -378,9 +394,14 @@ fn input_error_to_ax_error(err: InputError) -> AxError {
     }
 }
 
-fn return_zero_bits(arg: usize, size: usize, bits: usize) -> AxResult<usize> {
+fn return_zero_bits(
+    current: &crate::task::UserTaskRef,
+    arg: usize,
+    size: usize,
+    bits: usize,
+) -> AxResult<usize> {
     let len = bits.div_ceil(8).min(size);
-    UserPtr::<u8>::from(arg).write_slice(&vec![0; len])?;
+    UserPtr::<u8>::from(arg).write_slice(current, &vec![0; len])?;
     Ok(len)
 }
 
@@ -458,19 +479,31 @@ impl DeviceOps for EventDev {
         Some(self)
     }
 
-    fn ioctl(&self, cmd: u32, arg: usize) -> VfsResult<usize> {
+    fn ioctl(&self, current: &crate::task::UserTaskRef, cmd: u32, arg: usize) -> VfsResult<usize> {
         match cmd {
             EVIOCGVERSION => {
-                UserPtr::<u32>::from(arg).write(0x10001)?;
+                UserPtr::<u32>::from(arg).write(current, 0x10001)?;
                 Ok(0)
             }
             EVIOCGID => {
                 let device_id = self.inner.lock().device.device_id();
                 let user = UserPtr::<InputDeviceId>::from(arg);
-                user.write_field(offset_of!(InputDeviceId, bus_type), device_id.bus_type)?;
-                user.write_field(offset_of!(InputDeviceId, vendor), device_id.vendor)?;
-                user.write_field(offset_of!(InputDeviceId, product), device_id.product)?;
-                user.write_field(offset_of!(InputDeviceId, version), device_id.version)?;
+                user.write_field(
+                    current,
+                    offset_of!(InputDeviceId, bus_type),
+                    device_id.bus_type,
+                )?;
+                user.write_field(current, offset_of!(InputDeviceId, vendor), device_id.vendor)?;
+                user.write_field(
+                    current,
+                    offset_of!(InputDeviceId, product),
+                    device_id.product,
+                )?;
+                user.write_field(
+                    current,
+                    offset_of!(InputDeviceId, version),
+                    device_id.version,
+                )?;
                 Ok(0)
             }
             EVIOCGRAB => Ok(0),
@@ -500,18 +533,18 @@ impl DeviceOps for EventDev {
                             // EVIOCGNAME
                             0x06 => {
                                 let name = self.inner.lock().device.name().to_string();
-                                return return_str(arg, size, &name);
+                                return return_str(current, arg, size, &name);
                             }
                             // EVIOCGPHYS
                             0x07 => {
                                 let location =
                                     self.inner.lock().device.physical_location().to_string();
-                                return return_str(arg, size, &location);
+                                return return_str(current, arg, size, &location);
                             }
                             // EVIOCGUNIQ
                             0x08 => {
                                 let unique_id = self.inner.lock().device.unique_id().to_string();
-                                return return_str(arg, size, &unique_id);
+                                return return_str(current, arg, size, &unique_id);
                             }
                             // EVIOCGPROP — device property bitmap. libinput
                             // uses INPUT_PROP_POINTER to keep the cursor
@@ -519,7 +552,7 @@ impl DeviceOps for EventDev {
                             // virtio-tablet; we synthesize the bit at probe
                             // for any non-touchscreen with REL/ABS axes.
                             0x09 => {
-                                return write_user_bytes(arg, size, &self.prop_bits);
+                                return write_user_bytes(current, arg, size, &self.prop_bits);
                             }
                             // EVIOCGKEY
                             0x18 => {
@@ -530,24 +563,39 @@ impl DeviceOps for EventDev {
                                     key_state.extend_from_slice(bytes);
                                     key_state
                                 };
-                                return write_user_bytes(arg, size, &key_state);
+                                return write_user_bytes(current, arg, size, &key_state);
                             }
                             // EVIOCGLED
                             0x19 => {
-                                return return_zero_bits(arg, size, EventType::Led.bits_count());
+                                return return_zero_bits(
+                                    current,
+                                    arg,
+                                    size,
+                                    EventType::Led.bits_count(),
+                                );
                             }
                             // EVIOCGSND
                             0x1a => {
-                                return return_zero_bits(arg, size, EventType::Sound.bits_count());
+                                return return_zero_bits(
+                                    current,
+                                    arg,
+                                    size,
+                                    EventType::Sound.bits_count(),
+                                );
                             }
                             // EVIOCGSW
                             0x1b => {
-                                return return_zero_bits(arg, size, EventType::Switch.bits_count());
+                                return return_zero_bits(
+                                    current,
+                                    arg,
+                                    size,
+                                    EventType::Switch.bits_count(),
+                                );
                             }
                             _ => {}
                         }
                         if nr & !EventType::MAX == EventType::COUNT {
-                            return self.get_event_bits(arg, size, nr & EventType::MAX);
+                            return self.get_event_bits(current, arg, size, nr & EventType::MAX);
                         }
                         const ABS_CNT: u8 = 0x40;
                         if nr & !(ABS_CNT - 1) == ABS_CNT {
@@ -581,7 +629,7 @@ impl DeviceOps for EventDev {
                                 resolution: info.res,
                             };
                             let bytes = abs.as_bytes();
-                            UserPtr::<u8>::from(arg).write_slice(bytes)?;
+                            UserPtr::<u8>::from(arg).write_slice(current, bytes)?;
                             return Ok(bytes.len());
                         }
                         return Err(AxError::InvalidInput);

@@ -3,9 +3,9 @@ use core::mem::{self, MaybeUninit};
 use ax_errno::{AxError, AxResult};
 use ax_runtime::hal::cpu::uspace::UserContext;
 use bytemuck::AnyBitPattern;
-use starry_vm::vm_read_slice;
 
 use super::clone::{CloneArgs, CloneFlags};
+use crate::mm::vm_read_slice;
 
 /// Structure passed to clone3() system call.
 #[repr(C)]
@@ -89,7 +89,7 @@ pub fn sys_clone3(
     let read_len = size.min(buffer.len());
     // SAFETY: MaybeUninit<T> is compatible with T, and we're filling in the
     // buffer with bytes read from the user
-    vm_read_slice(args, unsafe {
+    vm_read_slice(current, args, unsafe {
         mem::transmute::<&mut [u8], &mut [MaybeUninit<u8>]>(&mut buffer[..read_len])
     })?;
     let clone3_args: Clone3Args =

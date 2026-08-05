@@ -4,9 +4,8 @@ use ax_errno::AxError;
 use ax_hal::mem::{PhysAddr, phys_to_virt};
 use axfs_ng_vfs::{NodeFlags, VfsResult};
 use bytemuck::AnyBitPattern;
-use starry_vm::VmPtr;
 
-use crate::pseudofs::DeviceOps;
+use crate::{mm::VmPtr, pseudofs::DeviceOps};
 
 const FMUX_PBASE: usize = 0x0300_1000;
 const FMUX_SIZE: usize = 0x1D8;
@@ -68,11 +67,11 @@ impl DeviceOps for PinmuxDev {
     }
 
     /// Binary IOCTL interface: `ioctl(fd, PINMUX_SET, &PinmuxOp{offset, value})`
-    fn ioctl(&self, cmd: u32, arg: usize) -> VfsResult<usize> {
+    fn ioctl(&self, current: &crate::task::UserTaskRef, cmd: u32, arg: usize) -> VfsResult<usize> {
         if cmd != PINMUX_SET {
             return Err(AxError::InvalidInput);
         }
-        let op: PinmuxOp = (arg as *const PinmuxOp).vm_read()?;
+        let op: PinmuxOp = (arg as *const PinmuxOp).vm_read(current)?;
         Self::write_fmux(op.offset as usize, op.value)?;
         Ok(0)
     }

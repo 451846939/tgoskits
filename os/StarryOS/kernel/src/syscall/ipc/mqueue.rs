@@ -13,7 +13,6 @@ use linux_raw_sys::general::{
     __kernel_mode_t, __kernel_timespec, O_ACCMODE, O_CREAT, O_EXCL, O_NONBLOCK, O_RDONLY, O_RDWR,
     O_WRONLY, RLIMIT_MSGQUEUE, SIGEV_NONE, SIGEV_SIGNAL, SIGEV_THREAD, sigevent,
 };
-use starry_vm::{VmMutPtr, VmPtr, vm_load, vm_write_slice};
 
 use crate::{
     file::{add_file_like, get_file_like, netlink::NetlinkSocket},
@@ -22,18 +21,21 @@ use crate::{
         charge_open_bytes, msg_default, msg_max, msgsize_default, msgsize_max, queues_count,
         queues_max, validate_name,
     },
-    mm::vm_load_string,
+    mm::{VmMutPtr, VmPtr, vm_load, vm_load_string, vm_write_slice},
     time::TimeValueLike,
 };
 
 /// Resolve an optional absolute `CLOCK_REALTIME` timeout pointer into a
 /// wall-clock deadline. A null pointer means "wait forever"; a supplied
 /// timespec is validated the way Linux does (`EINVAL` on out-of-range nsec).
-fn load_deadline(abs_timeout: *const __kernel_timespec) -> AxResult<Option<core::time::Duration>> {
+fn load_deadline(
+    current: &crate::task::UserTaskRef,
+    abs_timeout: *const __kernel_timespec,
+) -> AxResult<Option<core::time::Duration>> {
     if abs_timeout.is_null() {
         return Ok(None);
     }
-    let ts: __kernel_timespec = unsafe { abs_timeout.vm_read_uninit()?.assume_init() };
+    let ts: __kernel_timespec = unsafe { abs_timeout.vm_read_uninit(current)?.assume_init() };
     Ok(Some(ts.try_into_time_value()?))
 }
 
@@ -58,9 +60,9 @@ pub fn sys_mq_open(
     let user_attr = if attr.is_null() {
         None
     } else {
-        Some(attr.vm_read()?)
+        Some(attr.vm_read(current)?)
     };
-    let raw = vm_load_string(name)?;
+    let raw = vm_load_string(current, name)?;
     let short = validate_name(&raw)?;
     let key = {
         let mut k = alloc::string::String::with_capacity(short.len() + 1);
@@ -220,7 +222,7 @@ pub fn sys_mq_unlink(
     current: &crate::task::UserTaskRef,
     name: *const core::ffi::c_char,
 ) -> AxResult<isize> {
-    let raw = vm_load_string(name)?;
+    let raw = vm_load_string(current, name)?;
     let short = validate_name(&raw)?;
     let key = {
         let mut k = alloc::string::String::with_capacity(short.len() + 1);
@@ -261,6 +263,7 @@ fn queue_from_fd(mqdes: i32) -> AxResult<Arc<MessageQueue>> {
 
 /// `mq_timedsend(mqdes, msg, len, prio, abs_timeout)`.
 pub fn sys_mq_timedsend(
+    current: &crate::task::UserTaskRef,
     mqdes: i32,
     msg_ptr: *const u8,
     msg_len: usize,
@@ -273,8 +276,8 @@ pub fn sys_mq_timedsend(
         return Err(LinuxError::EBADF.into());
     }
     let queue = desc.queue();
-    let deadline = load_deadline(abs_timeout)?;
-    let data = vm_load(msg_ptr, msg_len)?;
+    let deadline = load_deadline(current, abs_timeout)?;
+    let data = vm_load(current, msg_ptr, msg_len)?;
     queue.send(&data, msg_prio, deadline, desc.is_nonblocking())?;
     Ok(0)
 }
@@ -284,6 +287,7 @@ pub fn sys_mq_timedsend(
 /// Returns the number of bytes copied. `msg_prio`, when non-null, receives the
 /// priority the message was sent with.
 pub fn sys_mq_timedreceive(
+    current: &crate::task::UserTaskRef,
     mqdes: i32,
     msg_ptr: *mut u8,
     msg_len: usize,
@@ -296,11 +300,11 @@ pub fn sys_mq_timedreceive(
         return Err(LinuxError::EBADF.into());
     }
     let queue = desc.queue();
-    let deadline = load_deadline(abs_timeout)?;
+    let deadline = load_deadline(current, abs_timeout)?;
     let (data, prio) = queue.receive(msg_len, deadline, desc.is_nonblocking())?;
-    vm_write_slice(msg_ptr, &data)?;
+    vm_write_slice(current, msg_ptr, &data)?;
     if !msg_prio.is_null() {
-        msg_prio.vm_write(prio)?;
+        msg_prio.vm_write(current, prio)?;
     }
     Ok(data.len() as isize)
 }
@@ -325,7 +329,7 @@ pub fn sys_mq_notify(
     let req = if sevp.is_null() {
         NotifyRequest::Unregister
     } else {
-        let sev: sigevent = unsafe { sevp.vm_read_uninit()?.assume_init() };
+        let sev: sigevent = unsafe { sevp.vm_read_uninit(current)?.assume_init() };
         let kind = sev.sigev_notify as u32;
         match kind {
             SIGEV_SIGNAL => {
@@ -359,7 +363,7 @@ pub fn sys_mq_notify(
                     .downcast_arc::<NetlinkSocket>()
                     .map_err(|_| AxError::from(LinuxError::EINVAL))?;
                 let cookie_ptr = unsafe { sev.sigev_value.sival_ptr } as *const u8;
-                let bytes = vm_load(cookie_ptr, NOTIFY_COOKIE_LEN)?;
+                let bytes = vm_load(current, cookie_ptr, NOTIFY_COOKIE_LEN)?;
                 let mut cookie = [0u8; NOTIFY_COOKIE_LEN];
                 cookie.copy_from_slice(&bytes);
                 NotifyRequest::Thread { sock, cookie }
@@ -378,6 +382,7 @@ pub fn sys_mq_notify(
 /// applied (sizes and count are read-only). When `oldattr` is non-null, the
 /// attributes *before* any change are written back.
 pub fn sys_mq_getsetattr(
+    current: &crate::task::UserTaskRef,
     mqdes: i32,
     newattr: *const MqAttr,
     oldattr: *mut MqAttr,
@@ -393,7 +398,7 @@ pub fn sys_mq_getsetattr(
     previous.mq_flags = (desc.flags() & O_NONBLOCK) as i64;
 
     if !newattr.is_null() {
-        let new: MqAttr = newattr.vm_read()?;
+        let new: MqAttr = newattr.vm_read(current)?;
         // Linux `do_mq_getsetattr` rejects any bit other than `O_NONBLOCK` in
         // `mq_flags` with `EINVAL` before applying the change.
         if new.mq_flags & !(O_NONBLOCK as i64) != 0 {
@@ -404,7 +409,7 @@ pub fn sys_mq_getsetattr(
         queue.touch_attr();
     }
     if !oldattr.is_null() {
-        oldattr.vm_write(previous)?;
+        oldattr.vm_write(current, previous)?;
     }
     Ok(0)
 }

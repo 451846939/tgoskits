@@ -11,7 +11,8 @@ use alloc::vec;
 use ax_errno::{AxError, AxResult};
 use ax_memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
 use ax_runtime::hal::paging::MappingFlags;
-use starry_vm::vm_write_slice;
+
+use crate::mm::vm_write_slice;
 
 /// Check whether pages are resident in memory.
 ///
@@ -118,7 +119,7 @@ pub fn sys_mincore(
 
     // EFAULT: Write result to user space
     // vm_write_slice will return EFAULT if vec is invalid
-    vm_write_slice(vec, result.as_slice())?;
+    vm_write_slice(current, vec, result.as_slice())?;
 
     Ok(0)
 }

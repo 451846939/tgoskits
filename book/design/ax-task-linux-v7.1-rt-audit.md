@@ -1619,6 +1619,90 @@ Starry uaccess 也删除了同一次 copy 中的第二次任务查询：`prepare
 它仍不是“已达到 Linux RT 同一绝对水平”的证据。后续比较继续以 Linux RT 同机 workload、
 调用链和 tail latency 为准，而不是用查询次数下降替代最终性能验收。
 
+### Starry 用户内存的显式 current capability
+
+syscall current capability 传播后，旧 `starry-vm` 仍通过全局 `VmImpl` provider 在任意
+`VmPtr`、`VmBytes` 或驱动 `ioctl` 内重新取得当前任务。这不仅重复前一节已经删除的
+current-handle 查询，还掩盖了更重要的生命周期差异：同步 syscall 借用当前任务、异步
+worker 保存用户指针、访问另一个进程的地址空间，三者不能共用一个无类型的全局入口。
+
+Linux v7.1 对应边界是：
+
+- 普通 `copy_from_user()` / `copy_to_user()` 只访问调用者当前 `mm`，fault 和睡眠都发生在
+  当前 syscall 的任务上下文；
+- `access_process_vm()` 先取得目标 `mm` 的稳定引用，`process_vm_readv/writev` 则通过
+  `pin_user_pages_remote()` 为这次同步远程拷贝固定目标页，完成后解除固定；两者都不是把
+  “当前任务”隐藏成通用远程访问能力；
+- usbfs submit 先把 OUT payload 复制进内核拥有的 buffer。硬件 completion callback 只发布
+  状态并唤醒等待者，`processcompl()` 在 reap syscall 的任务上下文把 IN payload 和 URB 结果
+  写回用户空间。只有显式注册的 DMA coherent mapping 例外地跨异步期保存用户映射，并用
+  VMA/URB 使用计数约束释放；它不是普通裸用户指针的兜底。
+
+Starry 当前按这条所有权线破坏性收敛，不保留旧 provider 兼容层：
+
+- `VmIo` 只是一项由调用者提供的能力，所有 `vm_load`、`vm_read`、`vm_write`、字符串和
+  iovec helper 都显式借用 `&UserTaskRef`；syscall dispatcher 持有的强引用覆盖整个同步
+  调用和其中的 park/resume，不需要再次查询 scheduler current；
+- task-bound `VmPtr`、`VmMutPtr`、`VmBytes`、`VmBytesMut` 和 `IoVectorBuf` 保存的是不可逃逸的
+  task borrow，而不是可跨线程升级的裸 extension 指针。零长度只能表示“不执行拷贝”，
+  不能被当作用户地址有效性证明；
+- `FileLike::ioctl` 与 `DeviceOps::ioctl` 显式接收当前任务。没有 current capability 的通用
+  VFS node 不尝试猜测任务或调用驱动用户内存接口；ION 析构改用专用内核态 release 操作，
+  不再伪造一个指向内核栈的用户 ioctl 参数；
+- USB async owner 只保存内核 buffer、typed status 和作为 completion cookie 的用户 URB 地址值。
+  worker/IRQ 不保存 task handle、不把该地址转换为可解引用引用，也不执行 faultable copy；
+  reap syscall 使用自己的 current capability 完成最终写回，和 Linux `processcompl()` 的阶段
+  划分一致；
+- `UserMemoryProvider` 的 raw faultable copy 仍只允许用于当前正在执行的 task。若未来支持
+  ptrace/process-vm 式跨任务读写，必须新增以稳定 address-space 引用和页固定/直接页表访问为
+  边界的 capability，不能把另一个 `UserTaskRef` 传给当前 fault handler 冒充远程访问。
+
+剩余受限边界是第三方 eBPF auxiliary trait：它的 callback 签名没有 current-task 参数，三个
+adapter 暂时只能在 callback 入口解析 `current_user_task()`。BPF syscall attr 的用户访问已经
+显式接收 dispatcher capability；后续应升级外部 trait，使 helper borrow 随调用链传入，而不是
+把这个受约束桥接扩散成新的全局 provider。
+
+确定性红测 `vm_access_requires_an_explicit_provider` 在旧 API 上因缺少显式 provider 稳定
+编译失败，迁移后同一类型约束通过。另一个行为回归覆盖 `T` 大于单次 buffer 容量时
+`vm_load_until_nul` 仍必须前进，避免步长被整数除法截断为零而永久循环。本检查点的性能验收
+继续使用上一节同一 qperf workload：必须同时报告 current-handle 查询、完整 QEMU 时间、
+raw clock-pair 和八个 wakeup p50；在新数据取得前不得把接口收敛本身表述为性能提升，更不能
+据此声明已经达到 Linux PREEMPT_RT 水平。
+
+### 2026-08-05 显式 capability 检查点的 Linux RT 同源对照
+
+本检查点重新从 `/home/zhourui/linux-src` 的 Linux v7.1
+`8cd9520d35a6c38db6567e97dd93b1f11f185dc6` 构建独立 x86_64 内核和 initramfs，配置明确启用
+`CONFIG_PREEMPT_RT=y`、`CONFIG_SMP=y`、`CONFIG_NR_CPUS=2`、
+`CONFIG_HIGH_RES_TIMERS=y`、`CONFIG_FUTEX_PI=y` 和 `CONFIG_HZ_1000=y`。Linux `/init`
+与 Starry app 均由当前 `main.c`、`handoff.c`、`timer.c`、`stats.c` 以 `-O2 -pthread -static`
+构建；Linux 只额外定义 `BENCH_INIT` 负责挂载 procfs、运行同一 workload 并关机。两边均使用
+Q35/TCG、`-cpu max`、2 vCPU、512 MiB，并同时发布 `clock_read=raw_syscall` 与正式通过标志。
+
+Starry 完整 app 命令耗时 94.88 秒，其中 QEMU 阶段 77.69 秒；Linux 直接 bzImage/initramfs
+启动到关机耗时 41.43 秒。二者启动链不同：Starry 经过 OVMF、NVMe/rootfs 和网络设备，Linux
+使用 BIOS 直接启动最小 initramfs，因此总用时只用于复现记录，不能当作 scheduler 倍数。
+同源 workload 的唤醒分位数可以比较，结果如下，延迟单位为微秒：
+
+| 策略与场景 | Linux p50 / p99 | Starry p50 / p99 | p50 倍数 |
+| --- | ---: | ---: | ---: |
+| OTHER，同 CPU 线程 futex | 14.574 / 51.953 | 103.454 / 198.230 | 7.10x |
+| OTHER，跨 CPU 线程 futex | 26.830 / 75.548 | 109.595 / 208.996 | 4.08x |
+| OTHER，跨 CPU 进程 futex | 30.475 / 78.335 | 106.516 / 206.496 | 3.50x |
+| OTHER，绝对 timer | 48.025 / 122.214 | 161.404 / 310.214 | 3.36x |
+| FIFO:80，同 CPU 线程 futex | 12.452 / 49.819 | 104.214 / 201.023 | 8.37x |
+| FIFO:80，跨 CPU 线程 futex | 23.382 / 65.785 | 104.398 / 202.592 | 4.46x |
+| FIFO:80，跨 CPU 进程 futex | 25.452 / 67.536 | 108.159 / 215.144 | 4.25x |
+| FIFO:80，绝对 timer | 33.744 / 100.079 | 165.470 / 317.074 | 4.90x |
+
+Linux/Starry raw clock-pair 最小值分别为 0.665/19.962 微秒。这个测量成本包含在每个样本中，
+但不能从跨线程分位数中直接相减。Starry FIFO 同核 futex 还出现两个超过 10 毫秒的样本，最大
+50.405 毫秒；Linux 对应最大值为 0.249 毫秒。当前证据因此明确否定“已经达到 Linux RT
+同一水平”。源码调用链审计把下一阶段优先级收敛为：合并 `clock_gettime` 的两次 faultable
+用户写、缩短 wake/runqueue 事务、把 policy 更新改为 Linux rq-lock 式同步提交，并统一
+scheduler-work generation 与 switch-tail 的完成协议。不能用提高 tick 频率或加入兼容轮询掩盖
+这些所有权问题。
+
 ## 模块化结果
 
 - `TaskSystem` orchestration 只负责编排，registry/reap、placement、owner scheduling、deadline、PI、balance、deferred work 分模块；

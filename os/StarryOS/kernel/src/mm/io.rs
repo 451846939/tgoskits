@@ -3,9 +3,12 @@ use core::mem::{self, MaybeUninit};
 use ax_errno::{AxError, AxResult};
 use ax_io::prelude::*;
 use bytemuck::{AnyBitPattern, NoUninit};
-use starry_vm::{VmPtr, vm_read_slice, vm_write_slice};
 
 use super::check_access;
+use crate::{
+    mm::{VmPtr, vm_read_slice, vm_write_slice},
+    task::UserTaskRef,
+};
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone, AnyBitPattern, NoUninit)]
@@ -14,21 +17,21 @@ pub struct IoVec {
     pub iov_len: isize,
 }
 
-#[derive(Default)]
-pub struct IoVectorBuf {
+pub struct IoVectorBuf<'task> {
+    task: &'task UserTaskRef,
     iovs: *const IoVec,
     iovcnt: usize,
     len: usize,
 }
 
-impl IoVectorBuf {
-    pub fn new(iovs: *const IoVec, iovcnt: usize) -> AxResult<Self> {
+impl<'task> IoVectorBuf<'task> {
+    pub fn new(task: &'task UserTaskRef, iovs: *const IoVec, iovcnt: usize) -> AxResult<Self> {
         if iovcnt > 1024 {
             return Err(AxError::InvalidInput);
         }
         let mut len = 0usize;
         for i in 0..iovcnt {
-            let iov = iovs.wrapping_add(i).vm_read()?;
+            let iov = iovs.wrapping_add(i).vm_read(task)?;
             if iov.iov_len < 0 {
                 return Err(AxError::InvalidInput);
             }
@@ -41,10 +44,15 @@ impl IoVectorBuf {
                 .filter(|len| *len <= isize::MAX as usize)
                 .ok_or(AxError::InvalidInput)?;
         }
-        Ok(Self { iovs, iovcnt, len })
+        Ok(Self {
+            task,
+            iovs,
+            iovcnt,
+            len,
+        })
     }
 
-    pub fn into_io(self) -> IoVectorBufIo {
+    pub fn into_io(self) -> IoVectorBufIo<'task> {
         IoVectorBufIo {
             inner: self,
             start: 0,
@@ -53,16 +61,20 @@ impl IoVectorBuf {
     }
 }
 
-pub struct IoVectorBufIo {
-    inner: IoVectorBuf,
+pub struct IoVectorBufIo<'task> {
+    inner: IoVectorBuf<'task>,
     start: usize,
     offset: usize,
 }
 
-impl IoVectorBufIo {
+impl IoVectorBufIo<'_> {
     fn skip_empty(&mut self) -> AxResult<()> {
         while self.start < self.inner.iovcnt {
-            let iov = self.inner.iovs.wrapping_add(self.start).vm_read()?;
+            let iov = self
+                .inner
+                .iovs
+                .wrapping_add(self.start)
+                .vm_read(self.inner.task)?;
             if iov.iov_len as usize > self.offset {
                 break;
             }
@@ -73,7 +85,7 @@ impl IoVectorBufIo {
     }
 }
 
-impl Read for IoVectorBufIo {
+impl Read for IoVectorBufIo<'_> {
     fn read(&mut self, buf: &mut [u8]) -> AxResult<usize> {
         let mut count = 0;
         loop {
@@ -81,14 +93,24 @@ impl Read for IoVectorBufIo {
             if self.start >= self.inner.iovcnt {
                 break;
             }
-            let iov = self.inner.iovs.wrapping_add(self.start).vm_read()?;
+            let iov = self
+                .inner
+                .iovs
+                .wrapping_add(self.start)
+                .vm_read(self.inner.task)?;
             let len = (iov.iov_len as usize - self.offset).min(buf.len() - count);
             if len == 0 {
                 break;
             }
-            vm_read_slice(iov.iov_base.wrapping_add(self.offset), unsafe {
-                mem::transmute::<&mut [u8], &mut [MaybeUninit<u8>]>(&mut buf[count..count + len])
-            })?;
+            vm_read_slice(
+                self.inner.task,
+                iov.iov_base.wrapping_add(self.offset),
+                unsafe {
+                    mem::transmute::<&mut [u8], &mut [MaybeUninit<u8>]>(
+                        &mut buf[count..count + len],
+                    )
+                },
+            )?;
             self.offset += len;
             self.inner.len -= len;
             count += len;
@@ -97,7 +119,7 @@ impl Read for IoVectorBufIo {
     }
 }
 
-impl Write for IoVectorBufIo {
+impl Write for IoVectorBufIo<'_> {
     fn write(&mut self, buf: &[u8]) -> AxResult<usize> {
         let mut count = 0;
         loop {
@@ -105,12 +127,17 @@ impl Write for IoVectorBufIo {
             if self.start >= self.inner.iovcnt {
                 break;
             }
-            let iov = self.inner.iovs.wrapping_add(self.start).vm_read()?;
+            let iov = self
+                .inner
+                .iovs
+                .wrapping_add(self.start)
+                .vm_read(self.inner.task)?;
             let len = (iov.iov_len as usize - self.offset).min(buf.len() - count);
             if len == 0 {
                 break;
             }
             vm_write_slice(
+                self.inner.task,
                 iov.iov_base.wrapping_add(self.offset),
                 &buf[count..count + len],
             )?;
@@ -126,13 +153,13 @@ impl Write for IoVectorBufIo {
     }
 }
 
-impl IoBuf for IoVectorBufIo {
+impl IoBuf for IoVectorBufIo<'_> {
     fn remaining(&self) -> usize {
         self.inner.len
     }
 }
 
-impl IoBufMut for IoVectorBufIo {
+impl IoBufMut for IoVectorBufIo<'_> {
     fn remaining_mut(&self) -> usize {
         self.inner.len
     }

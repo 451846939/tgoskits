@@ -8,12 +8,12 @@ use linux_raw_sys::general::{
 };
 use starry_process::{Pid, Process};
 use starry_signal::{SignalInfo, Signo};
-use starry_vm::{VmMutPtr, VmPtr};
 
 use super::ptrace::PTRACE_EVENT_STOP;
 use super::wait_scan::WaitCandidateScan;
 use crate::{
     file::{PidFd, get_file_like},
+    mm::{VmMutPtr, VmPtr},
     task::{
         JobStatus, ProcessData, ProcessIdentity, decode_wait_status, future::block_on_user,
         get_process_data, get_task, get_zombie_cred, is_reaped_process, is_zombie_clone_child,
@@ -310,7 +310,7 @@ pub fn sys_waitpid(
             let wait_pid = target.ptrace_report_pid(child, &data);
             let status = stopped_wait_status(&data, signo);
             if let Some(exit_code) = exit_code.nullable() {
-                exit_code.vm_write(status)?;
+                exit_code.vm_write(current, status)?;
             }
             data.mark_ptrace_stop_reported_for(stop_tid);
             return Ok(Some(wait_pid as _));
@@ -318,7 +318,7 @@ pub fn sys_waitpid(
             // Copy status before claiming the unique reap transition. A failed
             // user write leaves the zombie available for a later retry.
             if let Some(exit_code) = exit_code.nullable() {
-                exit_code.vm_write(child.exit_code())?;
+                exit_code.vm_write(current, child.exit_code())?;
             }
             if let Some(cpu_time) = reap_process(child) {
                 proc_data.add_child_cpu_time(cpu_time.user(), cpu_time.system());
@@ -346,7 +346,7 @@ pub fn sys_waitpid(
                     // `exit_code` pointer leaves the report intact to retry
                     // (mirrors the zombie-reap ordering above).
                     if let Some(exit_code) = exit_code.nullable() {
-                        exit_code.vm_write(raw)?;
+                        exit_code.vm_write(current, raw)?;
                     }
                     cdata.take_job_status_if(want_stopped, want_continued);
                     return Ok(Some(child.pid() as _));
@@ -483,7 +483,7 @@ pub fn sys_waitid(
                     linux_raw_sys::general::CLD_TRAPPED as i32,
                     stopped_wait_signo(&data, signo),
                 );
-                infop.cast::<SignalInfo>().vm_write(siginfo)?;
+                infop.cast::<SignalInfo>().vm_write(current, siginfo)?;
             }
             if !options.contains(WaitIdOptions::WNOWAIT) {
                 data.mark_ptrace_stop_reported_for(stop_tid);
@@ -512,7 +512,7 @@ pub fn sys_waitid(
                     if let Some(infop) = infop.nullable() {
                         let siginfo =
                             SignalInfo::new_sigchld(child.pid(), child_uid(child), code, status);
-                        infop.cast::<SignalInfo>().vm_write(siginfo)?;
+                        infop.cast::<SignalInfo>().vm_write(current, siginfo)?;
                     }
                     if !options.contains(WaitIdOptions::WNOWAIT) {
                         data.take_job_status_if(want_stopped, want_continued);
@@ -531,7 +531,7 @@ pub fn sys_waitid(
 
             if let Some(infop) = infop.nullable() {
                 let siginfo = SignalInfo::new_sigchld(child_pid, child_uid, code, status);
-                infop.cast::<SignalInfo>().vm_write(siginfo)?;
+                infop.cast::<SignalInfo>().vm_write(current, siginfo)?;
             }
 
             if options.contains(WaitIdOptions::WNOWAIT) {
@@ -548,7 +548,7 @@ pub fn sys_waitid(
         } else if options.contains(WaitIdOptions::WNOHANG) {
             if let Some(infop) = infop.nullable() {
                 let zeroed = SignalInfo::zeroed();
-                infop.cast::<SignalInfo>().vm_write(zeroed)?;
+                infop.cast::<SignalInfo>().vm_write(current, zeroed)?;
             }
             Ok(Some(0))
         } else {

@@ -7,15 +7,18 @@ use ax_runtime::hal::cpu::uspace::UserContext;
 use linux_raw_sys::general::{CLD_CONTINUED, CLD_STOPPED, CLD_TRAPPED, RLIMIT_RTTIME};
 use starry_process::Pid;
 use starry_signal::{SignalInfo, SignalOSAction, SignalSet, Signo};
-#[cfg(target_arch = "riscv64")]
-use starry_vm::vm_read_slice;
 
 use super::{
-    AsThread, ProcessData, RttimeLimitAction, Thread, current_user_task, do_exit, get_process_data,
-    get_process_group, get_task, is_zombie_pid,
+    ProcessData, RttimeLimitAction, Thread, UserTaskRef, current_user_task, do_exit,
+    get_process_data, get_process_group, get_task, is_zombie_pid,
     signal_publication::publish_before_fatal_stop_release,
 };
-use crate::task::future::{UserWaitOutcome, block_on, block_on_user};
+#[cfg(target_arch = "riscv64")]
+use crate::mm::vm_read_slice;
+use crate::{
+    mm::UserMemoryProvider,
+    task::future::{UserWaitOutcome, block_on, block_on_user},
+};
 
 /// Information needed to restart a syscall if SA_RESTART applies.
 pub struct SyscallRestartInfo {
@@ -35,14 +38,14 @@ struct UserStackFrame {
 }
 
 #[cfg(target_arch = "riscv64")]
-fn read_user_stack_frame(fp: usize) -> Option<UserStackFrame> {
+fn read_user_stack_frame(current: &UserTaskRef, fp: usize) -> Option<UserStackFrame> {
     let frame_addr = fp.checked_sub(size_of::<UserStackFrame>())?;
     if frame_addr == 0 || !frame_addr.is_multiple_of(align_of::<usize>()) {
         return None;
     }
 
     let mut words = [MaybeUninit::<usize>::uninit(); 2];
-    vm_read_slice(frame_addr as *const usize, &mut words).ok()?;
+    vm_read_slice(current, frame_addr as *const usize, &mut words).ok()?;
 
     Some(UserStackFrame {
         fp: unsafe { words[0].assume_init() },
@@ -51,7 +54,7 @@ fn read_user_stack_frame(fp: usize) -> Option<UserStackFrame> {
 }
 
 #[cfg(target_arch = "riscv64")]
-fn dump_user_backtrace(uctx: &UserContext) {
+fn dump_user_backtrace(current: &UserTaskRef, uctx: &UserContext) {
     const MAX_USER_FRAMES: usize = 32;
 
     let mut fp = uctx.regs.s0;
@@ -62,7 +65,7 @@ fn dump_user_backtrace(uctx: &UserContext) {
     );
 
     for depth in 1..MAX_USER_FRAMES {
-        let Some(frame) = read_user_stack_frame(fp) else {
+        let Some(frame) = read_user_stack_frame(current, fp) else {
             warn!("  <unwind stopped: unreadable frame at fp={:#018x}>", fp);
             break;
         };
@@ -88,10 +91,10 @@ fn dump_user_backtrace(uctx: &UserContext) {
 }
 
 #[cfg(not(target_arch = "riscv64"))]
-fn dump_user_backtrace(_uctx: &UserContext) {}
+fn dump_user_backtrace(_current: &UserTaskRef, _uctx: &UserContext) {}
 
 /// Dump user-mode register state once the signal disposition really terminates.
-fn dump_user_crash_context(uctx: &UserContext) {
+fn dump_user_crash_context(current: &UserTaskRef, uctx: &UserContext) {
     #[cfg(target_arch = "riscv64")]
     {
         let r = &uctx.regs;
@@ -168,7 +171,7 @@ fn dump_user_crash_context(uctx: &UserContext) {
         warn!("user register dump: not implemented for this arch");
     }
 
-    dump_user_backtrace(uctx);
+    dump_user_backtrace(current, uctx);
 }
 
 /// Block the current thread in a ptrace stop.
@@ -301,11 +304,12 @@ fn notify_ptrace_waiter(thr: &Thread, signo: Signo) {
 }
 
 pub fn check_signals(
-    thr: &Thread,
+    current: &UserTaskRef,
     uctx: &mut UserContext,
     restore_blocked: Option<SignalSet>,
     restart_info: Option<&SyscallRestartInfo>,
 ) -> bool {
+    let thr = current.as_thread();
     queue_rttime_limit_signal(thr);
     if thr.take_deadline_overrun() {
         let _result = thr
@@ -327,32 +331,35 @@ pub fn check_signals(
         return true;
     }
 
-    let Some((sig, os_action)) =
-        thr.signal()
-            .check_signals_with(uctx, restore_blocked, |uctx, _sig, restartable| {
-                // Apply the SA_RESTART decision once per interrupted syscall.
-                // Callers pass `Some(info)` only for the first delivered signal;
-                // later iterations pass `None`, so the restart adjustment remains
-                // single-shot.
-                if let Some(info) = restart_info
-                    && (uctx.retval() as isize) == -(ax_errno::LinuxError::EINTR.code() as isize)
-                    && restartable
-                {
-                    let new_ip = uctx.ip() - uctx.syscall_insn_len();
-                    uctx.set_ip(new_ip);
-                    uctx.set_arg0(info.saved_a0);
-                    // On x86_64, rax holds both the syscall number and the return
-                    // value, so the syscall entry path clobbered sysno with -EINTR.
-                    // Restore it before the syscall instruction re-executes. On
-                    // RISC-V/AArch64/LoongArch64 sysno lives in a separate register
-                    // (a7/x8/a7) that was not touched, so no restore is needed.
-                    #[cfg(target_arch = "x86_64")]
-                    uctx.set_sysno(info.saved_sysno);
-                    #[cfg(not(target_arch = "x86_64"))]
-                    let _ = info.saved_sysno;
-                }
-            })
-    else {
+    let mut user_memory = UserMemoryProvider::new(current);
+    let Some((sig, os_action)) = thr.signal().check_signals_with(
+        &mut user_memory,
+        uctx,
+        restore_blocked,
+        |uctx, _sig, restartable| {
+            // Apply the SA_RESTART decision once per interrupted syscall.
+            // Callers pass `Some(info)` only for the first delivered signal;
+            // later iterations pass `None`, so the restart adjustment remains
+            // single-shot.
+            if let Some(info) = restart_info
+                && (uctx.retval() as isize) == -(ax_errno::LinuxError::EINTR.code() as isize)
+                && restartable
+            {
+                let new_ip = uctx.ip() - uctx.syscall_insn_len();
+                uctx.set_ip(new_ip);
+                uctx.set_arg0(info.saved_a0);
+                // On x86_64, rax holds both the syscall number and the return
+                // value, so the syscall entry path clobbered sysno with -EINTR.
+                // Restore it before the syscall instruction re-executes. On
+                // RISC-V/AArch64/LoongArch64 sysno lives in a separate register
+                // (a7/x8/a7) that was not touched, so no restore is needed.
+                #[cfg(target_arch = "x86_64")]
+                uctx.set_sysno(info.saved_sysno);
+                #[cfg(not(target_arch = "x86_64"))]
+                let _ = info.saved_sysno;
+            }
+        },
+    ) else {
         return false;
     };
 
@@ -390,13 +397,13 @@ pub fn check_signals(
     match os_action {
         SignalOSAction::Terminate => {
             if dump_on_terminate {
-                dump_user_crash_context(uctx);
+                dump_user_crash_context(current, uctx);
             }
             do_exit(signo as i32, true);
         }
         SignalOSAction::CoreDump => {
             if dump_on_terminate {
-                dump_user_crash_context(uctx);
+                dump_user_crash_context(current, uctx);
             }
             do_exit(128 + signo as i32, true);
         }
@@ -746,7 +753,7 @@ pub fn raise_signal_fatal(sig: SignalInfo, uctx: &UserContext) -> AxResult<()> {
         // right one to terminate, so dump and exit here directly so
         // userspace cannot lose the register state.
         thread.clear_fault_dump();
-        dump_user_crash_context(uctx);
+        dump_user_crash_context(&curr, uctx);
         do_exit(signo as i32, true);
     }
 

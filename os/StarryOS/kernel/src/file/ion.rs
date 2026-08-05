@@ -10,13 +10,7 @@ use axpoll::{IoEvents, Pollable};
 use sg2002_tpu::ion::IonBuffer;
 
 use super::{FileLike, Kstat};
-use crate::pseudofs::{
-    DeviceMmap, DeviceOps,
-    dev::{
-        ION_DEVICE,
-        ion::{ION_IOC_FREE, IonHandleData},
-    },
-};
+use crate::pseudofs::{DeviceMmap, dev::ION_DEVICE};
 
 /// Ion Buffer 文件
 ///
@@ -92,8 +86,7 @@ impl Drop for IonBufferFile {
         // ION_IOC_FREE 的情况下，全局 buffer 表里的强引用也会被移除。
         // 物理页的真正释放由最后一个 `Arc<IonBuffer>` 在 Drop 时完成。
         if let Some(dev) = ION_DEVICE.get() {
-            let handle_data = IonHandleData { handle };
-            let _ = dev.ioctl(ION_IOC_FREE, &handle_data as *const _ as usize);
+            dev.release_handle(handle);
         } else {
             error!(
                 "Failed to find ion device to free buffer handle: {}",

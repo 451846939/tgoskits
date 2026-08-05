@@ -4,10 +4,10 @@ use ax_errno::{AxError, AxResult};
 use bitflags::bitflags;
 use linux_raw_sys::general::{SI_TKILL, SI_USER};
 use starry_signal::{SignalInfo, Signo};
-use starry_vm::VmPtr;
 
 use crate::{
     file::{FD_TABLE, FileLike, PidFd, add_file_like, current_fd_table},
+    mm::VmPtr,
     syscall::signal::check_kill_permission,
     task::{
         get_task, pidfd_process_identity, pidfd_thread_identity, send_signal_to_process,
@@ -168,7 +168,7 @@ pub fn sys_pidfd_send_signal(
         Some(make_pidfd_siginfo(current, signo, scope))
     } else {
         let signo_parsed = parse_signo(signo)?;
-        let info = unsafe { sig.vm_read_uninit()?.assume_init() };
+        let info = unsafe { sig.vm_read_uninit(current)?.assume_init() };
         if info.signo() != signo_parsed {
             return Err(AxError::InvalidInput);
         }

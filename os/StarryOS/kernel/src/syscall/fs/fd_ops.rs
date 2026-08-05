@@ -10,14 +10,13 @@ use ax_fs_ng::vfs::{FS_CONTEXT, FileBackend, MountNamespace, OpenOptions, OpenRe
 use axfs_ng_vfs::{DirEntry, FileNode, Location, NodeOps, NodeType, Reference};
 use bitflags::bitflags;
 use linux_raw_sys::general::*;
-use starry_vm::{VmMutPtr, VmPtr, vm_load};
 
 use crate::{
     file::{
         Directory, FD_TABLE, File, FileDescriptor, FileLike, MountTableFile, NsFd, Pipe,
         add_file_like, close_file_like, get_file_like, memfd::Memfd, with_fs,
     },
-    mm::vm_load_path_string,
+    mm::{VmMutPtr, VmPtr, vm_load, vm_load_path_string},
     pseudofs::{Device, dev::tty},
     task::get_task,
 };
@@ -267,13 +266,18 @@ const OPENAT2_VALID_FLAGS: u64 = (O_ACCMODE
     | O_PATH
     | O_TMPFILE) as u64;
 
-fn openat2_check_extra_bytes(how: *const OpenHow, size: usize) -> AxResult<()> {
+fn openat2_check_extra_bytes(
+    current: &crate::task::UserTaskRef,
+    how: *const OpenHow,
+    size: usize,
+) -> AxResult<()> {
     let base_size = size_of::<OpenHow>();
     if size <= base_size {
         return Ok(());
     }
 
     let extra = vm_load(
+        current,
         unsafe { (how as *const u8).add(base_size) },
         size - base_size,
     )?;
@@ -399,7 +403,7 @@ pub fn sys_openat(
 
     let curr = current;
     let thread = curr.as_thread();
-    let path = vm_load_path_string(path)?;
+    let path = vm_load_path_string(current, path)?;
     debug!("sys_openat <= {dirfd} {path:?} {flags:#o} {mode:#o}");
 
     let uflags = flags as u32;
@@ -481,8 +485,8 @@ pub fn sys_openat2(
         return Err(AxError::InvalidInput);
     }
 
-    let how_value = how.vm_read()?;
-    openat2_check_extra_bytes(how, size)?;
+    let how_value = how.vm_read(current)?;
+    openat2_check_extra_bytes(current, how, size)?;
 
     if how_value.flags & !OPENAT2_VALID_FLAGS != 0 {
         return Err(AxError::InvalidInput);
@@ -522,7 +526,7 @@ pub fn sys_openat2(
         return sys_openat(current, dirfd, path, flags, mode);
     }
 
-    let path = vm_load_path_string(path)?;
+    let path = vm_load_path_string(current, path)?;
     if path.is_empty() {
         return Err(AxError::NotFound);
     }
@@ -827,11 +831,11 @@ pub fn sys_fcntl(
         // RocksDB/BookKeeper/Pulsar use these for WAL/SST files.
         1035 | 1037 => {
             // No stored hint → report the implicit default RWH_WRITE_LIFE_NOT_SET.
-            (arg as *mut u64).vm_write(0u64)?;
+            (arg as *mut u64).vm_write(current, 0u64)?;
             Ok(0)
         }
         1036 | 1038 => {
-            let hint = (arg as *const u64).vm_read()?;
+            let hint = (arg as *const u64).vm_read(current)?;
             // Valid hints are RWH_WRITE_LIFE_NOT_SET..=RWH_WRITE_LIFE_EXTREME (0..=5).
             if hint > 5 {
                 return Err(AxError::InvalidInput);

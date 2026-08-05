@@ -23,11 +23,11 @@ use axfs_ng_vfs::Filesystem;
 use axpoll::{IoEvents, PollSet, Pollable};
 use crab_usb::usb_if::endpoint::{TransferCompletion, TransferRequest};
 use event_listener::Event as NotifyEvent;
-use starry_vm::{VmMutPtr, VmPtr, vm_load, vm_write_slice};
 
 use self::{irq::manager, manager::UsbFsManager, tree::UsbRootDir};
 use crate::{
     file::{File as KernelFile, FileLike, IoDst, IoSrc, Kstat},
+    mm::{VmMutPtr, VmPtr, vm_load, vm_write_slice},
     pseudofs::{SimpleDir, SimpleFs},
 };
 
@@ -423,9 +423,13 @@ impl UsbDeviceFile {
         Ok(0)
     }
 
-    fn set_configuration_ioctl(&self, arg: usize) -> AxResult<usize> {
+    fn set_configuration_ioctl(
+        &self,
+        current: &crate::task::UserTaskRef,
+        arg: usize,
+    ) -> AxResult<usize> {
         let _lifecycle_guard = self.lifecycle_lock.lock();
-        let configuration = descriptor::read_usbdevfs_u32(arg)?;
+        let configuration = descriptor::read_usbdevfs_u32(current, arg)?;
         if configuration > u8::MAX as u32 {
             return Err(AxError::InvalidInput);
         }
@@ -495,20 +499,24 @@ impl UsbDeviceFile {
         Ok(())
     }
 
-    fn get_driver_ioctl(&self, arg: usize) -> AxResult<usize> {
-        let mut get_driver = (arg as *const descriptor::UsbdevfsGetDriver).vm_read()?;
+    fn get_driver_ioctl(&self, current: &crate::task::UserTaskRef, arg: usize) -> AxResult<usize> {
+        let mut get_driver = (arg as *const descriptor::UsbdevfsGetDriver).vm_read(current)?;
         if get_driver.interface > u8::MAX as u32 {
             return Err(AxError::InvalidInput);
         }
 
         get_driver.driver.fill(0);
         get_driver.driver[..5].copy_from_slice(b"usbfs");
-        (arg as *mut descriptor::UsbdevfsGetDriver).vm_write(get_driver)?;
+        (arg as *mut descriptor::UsbdevfsGetDriver).vm_write(current, get_driver)?;
         Ok(0)
     }
 
-    fn kernel_driver_ioctl(&self, arg: usize) -> AxResult<usize> {
-        let command = descriptor::read_usbdevfs_ioctl(arg)?;
+    fn kernel_driver_ioctl(
+        &self,
+        current: &crate::task::UserTaskRef,
+        arg: usize,
+    ) -> AxResult<usize> {
+        let command = descriptor::read_usbdevfs_ioctl(current, arg)?;
         if command.ifno < 0 || command.ifno > u8::MAX as i32 {
             return Err(AxError::InvalidInput);
         }
@@ -518,8 +526,12 @@ impl UsbDeviceFile {
         }
     }
 
-    fn disconnect_claim_ioctl(&self, arg: usize) -> AxResult<usize> {
-        let claim = descriptor::read_usbdevfs_disconnect_claim(arg)?;
+    fn disconnect_claim_ioctl(
+        &self,
+        current: &crate::task::UserTaskRef,
+        arg: usize,
+    ) -> AxResult<usize> {
+        let claim = descriptor::read_usbdevfs_disconnect_claim(current, arg)?;
         if claim.interface > u8::MAX as u32 {
             return Err(AxError::InvalidInput);
         }
@@ -534,6 +546,7 @@ impl UsbDeviceFile {
 
     fn run_endpoint_transfer(
         &self,
+        current: &crate::task::UserTaskRef,
         endpoint: u8,
         transfer_type: EndpointTransferType,
         data: *mut u8,
@@ -561,11 +574,11 @@ impl UsbDeviceFile {
                     return Err(AxError::InvalidData);
                 }
                 if actual > 0 {
-                    vm_write_slice(data, &buffer[..actual])?;
+                    vm_write_slice(current, data, &buffer[..actual])?;
                 }
                 Ok(actual)
             } else {
-                let buffer = read_user_bytes(data as *const u8, len)?;
+                let buffer = read_user_bytes(current, data as *const u8, len)?;
                 match transfer_type {
                     EndpointTransferType::Bulk => lease.bulk_out(endpoint, &buffer),
                     EndpointTransferType::Interrupt => lease.interrupt_out(endpoint, &buffer),
@@ -577,12 +590,13 @@ impl UsbDeviceFile {
         })
     }
 
-    fn bulk_ioctl(&self, arg: usize) -> AxResult<usize> {
-        let bulk = descriptor::read_usbdevfs_bulktransfer(arg)?;
+    fn bulk_ioctl(&self, current: &crate::task::UserTaskRef, arg: usize) -> AxResult<usize> {
+        let bulk = descriptor::read_usbdevfs_bulktransfer(current, arg)?;
         if bulk.ep > u8::MAX as u32 {
             return Err(AxError::InvalidInput);
         }
         self.run_endpoint_transfer(
+            current,
             bulk.ep as u8,
             EndpointTransferType::Bulk,
             bulk.data,
@@ -591,8 +605,13 @@ impl UsbDeviceFile {
         )
     }
 
-    fn read_iso_packet_lengths(&self, urb_ptr: usize, num_packets: usize) -> AxResult<Vec<usize>> {
-        let packet_descs = read_iso_packet_descs(urb_ptr, num_packets)?;
+    fn read_iso_packet_lengths(
+        &self,
+        current: &crate::task::UserTaskRef,
+        urb_ptr: usize,
+        num_packets: usize,
+    ) -> AxResult<Vec<usize>> {
+        let packet_descs = read_iso_packet_descs(current, urb_ptr, num_packets)?;
         let mut total_length = 0usize;
         let mut packet_lengths = Vec::with_capacity(num_packets);
         for packet_desc in &packet_descs {
@@ -607,12 +626,13 @@ impl UsbDeviceFile {
 
     fn write_iso_packet_results(
         &self,
+        current: &crate::task::UserTaskRef,
         urb_ptr: usize,
         packet_lengths: &[usize],
         actual_total: usize,
         packet_actual_lengths: &[usize],
     ) -> AxResult<()> {
-        let mut packet_descs = read_iso_packet_descs(urb_ptr, packet_lengths.len())?;
+        let mut packet_descs = read_iso_packet_descs(current, urb_ptr, packet_lengths.len())?;
         if !packet_actual_lengths.is_empty() {
             if packet_actual_lengths.len() != packet_lengths.len() {
                 return Err(AxError::InvalidData);
@@ -621,7 +641,7 @@ impl UsbDeviceFile {
                 packet_desc.actual_length = (*packet_actual).min(u32::MAX as usize) as u32;
                 packet_desc.status = 0;
             }
-            return write_iso_packet_descs(urb_ptr, &packet_descs);
+            return write_iso_packet_descs(current, urb_ptr, &packet_descs);
         }
 
         let mut remaining = actual_total;
@@ -631,15 +651,24 @@ impl UsbDeviceFile {
             packet_desc.status = 0;
             remaining -= packet_actual;
         }
-        write_iso_packet_descs(urb_ptr, &packet_descs)
+        write_iso_packet_descs(current, urb_ptr, &packet_descs)
     }
 
-    fn write_completed_urb(&self, completed: CompletedUrb) -> AxResult<()> {
-        let mut urb = (completed.user_urb_ptr as *const descriptor::UsbdevfsUrb).vm_read()?;
+    fn write_completed_urb(
+        &self,
+        current: &crate::task::UserTaskRef,
+        completed: CompletedUrb,
+    ) -> AxResult<()> {
+        let CompletedUrb {
+            user_urb_ptr,
+            result,
+            log,
+        } = completed;
+        let mut urb = (user_urb_ptr as *const descriptor::UsbdevfsUrb).vm_read(current)?;
         let buffer = urb.buffer;
         let buffer_length = urb.buffer_length;
 
-        match completed.result {
+        match result {
             Ok(result) => {
                 if !result.data.is_empty() {
                     let user_len = buffer_length.max(0) as usize;
@@ -651,11 +680,12 @@ impl UsbDeviceFile {
                         .checked_add(result.data_offset)
                         .ok_or(AxError::InvalidInput)?
                         as *mut u8;
-                    vm_write_slice(buffer_ptr, &result.data[..copy_len])?;
+                    vm_write_slice(current, buffer_ptr, &result.data[..copy_len])?;
                 }
                 if !result.packet_lengths.is_empty() {
                     self.write_iso_packet_results(
-                        completed.user_urb_ptr,
+                        current,
+                        user_urb_ptr,
                         &result.packet_lengths,
                         result.actual_length,
                         &result.packet_actual_lengths,
@@ -664,11 +694,11 @@ impl UsbDeviceFile {
                 urb.status = 0;
                 urb.actual_length = result.actual_length as i32;
                 urb.error_count = 0;
-                (completed.user_urb_ptr as *mut descriptor::UsbdevfsUrb).vm_write(urb)?;
-                if completed.log {
+                (user_urb_ptr as *mut descriptor::UsbdevfsUrb).vm_write(current, urb)?;
+                if log {
                     debug!(
                         "usbfs: reap urb ptr={:#x} status=0 actual={} packets={}",
-                        completed.user_urb_ptr,
+                        user_urb_ptr,
                         result.actual_length,
                         result.packet_lengths.len()
                     );
@@ -680,20 +710,20 @@ impl UsbDeviceFile {
                 urb.status = status;
                 urb.actual_length = 0;
                 urb.error_count = 1;
-                (completed.user_urb_ptr as *mut descriptor::UsbdevfsUrb).vm_write(urb)?;
-                if completed.log {
+                (user_urb_ptr as *mut descriptor::UsbdevfsUrb).vm_write(current, urb)?;
+                if log {
                     if matches!(
                         linux_error,
                         LinuxError::ECONNRESET | LinuxError::EINTR | LinuxError::ENOENT
                     ) {
                         debug!(
                             "usbfs: reap urb ptr={:#x} status={} err={:?}",
-                            completed.user_urb_ptr, status, err
+                            user_urb_ptr, status, err
                         );
                     } else {
                         warn!(
                             "usbfs: reap urb ptr={:#x} status={} err={:?}",
-                            completed.user_urb_ptr, status, err
+                            user_urb_ptr, status, err
                         );
                     }
                 }
@@ -928,13 +958,14 @@ impl UsbDeviceFile {
 
     fn submit_endpoint_urb_async(
         &self,
+        current: &crate::task::UserTaskRef,
         arg: usize,
         expected_urb_type: u8,
         transfer_type: EndpointTransferType,
         packet_lengths: Vec<usize>,
         total_length: usize,
     ) -> AxResult<usize> {
-        let urb = (arg as *const descriptor::UsbdevfsUrb).vm_read()?;
+        let urb = (arg as *const descriptor::UsbdevfsUrb).vm_read(current)?;
         let (urb_type, endpoint, buffer, buffer_length) =
             (urb.type_, urb.endpoint, urb.buffer, urb.buffer_length);
         if urb_type != expected_urb_type {
@@ -953,7 +984,7 @@ impl UsbDeviceFile {
         let mut buffer = if is_in {
             alloc::vec![0; total_length]
         } else {
-            read_user_bytes(buffer as *const u8, total_length)?
+            read_user_bytes(current, buffer as *const u8, total_length)?
         };
 
         let log = usbfs_should_log_urb();
@@ -1035,8 +1066,12 @@ impl UsbDeviceFile {
         Ok(0)
     }
 
-    fn submit_control_urb(&self, arg: usize) -> AxResult<usize> {
-        let urb = (arg as *const descriptor::UsbdevfsUrb).vm_read()?;
+    fn submit_control_urb(
+        &self,
+        current: &crate::task::UserTaskRef,
+        arg: usize,
+    ) -> AxResult<usize> {
+        let urb = (arg as *const descriptor::UsbdevfsUrb).vm_read(current)?;
         let (urb_type, urb_buffer, buffer_length) = (urb.type_, urb.buffer, urb.buffer_length);
         if urb_type != descriptor::USBDEVFS_URB_TYPE_CONTROL {
             return Err(ax_errno::AxError::Unsupported);
@@ -1046,7 +1081,7 @@ impl UsbDeviceFile {
         }
 
         let mut setup_bytes = [0u8; 8];
-        read_user_bytes_into(urb_buffer as *const u8, &mut setup_bytes)?;
+        read_user_bytes_into(current, urb_buffer as *const u8, &mut setup_bytes)?;
         let b_request_type = setup_bytes[0];
         let b_request = setup_bytes[1];
         let w_value = u16::from_le_bytes([setup_bytes[2], setup_bytes[3]]);
@@ -1073,7 +1108,7 @@ impl UsbDeviceFile {
             let data_ptr = (urb_buffer as usize)
                 .checked_add(8)
                 .ok_or(AxError::InvalidInput)? as *const u8;
-            read_user_bytes(data_ptr, w_length)?
+            read_user_bytes(current, data_ptr, w_length)?
         };
         let request = match is_in {
             true => TransferRequest::control_in(setup, &mut buffer),
@@ -1111,8 +1146,8 @@ impl UsbDeviceFile {
         Ok(0)
     }
 
-    fn submit_bulk_urb(&self, arg: usize) -> AxResult<usize> {
-        let urb = (arg as *const descriptor::UsbdevfsUrb).vm_read()?;
+    fn submit_bulk_urb(&self, current: &crate::task::UserTaskRef, arg: usize) -> AxResult<usize> {
+        let urb = (arg as *const descriptor::UsbdevfsUrb).vm_read(current)?;
         if urb.type_ != descriptor::USBDEVFS_URB_TYPE_BULK {
             return Err(ax_errno::AxError::Unsupported);
         }
@@ -1121,6 +1156,7 @@ impl UsbDeviceFile {
         }
 
         self.submit_endpoint_urb_async(
+            current,
             arg,
             descriptor::USBDEVFS_URB_TYPE_BULK,
             EndpointTransferType::Bulk,
@@ -1129,8 +1165,12 @@ impl UsbDeviceFile {
         )
     }
 
-    fn submit_interrupt_urb(&self, arg: usize) -> AxResult<usize> {
-        let mut urb = (arg as *const descriptor::UsbdevfsUrb).vm_read()?;
+    fn submit_interrupt_urb(
+        &self,
+        current: &crate::task::UserTaskRef,
+        arg: usize,
+    ) -> AxResult<usize> {
+        let mut urb = (arg as *const descriptor::UsbdevfsUrb).vm_read(current)?;
         if urb.type_ != descriptor::USBDEVFS_URB_TYPE_INTERRUPT {
             return Err(ax_errno::AxError::Unsupported);
         }
@@ -1146,7 +1186,7 @@ impl UsbDeviceFile {
             }
             urb.status = 0;
             urb.actual_length = 0;
-            (arg as *mut descriptor::UsbdevfsUrb).vm_write(urb)?;
+            (arg as *mut descriptor::UsbdevfsUrb).vm_write(current, urb)?;
             self.submitted_urbs.lock().push_back(SubmittedUrb {
                 user_urb_ptr: arg,
                 transfer: SubmittedUrbTransfer::Deferred(UsbfsQuirk::DeferredStatusInterrupt),
@@ -1161,6 +1201,7 @@ impl UsbDeviceFile {
         }
 
         self.submit_endpoint_urb_async(
+            current,
             arg,
             descriptor::USBDEVFS_URB_TYPE_INTERRUPT,
             EndpointTransferType::Interrupt,
@@ -1169,8 +1210,8 @@ impl UsbDeviceFile {
         )
     }
 
-    fn submit_iso_urb(&self, arg: usize) -> AxResult<usize> {
-        let urb = (arg as *const descriptor::UsbdevfsUrb).vm_read()?;
+    fn submit_iso_urb(&self, current: &crate::task::UserTaskRef, arg: usize) -> AxResult<usize> {
+        let urb = (arg as *const descriptor::UsbdevfsUrb).vm_read(current)?;
         if urb.type_ != descriptor::USBDEVFS_URB_TYPE_ISO {
             return Err(ax_errno::AxError::Unsupported);
         }
@@ -1186,7 +1227,8 @@ impl UsbDeviceFile {
             return Err(AxError::Unsupported);
         }
 
-        let packet_lengths = self.read_iso_packet_lengths(arg, urb.number_of_packets as usize)?;
+        let packet_lengths =
+            self.read_iso_packet_lengths(current, arg, urb.number_of_packets as usize)?;
         let total_length = packet_lengths.iter().try_fold(0usize, |acc, len| {
             acc.checked_add(*len).ok_or(AxError::OutOfRange)
         })?;
@@ -1195,6 +1237,7 @@ impl UsbDeviceFile {
         }
 
         self.submit_endpoint_urb_async(
+            current,
             arg,
             descriptor::USBDEVFS_URB_TYPE_ISO,
             EndpointTransferType::Isochronous,
@@ -1203,23 +1246,28 @@ impl UsbDeviceFile {
         )
     }
 
-    fn submit_urb(&self, arg: usize) -> AxResult<usize> {
+    fn submit_urb(&self, current: &crate::task::UserTaskRef, arg: usize) -> AxResult<usize> {
         self.collect_submitted_urbs(None);
-        let urb = (arg as *const descriptor::UsbdevfsUrb).vm_read()?;
+        let urb = (arg as *const descriptor::UsbdevfsUrb).vm_read(current)?;
         let type_ = urb.type_;
         match type_ {
             descriptor::USBDEVFS_URB_TYPE_CONTROL => {
                 let _lifecycle_guard = self.lifecycle_lock.lock();
-                self.submit_control_urb(arg)
+                self.submit_control_urb(current, arg)
             }
-            descriptor::USBDEVFS_URB_TYPE_BULK => self.submit_bulk_urb(arg),
-            descriptor::USBDEVFS_URB_TYPE_INTERRUPT => self.submit_interrupt_urb(arg),
-            descriptor::USBDEVFS_URB_TYPE_ISO => self.submit_iso_urb(arg),
+            descriptor::USBDEVFS_URB_TYPE_BULK => self.submit_bulk_urb(current, arg),
+            descriptor::USBDEVFS_URB_TYPE_INTERRUPT => self.submit_interrupt_urb(current, arg),
+            descriptor::USBDEVFS_URB_TYPE_ISO => self.submit_iso_urb(current, arg),
             _ => Err(ax_errno::AxError::Unsupported),
         }
     }
 
-    fn reap_urb(&self, arg: usize, nonblocking: bool) -> AxResult<usize> {
+    fn reap_urb(
+        &self,
+        current: &crate::task::UserTaskRef,
+        arg: usize,
+        nonblocking: bool,
+    ) -> AxResult<usize> {
         self.collect_submitted_urbs(None);
         if !nonblocking && self.pending_urbs.lock().is_empty() {
             crate::task::future::block_on(poll_fn(|cx| {
@@ -1244,8 +1292,8 @@ impl UsbDeviceFile {
             return Err(ax_errno::AxError::WouldBlock);
         };
         let user_urb_ptr = completed.user_urb_ptr;
-        self.write_completed_urb(completed)?;
-        (arg as *mut usize).vm_write(user_urb_ptr)?;
+        self.write_completed_urb(current, completed)?;
+        (arg as *mut usize).vm_write(current, user_urb_ptr)?;
         if usbfs_should_log_urb() {
             debug!("usbfs: reap urb returns ptr={:#x}", user_urb_ptr);
         }
@@ -1301,11 +1349,11 @@ impl FileLike for UsbDeviceFile {
         self.base.file_mmap()
     }
 
-    fn ioctl(&self, cmd: u32, arg: usize) -> AxResult<usize> {
+    fn ioctl(&self, current: &crate::task::UserTaskRef, cmd: u32, arg: usize) -> AxResult<usize> {
         match cmd {
             descriptor::USBDEVFS_CONTROL => {
                 let log = usbfs_should_log_urb();
-                let ctrl = descriptor::read_usbdevfs_ctrltransfer(arg).ok();
+                let ctrl = descriptor::read_usbdevfs_ctrltransfer(current, arg).ok();
                 if let Some(ctrl) = ctrl
                     && log
                 {
@@ -1319,9 +1367,10 @@ impl FileLike for UsbDeviceFile {
                         ctrl.w_length
                     );
                 }
-                match manager::is_snapshot_control_ioctl(arg) {
+                match manager::is_snapshot_control_ioctl(current, arg) {
                     Ok(true) => {
                         let result = self.manager.snapshot_device_ioctl(
+                            current,
                             self.bus_num,
                             self.device_num,
                             cmd,
@@ -1335,55 +1384,55 @@ impl FileLike for UsbDeviceFile {
                     Ok(false) => {}
                     Err(err) => return Err(err),
                 }
-                let result = self.with_live_lease(|lease| lease.ioctl(cmd, arg));
+                let result = self.with_live_lease(|lease| lease.ioctl(current, cmd, arg));
                 if log {
                     debug!("usbfs: control ioctl result={:?}", result);
                 }
                 result
             }
             descriptor::USBDEVFS_CLAIMINTERFACE => {
-                let interface = descriptor::read_usbdevfs_u32(arg)?;
+                let interface = descriptor::read_usbdevfs_u32(current, arg)?;
                 if interface > u8::MAX as u32 {
                     return Err(AxError::InvalidInput);
                 }
                 self.claim_interface(interface as u8, 0, false)
             }
             descriptor::USBDEVFS_RELEASEINTERFACE => {
-                let interface = descriptor::read_usbdevfs_u32(arg)?;
+                let interface = descriptor::read_usbdevfs_u32(current, arg)?;
                 if interface > u8::MAX as u32 {
                     return Err(AxError::InvalidInput);
                 }
                 self.release_interface(interface as u8)
             }
-            descriptor::USBDEVFS_GETDRIVER => self.get_driver_ioctl(arg),
+            descriptor::USBDEVFS_GETDRIVER => self.get_driver_ioctl(current, arg),
             descriptor::USBDEVFS_SETINTERFACE => {
-                let set = descriptor::read_usbdevfs_setinterface(arg)?;
+                let set = descriptor::read_usbdevfs_setinterface(current, arg)?;
                 if set.interface > u8::MAX as u32 || set.altsetting > u8::MAX as u32 {
                     return Err(AxError::InvalidInput);
                 }
                 self.claim_interface(set.interface as u8, set.altsetting as u8, true)
             }
-            descriptor::USBDEVFS_SETCONFIGURATION => self.set_configuration_ioctl(arg),
+            descriptor::USBDEVFS_SETCONFIGURATION => self.set_configuration_ioctl(current, arg),
             descriptor::USBDEVFS_CLEAR_HALT => {
-                let endpoint = descriptor::read_usbdevfs_u32(arg)?;
+                let endpoint = descriptor::read_usbdevfs_u32(current, arg)?;
                 if endpoint > u8::MAX as u32 {
                     return Err(AxError::InvalidInput);
                 }
                 self.with_live_lease(|lease| lease.clear_halt(endpoint as u8))?;
                 Ok(0)
             }
-            descriptor::USBDEVFS_IOCTL => self.kernel_driver_ioctl(arg),
+            descriptor::USBDEVFS_IOCTL => self.kernel_driver_ioctl(current, arg),
             descriptor::USBDEVFS_DISCONNECT | descriptor::USBDEVFS_CONNECT => Ok(0),
-            descriptor::USBDEVFS_DISCONNECT_CLAIM => self.disconnect_claim_ioctl(arg),
+            descriptor::USBDEVFS_DISCONNECT_CLAIM => self.disconnect_claim_ioctl(current, arg),
             descriptor::USBDEVFS_DISCARDURB => self.discard_urb(arg),
-            descriptor::USBDEVFS_BULK => self.bulk_ioctl(arg),
-            descriptor::USBDEVFS_SUBMITURB => self.submit_urb(arg),
-            descriptor::USBDEVFS_REAPURB => self.reap_urb(arg, false),
-            descriptor::USBDEVFS_REAPURBNDELAY => self.reap_urb(arg, true),
+            descriptor::USBDEVFS_BULK => self.bulk_ioctl(current, arg),
+            descriptor::USBDEVFS_SUBMITURB => self.submit_urb(current, arg),
+            descriptor::USBDEVFS_REAPURB => self.reap_urb(current, arg, false),
+            descriptor::USBDEVFS_REAPURBNDELAY => self.reap_urb(current, arg, true),
             descriptor::USBDEVFS_CONNECTINFO | descriptor::USBDEVFS_GET_CAPABILITIES => self
                 .manager
-                .snapshot_device_ioctl(self.bus_num, self.device_num, cmd, arg),
-            _ => self.with_live_lease(|lease| lease.ioctl(cmd, arg)),
+                .snapshot_device_ioctl(current, self.bus_num, self.device_num, cmd, arg),
+            _ => self.with_live_lease(|lease| lease.ioctl(current, cmd, arg)),
         }
     }
 
@@ -1733,41 +1782,51 @@ fn iso_packet_descs_ptr(urb_ptr: usize) -> AxResult<*mut descriptor::UsbdevfsIso
         .ok_or(AxError::OutOfRange)
 }
 
-fn read_user_bytes(ptr: *const u8, len: usize) -> AxResult<Vec<u8>> {
+fn read_user_bytes(
+    current: &crate::task::UserTaskRef,
+    ptr: *const u8,
+    len: usize,
+) -> AxResult<Vec<u8>> {
     if len == 0 {
         return Ok(Vec::new());
     }
-    vm_load(ptr, len).map_err(Into::into)
+    vm_load(current, ptr, len).map_err(Into::into)
 }
 
-fn read_user_bytes_into(ptr: *const u8, dst: &mut [u8]) -> AxResult<()> {
+fn read_user_bytes_into(
+    current: &crate::task::UserTaskRef,
+    ptr: *const u8,
+    dst: &mut [u8],
+) -> AxResult<()> {
     if dst.is_empty() {
         return Ok(());
     }
-    let bytes = read_user_bytes(ptr, dst.len())?;
+    let bytes = read_user_bytes(current, ptr, dst.len())?;
     dst.copy_from_slice(&bytes);
     Ok(())
 }
 
 fn read_iso_packet_descs(
+    current: &crate::task::UserTaskRef,
     urb_ptr: usize,
     num_packets: usize,
 ) -> AxResult<Vec<descriptor::UsbdevfsIsoPacketDesc>> {
     let ptr = iso_packet_descs_ptr(urb_ptr)? as *const descriptor::UsbdevfsIsoPacketDesc;
     let mut descs = Vec::with_capacity(num_packets);
     for index in 0..num_packets {
-        descs.push(unsafe { ptr.add(index) }.vm_read()?);
+        descs.push(unsafe { ptr.add(index) }.vm_read(current)?);
     }
     Ok(descs)
 }
 
 fn write_iso_packet_descs(
+    current: &crate::task::UserTaskRef,
     urb_ptr: usize,
     descs: &[descriptor::UsbdevfsIsoPacketDesc],
 ) -> AxResult<()> {
     let ptr = iso_packet_descs_ptr(urb_ptr)?;
     if !descs.is_empty() {
-        vm_write_slice(ptr, descs)?;
+        vm_write_slice(current, ptr, descs)?;
     }
     Ok(())
 }

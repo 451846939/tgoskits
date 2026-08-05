@@ -27,10 +27,12 @@ use sg200x_jpu::{
     FrameLayout, FrameLayoutError, JpuInspectError, JpuPixelFormat, JpuScale, PlaneLayout,
     inspect_jpeg_layout,
 };
-use starry_vm::{VmMutPtr, VmPtr, vm_read_slice};
 
 use super::cvi_jpu::{CviJpu, DecodedJpuFrame};
-use crate::pseudofs::DeviceOps;
+use crate::{
+    mm::{VmMutPtr, VmPtr, vm_read_slice},
+    pseudofs::DeviceOps,
+};
 
 const MAX_STREAM_BYTES: usize = 16 * 1024 * 1024;
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
@@ -162,7 +164,12 @@ impl VdecState {
         Ok(())
     }
 
-    fn send_stream(&mut self, jpu: &CviJpu, argument: usize) -> VfsResult<()> {
+    fn send_stream(
+        &mut self,
+        current: &crate::task::UserTaskRef,
+        jpu: &CviJpu,
+        argument: usize,
+    ) -> VfsResult<()> {
         if self.phase != ChannelPhase::Receiving {
             return Err(AxError::InvalidInput);
         }
@@ -170,11 +177,12 @@ impl VdecState {
             return Err(AxError::ResourceBusy);
         }
 
-        let stream_ex = (argument as *const VdecStreamEx).vm_read()?;
+        let stream_ex = (argument as *const VdecStreamEx).vm_read(current)?;
         let stream_pointer = checked_user_pointer::<VdecStream>(stream_ex.stream)?;
-        let stream = stream_pointer.vm_read()?;
+        let stream = stream_pointer.vm_read(current)?;
         validate_stream(&stream, &self.attr)?;
         read_user_bytes_into(
+            current,
             &mut self.stream_scratch,
             stream.address,
             usize::try_from(stream.length).map_err(|_| AxError::InvalidInput)?,
@@ -202,18 +210,22 @@ impl VdecState {
         Ok(())
     }
 
-    fn get_frame(&self, argument: usize) -> VfsResult<()> {
+    fn get_frame(&self, current: &crate::task::UserTaskRef, argument: usize) -> VfsResult<()> {
         let pending = self.pending.ok_or(AxError::ResourceBusy)?;
         let wrapper_pointer = argument as *mut VideoFrameInfoEx;
-        let wrapper = wrapper_pointer.vm_read()?;
+        let wrapper = wrapper_pointer.vm_read(current)?;
         let frame_pointer = checked_user_mut_pointer::<VideoFrameInfo>(wrapper.frame_info)?;
-        frame_pointer.vm_write(pending.info)?;
-        wrapper_pointer.vm_write(wrapper)?;
+        frame_pointer.vm_write(current, pending.info)?;
+        wrapper_pointer.vm_write(current, wrapper)?;
         Ok(())
     }
 
-    fn release_frame(&mut self, argument: usize) -> VfsResult<()> {
-        let supplied = (argument as *const VideoFrameInfo).vm_read()?;
+    fn release_frame(
+        &mut self,
+        current: &crate::task::UserTaskRef,
+        argument: usize,
+    ) -> VfsResult<()> {
+        let supplied = (argument as *const VideoFrameInfo).vm_read(current)?;
         let pending = self.pending.ok_or(AxError::InvalidInput)?;
         if !same_frame(&supplied, &pending.info) {
             return Err(AxError::InvalidInput);
@@ -269,20 +281,25 @@ impl DeviceOps for CviVdec {
         Err(AxError::OperationNotSupported)
     }
 
-    fn ioctl(&self, command: u32, argument: usize) -> VfsResult<usize> {
+    fn ioctl(
+        &self,
+        current: &crate::task::UserTaskRef,
+        command: u32,
+        argument: usize,
+    ) -> VfsResult<usize> {
         let mut state = self.state.lock();
         match command {
             CVI_VC_VDEC_CREATE_CHN => {
-                let attr = (argument as *const VdecChnAttr).vm_read()?;
+                let attr = (argument as *const VdecChnAttr).vm_read(current)?;
                 state.create(&self.jpu, attr)?;
             }
             CVI_VC_VDEC_DESTROY_CHN => state.destroy(&self.jpu)?,
             CVI_VC_VDEC_GET_CHN_ATTR => {
                 ensure_created(state.phase)?;
-                (argument as *mut VdecChnAttr).vm_write(state.attr)?;
+                (argument as *mut VdecChnAttr).vm_write(current, state.attr)?;
             }
             CVI_VC_VDEC_SET_CHN_ATTR => {
-                let attr = (argument as *const VdecChnAttr).vm_read()?;
+                let attr = (argument as *const VdecChnAttr).vm_read(current)?;
                 state.set_attr(attr)?;
             }
             CVI_VC_VDEC_START_RECV_STREAM => state.start()?,
@@ -290,23 +307,23 @@ impl DeviceOps for CviVdec {
             CVI_VC_VDEC_QUERY_STATUS => {
                 ensure_created(state.phase)?;
                 let pointer = argument as *mut VdecChnStatus;
-                let _previous = pointer.vm_read()?;
-                pointer.vm_write(state.status())?;
+                let _previous = pointer.vm_read(current)?;
+                pointer.vm_write(current, state.status())?;
             }
             CVI_VC_VDEC_RESET_CHN => state.reset()?,
             CVI_VC_VDEC_SET_CHN_PARAM => {
-                let param = (argument as *const VdecChnParam).vm_read()?;
+                let param = (argument as *const VdecChnParam).vm_read(current)?;
                 state.set_param(param)?;
             }
             CVI_VC_VDEC_GET_CHN_PARAM => {
                 ensure_created(state.phase)?;
-                (argument as *mut VdecChnParam).vm_write(state.param)?;
+                (argument as *mut VdecChnParam).vm_write(current, state.param)?;
             }
-            CVI_VC_VDEC_SEND_STREAM => state.send_stream(&self.jpu, argument)?,
-            CVI_VC_VDEC_GET_FRAME => state.get_frame(argument)?,
-            CVI_VC_VDEC_RELEASE_FRAME => state.release_frame(argument)?,
+            CVI_VC_VDEC_SEND_STREAM => state.send_stream(current, &self.jpu, argument)?,
+            CVI_VC_VDEC_GET_FRAME => state.get_frame(current, argument)?,
+            CVI_VC_VDEC_RELEASE_FRAME => state.release_frame(current, argument)?,
             CVI_VC_VDEC_SET_JPEG_SCALE => {
-                let scale = (argument as *const u32).vm_read()?;
+                let scale = (argument as *const u32).vm_read(current)?;
                 state.set_scale(scale)?;
             }
             _ => return Err(AxError::NotATty),
@@ -432,7 +449,12 @@ fn checked_user_mut_pointer<T>(address: u64) -> VfsResult<*mut T> {
     Ok(checked_user_pointer::<T>(address)? as *mut T)
 }
 
-fn read_user_bytes_into(bytes: &mut Vec<u8>, address: u64, length: usize) -> VfsResult<()> {
+fn read_user_bytes_into(
+    current: &crate::task::UserTaskRef,
+    bytes: &mut Vec<u8>,
+    address: u64,
+    length: usize,
+) -> VfsResult<()> {
     let pointer = checked_user_pointer::<u8>(address)?;
     pointer
         .addr()
@@ -442,7 +464,7 @@ fn read_user_bytes_into(bytes: &mut Vec<u8>, address: u64, length: usize) -> Vfs
     bytes
         .try_reserve_exact(length)
         .map_err(|_| AxError::NoMemory)?;
-    vm_read_slice(pointer, &mut bytes.spare_capacity_mut()[..length])?;
+    vm_read_slice(current, pointer, &mut bytes.spare_capacity_mut()[..length])?;
     // SAFETY: `vm_read_slice` initialized every byte in the reserved range.
     unsafe { bytes.set_len(length) };
     Ok(())

@@ -6,13 +6,15 @@ use ax_sync::PiMutex;
 use bytemuck::AnyBitPattern;
 use linux_raw_sys::general::*;
 use starry_process::Pid;
-use starry_vm::{VmMutPtr, VmPtr, vm_load, vm_write_slice};
 
 use super::{
     IPC_CREAT, IPC_EXCL, IPC_INFO, IPC_PRIVATE, IPC_RMID, IPC_SET, IPC_STAT, IpcPerm, MSG_INFO,
     MSG_STAT, has_ipc_permission, next_ipc_id,
 };
-use crate::task::WaitQueue as MsgWaitQueue;
+use crate::{
+    mm::{VmMutPtr, VmPtr, vm_load, vm_write_slice},
+    task::WaitQueue as MsgWaitQueue,
+};
 
 /// Data structure describing a message queue.
 #[repr(C)]
@@ -515,7 +517,7 @@ pub fn sys_msgsnd(
 
     // read message from user space
     let mtype_ptr = unsafe { core::ptr::addr_of!((*msgp).mtype) };
-    let mtype: i64 = mtype_ptr.vm_read()?;
+    let mtype: i64 = mtype_ptr.vm_read(current)?;
 
     if mtype <= 0 {
         return Err(AxError::from(LinuxError::EINVAL)); // EINVAL - invalid message type
@@ -523,7 +525,7 @@ pub fn sys_msgsnd(
 
     // read data part
     let mtext_ptr = unsafe { core::ptr::addr_of!((*msgp).mtext) };
-    let data_vec = vm_load(mtext_ptr.cast::<u8>(), msgsz)?;
+    let data_vec = vm_load(current, mtext_ptr.cast::<u8>(), msgsz)?;
     let data_len = data_vec.len();
 
     loop {
@@ -685,12 +687,12 @@ pub fn sys_msgrcv(
 
     // Write mtype
     let mtype_ptr = unsafe { core::ptr::addr_of_mut!((*msgp).mtype) };
-    mtype_ptr.vm_write(mtype)?;
+    mtype_ptr.vm_write(current, mtype)?;
 
     // Write data part
     let data_ptr = unsafe { core::ptr::addr_of_mut!((*msgp).mtext) };
     let copy_len = data_slice.len().min(msgsz);
-    vm_write_slice(data_ptr.cast::<u8>(), &data_slice[..copy_len])?;
+    vm_write_slice(current, data_ptr.cast::<u8>(), &data_slice[..copy_len])?;
 
     // Remove the message from the queue (normal mode only)
     if should_remove {
@@ -778,7 +780,7 @@ pub fn sys_msgctl(
 
         // Copy to user space
         let ptr = buf as *mut MsgInfo;
-        ptr.vm_write(info)?;
+        ptr.vm_write(current, info)?;
         return Ok(0);
     }
 
@@ -822,7 +824,7 @@ pub fn sys_msgctl(
         };
 
         let ptr = buf as *mut msqid_ds;
-        ptr.vm_write(info_ds)?;
+        ptr.vm_write(current, info_ds)?;
 
         return Ok(ns_queues_count as isize);
     }
@@ -843,7 +845,7 @@ pub fn sys_msgctl(
                 }
 
                 let ptr = buf as *mut msqid_ds;
-                ptr.vm_write(guard.msqid_ds)?;
+                ptr.vm_write(current, guard.msqid_ds)?;
                 Ok(actual_msqid as isize)
             });
 
@@ -877,7 +879,7 @@ pub fn sys_msgctl(
 
         // Copy queue status to user space
         let ptr = buf as *mut msqid_ds;
-        ptr.vm_write(msg_queue.msqid_ds)?;
+        ptr.vm_write(current, msg_queue.msqid_ds)?;
 
         return Ok(0);
     }
@@ -893,7 +895,7 @@ pub fn sys_msgctl(
     if cmd == IPC_SET {
         // Read new settings from user space
         let ptr = buf as *const msqid_ds;
-        let user_buf = ptr.vm_read()?;
+        let user_buf = ptr.vm_read(current)?;
 
         // Update permission information (fields allowed by man-page)
         msg_queue.msqid_ds.msg_perm.uid = user_buf.msg_perm.uid;

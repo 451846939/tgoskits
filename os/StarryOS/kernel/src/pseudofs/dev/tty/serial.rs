@@ -75,7 +75,12 @@ impl DeviceOps for NoConsole {
         Err(AxError::NoSuchDevice)
     }
 
-    fn ioctl(&self, _cmd: u32, _arg: usize) -> AxResult<usize> {
+    fn ioctl(
+        &self,
+        _current: &crate::task::UserTaskRef,
+        _cmd: u32,
+        _arg: usize,
+    ) -> AxResult<usize> {
         Err(AxError::NoSuchDevice)
     }
 

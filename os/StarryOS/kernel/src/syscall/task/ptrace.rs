@@ -15,7 +15,6 @@ use ax_memory_addr::{MemoryAddr, VirtAddr};
 use ax_runtime::hal::paging::MappingFlags;
 use starry_process::Pid;
 use starry_signal::{SignalInfo, Signo};
-use starry_vm::{VmMutPtr, VmPtr, vm_read_slice, vm_write_slice};
 
 #[cfg(any(
     target_arch = "riscv64",
@@ -26,7 +25,7 @@ use crate::task::PtraceStopFpData;
 #[cfg(target_arch = "x86_64")]
 use crate::task::PtraceStopFpData;
 use crate::{
-    mm::{AddrSpace, IoVec},
+    mm::{AddrSpace, IoVec, VmMutPtr, VmPtr, vm_read_slice, vm_write_slice},
     task::{Cred, ProcessData, get_process_cred, get_process_data, get_task},
 };
 
@@ -412,7 +411,7 @@ fn ptrace_geteventmsg(
 ) -> AxResult<isize> {
     let (tracee, tid) = ptrace_stopped_tracee_with_tid(current, pid)?;
     let msg = tracee.ptrace_event_msg_for(tid);
-    (data as *mut usize).vm_write(msg)?;
+    (data as *mut usize).vm_write(current, msg)?;
     Ok(0)
 }
 
@@ -433,7 +432,7 @@ fn ptrace_getsiginfo(
         target_arch = "x86_64"
     ))]
     {
-        (data as *mut SignalInfo).vm_write(siginfo)?;
+        (data as *mut SignalInfo).vm_write(current, siginfo)?;
         Ok(0)
     }
 
@@ -464,7 +463,7 @@ fn ptrace_setsiginfo(
         return Err(AxError::InvalidInput);
     }
     let (tracee, tid) = ptrace_stopped_tracee_with_tid(current, pid)?;
-    let siginfo = ptrace_read_user_siginfo(data)?;
+    let siginfo = ptrace_read_user_siginfo(current, data)?;
     let signo = ptrace_siginfo_signo(&siginfo)?;
     if !tracee.set_ptrace_stop_siginfo_for(tid, signo, siginfo) {
         return Err(AxError::from(LinuxError::ESRCH));
@@ -538,7 +537,7 @@ fn ptrace_getregs(current: &crate::task::UserTaskRef, pid: usize, data: usize) -
             size_of::<ArchUserRegs>(),
         )
     };
-    vm_write_slice(data as *mut u8, bytes)?;
+    vm_write_slice(current, data as *mut u8, bytes)?;
     Ok(0)
 }
 
@@ -563,7 +562,7 @@ fn ptrace_setregs(current: &crate::task::UserTaskRef, pid: usize, data: usize) -
     if data == 0 {
         return Err(AxError::InvalidInput);
     }
-    let regs = ptrace_read_user_regs(data)?;
+    let regs = ptrace_read_user_regs(current, data)?;
     ptrace_write_stopped_user_regs(current, pid, regs)
 }
 
@@ -599,7 +598,7 @@ fn ptrace_getfpregs(
             size_of::<ArchFpRegs>(),
         )
     };
-    vm_write_slice(data as *mut u8, bytes)?;
+    vm_write_slice(current, data as *mut u8, bytes)?;
     Ok(0)
 }
 
@@ -628,7 +627,7 @@ fn ptrace_setfpregs(
     if data == 0 {
         return Err(AxError::InvalidInput);
     }
-    let regs = ptrace_read_user_fpregs(data)?;
+    let regs = ptrace_read_user_fpregs(current, data)?;
     ptrace_write_stopped_fp_regs(current, pid, regs)
 }
 
@@ -760,15 +759,15 @@ fn ptrace_getregset_prstatus(
         )
     };
 
-    let mut iov = (data as *const IoVec).vm_read()?;
+    let mut iov = (data as *const IoVec).vm_read(current)?;
     if iov.iov_len < 0 {
         return Err(AxError::InvalidInput);
     }
 
     let copy_len = (iov.iov_len as usize).min(reg_bytes.len());
-    vm_write_slice(iov.iov_base, &reg_bytes[..copy_len])?;
+    vm_write_slice(current, iov.iov_base, &reg_bytes[..copy_len])?;
     iov.iov_len = copy_len as isize;
-    (data as *mut IoVec).vm_write(iov)?;
+    (data as *mut IoVec).vm_write(current, iov)?;
     Ok(0)
 }
 
@@ -800,12 +799,12 @@ fn ptrace_setregset_prstatus(
 
     let reg_size = size_of::<ArchUserRegs>() as isize;
 
-    let iov = (data as *const IoVec).vm_read()?;
+    let iov = (data as *const IoVec).vm_read(current)?;
     if iov.iov_len < reg_size {
         return Err(AxError::InvalidInput);
     }
 
-    let regs = ptrace_read_user_regs(iov.iov_base as usize)?;
+    let regs = ptrace_read_user_regs(current, iov.iov_base as usize)?;
     ptrace_write_stopped_user_regs(current, pid, regs)
 }
 
@@ -863,7 +862,10 @@ fn ptrace_read_stopped_user_regs(
     target_arch = "loongarch64",
     target_arch = "x86_64"
 ))]
-fn ptrace_read_user_regs(data: usize) -> AxResult<ArchUserRegs> {
+fn ptrace_read_user_regs(
+    current: &crate::task::UserTaskRef,
+    data: usize,
+) -> AxResult<ArchUserRegs> {
     let mut regs = MaybeUninit::<ArchUserRegs>::uninit();
     let bytes = unsafe {
         slice::from_raw_parts_mut(
@@ -871,7 +873,7 @@ fn ptrace_read_user_regs(data: usize) -> AxResult<ArchUserRegs> {
             size_of::<ArchUserRegs>(),
         )
     };
-    starry_vm::vm_read_slice(data as *const u8, bytes)?;
+    vm_read_slice(current, data as *const u8, bytes)?;
     Ok(unsafe { regs.assume_init() })
 }
 
@@ -926,7 +928,7 @@ fn ptrace_getregset_fpregset(
         return Err(AxError::InvalidInput);
     }
     let regs = ptrace_read_stopped_fp_regs(current, pid)?;
-    let mut iov = (data as *const IoVec).vm_read()?;
+    let mut iov = (data as *const IoVec).vm_read(current)?;
     if iov.iov_len < 0 {
         return Err(AxError::InvalidInput);
     }
@@ -937,9 +939,9 @@ fn ptrace_getregset_fpregset(
         )
     };
     let copy_len = (iov.iov_len as usize).min(bytes.len());
-    vm_write_slice(iov.iov_base, &bytes[..copy_len])?;
+    vm_write_slice(current, iov.iov_base, &bytes[..copy_len])?;
     iov.iov_len = copy_len as isize;
-    (data as *mut IoVec).vm_write(iov)?;
+    (data as *mut IoVec).vm_write(current, iov)?;
     Ok(0)
 }
 
@@ -957,11 +959,11 @@ fn ptrace_setregset_fpregset(
     if data == 0 {
         return Err(AxError::InvalidInput);
     }
-    let iov = (data as *const IoVec).vm_read()?;
+    let iov = (data as *const IoVec).vm_read(current)?;
     if iov.iov_len < size_of::<ArchFpRegs>() as isize {
         return Err(AxError::InvalidInput);
     }
-    let regs = ptrace_read_user_fpregs(iov.iov_base as usize)?;
+    let regs = ptrace_read_user_fpregs(current, iov.iov_base as usize)?;
     ptrace_write_stopped_fp_regs(current, pid, regs)
 }
 
@@ -988,7 +990,10 @@ fn ptrace_read_stopped_fp_regs(
     target_arch = "loongarch64",
     target_arch = "x86_64"
 ))]
-fn ptrace_read_user_fpregs(data: usize) -> AxResult<ArchFpRegs> {
+fn ptrace_read_user_fpregs(
+    current: &crate::task::UserTaskRef,
+    data: usize,
+) -> AxResult<ArchFpRegs> {
     let mut regs = MaybeUninit::<ArchFpRegs>::uninit();
     let bytes = unsafe {
         slice::from_raw_parts_mut(
@@ -996,7 +1001,7 @@ fn ptrace_read_user_fpregs(data: usize) -> AxResult<ArchFpRegs> {
             size_of::<ArchFpRegs>(),
         )
     };
-    starry_vm::vm_read_slice(data as *const u8, bytes)?;
+    vm_read_slice(current, data as *const u8, bytes)?;
     Ok(unsafe { regs.assume_init() })
 }
 
@@ -1006,7 +1011,10 @@ fn ptrace_read_user_fpregs(data: usize) -> AxResult<ArchFpRegs> {
     target_arch = "loongarch64",
     target_arch = "x86_64"
 ))]
-fn ptrace_read_user_siginfo(data: usize) -> AxResult<SignalInfo> {
+fn ptrace_read_user_siginfo(
+    current: &crate::task::UserTaskRef,
+    data: usize,
+) -> AxResult<SignalInfo> {
     let mut siginfo = MaybeUninit::<SignalInfo>::uninit();
     let bytes = unsafe {
         slice::from_raw_parts_mut(
@@ -1014,7 +1022,7 @@ fn ptrace_read_user_siginfo(data: usize) -> AxResult<SignalInfo> {
             size_of::<SignalInfo>(),
         )
     };
-    starry_vm::vm_read_slice(data as *const u8, bytes)?;
+    vm_read_slice(current, data as *const u8, bytes)?;
     Ok(unsafe { siginfo.assume_init() })
 }
 
@@ -1069,7 +1077,7 @@ fn ptrace_peekdata(
         return Err(AxError::InvalidInput);
     }
     let tracee = ptrace_stopped_tracee(current, pid)?;
-    (data as *mut usize).vm_write(ptrace_read_word(&tracee, addr)?)?;
+    (data as *mut usize).vm_write(current, ptrace_read_word(&tracee, addr)?)?;
     Ok(0)
 }
 
@@ -1157,8 +1165,8 @@ fn process_vm_copy(
     write_remote: bool,
 ) -> AxResult<isize> {
     let tracee = process_vm_tracee(current, pid)?;
-    let local = read_iovecs(local_iov, liovcnt)?;
-    let remote = read_iovecs(remote_iov, riovcnt)?;
+    let local = read_iovecs(current, local_iov, liovcnt)?;
+    let remote = read_iovecs(current, remote_iov, riovcnt)?;
 
     let mut local_idx = 0;
     let mut remote_idx = 0;
@@ -1192,11 +1200,11 @@ fn process_vm_copy(
                     data.len(),
                 )
             };
-            vm_read_slice(local_addr, bytes)?;
+            vm_read_slice(current, local_addr, bytes)?;
             remote_write(&tracee, remote_addr, &data)
         } else {
             let data = remote_read(&tracee, remote_addr, chunk_len)?;
-            vm_write_slice(local_addr, &data)?;
+            vm_write_slice(current, local_addr, &data)?;
             Ok(())
         };
 
@@ -1232,7 +1240,11 @@ fn ptrace_tracee_by_pid_or_tid(pid: Pid) -> AxResult<Arc<ProcessData>> {
         .map_err(|_| AxError::from(LinuxError::ESRCH))
 }
 
-fn read_iovecs(iov: *const IoVec, iovcnt: usize) -> AxResult<Vec<IoVec>> {
+fn read_iovecs(
+    current: &crate::task::UserTaskRef,
+    iov: *const IoVec,
+    iovcnt: usize,
+) -> AxResult<Vec<IoVec>> {
     if iovcnt > 1024 {
         return Err(AxError::InvalidInput);
     }
@@ -1240,7 +1252,7 @@ fn read_iovecs(iov: *const IoVec, iovcnt: usize) -> AxResult<Vec<IoVec>> {
     let mut iovecs = Vec::with_capacity(iovcnt);
     let mut total = 0usize;
     for idx in 0..iovcnt {
-        let iov = iov.wrapping_add(idx).vm_read()?;
+        let iov = iov.wrapping_add(idx).vm_read(current)?;
         if iov.iov_len < 0 {
             return Err(AxError::InvalidInput);
         }
@@ -2416,7 +2428,7 @@ fn ptrace_peekuser(
     let range = ptrace_user_word_range_x86_64(addr)?;
     let user = ptrace_read_stopped_user_area_x86_64(current, pid)?;
     let value = u64::from_ne_bytes(user[range].try_into().unwrap()) as usize;
-    (data as *mut usize).vm_write(value)?;
+    (data as *mut usize).vm_write(current, value)?;
     Ok(0)
 }
 

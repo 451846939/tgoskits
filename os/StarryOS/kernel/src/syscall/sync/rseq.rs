@@ -1,7 +1,8 @@
 use core::mem::size_of;
 
 use ax_errno::{AxError, LinuxError};
-use starry_vm::{VmMutPtr, VmPtr};
+
+use crate::mm::{VmMutPtr, VmPtr};
 
 /// Linux rseq area layout used for ABI validation.
 #[repr(C)]
@@ -35,16 +36,24 @@ fn validate_rseq_args(addr: *mut u8, len: usize, flags: u32) -> Result<usize, Ax
     Ok(addr)
 }
 
-fn ensure_rseq_area_accessible(addr: usize) -> Result<(), AxError> {
+fn ensure_rseq_area_accessible(
+    current: &crate::task::UserTaskRef,
+    addr: usize,
+) -> Result<(), AxError> {
     let area = addr as *mut RseqArea;
-    let _ = area.vm_read_uninit().map_err(|_| AxError::BadAddress)?;
-    area.vm_write(RseqArea {
-        cpu_id_start: 0,
-        cpu_id: RSEQ_CPU_ID_UNINITIALIZED,
-        rseq_cs: 0,
-        flags: 0,
-        padding: [0; 3],
-    })
+    let _ = area
+        .vm_read_uninit(current)
+        .map_err(|_| AxError::BadAddress)?;
+    area.vm_write(
+        current,
+        RseqArea {
+            cpu_id_start: 0,
+            cpu_id: RSEQ_CPU_ID_UNINITIALIZED,
+            rseq_cs: 0,
+            flags: 0,
+            padding: [0; 3],
+        },
+    )
     .map_err(|_| AxError::BadAddress)?;
     Ok(())
 }
@@ -88,7 +97,7 @@ pub fn sys_rseq(
         return Err(AxError::from(LinuxError::EBUSY));
     }
 
-    ensure_rseq_area_accessible(addr)?;
+    ensure_rseq_area_accessible(current, addr)?;
     thr.set_rseq_state(addr, sig);
     Ok(0)
 }

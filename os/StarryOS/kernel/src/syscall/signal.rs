@@ -8,9 +8,9 @@ use linux_raw_sys::general::{
 };
 use starry_process::Pid;
 use starry_signal::{SignalInfo, SignalSet, SignalStack, Signo};
-use starry_vm::{VmMutPtr, VmPtr};
 
 use crate::{
+    mm::{UserMemoryProvider, VmMutPtr, VmPtr},
     task::{
         block_next_signal, check_signals,
         future::{UserWaitOutcome, block_on_user, block_on_user_timeout},
@@ -46,11 +46,11 @@ pub fn sys_rt_sigprocmask(
     let old = sig.blocked();
 
     if let Some(oldset) = oldset.nullable() {
-        oldset.vm_write(old)?;
+        oldset.vm_write(current, old)?;
     }
 
     if let Some(set) = set.nullable() {
-        let set = unsafe { set.vm_read_uninit()?.assume_init() };
+        let set = unsafe { set.vm_read_uninit(current)?.assume_init() };
 
         let set = match how as u32 {
             SIG_BLOCK => old | set,
@@ -80,11 +80,12 @@ pub fn sys_rt_sigaction(
         return Err(AxError::InvalidInput);
     }
 
+    let mut user_memory = UserMemoryProvider::new(current);
     current
         .as_thread()
         .proc_data
         .signal
-        .set_action(signo, act, oldact)
+        .set_action(&mut user_memory, signo, act, oldact)
 }
 
 pub fn sys_rt_sigpending(
@@ -93,7 +94,7 @@ pub fn sys_rt_sigpending(
     sigsetsize: usize,
 ) -> AxResult<isize> {
     check_sigset_size(sigsetsize)?;
-    set.vm_write(current.as_thread().signal().pending())?;
+    set.vm_write(current, current.as_thread().signal().pending())?;
     Ok(0)
 }
 
@@ -260,7 +261,7 @@ pub(crate) fn make_queue_signal_info(
     }
 
     let signo = parse_signo(signo)?;
-    let mut sig = unsafe { sig.vm_read_uninit()?.assume_init() };
+    let mut sig = unsafe { sig.vm_read_uninit(current)?.assume_init() };
     sig.set_signo(signo);
     if current.as_thread().proc_data.proc.pid() != tgid
         && (sig.code() >= 0 || sig.code() == SI_TKILL)
@@ -304,7 +305,11 @@ pub fn sys_rt_sigreturn(
     uctx: &mut UserContext,
 ) -> AxResult<isize> {
     block_next_signal();
-    current.as_thread().signal().restore(uctx)?;
+    let mut user_memory = UserMemoryProvider::new(current);
+    current
+        .as_thread()
+        .signal()
+        .restore(&mut user_memory, uctx)?;
     Ok(uctx.retval() as isize)
 }
 
@@ -318,10 +323,10 @@ pub fn sys_rt_sigtimedwait(
 ) -> AxResult<isize> {
     check_sigset_size(sigsetsize)?;
 
-    let set = unsafe { set.vm_read_uninit()?.assume_init() };
+    let set = unsafe { set.vm_read_uninit(current)?.assume_init() };
 
     let timeout = if let Some(ts) = timeout.nullable() {
-        let ts = unsafe { ts.vm_read_uninit()?.assume_init() };
+        let ts = unsafe { ts.vm_read_uninit(current)?.assume_init() };
         Some(ts.try_into_time_value()?)
     } else {
         None
@@ -345,7 +350,7 @@ pub fn sys_rt_sigtimedwait(
     let fut = poll_fn(|cx| {
         if let Some(sig) = signal.dequeue_signal(&set) {
             Poll::Ready(Some(sig))
-        } else if check_signals(thr, uctx, Some(old_blocked), None) {
+        } else if check_signals(current, uctx, Some(old_blocked), None) {
             Poll::Ready(None)
         } else {
             signal.register_sigwait_waker(cx.waker());
@@ -354,7 +359,7 @@ pub fn sys_rt_sigtimedwait(
             // after this check wakes the registered future.
             if let Some(sig) = signal.dequeue_signal(&set) {
                 Poll::Ready(Some(sig))
-            } else if check_signals(thr, uctx, Some(old_blocked), None) {
+            } else if check_signals(current, uctx, Some(old_blocked), None) {
                 Poll::Ready(None)
             } else {
                 Poll::Pending
@@ -379,7 +384,7 @@ pub fn sys_rt_sigtimedwait(
     signal.finish_sigwait();
 
     if let Some(info) = info.nullable() {
-        info.cast::<SignalInfo>().vm_write(sig)?;
+        info.cast::<SignalInfo>().vm_write(current, sig)?;
     }
 
     Ok(sig.signo() as _)
@@ -396,7 +401,7 @@ pub fn sys_rt_sigsuspend(
     let curr = current;
     let thr = curr.as_thread();
 
-    let set = unsafe { set.vm_read_uninit()?.assume_init() };
+    let set = unsafe { set.vm_read_uninit(current)?.assume_init() };
     let old_blocked = thr.signal().set_blocked(set);
 
     // sigsuspend always returns -EINTR when a signal is caught
@@ -406,7 +411,7 @@ pub fn sys_rt_sigsuspend(
     let _outcome = block_on_user(
         curr,
         poll_fn(|_cx| {
-            if check_signals(thr, uctx, Some(old_blocked), None) {
+            if check_signals(current, uctx, Some(old_blocked), None) {
                 return Poll::Ready(());
             }
             Poll::Pending
@@ -426,11 +431,11 @@ pub fn sys_sigaltstack(
     let sig = curr.as_thread().signal();
 
     if let Some(old_ss) = old_ss.nullable() {
-        old_ss.vm_write(sig.stack())?;
+        old_ss.vm_write(current, sig.stack())?;
     }
 
     if let Some(ss) = ss.nullable() {
-        let ss = unsafe { ss.vm_read_uninit()?.assume_init() };
+        let ss = unsafe { ss.vm_read_uninit(current)?.assume_init() };
         if sig.stack_active() {
             return Err(AxError::OperationNotPermitted);
         }

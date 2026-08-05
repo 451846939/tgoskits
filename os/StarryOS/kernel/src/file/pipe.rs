@@ -18,11 +18,11 @@ use ringbuf::{
     traits::{Consumer, Observer, Producer},
 };
 use starry_signal::{SignalInfo, Signo};
-use starry_vm::VmMutPtr;
 
 use super::{FileLike, Kstat};
 use crate::{
     file::{IoDst, IoSrc},
+    mm::VmMutPtr,
     task::{
         current_user_task,
         future::{block_on_user, poll_io},
@@ -313,10 +313,13 @@ impl FileLike for Pipe {
         self.non_blocking.load(Ordering::Acquire)
     }
 
-    fn ioctl(&self, cmd: u32, arg: usize) -> AxResult<usize> {
+    fn ioctl(&self, current: &crate::task::UserTaskRef, cmd: u32, arg: usize) -> AxResult<usize> {
         match cmd {
             FIONREAD => {
-                (arg as *mut u32).vm_write(self.shared.state.lock().buffer.occupied_len() as u32)?;
+                (arg as *mut u32).vm_write(
+                    current,
+                    self.shared.state.lock().buffer.occupied_len() as u32,
+                )?;
                 Ok(0)
             }
             _ => Err(AxError::NotATty),

@@ -136,7 +136,7 @@ pub fn sys_bind(
     addrlen: u32,
 ) -> AxResult<isize> {
     if let Ok(socket) = NetlinkSocket::from_fd(fd) {
-        let mut addr = super::addr::read_netlink_addr(addr, addrlen as _)?;
+        let mut addr = super::addr::read_netlink_addr(current, addr, addrlen as _)?;
         if addr.nl_pid == 0 {
             addr.nl_pid = current.as_thread().proc_data.proc.pid();
         }
@@ -146,14 +146,13 @@ pub fn sys_bind(
     }
 
     if let Ok(packet) = PacketSocket::from_fd(fd) {
-        let addr =
-            SockAddrLl::read_from_user(addr.address().as_usize() as *const sockaddr, addrlen)?;
+        let addr = SockAddrLl::read_from_user(current, addr.as_ptr(), addrlen)?;
         packet.bind_ll(addr)?;
         return Ok(0);
     }
 
     let socket = Socket::from_fd(fd)?;
-    let mut addr = SocketAddrEx::read_from_user(addr, addrlen)?;
+    let mut addr = SocketAddrEx::read_from_user(current, addr, addrlen)?;
     if socket.ip_domain() == AF_INET6 {
         addr = normalize_socket_addr_ex_for_ip_stack(addr, true)?;
     }
@@ -187,9 +186,14 @@ pub fn sys_bind(
     Ok(0)
 }
 
-pub fn sys_connect(fd: i32, addr: UserConstPtr<sockaddr>, addrlen: u32) -> AxResult<isize> {
+pub fn sys_connect(
+    current: &crate::task::UserTaskRef,
+    fd: i32,
+    addr: UserConstPtr<sockaddr>,
+    addrlen: u32,
+) -> AxResult<isize> {
     let socket = Socket::from_fd(fd)?;
-    let mut addr = SocketAddrEx::read_from_user(addr, addrlen)?;
+    let mut addr = SocketAddrEx::read_from_user(current, addr, addrlen)?;
     if socket.ip_domain() == AF_INET6 {
         addr = normalize_socket_addr_ex_for_ip_stack(addr, false)?;
     }
@@ -219,14 +223,16 @@ pub fn sys_listen(fd: i32, backlog: i32) -> AxResult<isize> {
 }
 
 pub fn sys_accept(
+    current: &crate::task::UserTaskRef,
     fd: i32,
     addr: UserPtr<sockaddr>,
     addrlen: UserPtr<socklen_t>,
 ) -> AxResult<isize> {
-    sys_accept4(fd, addr, addrlen, 0)
+    sys_accept4(current, fd, addr, addrlen, 0)
 }
 
 pub fn sys_accept4(
+    current: &crate::task::UserTaskRef,
     fd: i32,
     addr: UserPtr<sockaddr>,
     addrlen: UserPtr<socklen_t>,
@@ -253,9 +259,9 @@ pub fn sys_accept4(
     debug!("sys_accept => fd: {fd}, addr: {remote_addr:?}");
 
     if !addr.is_null() {
-        let mut addrlen_value = addrlen.read()?;
-        remote_addr.write_to_user(addr, &mut addrlen_value)?;
-        addrlen.write(addrlen_value)?;
+        let mut addrlen_value = addrlen.read(current)?;
+        remote_addr.write_to_user(current, addr, &mut addrlen_value)?;
+        addrlen.write(current, addrlen_value)?;
     }
 
     Ok(fd)
@@ -316,10 +322,13 @@ pub fn sys_socketpair(
     }
     let cloexec = raw_ty & O_CLOEXEC != 0;
 
-    fds.write([
-        sock1.add_to_fd_table(cloexec)?,
-        sock2.add_to_fd_table(cloexec)?,
-    ])?;
+    fds.write(
+        current,
+        [
+            sock1.add_to_fd_table(cloexec)?,
+            sock2.add_to_fd_table(cloexec)?,
+        ],
+    )?;
     Ok(0)
 }
 

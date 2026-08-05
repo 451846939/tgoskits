@@ -31,7 +31,11 @@ pub enum CMsg {
     Rights { fds: Vec<Arc<dyn FileLike>> },
 }
 impl CMsg {
-    pub fn parse(hdr_addr: usize, hdr: &cmsghdr) -> AxResult<Self> {
+    pub fn parse(
+        current: &crate::task::UserTaskRef,
+        hdr_addr: usize,
+        hdr: &cmsghdr,
+    ) -> AxResult<Self> {
         if hdr.cmsg_len < size_of::<cmsghdr>() {
             return Err(AxError::InvalidInput);
         }
@@ -45,7 +49,7 @@ impl CMsg {
                     return Err(AxError::InvalidInput);
                 }
                 let data = UserConstPtr::<u8>::from(hdr_addr + size_of::<cmsghdr>())
-                    .read_slice(data_len)?;
+                    .read_slice(current, data_len)?;
                 let mut fds = Vec::new();
                 for fd in data.as_chunks::<{ size_of::<i32>() }>().0 {
                     let fd = i32::from_ne_bytes(*fd);
@@ -64,16 +68,22 @@ impl CMsg {
     }
 }
 
-pub struct CMsgBuilder<'a> {
+pub struct CMsgBuilder<'task, 'len> {
+    current: &'task crate::task::UserTaskRef,
     hdr: UserPtr<cmsghdr>,
-    len: &'a mut usize,
+    len: &'len mut usize,
     capacity: usize,
     written: usize,
 }
-impl<'a> CMsgBuilder<'a> {
-    pub fn new(msg: UserPtr<cmsghdr>, len: &'a mut usize) -> Self {
+impl<'task, 'len> CMsgBuilder<'task, 'len> {
+    pub fn new(
+        current: &'task crate::task::UserTaskRef,
+        msg: UserPtr<cmsghdr>,
+        len: &'len mut usize,
+    ) -> Self {
         let capacity = *len;
         Self {
+            current,
             hdr: msg,
             len,
             capacity,
@@ -122,12 +132,12 @@ impl<'a> CMsgBuilder<'a> {
             return Err(AxError::InvalidInput);
         };
         self.hdr
-            .write_field(offset_of!(cmsghdr, cmsg_len), cmsg_len)?;
+            .write_field(self.current, offset_of!(cmsghdr, cmsg_len), cmsg_len)?;
         self.hdr
-            .write_field(offset_of!(cmsghdr, cmsg_level), level as i32)?;
+            .write_field(self.current, offset_of!(cmsghdr, cmsg_level), level as i32)?;
         self.hdr
-            .write_field(offset_of!(cmsghdr, cmsg_type), ty as i32)?;
-        UserPtr::<u8>::from(hdr_addr + size_of::<cmsghdr>()).write_slice(&data)?;
+            .write_field(self.current, offset_of!(cmsghdr, cmsg_type), ty as i32)?;
+        UserPtr::<u8>::from(hdr_addr + size_of::<cmsghdr>()).write_slice(self.current, &data)?;
         let cmsg_space = cmsg_align(cmsg_len);
         self.hdr = UserPtr::from(hdr_addr + cmsg_space);
         self.written += cmsg_space;

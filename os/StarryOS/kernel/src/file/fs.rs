@@ -16,11 +16,11 @@ use linux_raw_sys::{
     general::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, O_APPEND, O_EXCL},
     ioctl::TIOCSCTTY,
 };
-use starry_vm::VmPtr;
 
 use super::{FileLike, Kstat, get_file_like};
 use crate::{
     file::{IoDst, IoSrc},
+    mm::VmPtr,
     pseudofs::Device,
     task::{
         current_user_task,
@@ -224,7 +224,7 @@ impl FileLike for File {
         Some((m.device, m.inode))
     }
 
-    fn ioctl(&self, cmd: u32, arg: usize) -> AxResult<usize> {
+    fn ioctl(&self, current: &crate::task::UserTaskRef, cmd: u32, arg: usize) -> AxResult<usize> {
         let loc = self.inner().backend()?.location();
         if cmd == TIOCSCTTY
             && let Some(result) = crate::pseudofs::dev::tty::bind_pty_at_location(loc.clone())
@@ -233,10 +233,16 @@ impl FileLike for File {
         }
         match cmd {
             DFS_IOCTL_ATOMIC_WRITE_SET => {
-                let _enabled: u32 = (arg as *const u32).vm_read()?;
+                let _enabled: u32 = (arg as *const u32).vm_read(current)?;
                 Ok(0)
             }
-            _ => loc.ioctl(cmd, arg),
+            _ => {
+                if let Ok(device) = loc.entry().downcast::<Device>() {
+                    device.ioctl_for_task(current, cmd, arg)
+                } else {
+                    loc.ioctl(cmd, arg)
+                }
+            }
         }
     }
 

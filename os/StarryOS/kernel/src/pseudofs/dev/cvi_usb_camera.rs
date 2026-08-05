@@ -20,11 +20,13 @@ use sg200x_bsp::{
         host::{self, UvcEnumerated, dwc2, dwc2::ep0 as dwc2_ep0},
     },
 };
-use starry_vm::{VmMutPtr, vm_write_slice};
 use tock_registers::interfaces::Writeable;
 
 use super::cvi_jpu::CviJpu;
-use crate::pseudofs::DeviceOps;
+use crate::{
+    mm::{VmMutPtr, vm_write_slice},
+    pseudofs::DeviceOps,
+};
 
 const IOBLK_G1_USB_VBUS_DET_OFF: usize = 0x020;
 
@@ -342,12 +344,16 @@ impl CviCamera {
         }
     }
 
-    fn write_yuv_frame(&self, destination: *mut u8) -> VfsResult<usize> {
+    fn write_yuv_frame(
+        &self,
+        current: &crate::task::UserTaskRef,
+        destination: *mut u8,
+    ) -> VfsResult<usize> {
         // Hold the camera lock until decode has consumed the static USB DMA
         // slice; another capture must not overwrite it concurrently.
         let mut state = self.state.lock();
         let jpeg = state.frame()?;
-        self.jpu.decode_camera_to_user(jpeg, destination)
+        self.jpu.decode_camera_to_user(current, jpeg, destination)
     }
 }
 
@@ -368,7 +374,7 @@ impl DeviceOps for CviCamera {
         NodeFlags::NON_CACHEABLE | NodeFlags::STREAM
     }
 
-    fn ioctl(&self, cmd: u32, arg: usize) -> VfsResult<usize> {
+    fn ioctl(&self, current: &crate::task::UserTaskRef, cmd: u32, arg: usize) -> VfsResult<usize> {
         match cmd {
             CVI_CAMERA_IOCTL_INIT => {
                 self.state.lock().ensure_initialized()?;
@@ -376,15 +382,15 @@ impl DeviceOps for CviCamera {
             }
             CVI_CAMERA_IOCTL_GET_INFO => {
                 let info = self.state.lock().info()?;
-                (arg as *mut CameraInfo).vm_write(info)?;
+                (arg as *mut CameraInfo).vm_write(current, info)?;
                 Ok(0)
             }
             CVI_CAMERA_IOCTL_GET_FRAME => {
                 let frame = self.state.lock().frame()?;
-                vm_write_slice(arg as *mut u8, frame)?;
+                vm_write_slice(current, arg as *mut u8, frame)?;
                 Ok(frame.len())
             }
-            CVI_CAMERA_IOCTL_GET_YUV_FRAME => self.write_yuv_frame(arg as *mut u8),
+            CVI_CAMERA_IOCTL_GET_YUV_FRAME => self.write_yuv_frame(current, arg as *mut u8),
             _ => Err(AxError::NotATty),
         }
     }

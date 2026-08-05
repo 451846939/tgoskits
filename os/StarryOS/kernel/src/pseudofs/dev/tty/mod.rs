@@ -25,7 +25,6 @@ use axfs_ng_vfs::{Location, NodeFlags};
 use axpoll::{IoEvents, Pollable};
 use starry_process::Process;
 use starry_signal::{SignalInfo, Signo};
-use starry_vm::{VmMutPtr, VmPtr};
 
 pub(crate) use self::pts::{DevPtsMount, DevPtsOptions, PtsInstance};
 use self::terminal::{
@@ -41,6 +40,7 @@ pub use self::{
     usb_serial::usb_serial_tty,
 };
 use crate::{
+    mm::{VmMutPtr, VmPtr},
     pseudofs::{Device, DeviceOps},
     task::{current_user_task, get_process_group, send_signal_to_process_group},
 };
@@ -200,22 +200,22 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
         Ok(buf.len())
     }
 
-    fn ioctl(&self, cmd: u32, arg: usize) -> AxResult<usize> {
+    fn ioctl(&self, current: &crate::task::UserTaskRef, cmd: u32, arg: usize) -> AxResult<usize> {
         use linux_raw_sys::ioctl::*;
         match cmd {
             TCGETS => {
                 let termios = *self.terminal.termios.lock().as_ref().deref();
-                (arg as *mut Termios).vm_write(termios)?;
+                (arg as *mut Termios).vm_write(current, termios)?;
             }
             TCGETS2 => {
                 let termios = *self.terminal.termios.lock().as_ref();
-                (arg as *mut Termios2).vm_write(termios)?;
+                (arg as *mut Termios2).vm_write(current, termios)?;
             }
             TCSETS | TCSETSF | TCSETSW => {
                 // Note: vm_read() must complete before acquiring the terminal lock.
                 // Faultable user memory access inside an atomic context (preemption
                 // disabled) will call might_sleep() in handle_page_fault and panic.
-                let termios = Arc::new(Termios2::new((arg as *const Termios).vm_read()?));
+                let termios = Arc::new(Termios2::new((arg as *const Termios).vm_read(current)?));
                 if matches!(cmd, TCSETSF | TCSETSW) {
                     self.writer.drain()?;
                 }
@@ -231,7 +231,7 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
                 }
             }
             TCSETS2 | TCSETSF2 | TCSETSW2 => {
-                let termios = Arc::new((arg as *const Termios2).vm_read()?);
+                let termios = Arc::new((arg as *const Termios2).vm_read(current)?);
                 if matches!(cmd, TCSETSF2 | TCSETSW2) {
                     self.writer.drain()?;
                 }
@@ -252,19 +252,19 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
                     .job_control
                     .foreground()
                     .ok_or(AxError::NoSuchProcess)?;
-                (arg as *mut u32).vm_write(foreground.pgid())?;
+                (arg as *mut u32).vm_write(current, foreground.pgid())?;
             }
             TIOCSPGRP => {
-                let pgid: u32 = (arg as *const u32).vm_read()?;
+                let pgid: u32 = (arg as *const u32).vm_read(current)?;
                 let pg = get_process_group(pgid)?;
                 self.terminal.job_control.set_foreground(&pg)?;
             }
             TIOCGWINSZ => {
                 let window_size = *self.terminal.window_size.lock();
-                (arg as *mut WindowSize).vm_write(window_size)?;
+                (arg as *mut WindowSize).vm_write(current, window_size)?;
             }
             TIOCSWINSZ => {
-                let window_size = (arg as *const WindowSize).vm_read()?;
+                let window_size = (arg as *const WindowSize).vm_read(current)?;
                 let old = {
                     let mut guard = self.terminal.window_size.lock();
                     let old = *guard;
@@ -294,16 +294,15 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
             }
             TIOCSPTLCK => {}
             TIOCGPTN => {
-                (arg as *mut u32).vm_write(self.pty_number())?;
+                (arg as *mut u32).vm_write(current, self.pty_number())?;
             }
             TIOCSCTTY => {
                 self.this
                     .upgrade()
                     .unwrap()
-                    .bind_to(&current_user_task().as_thread().proc_data.proc)?;
+                    .bind_to(&current.as_thread().proc_data.proc)?;
             }
             TIOCNOTTY => {
-                let current = current_user_task();
                 let session = current.as_thread().proc_data.proc.group().session();
                 let this: Arc<dyn Any + Send + Sync> = self.this.upgrade().unwrap();
                 let binding = self
@@ -398,7 +397,12 @@ impl DeviceOps for CurrentTty {
         Ok(0)
     }
 
-    fn ioctl(&self, _cmd: u32, _arg: usize) -> AxResult<usize> {
+    fn ioctl(
+        &self,
+        _current: &crate::task::UserTaskRef,
+        _cmd: u32,
+        _arg: usize,
+    ) -> AxResult<usize> {
         unreachable!()
     }
 

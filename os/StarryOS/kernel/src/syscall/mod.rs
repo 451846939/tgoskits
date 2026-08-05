@@ -89,7 +89,12 @@ pub fn handle_syscall(current: &UserTaskRef, uctx: &mut UserContext) {
 
     let result = match sysno {
         // fs ctl
-        Sysno::ioctl => sys_ioctl(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
+        Sysno::ioctl => sys_ioctl(
+            current,
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+        ),
         Sysno::chdir => sys_chdir(current, uctx.arg0() as _),
         Sysno::fchdir => sys_fchdir(uctx.arg0() as _),
         Sysno::chroot => sys_chroot(current, uctx.arg0() as _),
@@ -115,10 +120,16 @@ pub fn handle_syscall(current: &UserTaskRef, uctx: &mut UserContext) {
             uctx.arg2() as _,
             uctx.arg3() as _,
         ),
-        Sysno::getdents64 => sys_getdents64(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
+        Sysno::getdents64 => sys_getdents64(
+            current,
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+        ),
         #[cfg(target_arch = "x86_64")]
-        Sysno::link => sys_link(uctx.arg0() as _, uctx.arg1() as _),
+        Sysno::link => sys_link(current, uctx.arg0() as _, uctx.arg1() as _),
         Sysno::linkat => sys_linkat(
+            current,
             uctx.arg0() as _,
             uctx.arg1() as _,
             uctx.arg2() as _,
@@ -126,11 +137,16 @@ pub fn handle_syscall(current: &UserTaskRef, uctx: &mut UserContext) {
             uctx.arg4() as _,
         ),
         #[cfg(target_arch = "x86_64")]
-        Sysno::rmdir => sys_rmdir(uctx.arg0() as _),
+        Sysno::rmdir => sys_rmdir(current, uctx.arg0() as _),
         #[cfg(target_arch = "x86_64")]
-        Sysno::unlink => sys_unlink(uctx.arg0() as _),
-        Sysno::unlinkat => sys_unlinkat(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
-        Sysno::getcwd => sys_getcwd(uctx.arg0() as _, uctx.arg1() as _),
+        Sysno::unlink => sys_unlink(current, uctx.arg0() as _),
+        Sysno::unlinkat => sys_unlinkat(
+            current,
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+        ),
+        Sysno::getcwd => sys_getcwd(current, uctx.arg0() as _, uctx.arg1() as _),
         #[cfg(target_arch = "x86_64")]
         Sysno::symlink => sys_symlink(current, uctx.arg0() as _, uctx.arg1() as _),
         Sysno::symlinkat => sys_symlinkat(
@@ -140,15 +156,17 @@ pub fn handle_syscall(current: &UserTaskRef, uctx: &mut UserContext) {
             uctx.arg2() as _,
         ),
         #[cfg(target_arch = "x86_64")]
-        Sysno::rename => sys_rename(uctx.arg0() as _, uctx.arg1() as _),
+        Sysno::rename => sys_rename(current, uctx.arg0() as _, uctx.arg1() as _),
         #[cfg(not(target_arch = "riscv64"))]
         Sysno::renameat => sys_renameat(
+            current,
             uctx.arg0() as _,
             uctx.arg1() as _,
             uctx.arg2() as _,
             uctx.arg3() as _,
         ),
         Sysno::renameat2 => sys_renameat2(
+            current,
             uctx.arg0() as _,
             uctx.arg1() as _,
             uctx.arg2() as _,
@@ -159,28 +177,47 @@ pub fn handle_syscall(current: &UserTaskRef, uctx: &mut UserContext) {
         Sysno::syncfs => sys_syncfs(uctx.arg0() as _),
 
         // xattr stubs — rsext4 has no extended attributes, return empty/ENODATA/EOPNOTSUPP
-        Sysno::listxattr => sys_listxattr(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
-        Sysno::llistxattr => sys_llistxattr(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
-        Sysno::flistxattr => sys_flistxattr(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
+        Sysno::listxattr => sys_listxattr(
+            current,
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+        ),
+        Sysno::llistxattr => sys_llistxattr(
+            current,
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+        ),
+        Sysno::flistxattr => sys_flistxattr(
+            current,
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+        ),
         Sysno::getxattr => sys_getxattr(
+            current,
             uctx.arg0() as _,
             uctx.arg1() as _,
             uctx.arg2() as _,
             uctx.arg3() as _,
         ),
         Sysno::lgetxattr => sys_lgetxattr(
+            current,
             uctx.arg0() as _,
             uctx.arg1() as _,
             uctx.arg2() as _,
             uctx.arg3() as _,
         ),
         Sysno::fgetxattr => sys_fgetxattr(
+            current,
             uctx.arg0() as _,
             uctx.arg1() as _,
             uctx.arg2() as _,
             uctx.arg3() as _,
         ),
         Sysno::setxattr => sys_setxattr(
+            current,
             uctx.arg0() as _,
             uctx.arg1() as _,
             uctx.arg2() as _,
@@ -188,6 +225,7 @@ pub fn handle_syscall(current: &UserTaskRef, uctx: &mut UserContext) {
             uctx.arg4() as _,
         ),
         Sysno::lsetxattr => sys_lsetxattr(
+            current,
             uctx.arg0() as _,
             uctx.arg1() as _,
             uctx.arg2() as _,
@@ -195,15 +233,16 @@ pub fn handle_syscall(current: &UserTaskRef, uctx: &mut UserContext) {
             uctx.arg4() as _,
         ),
         Sysno::fsetxattr => sys_fsetxattr(
+            current,
             uctx.arg0() as _,
             uctx.arg1() as _,
             uctx.arg2() as _,
             uctx.arg3() as _,
             uctx.arg4() as _,
         ),
-        Sysno::removexattr => sys_removexattr(uctx.arg0() as _, uctx.arg1() as _),
-        Sysno::lremovexattr => sys_lremovexattr(uctx.arg0() as _, uctx.arg1() as _),
-        Sysno::fremovexattr => sys_fremovexattr(uctx.arg0() as _, uctx.arg1() as _),
+        Sysno::removexattr => sys_removexattr(current, uctx.arg0() as _, uctx.arg1() as _),
+        Sysno::lremovexattr => sys_lremovexattr(current, uctx.arg0() as _, uctx.arg1() as _),
+        Sysno::fremovexattr => sys_fremovexattr(current, uctx.arg0() as _, uctx.arg1() as _),
 
         // file ops
         #[cfg(target_arch = "x86_64")]
@@ -252,17 +291,23 @@ pub fn handle_syscall(current: &UserTaskRef, uctx: &mut UserContext) {
             uctx.arg3() as _,
         ),
         #[cfg(target_arch = "x86_64")]
-        Sysno::readlink => sys_readlink(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
+        Sysno::readlink => sys_readlink(
+            current,
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+        ),
         Sysno::readlinkat => sys_readlinkat(
+            current,
             uctx.arg0() as _,
             uctx.arg1() as _,
             uctx.arg2() as _,
             uctx.arg3() as _,
         ),
         #[cfg(target_arch = "x86_64")]
-        Sysno::utime => sys_utime(uctx.arg0() as _, uctx.arg1() as _),
+        Sysno::utime => sys_utime(current, uctx.arg0() as _, uctx.arg1() as _),
         #[cfg(target_arch = "x86_64")]
-        Sysno::utimes => sys_utimes(uctx.arg0() as _, uctx.arg1() as _),
+        Sysno::utimes => sys_utimes(current, uctx.arg0() as _, uctx.arg1() as _),
         Sysno::utimensat => sys_utimensat(
             current,
             uctx.arg0() as _,
@@ -315,10 +360,30 @@ pub fn handle_syscall(current: &UserTaskRef, uctx: &mut UserContext) {
         Sysno::flock => sys_flock(current, uctx.arg0() as _, uctx.arg1() as _),
 
         // io
-        Sysno::read => sys_read(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
-        Sysno::readv => sys_readv(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
-        Sysno::write => sys_write(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
-        Sysno::writev => sys_writev(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
+        Sysno::read => sys_read(
+            current,
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+        ),
+        Sysno::readv => sys_readv(
+            current,
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+        ),
+        Sysno::write => sys_write(
+            current,
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+        ),
+        Sysno::writev => sys_writev(
+            current,
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+        ),
         Sysno::lseek => sys_lseek(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
         Sysno::truncate => sys_truncate(current, uctx.arg0() as _, uctx.arg1() as _),
         Sysno::ftruncate => sys_ftruncate(uctx.arg0() as _, uctx.arg1() as _),
@@ -343,18 +408,21 @@ pub fn handle_syscall(current: &UserTaskRef, uctx: &mut UserContext) {
             uctx.arg3() as _,
         ),
         Sysno::pread64 => sys_pread64(
+            current,
             uctx.arg0() as _,
             uctx.arg1() as _,
             uctx.arg2() as _,
             uctx.arg3() as _,
         ),
         Sysno::pwrite64 => sys_pwrite64(
+            current,
             uctx.arg0() as _,
             uctx.arg1() as _,
             uctx.arg2() as _,
             uctx.arg3() as _,
         ),
         Sysno::preadv => sys_preadv(
+            current,
             uctx.arg0() as _,
             uctx.arg1() as _,
             uctx.arg2() as _,
@@ -362,6 +430,7 @@ pub fn handle_syscall(current: &UserTaskRef, uctx: &mut UserContext) {
             uctx.arg4(),
         ),
         Sysno::pwritev => sys_pwritev(
+            current,
             uctx.arg0() as _,
             uctx.arg1() as _,
             uctx.arg2() as _,
@@ -371,6 +440,7 @@ pub fn handle_syscall(current: &UserTaskRef, uctx: &mut UserContext) {
         // Kernel ABI: SYSCALL_DEFINE6(preadv2, fd, vec, vlen, pos_l, pos_h, flags)
         // arg4 is pos_h (high 32 bits of offset); flags is arg5.
         Sysno::preadv2 => sys_preadv2(
+            current,
             uctx.arg0() as _,
             uctx.arg1() as _,
             uctx.arg2() as _,
@@ -379,6 +449,7 @@ pub fn handle_syscall(current: &UserTaskRef, uctx: &mut UserContext) {
             uctx.arg5() as _,
         ),
         Sysno::pwritev2 => sys_pwritev2(
+            current,
             uctx.arg0() as _,
             uctx.arg1() as _,
             uctx.arg2() as _,
@@ -435,8 +506,9 @@ pub fn handle_syscall(current: &UserTaskRef, uctx: &mut UserContext) {
             uctx.arg1() as _,
             uctx.arg2() as _,
         ),
-        Sysno::io_uring_setup => sys_io_uring_setup(uctx.arg0() as _, uctx.arg1() as _),
+        Sysno::io_uring_setup => sys_io_uring_setup(current, uctx.arg0() as _, uctx.arg1() as _),
         Sysno::io_uring_enter => sys_io_uring_enter(
+            current,
             uctx.arg0() as _,
             uctx.arg1() as _,
             uctx.arg2() as _,
@@ -445,18 +517,21 @@ pub fn handle_syscall(current: &UserTaskRef, uctx: &mut UserContext) {
             uctx.arg5(),
         ),
         Sysno::io_uring_register => sys_io_uring_register(
+            current,
             uctx.arg0() as _,
             uctx.arg1() as _,
             uctx.arg2(),
             uctx.arg3() as _,
         ),
         Sysno::sendfile => sys_sendfile(
+            current,
             uctx.arg0() as _,
             uctx.arg1() as _,
             uctx.arg2() as _,
             uctx.arg3() as _,
         ),
         Sysno::copy_file_range => sys_copy_file_range(
+            current,
             uctx.arg0() as _,
             uctx.arg1() as _,
             uctx.arg2() as _,
@@ -465,6 +540,7 @@ pub fn handle_syscall(current: &UserTaskRef, uctx: &mut UserContext) {
             uctx.arg5() as _,
         ),
         Sysno::splice => sys_splice(
+            current,
             uctx.arg0() as _,
             uctx.arg1() as _,
             uctx.arg2() as _,
@@ -513,6 +589,7 @@ pub fn handle_syscall(current: &UserTaskRef, uctx: &mut UserContext) {
         Sysno::epoll_create => sys_epoll_create(uctx.arg0() as _),
         Sysno::epoll_create1 => sys_epoll_create1(uctx.arg0() as _),
         Sysno::epoll_ctl => sys_epoll_ctl(
+            current,
             uctx.arg0() as _,
             uctx.arg1() as _,
             uctx.arg2() as _,
@@ -591,9 +668,9 @@ pub fn handle_syscall(current: &UserTaskRef, uctx: &mut UserContext) {
         ),
 
         // pipe
-        Sysno::pipe2 => sys_pipe2(uctx.arg0() as _, uctx.arg1() as _),
+        Sysno::pipe2 => sys_pipe2(current, uctx.arg0() as _, uctx.arg1() as _),
         #[cfg(target_arch = "x86_64")]
-        Sysno::pipe => sys_pipe2(uctx.arg0() as _, 0),
+        Sysno::pipe => sys_pipe2(current, uctx.arg0() as _, 0),
 
         // event
         Sysno::eventfd2 => sys_eventfd2(uctx.arg0() as _, uctx.arg1() as _),
@@ -602,18 +679,22 @@ pub fn handle_syscall(current: &UserTaskRef, uctx: &mut UserContext) {
         #[cfg(target_arch = "x86_64")]
         Sysno::inotify_init => sys_inotify_init1(0),
         Sysno::inotify_init1 => sys_inotify_init1(uctx.arg0() as _),
-        Sysno::inotify_add_watch => {
-            sys_inotify_add_watch(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _)
-        }
+        Sysno::inotify_add_watch => sys_inotify_add_watch(
+            current,
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+        ),
         Sysno::inotify_rm_watch => sys_inotify_rm_watch(uctx.arg0() as _, uctx.arg1() as _),
         Sysno::timerfd_create => sys_timerfd_create(uctx.arg0() as _, uctx.arg1() as _),
         Sysno::timerfd_settime => sys_timerfd_settime(
+            current,
             uctx.arg0() as _,
             uctx.arg1() as _,
             uctx.arg2() as _,
             uctx.arg3() as _,
         ),
-        Sysno::timerfd_gettime => sys_timerfd_gettime(uctx.arg0() as _, uctx.arg1() as _),
+        Sysno::timerfd_gettime => sys_timerfd_gettime(current, uctx.arg0() as _, uctx.arg1() as _),
 
         // pidfd
         Sysno::pidfd_open => sys_pidfd_open(uctx.arg0() as _, uctx.arg1() as _),
@@ -636,12 +717,13 @@ pub fn handle_syscall(current: &UserTaskRef, uctx: &mut UserContext) {
 
         // fs stat
         #[cfg(target_arch = "x86_64")]
-        Sysno::stat => sys_stat(uctx.arg0() as _, uctx.arg1() as _),
-        Sysno::fstat => sys_fstat(uctx.arg0() as _, uctx.arg1() as _),
+        Sysno::stat => sys_stat(current, uctx.arg0() as _, uctx.arg1() as _),
+        Sysno::fstat => sys_fstat(current, uctx.arg0() as _, uctx.arg1() as _),
         #[cfg(target_arch = "x86_64")]
-        Sysno::lstat => sys_lstat(uctx.arg0() as _, uctx.arg1() as _),
+        Sysno::lstat => sys_lstat(current, uctx.arg0() as _, uctx.arg1() as _),
         #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
         Sysno::newfstatat => sys_fstatat(
+            current,
             uctx.arg0() as _,
             uctx.arg1() as _,
             uctx.arg2() as _,
@@ -649,12 +731,14 @@ pub fn handle_syscall(current: &UserTaskRef, uctx: &mut UserContext) {
         ),
         #[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
         Sysno::fstatat => sys_fstatat(
+            current,
             uctx.arg0() as _,
             uctx.arg1() as _,
             uctx.arg2() as _,
             uctx.arg3() as _,
         ),
         Sysno::statx => sys_statx(
+            current,
             uctx.arg0() as _,
             uctx.arg1() as _,
             uctx.arg2() as _,
@@ -677,9 +761,10 @@ pub fn handle_syscall(current: &UserTaskRef, uctx: &mut UserContext) {
             uctx.arg2() as _,
             uctx.arg3() as _,
         ),
-        Sysno::statfs => sys_statfs(uctx.arg0() as _, uctx.arg1() as _),
-        Sysno::fstatfs => sys_fstatfs(uctx.arg0() as _, uctx.arg1() as _),
+        Sysno::statfs => sys_statfs(current, uctx.arg0() as _, uctx.arg1() as _),
+        Sysno::fstatfs => sys_fstatfs(current, uctx.arg0() as _, uctx.arg1() as _),
         Sysno::name_to_handle_at => sys_name_to_handle_at(
+            current,
             uctx.arg0() as _,
             uctx.arg1() as _,
             uctx.arg2() as _,
@@ -805,9 +890,9 @@ pub fn handle_syscall(current: &UserTaskRef, uctx: &mut UserContext) {
             uctx.arg4() as _,
         ),
         Sysno::set_tid_address => sys_set_tid_address(current, uctx.arg0()),
-        Sysno::getcpu => sys_getcpu(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2()),
+        Sysno::getcpu => sys_getcpu(current, uctx.arg0() as _, uctx.arg1() as _, uctx.arg2()),
         #[cfg(target_arch = "x86_64")]
-        Sysno::arch_prctl => sys_arch_prctl(uctx, uctx.arg0() as _, uctx.arg1() as _),
+        Sysno::arch_prctl => sys_arch_prctl(current, uctx, uctx.arg0() as _, uctx.arg1() as _),
         Sysno::prctl => sys_prctl(
             current,
             uctx.arg0() as _,
@@ -866,16 +951,21 @@ pub fn handle_syscall(current: &UserTaskRef, uctx: &mut UserContext) {
             uctx.arg2() as _,
         ),
         Sysno::get_mempolicy => sys_get_mempolicy(
+            current,
             uctx.arg0() as _,
             uctx.arg1() as _,
             uctx.arg2() as _,
             uctx.arg3() as _,
             uctx.arg4() as _,
         ),
-        Sysno::set_mempolicy => {
-            sys_set_mempolicy(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _)
-        }
+        Sysno::set_mempolicy => sys_set_mempolicy(
+            current,
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+        ),
         Sysno::mbind => sys_mbind(
+            current,
             uctx.arg0() as _,
             uctx.arg1() as _,
             uctx.arg2() as _,
@@ -996,9 +1086,12 @@ pub fn handle_syscall(current: &UserTaskRef, uctx: &mut UserContext) {
             uctx.arg4() as _,
             uctx.arg5() as _,
         ),
-        Sysno::get_robust_list => {
-            sys_get_robust_list(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _)
-        }
+        Sysno::get_robust_list => sys_get_robust_list(
+            current,
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+        ),
         Sysno::set_robust_list => sys_set_robust_list(current, uctx.arg0() as _, uctx.arg1() as _),
 
         // sys
@@ -1027,7 +1120,7 @@ pub fn handle_syscall(current: &UserTaskRef, uctx: &mut UserContext) {
         Sysno::uname => sys_uname(current, uctx.arg0() as _),
         Sysno::sethostname => sys_sethostname(current, uctx.arg0() as _, uctx.arg1() as _),
         Sysno::setdomainname => sys_setdomainname(current, uctx.arg0() as _, uctx.arg1() as _),
-        Sysno::sysinfo => sys_sysinfo(uctx.arg0() as _),
+        Sysno::sysinfo => sys_sysinfo(current, uctx.arg0() as _),
         Sysno::syslog => sys_syslog(
             current,
             uctx.arg0() as _,
@@ -1041,7 +1134,12 @@ pub fn handle_syscall(current: &UserTaskRef, uctx: &mut UserContext) {
             uctx.arg2() as _,
             uctx.arg3(),
         ),
-        Sysno::getrandom => sys_getrandom(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
+        Sysno::getrandom => sys_getrandom(
+            current,
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+        ),
         Sysno::seccomp => sys_seccomp(
             current,
             uctx.arg0() as _,
@@ -1052,6 +1150,7 @@ pub fn handle_syscall(current: &UserTaskRef, uctx: &mut UserContext) {
         Sysno::riscv_flush_icache => sys_riscv_flush_icache(uctx.arg0(), uctx.arg1(), uctx.arg2()),
         #[cfg(target_arch = "riscv64")]
         Sysno::riscv_hwprobe => sys_riscv_hwprobe(
+            current,
             uctx.arg0() as _,
             uctx.arg1() as _,
             uctx.arg2() as _,
@@ -1076,11 +1175,11 @@ pub fn handle_syscall(current: &UserTaskRef, uctx: &mut UserContext) {
 
         // time
         #[cfg(target_arch = "x86_64")]
-        Sysno::time => sys_time(uctx.arg0() as _),
-        Sysno::gettimeofday => sys_gettimeofday(uctx.arg0() as _, uctx.arg1() as _),
+        Sysno::time => sys_time(current, uctx.arg0() as _),
+        Sysno::gettimeofday => sys_gettimeofday(current, uctx.arg0() as _, uctx.arg1() as _),
         Sysno::times => sys_times(current, uctx.arg0() as _),
         Sysno::clock_gettime => sys_clock_gettime(current, uctx.arg0() as _, uctx.arg1() as _),
-        Sysno::clock_getres => sys_clock_getres(uctx.arg0() as _, uctx.arg1() as _),
+        Sysno::clock_getres => sys_clock_getres(current, uctx.arg0() as _, uctx.arg1() as _),
         Sysno::getitimer => sys_getitimer(current, uctx.arg0() as _, uctx.arg1() as _),
         Sysno::setitimer => sys_setitimer(
             current,
@@ -1123,6 +1222,7 @@ pub fn handle_syscall(current: &UserTaskRef, uctx: &mut UserContext) {
         ),
         Sysno::mq_unlink => sys_mq_unlink(current, uctx.arg0() as _),
         Sysno::mq_timedsend => sys_mq_timedsend(
+            current,
             uctx.arg0() as _,
             uctx.arg1() as _,
             uctx.arg2() as _,
@@ -1130,6 +1230,7 @@ pub fn handle_syscall(current: &UserTaskRef, uctx: &mut UserContext) {
             uctx.arg4() as _,
         ),
         Sysno::mq_timedreceive => sys_mq_timedreceive(
+            current,
             uctx.arg0() as _,
             uctx.arg1() as _,
             uctx.arg2() as _,
@@ -1137,9 +1238,12 @@ pub fn handle_syscall(current: &UserTaskRef, uctx: &mut UserContext) {
             uctx.arg4() as _,
         ),
         Sysno::mq_notify => sys_mq_notify(current, uctx.arg0() as _, uctx.arg1() as _),
-        Sysno::mq_getsetattr => {
-            sys_mq_getsetattr(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _)
-        }
+        Sysno::mq_getsetattr => sys_mq_getsetattr(
+            current,
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+        ),
 
         // shm
         Sysno::shmget => sys_shmget(
@@ -1182,16 +1286,33 @@ pub fn handle_syscall(current: &UserTaskRef, uctx: &mut UserContext) {
             uctx.arg1().into(),
             uctx.arg2() as _,
         ),
-        Sysno::connect => sys_connect(uctx.arg0() as _, uctx.arg1().into(), uctx.arg2() as _),
-        Sysno::getsockname => {
-            sys_getsockname(uctx.arg0() as _, uctx.arg1().into(), uctx.arg2().into())
-        }
-        Sysno::getpeername => {
-            sys_getpeername(uctx.arg0() as _, uctx.arg1().into(), uctx.arg2().into())
-        }
+        Sysno::connect => sys_connect(
+            current,
+            uctx.arg0() as _,
+            uctx.arg1().into(),
+            uctx.arg2() as _,
+        ),
+        Sysno::getsockname => sys_getsockname(
+            current,
+            uctx.arg0() as _,
+            uctx.arg1().into(),
+            uctx.arg2().into(),
+        ),
+        Sysno::getpeername => sys_getpeername(
+            current,
+            uctx.arg0() as _,
+            uctx.arg1().into(),
+            uctx.arg2().into(),
+        ),
         Sysno::listen => sys_listen(uctx.arg0() as _, uctx.arg1() as _),
-        Sysno::accept => sys_accept(uctx.arg0() as _, uctx.arg1().into(), uctx.arg2().into()),
+        Sysno::accept => sys_accept(
+            current,
+            uctx.arg0() as _,
+            uctx.arg1().into(),
+            uctx.arg2().into(),
+        ),
         Sysno::accept4 => sys_accept4(
+            current,
             uctx.arg0() as _,
             uctx.arg1().into(),
             uctx.arg2().into(),
@@ -1199,6 +1320,7 @@ pub fn handle_syscall(current: &UserTaskRef, uctx: &mut UserContext) {
         ),
         Sysno::shutdown => sys_shutdown(uctx.arg0() as _, uctx.arg1() as _),
         Sysno::sendto => sys_sendto(
+            current,
             uctx.arg0() as _,
             uctx.arg1() as _,
             uctx.arg2() as _,
@@ -1207,6 +1329,7 @@ pub fn handle_syscall(current: &UserTaskRef, uctx: &mut UserContext) {
             uctx.arg5() as _,
         ),
         Sysno::recvfrom => sys_recvfrom(
+            current,
             uctx.arg0() as _,
             uctx.arg1() as _,
             uctx.arg2() as _,
@@ -1214,15 +1337,27 @@ pub fn handle_syscall(current: &UserTaskRef, uctx: &mut UserContext) {
             uctx.arg4().into(),
             uctx.arg5().into(),
         ),
-        Sysno::sendmsg => sys_sendmsg(uctx.arg0() as _, uctx.arg1().into(), uctx.arg2() as _),
-        Sysno::recvmsg => sys_recvmsg(uctx.arg0() as _, uctx.arg1().into(), uctx.arg2() as _),
+        Sysno::sendmsg => sys_sendmsg(
+            current,
+            uctx.arg0() as _,
+            uctx.arg1().into(),
+            uctx.arg2() as _,
+        ),
+        Sysno::recvmsg => sys_recvmsg(
+            current,
+            uctx.arg0() as _,
+            uctx.arg1().into(),
+            uctx.arg2() as _,
+        ),
         Sysno::sendmmsg => sys_sendmmsg(
+            current,
             uctx.arg0() as _,
             uctx.arg1().into(),
             uctx.arg2() as _,
             uctx.arg3() as _,
         ),
         Sysno::recvmmsg => sys_recvmmsg(
+            current,
             uctx.arg0() as _,
             uctx.arg1().into(),
             uctx.arg2() as _,
@@ -1230,6 +1365,7 @@ pub fn handle_syscall(current: &UserTaskRef, uctx: &mut UserContext) {
             uctx.arg4().into(),
         ),
         Sysno::getsockopt => sys_getsockopt(
+            current,
             uctx.arg0() as _,
             uctx.arg1() as _,
             uctx.arg2() as _,
@@ -1237,6 +1373,7 @@ pub fn handle_syscall(current: &UserTaskRef, uctx: &mut UserContext) {
             uctx.arg4().into(),
         ),
         Sysno::setsockopt => sys_setsockopt(
+            current,
             uctx.arg0() as _,
             uctx.arg1() as _,
             uctx.arg2() as _,
@@ -1246,6 +1383,7 @@ pub fn handle_syscall(current: &UserTaskRef, uctx: &mut UserContext) {
 
         // signal file descriptors
         Sysno::signalfd4 => sys_signalfd4(
+            current,
             uctx.arg0() as _,
             uctx.arg1() as _,
             uctx.arg2(),
@@ -1259,8 +1397,11 @@ pub fn handle_syscall(current: &UserTaskRef, uctx: &mut UserContext) {
         // dummy fds
         Sysno::userfaultfd | Sysno::memfd_secret => sys_dummy_fd(current, sysno),
 
-        Sysno::bpf => crate::ebpf::sys_bpf(uctx.arg0() as _, uctx.arg1(), uctx.arg2() as _),
+        Sysno::bpf => {
+            crate::ebpf::sys_bpf(current, uctx.arg0() as _, uctx.arg1(), uctx.arg2() as _)
+        }
         Sysno::perf_event_open => crate::perf::sys_perf_event_open(
+            current,
             uctx.arg0(),
             uctx.arg1() as _,
             uctx.arg2() as _,

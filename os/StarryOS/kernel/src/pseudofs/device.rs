@@ -59,7 +59,12 @@ pub trait DeviceOps: Send + Sync {
     /// Writes data to the device at the specified offset.
     fn write_at(&self, buf: &[u8], offset: u64) -> VfsResult<usize>;
     /// Manipulates the underlying device parameters of special files.
-    fn ioctl(&self, _cmd: u32, _arg: usize) -> VfsResult<usize> {
+    fn ioctl(
+        &self,
+        _current: &crate::task::UserTaskRef,
+        _cmd: u32,
+        _arg: usize,
+    ) -> VfsResult<usize> {
         Err(VfsError::NotATty)
     }
 
@@ -127,6 +132,16 @@ impl Device {
     pub fn mmap(&self, offset: u64, length: u64) -> DeviceMmap {
         self.ops.mmap(offset, length)
     }
+
+    /// Executes a user ioctl with an explicit address-space capability.
+    pub fn ioctl_for_task(
+        &self,
+        current: &crate::task::UserTaskRef,
+        cmd: u32,
+        arg: usize,
+    ) -> VfsResult<usize> {
+        self.ops.ioctl(current, cmd, arg)
+    }
 }
 
 #[inherit_methods(from = "self.node")]
@@ -183,7 +198,8 @@ impl FileNodeOps for Device {
     }
 
     fn ioctl(&self, cmd: u32, arg: usize) -> VfsResult<usize> {
-        self.ops.ioctl(cmd, arg)
+        let _ = (cmd, arg);
+        Err(VfsError::NotATty)
     }
 }
 

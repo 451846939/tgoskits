@@ -10,7 +10,7 @@ use alloc::sync::Arc;
 
 pub use device::IonDevice;
 // 从 sg2002-tpu 重新导出 OS 层实际使用的驱动类型
-pub use sg2002_tpu::ion::{IonBufferManager, IonHandleData, ioctl::ION_IOC_FREE};
+pub use sg2002_tpu::ion::IonBufferManager;
 use spin::Once;
 
 /// 全局共享的 Ion Buffer 管理器

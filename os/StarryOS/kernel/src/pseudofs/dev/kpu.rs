@@ -86,13 +86,16 @@ impl KpuDevice {
         })
     }
 
-    fn copy_command_range(arg: usize) -> VfsResult<CommandRange> {
+    fn copy_command_range(
+        current: &crate::task::UserTaskRef,
+        arg: usize,
+    ) -> VfsResult<CommandRange> {
         if arg == 0 {
             return Err(VfsError::InvalidInput);
         }
         // SAFETY: `CommandRange` is `repr(C)` with exactly two `u64` fields,
         // so every possible userspace byte pattern is a valid value.
-        unsafe { UserConstPtr::<CommandRange>::from(arg).read_abi() }
+        unsafe { UserConstPtr::<CommandRange>::from(arg).read_abi(current) }
             .map_err(|_| VfsError::InvalidData)
     }
 
@@ -146,21 +149,21 @@ impl DeviceOps for KpuDevice {
         Ok(size_of::<u32>())
     }
 
-    fn ioctl(&self, cmd: u32, arg: usize) -> VfsResult<usize> {
+    fn ioctl(&self, current: &crate::task::UserTaskRef, cmd: u32, arg: usize) -> VfsResult<usize> {
         match cmd {
             KPU_IOC_GET_STATUS => {
                 let status = self.hw.status();
-                copy_to_user(arg, &status)?;
+                copy_to_user(current, arg, &status)?;
                 Ok(0)
             }
             KPU_IOC_GET_INFO => {
                 let info = self.info();
-                copy_info_to_user(arg, &info)?;
+                copy_info_to_user(current, arg, &info)?;
                 Ok(0)
             }
             KPU_IOC_GET_IRQ_COUNT => {
                 let count = KPU_IRQ_COUNT.load(Ordering::Acquire);
-                copy_to_user(arg, &count)?;
+                copy_to_user(current, arg, &count)?;
                 Ok(0)
             }
             KPU_IOC_CLEAR => {
@@ -168,7 +171,7 @@ impl DeviceOps for KpuDevice {
                 Ok(0)
             }
             KPU_IOC_PROGRAM_COMMAND => {
-                let range = Self::copy_command_range(arg)?;
+                let range = Self::copy_command_range(current, arg)?;
                 self.hw
                     .program_command(range)
                     .map_err(|_| VfsError::InvalidInput)?;
@@ -179,7 +182,7 @@ impl DeviceOps for KpuDevice {
                 Ok(0)
             }
             KPU_IOC_RUN => {
-                let range = Self::copy_command_range(arg)?;
+                let range = Self::copy_command_range(current, arg)?;
                 self.hw
                     .run_command(range)
                     .map_err(|_| VfsError::InvalidInput)?;
@@ -595,25 +598,33 @@ fn decode_named_region(
     .flatten()
 }
 
-fn copy_to_user<T: NoUninit>(arg: usize, value: &T) -> VfsResult<()> {
+fn copy_to_user<T: NoUninit>(
+    current: &crate::task::UserTaskRef,
+    arg: usize,
+    value: &T,
+) -> VfsResult<()> {
     if arg == 0 {
         return Err(VfsError::InvalidInput);
     }
     UserPtr::<T>::from(arg)
-        .write(*value)
+        .write(current, *value)
         .map_err(|_| VfsError::InvalidData)
 }
 
-fn copy_info_to_user(arg: usize, info: &KpuInfo) -> VfsResult<()> {
+fn copy_info_to_user(
+    current: &crate::task::UserTaskRef,
+    arg: usize,
+    info: &KpuInfo,
+) -> VfsResult<()> {
     if arg == 0 {
         return Err(VfsError::InvalidInput);
     }
     let user = UserPtr::<KpuInfo>::from(arg);
-    user.write_field(offset_of!(KpuInfo, cfg_paddr), info.cfg_paddr)
-        .and_then(|()| user.write_field(offset_of!(KpuInfo, cfg_size), info.cfg_size))
-        .and_then(|()| user.write_field(offset_of!(KpuInfo, l2_paddr), info.l2_paddr))
-        .and_then(|()| user.write_field(offset_of!(KpuInfo, l2_size), info.l2_size))
-        .and_then(|()| user.write_field(offset_of!(KpuInfo, irq), info.irq))
-        .and_then(|()| user.write_field(offset_of!(KpuInfo, flags), info.flags))
+    user.write_field(current, offset_of!(KpuInfo, cfg_paddr), info.cfg_paddr)
+        .and_then(|()| user.write_field(current, offset_of!(KpuInfo, cfg_size), info.cfg_size))
+        .and_then(|()| user.write_field(current, offset_of!(KpuInfo, l2_paddr), info.l2_paddr))
+        .and_then(|()| user.write_field(current, offset_of!(KpuInfo, l2_size), info.l2_size))
+        .and_then(|()| user.write_field(current, offset_of!(KpuInfo, irq), info.irq))
+        .and_then(|()| user.write_field(current, offset_of!(KpuInfo, flags), info.flags))
         .map_err(|_| VfsError::InvalidData)
 }

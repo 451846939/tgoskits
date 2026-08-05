@@ -70,7 +70,7 @@ fn do_select(
     } else {
         // SAFETY: pselect6's argument record contains only a pointer-sized
         // address and a byte count, so every bit pattern is a valid record.
-        let sigmask = unsafe { sigmask.read_abi()? };
+        let sigmask = unsafe { sigmask.read_abi(current)? };
         check_sigset_size(sigmask.sigsetsize)?;
         let set = UserConstPtr::<SignalSet>::from(sigmask.set);
         if set.is_null() {
@@ -78,7 +78,7 @@ fn do_select(
         } else {
             // SAFETY: SignalSet is a transparent signal-bit mask; all bit
             // patterns are valid and unsupported bits are validated later.
-            Some(unsafe { set.read_abi()? })
+            Some(unsafe { set.read_abi(current)? })
         }
     };
 
@@ -87,17 +87,17 @@ fn do_select(
     let mut readfds_value = if readfds.is_null() {
         None
     } else {
-        Some(unsafe { readfds.read_abi()? })
+        Some(unsafe { readfds.read_abi(current)? })
     };
     let mut writefds_value = if writefds.is_null() {
         None
     } else {
-        Some(unsafe { writefds.read_abi()? })
+        Some(unsafe { writefds.read_abi(current)? })
     };
     let mut exceptfds_value = if exceptfds.is_null() {
         None
     } else {
-        Some(unsafe { exceptfds.read_abi()? })
+        Some(unsafe { exceptfds.read_abi(current)? })
     };
 
     let read_set = FdSet::new(nfds as _, readfds_value.as_ref());
@@ -191,13 +191,25 @@ fn do_select(
         }
     });
     if let Some(value) = readfds_value {
-        readfds.write_field(offset_of!(__kernel_fd_set, fds_bits), value.fds_bits)?;
+        readfds.write_field(
+            current,
+            offset_of!(__kernel_fd_set, fds_bits),
+            value.fds_bits,
+        )?;
     }
     if let Some(value) = writefds_value {
-        writefds.write_field(offset_of!(__kernel_fd_set, fds_bits), value.fds_bits)?;
+        writefds.write_field(
+            current,
+            offset_of!(__kernel_fd_set, fds_bits),
+            value.fds_bits,
+        )?;
     }
     if let Some(value) = exceptfds_value {
-        exceptfds.write_field(offset_of!(__kernel_fd_set, fds_bits), value.fds_bits)?;
+        exceptfds.write_field(
+            current,
+            offset_of!(__kernel_fd_set, fds_bits),
+            value.fds_bits,
+        )?;
     }
     result
 }
@@ -222,7 +234,7 @@ pub fn sys_select(
         } else {
             // SAFETY: timeval contains only signed integer fields; semantic
             // range validation is performed by try_into_time_value below.
-            Some(unsafe { timeout.read_abi()? })
+            Some(unsafe { timeout.read_abi(current)? })
         })
         .map(|it| it.try_into_time_value())
         .transpose()?,
@@ -257,7 +269,7 @@ pub fn sys_pselect6(
         } else {
             // SAFETY: timespec contains only signed integer fields; semantic
             // range validation is performed by try_into_time_value below.
-            Some(unsafe { timeout.read_abi()? })
+            Some(unsafe { timeout.read_abi(current)? })
         })
         .map(|ts| ts.try_into_time_value())
         .transpose()?,

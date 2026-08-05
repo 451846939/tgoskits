@@ -15,10 +15,9 @@ use ringbuf::{
     HeapRb,
     traits::{Consumer, Observer, Producer},
 };
-use starry_vm::{VmMutPtr, VmPtr, vm_read_slice, vm_write_slice};
 
 use crate::{
-    mm::UserPtr,
+    mm::{UserPtr, VmMutPtr, VmPtr, vm_read_slice, vm_write_slice},
     task::{SockFilter, SockFprog, get_task, processes},
 };
 
@@ -258,15 +257,15 @@ pub fn sys_getresuid(
 ) -> AxResult<isize> {
     let overflow = user_ns_overflow_uid(current);
     if overflow != 0 {
-        ruid.vm_write(overflow)?;
-        euid.vm_write(overflow)?;
-        suid.vm_write(overflow)?;
+        ruid.vm_write(current, overflow)?;
+        euid.vm_write(current, overflow)?;
+        suid.vm_write(current, overflow)?;
         return Ok(0);
     }
     let cred = current.as_thread().cred();
-    ruid.vm_write(cred.uid)?;
-    euid.vm_write(cred.euid)?;
-    suid.vm_write(cred.suid)?;
+    ruid.vm_write(current, cred.uid)?;
+    euid.vm_write(current, cred.euid)?;
+    suid.vm_write(current, cred.suid)?;
     Ok(0)
 }
 
@@ -278,15 +277,15 @@ pub fn sys_getresgid(
 ) -> AxResult<isize> {
     let overflow = user_ns_overflow_gid(current);
     if overflow != 0 {
-        rgid.vm_write(overflow)?;
-        egid.vm_write(overflow)?;
-        sgid.vm_write(overflow)?;
+        rgid.vm_write(current, overflow)?;
+        egid.vm_write(current, overflow)?;
+        sgid.vm_write(current, overflow)?;
         return Ok(0);
     }
     let cred = current.as_thread().cred();
-    rgid.vm_write(cred.gid)?;
-    egid.vm_write(cred.egid)?;
-    sgid.vm_write(cred.sgid)?;
+    rgid.vm_write(current, cred.gid)?;
+    egid.vm_write(current, cred.egid)?;
+    sgid.vm_write(current, cred.sgid)?;
     Ok(0)
 }
 
@@ -650,7 +649,7 @@ pub fn sys_getgroups(
         return Err(AxError::InvalidInput);
     }
     if ngroups > 0 {
-        vm_write_slice(list, &cred.groups)?;
+        vm_write_slice(current, list, &cred.groups)?;
     }
     Ok(ngroups as isize)
 }
@@ -681,7 +680,7 @@ pub fn sys_setgroups(
 
     let groups = if size > 0 {
         let mut buf: Vec<MaybeUninit<u32>> = vec![MaybeUninit::uninit(); size];
-        vm_read_slice(list, &mut buf)?;
+        vm_read_slice(current, list, &mut buf)?;
         // SAFETY: vm_read_slice filled all elements with data from user space.
         buf.into_iter()
             .map(|v| unsafe { v.assume_init() })
@@ -706,18 +705,26 @@ pub fn sys_uname(current: &crate::task::UserTaskRef, name: *mut new_utsname) -> 
         let ns = nsproxy.uts_ns.lock();
         axnsproxy::build_utsname(&ns)
     };
-    write_utsname(name, uts)?;
+    write_utsname(current, name, uts)?;
     Ok(0)
 }
 
-fn write_utsname(user: *mut new_utsname, value: new_utsname) -> AxResult<()> {
+fn write_utsname(
+    current: &crate::task::UserTaskRef,
+    user: *mut new_utsname,
+    value: new_utsname,
+) -> AxResult<()> {
     let user = UserPtr::from(user);
-    user.write_field_slice(offset_of!(new_utsname, sysname), &value.sysname)?;
-    user.write_field_slice(offset_of!(new_utsname, nodename), &value.nodename)?;
-    user.write_field_slice(offset_of!(new_utsname, release), &value.release)?;
-    user.write_field_slice(offset_of!(new_utsname, version), &value.version)?;
-    user.write_field_slice(offset_of!(new_utsname, machine), &value.machine)?;
-    user.write_field_slice(offset_of!(new_utsname, domainname), &value.domainname)
+    user.write_field_slice(current, offset_of!(new_utsname, sysname), &value.sysname)?;
+    user.write_field_slice(current, offset_of!(new_utsname, nodename), &value.nodename)?;
+    user.write_field_slice(current, offset_of!(new_utsname, release), &value.release)?;
+    user.write_field_slice(current, offset_of!(new_utsname, version), &value.version)?;
+    user.write_field_slice(current, offset_of!(new_utsname, machine), &value.machine)?;
+    user.write_field_slice(
+        current,
+        offset_of!(new_utsname, domainname),
+        &value.domainname,
+    )
 }
 
 pub fn sys_sethostname(
@@ -733,7 +740,7 @@ pub fn sys_sethostname(
         return Err(AxError::OperationNotPermitted);
     }
     let mut buf: Vec<MaybeUninit<u8>> = vec![MaybeUninit::uninit(); len];
-    vm_read_slice(name.cast::<u8>(), &mut buf)?;
+    vm_read_slice(current, name.cast::<u8>(), &mut buf)?;
     let bytes: Vec<u8> = unsafe { buf.into_iter().map(|v| v.assume_init()).collect() };
     let mut nodename: [c_char; 65] = [0; 65];
     unsafe {
@@ -758,7 +765,7 @@ pub fn sys_setdomainname(
         return Err(AxError::OperationNotPermitted);
     }
     let mut buf: Vec<MaybeUninit<u8>> = vec![MaybeUninit::uninit(); len];
-    vm_read_slice(name.cast::<u8>(), &mut buf)?;
+    vm_read_slice(current, name.cast::<u8>(), &mut buf)?;
     let bytes: Vec<u8> = unsafe { buf.into_iter().map(|v| v.assume_init()).collect() };
     let mut domainname: [c_char; 65] = [0; 65];
     unsafe {
@@ -774,7 +781,7 @@ pub fn sys_setdomainname(
     Ok(0)
 }
 
-pub fn sys_sysinfo(info: *mut sysinfo) -> AxResult<isize> {
+pub fn sys_sysinfo(current: &crate::task::UserTaskRef, info: *mut sysinfo) -> AxResult<isize> {
     let mut kinfo: sysinfo = unsafe { core::mem::zeroed() };
 
     let total = ax_runtime::hal::mem::total_ram_size();
@@ -794,25 +801,29 @@ pub fn sys_sysinfo(info: *mut sysinfo) -> AxResult<isize> {
     kinfo.procs = processes().len() as _;
     kinfo.mem_unit = 1;
 
-    write_sysinfo(info, kinfo)?;
+    write_sysinfo(current, info, kinfo)?;
     Ok(0)
 }
 
-fn write_sysinfo(user: *mut sysinfo, value: sysinfo) -> AxResult<()> {
+fn write_sysinfo(
+    current: &crate::task::UserTaskRef,
+    user: *mut sysinfo,
+    value: sysinfo,
+) -> AxResult<()> {
     let user = UserPtr::from(user);
-    user.write_field(offset_of!(sysinfo, uptime), value.uptime)?;
-    user.write_field(offset_of!(sysinfo, loads), value.loads)?;
-    user.write_field(offset_of!(sysinfo, totalram), value.totalram)?;
-    user.write_field(offset_of!(sysinfo, freeram), value.freeram)?;
-    user.write_field(offset_of!(sysinfo, sharedram), value.sharedram)?;
-    user.write_field(offset_of!(sysinfo, bufferram), value.bufferram)?;
-    user.write_field(offset_of!(sysinfo, totalswap), value.totalswap)?;
-    user.write_field(offset_of!(sysinfo, freeswap), value.freeswap)?;
-    user.write_field(offset_of!(sysinfo, procs), value.procs)?;
-    user.write_field(offset_of!(sysinfo, pad), value.pad)?;
-    user.write_field(offset_of!(sysinfo, totalhigh), value.totalhigh)?;
-    user.write_field(offset_of!(sysinfo, freehigh), value.freehigh)?;
-    user.write_field(offset_of!(sysinfo, mem_unit), value.mem_unit)
+    user.write_field(current, offset_of!(sysinfo, uptime), value.uptime)?;
+    user.write_field(current, offset_of!(sysinfo, loads), value.loads)?;
+    user.write_field(current, offset_of!(sysinfo, totalram), value.totalram)?;
+    user.write_field(current, offset_of!(sysinfo, freeram), value.freeram)?;
+    user.write_field(current, offset_of!(sysinfo, sharedram), value.sharedram)?;
+    user.write_field(current, offset_of!(sysinfo, bufferram), value.bufferram)?;
+    user.write_field(current, offset_of!(sysinfo, totalswap), value.totalswap)?;
+    user.write_field(current, offset_of!(sysinfo, freeswap), value.freeswap)?;
+    user.write_field(current, offset_of!(sysinfo, procs), value.procs)?;
+    user.write_field(current, offset_of!(sysinfo, pad), value.pad)?;
+    user.write_field(current, offset_of!(sysinfo, totalhigh), value.totalhigh)?;
+    user.write_field(current, offset_of!(sysinfo, freehigh), value.freehigh)?;
+    user.write_field(current, offset_of!(sysinfo, mem_unit), value.mem_unit)
 }
 
 fn require_syslog_privilege(current: &crate::task::UserTaskRef) -> AxResult<()> {
@@ -847,7 +858,7 @@ pub fn sys_syslog(
                 state.read(len)
             };
             if !data.is_empty() {
-                vm_write_slice(buf.cast::<u8>(), &data)?;
+                vm_write_slice(current, buf.cast::<u8>(), &data)?;
             }
             Ok(data.len() as isize)
         }
@@ -859,7 +870,7 @@ pub fn sys_syslog(
                 state.read_all(len)
             };
             if !data.is_empty() {
-                vm_write_slice(buf.cast::<u8>(), &data)?;
+                vm_write_slice(current, buf.cast::<u8>(), &data)?;
             }
             Ok(data.len() as isize)
         }
@@ -873,7 +884,7 @@ pub fn sys_syslog(
                 data
             };
             if !data.is_empty() {
-                vm_write_slice(buf.cast::<u8>(), &data)?;
+                vm_write_slice(current, buf.cast::<u8>(), &data)?;
             }
             Ok(data.len() as isize)
         }
@@ -927,7 +938,12 @@ bitflags::bitflags! {
     }
 }
 
-pub fn sys_getrandom(buf: *mut u8, len: usize, flags: u32) -> AxResult<isize> {
+pub fn sys_getrandom(
+    current: &crate::task::UserTaskRef,
+    buf: *mut u8,
+    len: usize,
+    flags: u32,
+) -> AxResult<isize> {
     if len == 0 {
         return Ok(0);
     }
@@ -948,7 +964,7 @@ pub fn sys_getrandom(buf: *mut u8, len: usize, flags: u32) -> AxResult<isize> {
     let mut kbuf = vec![0; len];
     let len = f.entry().as_file()?.read_at(&mut kbuf, 0)?;
 
-    vm_write_slice(buf, &kbuf)?;
+    vm_write_slice(current, buf, &kbuf)?;
 
     Ok(len as _)
 }
@@ -963,27 +979,37 @@ fn check_seccomp_install_permission(current: &crate::task::UserTaskRef) -> AxRes
     }
 }
 
-fn read_seccomp_filter(args: *const ()) -> AxResult<Vec<SockFilter>> {
+fn read_seccomp_filter(
+    current: &crate::task::UserTaskRef,
+    args: *const (),
+) -> AxResult<Vec<SockFilter>> {
     if args.is_null() {
         return Err(AxError::BadAddress);
     }
-    let prog = unsafe { (args as *const SockFprog).vm_read_uninit()?.assume_init() };
+    let prog = unsafe {
+        (args as *const SockFprog)
+            .vm_read_uninit(current)?
+            .assume_init()
+    };
     if prog.len == 0 || prog.filter.is_null() {
         return Err(AxError::InvalidInput);
     }
     let mut raw = vec![MaybeUninit::<SockFilter>::uninit(); prog.len as usize];
-    vm_read_slice(prog.filter, &mut raw)?;
+    vm_read_slice(current, prog.filter, &mut raw)?;
     Ok(raw
         .into_iter()
         .map(|insn| unsafe { insn.assume_init() })
         .collect())
 }
 
-fn seccomp_action_available(args: *const ()) -> AxResult<isize> {
+fn seccomp_action_available(
+    current: &crate::task::UserTaskRef,
+    args: *const (),
+) -> AxResult<isize> {
     if args.is_null() {
         return Err(AxError::BadAddress);
     }
-    let action = unsafe { (args as *const u32).vm_read_uninit()?.assume_init() };
+    let action = unsafe { (args as *const u32).vm_read_uninit(current)?.assume_init() };
     match action {
         SECCOMP_RET_ALLOW
         | SECCOMP_RET_LOG
@@ -1027,7 +1053,7 @@ pub fn sys_seccomp(
         }
         SECCOMP_SET_MODE_FILTER => {
             check_seccomp_install_permission(current)?;
-            let filter = read_seccomp_filter(args)?;
+            let filter = read_seccomp_filter(current, args)?;
             let curr = current;
             let thread = curr.as_thread();
             thread.append_seccomp_filter(filter)?;
@@ -1039,7 +1065,7 @@ pub fn sys_seccomp(
             if flags != 0 {
                 return Err(AxError::InvalidInput);
             }
-            return seccomp_action_available(args);
+            return seccomp_action_available(current, args);
         }
         _ => return Err(AxError::InvalidInput),
     }
@@ -1077,6 +1103,7 @@ struct RiscvHwprobe {
 
 #[cfg(target_arch = "riscv64")]
 pub fn sys_riscv_hwprobe(
+    current: &crate::task::UserTaskRef,
     pairs: *mut u8,
     pair_count: usize,
     cpu_count: usize,
@@ -1095,7 +1122,7 @@ pub fn sys_riscv_hwprobe(
 
     let input_pairs = crate::mm::UserConstPtr::<RiscvHwprobe>::from(pairs.cast_const().cast());
     let output_pairs = UserPtr::<RiscvHwprobe>::from(pairs.cast());
-    let mut pairs = input_pairs.read_slice(pair_count)?;
+    let mut pairs = input_pairs.read_slice(current, pair_count)?;
     for pair in &mut pairs {
         if let Some(value) = ax_runtime::hal::cpu::cap::riscv_hwprobe(pair.key) {
             pair.value = value;
@@ -1104,7 +1131,7 @@ pub fn sys_riscv_hwprobe(
             pair.value = 0;
         }
     }
-    output_pairs.write_slice(&pairs)?;
+    output_pairs.write_slice(current, &pairs)?;
 
     Ok(0)
 }

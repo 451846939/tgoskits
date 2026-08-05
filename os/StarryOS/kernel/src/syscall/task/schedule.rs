@@ -10,7 +10,6 @@ use linux_raw_sys::general::{
     __kernel_clockid_t, CLOCK_MONOTONIC, CLOCK_REALTIME, PRIO_PGRP, PRIO_PROCESS, PRIO_USER,
     RLIMIT_NICE, RLIMIT_RTPRIO, SCHED_RESET_ON_FORK, TIMER_ABSTIME, timespec,
 };
-use starry_vm::{VmMutPtr, VmPtr, vm_load, vm_write_slice};
 
 use super::schedule_abi::{
     SchedAttr, ScheduleUpdate, SchedulerPermission, check_policy_permission,
@@ -20,6 +19,7 @@ use super::schedule_abi::{
 #[cfg(any(target_arch = "aarch64", target_arch = "loongarch64"))]
 use crate::syscall::time::write_kernel_timespec;
 use crate::{
+    mm::{VmMutPtr, VmPtr, vm_load, vm_write_slice},
     syscall::time::write_timespec,
     task::{
         Cred, ProcessData, UserTaskRef,
@@ -56,7 +56,7 @@ pub fn sys_sched_rr_get_interval(
     user_interval: *mut timespec,
 ) -> AxResult<isize> {
     let interval = TimeValue::from_nanos(scheduler_interval_ns(current, pid)?);
-    write_timespec(user_interval, timespec::from_time_value(interval))?;
+    write_timespec(current, user_interval, timespec::from_time_value(interval))?;
     Ok(0)
 }
 
@@ -67,7 +67,11 @@ pub fn sys_sched_rr_get_interval_time64(
     user_interval: *mut __kernel_timespec,
 ) -> AxResult<isize> {
     let interval = TimeValue::from_nanos(scheduler_interval_ns(current, pid)?);
-    write_kernel_timespec(user_interval, __kernel_timespec::from_time_value(interval))?;
+    write_kernel_timespec(
+        current,
+        user_interval,
+        __kernel_timespec::from_time_value(interval),
+    )?;
     Ok(0)
 }
 
@@ -99,7 +103,7 @@ pub fn sys_nanosleep(
     rem: *mut timespec,
 ) -> AxResult<isize> {
     // FIXME: AnyBitPattern
-    let req = unsafe { req.vm_read_uninit()?.assume_init() }.try_into_time_value()?;
+    let req = unsafe { req.vm_read_uninit(current)?.assume_init() }.try_into_time_value()?;
     debug!("sys_nanosleep <= req: {req:?}");
 
     let (result, actual) = sleep_impl(current, hal::time::monotonic_time, req);
@@ -110,7 +114,7 @@ pub fn sys_nanosleep(
             let diff = req.saturating_sub(actual);
             debug!("sys_nanosleep => rem: {diff:?}");
             if let Some(rem) = rem.nullable() {
-                write_timespec(rem, timespec::from_time_value(diff))?;
+                write_timespec(current, rem, timespec::from_time_value(diff))?;
             }
             Err(err)
         }
@@ -133,7 +137,7 @@ pub fn sys_clock_nanosleep(
         }
     };
 
-    let req = unsafe { req.vm_read_uninit()?.assume_init() }.try_into_time_value()?;
+    let req = unsafe { req.vm_read_uninit(current)?.assume_init() }.try_into_time_value()?;
     debug!("sys_clock_nanosleep <= clock_id: {clock_id}, flags: {flags}, req: {req:?}");
 
     let is_abstime = flags & TIMER_ABSTIME != 0;
@@ -152,7 +156,7 @@ pub fn sys_clock_nanosleep(
                 let diff = dur.saturating_sub(actual);
                 debug!("sys_clock_nanosleep => rem: {diff:?}");
                 if let Some(rem) = rem.nullable() {
-                    write_timespec(rem, timespec::from_time_value(diff))?;
+                    write_timespec(current, rem, timespec::from_time_value(diff))?;
                 }
             }
             Err(err)
@@ -188,7 +192,7 @@ pub fn sys_sched_getaffinity(
         }
     }
 
-    vm_write_slice(user_mask, &mask_bytes)?;
+    vm_write_slice(current, user_mask, &mask_bytes)?;
 
     Ok(mask_bytes.len() as _)
 }
@@ -219,7 +223,7 @@ pub fn sys_sched_setaffinity(
     check_sched_permission(current, pid)?;
     let cpu_count = hal::cpu_num();
     let size = cpusetsize.min(cpu_count.div_ceil(8));
-    let user_mask = vm_load(user_mask, size)?;
+    let user_mask = vm_load(current, user_mask, size)?;
     let mut affinity = scheduler::CpuSet::empty(cpu_count);
     let mut any_cpu = false;
 
@@ -263,7 +267,7 @@ pub fn sys_sched_setscheduler(
     if param.is_null() {
         return Err(AxError::InvalidInput);
     }
-    let user_param = vm_load::<SchedParam>(param.cast(), 1)?
+    let user_param = vm_load::<SchedParam>(current, param.cast(), 1)?
         .into_iter()
         .next()
         .ok_or(AxError::BadState)?;
@@ -287,7 +291,7 @@ pub(crate) fn sys_sched_setattr(
     if flags != 0 || user_attr.is_null() || pid < 0 {
         return Err(AxError::InvalidInput);
     }
-    let attr = load_sched_attr(user_attr)?;
+    let attr = load_sched_attr(current, user_attr)?;
     let current_policy = scheduler_policy(current, pid)?;
     let update = parse_sched_attr(attr, current_policy)?;
     apply_scheduler_update(current, pid, current_policy, update)?;
@@ -324,7 +328,7 @@ pub(crate) fn sys_sched_getattr(
     let attr_bytes = bytemuck::bytes_of(&attr);
     let copy_size = output.len().min(attr_bytes.len());
     output[..copy_size].copy_from_slice(&attr_bytes[..copy_size]);
-    vm_write_slice(user_attr.cast::<u8>(), &output)?;
+    vm_write_slice(current, user_attr.cast::<u8>(), &output)?;
     Ok(0)
 }
 
@@ -339,7 +343,7 @@ pub fn sys_sched_getparam(
     let output = SchedParam {
         sched_priority: linux_sched_priority(scheduler_policy(current, pid)?),
     };
-    user_param.cast::<SchedParam>().vm_write(output)?;
+    user_param.cast::<SchedParam>().vm_write(current, output)?;
     Ok(0)
 }
 
@@ -352,7 +356,7 @@ pub fn sys_sched_setparam(
         return Err(AxError::InvalidInput);
     }
     let current_policy = scheduler_policy(current, pid)?;
-    let user_param = vm_load::<SchedParam>(param.cast(), 1)?
+    let user_param = vm_load::<SchedParam>(current, param.cast(), 1)?
         .into_iter()
         .next()
         .ok_or(AxError::BadState)?;
@@ -473,34 +477,38 @@ fn scheduler_tid(current: &crate::task::UserTaskRef, pid: i32) -> AxResult<u32> 
     }
 }
 
-fn load_sched_attr(user_attr: *mut SchedAttr) -> AxResult<SchedAttr> {
+fn load_sched_attr(
+    current: &crate::task::UserTaskRef,
+    user_attr: *mut SchedAttr,
+) -> AxResult<SchedAttr> {
     const SCHED_ATTR_V0_SIZE: usize = 48;
     const MAX_SCHED_ATTR_SIZE: usize = 4096;
 
-    let requested_size = user_attr.cast_const().cast::<u32>().vm_read()? as usize;
+    let requested_size = user_attr.cast_const().cast::<u32>().vm_read(current)? as usize;
     let requested_size = if requested_size == 0 {
         SCHED_ATTR_V0_SIZE
     } else {
         requested_size
     };
     if !(SCHED_ATTR_V0_SIZE..=MAX_SCHED_ATTR_SIZE).contains(&requested_size) {
-        write_sched_attr_size(user_attr)?;
+        write_sched_attr_size(current, user_attr)?;
         return Err(AxError::ArgumentListTooLong);
     }
 
     let known_size = core::mem::size_of::<SchedAttr>();
     let copy_size = requested_size.min(known_size);
-    let input = vm_load(user_attr.cast_const().cast::<u8>(), copy_size)?;
+    let input = vm_load(current, user_attr.cast_const().cast::<u8>(), copy_size)?;
     let mut attr = SchedAttr::zeroed();
     bytemuck::bytes_of_mut(&mut attr)[..copy_size].copy_from_slice(&input);
 
     if requested_size > known_size {
         let extra = vm_load(
+            current,
             user_attr.cast_const().cast::<u8>().wrapping_add(known_size),
             requested_size - known_size,
         )?;
         if extra.iter().any(|byte| *byte != 0) {
-            write_sched_attr_size(user_attr)?;
+            write_sched_attr_size(current, user_attr)?;
             return Err(AxError::ArgumentListTooLong);
         }
         attr.size = known_size as u32;
@@ -508,10 +516,13 @@ fn load_sched_attr(user_attr: *mut SchedAttr) -> AxResult<SchedAttr> {
     Ok(attr)
 }
 
-fn write_sched_attr_size(user_attr: *mut SchedAttr) -> AxResult<()> {
+fn write_sched_attr_size(
+    current: &crate::task::UserTaskRef,
+    user_attr: *mut SchedAttr,
+) -> AxResult<()> {
     user_attr
         .cast::<u32>()
-        .vm_write(core::mem::size_of::<SchedAttr>() as u32)
+        .vm_write(current, core::mem::size_of::<SchedAttr>() as u32)
         .map_err(AxError::from)
 }
 

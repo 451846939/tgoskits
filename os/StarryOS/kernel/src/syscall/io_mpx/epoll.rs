@@ -11,14 +11,13 @@ use linux_raw_sys::general::{
     timespec,
 };
 use starry_signal::SignalSet;
-use starry_vm::{vm_read_slice, vm_write_slice};
 
 use crate::{
     file::{
         FileLike,
         epoll::{Epoll, EpollEvent, EpollFlags},
     },
-    mm::{UserConstPtr, UserPtr, check_access},
+    mm::{UserConstPtr, UserPtr, check_access, vm_read_slice, vm_write_slice},
     syscall::signal::check_sigset_size,
     task::{
         future::{UserWaitOutcome, block_on_user_timeout, poll_io},
@@ -58,7 +57,10 @@ fn check_epoll_events_access(events: UserPtr<epoll_event>, maxevents: usize) -> 
 /// address that is `4 (mod 8)`. Reading through a typed `*const epoll_event`
 /// (which the generic VM helpers reject when the pointer is unaligned) would
 /// then fail with `EFAULT`. Copy at byte granularity to mirror Linux.
-fn read_epoll_event(event: UserConstPtr<epoll_event>) -> AxResult<epoll_event> {
+fn read_epoll_event(
+    current: &crate::task::UserTaskRef,
+    event: UserConstPtr<epoll_event>,
+) -> AxResult<epoll_event> {
     let mut buf = MaybeUninit::<epoll_event>::uninit();
     let dst = unsafe {
         core::slice::from_raw_parts_mut(
@@ -66,7 +68,7 @@ fn read_epoll_event(event: UserConstPtr<epoll_event>) -> AxResult<epoll_event> {
             size_of::<epoll_event>(),
         )
     };
-    vm_read_slice(event.address().as_ptr(), dst)?;
+    vm_read_slice(current, event.address().as_ptr(), dst)?;
     // SAFETY: all bytes were just initialized by the copy above and any bit
     // pattern is a valid `epoll_event` (plain old data).
     Ok(unsafe { buf.assume_init() })
@@ -80,6 +82,7 @@ fn read_epoll_event(event: UserConstPtr<epoll_event>) -> AxResult<epoll_event> {
 /// Linux's `__put_user` of each field has no alignment requirement, so we copy
 /// at byte granularity to match.
 fn write_epoll_event(
+    current: &crate::task::UserTaskRef,
     events: UserPtr<epoll_event>,
     index: usize,
     event: &epoll_event,
@@ -91,7 +94,7 @@ fn write_epoll_event(
             size_of::<epoll_event>(),
         )
     };
-    vm_write_slice(dst, src)?;
+    vm_write_slice(current, dst, src)?;
     Ok(())
 }
 
@@ -121,6 +124,7 @@ pub fn sys_epoll_create(size: i32) -> AxResult<isize> {
 }
 
 pub fn sys_epoll_ctl(
+    current: &crate::task::UserTaskRef,
     epfd: i32,
     op: u32,
     fd: i32,
@@ -134,7 +138,7 @@ pub fn sys_epoll_ctl(
     }
 
     let parse_event = || -> AxResult<(u32, EpollEvent, EpollFlags)> {
-        let event = read_epoll_event(event)?;
+        let event = read_epoll_event(current, event)?;
         let raw_events = event.events;
         let events = IoEvents::from_bits_truncate(event.events);
         let flags =
@@ -208,7 +212,7 @@ fn do_epoll_wait(
     } else {
         // SAFETY: SignalSet is a transparent signal-bit mask; every bit
         // pattern is valid and unsupported bits are handled by signal logic.
-        Some(unsafe { sigmask.read_abi()? })
+        Some(unsafe { sigmask.read_abi(current)? })
     };
 
     let task = current;
@@ -219,7 +223,7 @@ fn do_epoll_wait(
             poll_io(epoll.as_ref(), IoEvents::IN, false, || {
                 epoll.register_waiter_wakers()?;
                 epoll.poll_events_with(maxevents, |index, event| {
-                    write_epoll_event(events, index, &event)?;
+                    write_epoll_event(current, events, index, &event)?;
                     Ok(())
                 })
             }),
@@ -278,7 +282,7 @@ pub fn sys_epoll_pwait2(
     } else {
         // SAFETY: timespec contains only signed integer fields; semantic
         // range validation is performed by try_into_time_value below.
-        Some(unsafe { timeout.read_abi()? })
+        Some(unsafe { timeout.read_abi(current)? })
     })
     .map(|ts| ts.try_into_time_value())
     .transpose()?;

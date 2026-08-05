@@ -16,8 +16,6 @@ use ax_runtime::hal::time::monotonic_time;
 use ax_std::os::arceos::task::{self as scheduler, CurrentParkStart, ThreadWakeBatch};
 use ax_sync::{LockdepMutexExt, PiMutex};
 
-#[cfg(axtest)]
-use crate::task::current_user_task;
 use crate::{
     mm::{AddrSpace, Backend, SharedPages},
     task::{ProcessData, UserTaskRef, process_memory::ProcessMemoryShare},
@@ -354,6 +352,23 @@ impl WaitQueue {
         cleanup: Option<FutexWaitCleanup>,
         condition: impl FnOnce() -> Result<bool, FutexAccessError> + Unpin,
     ) -> Result<bool, FutexWaitError> {
+        self.wait_if_with_cleanup_nofault_with_task(
+            || task.clone(),
+            bitset,
+            timeout,
+            cleanup,
+            condition,
+        )
+    }
+
+    fn wait_if_with_cleanup_nofault_with_task(
+        &self,
+        task: impl FnOnce() -> UserTaskRef,
+        bitset: u32,
+        timeout: Option<Duration>,
+        cleanup: Option<FutexWaitCleanup>,
+        condition: impl FnOnce() -> Result<bool, FutexAccessError> + Unpin,
+    ) -> Result<bool, FutexWaitError> {
         let deadline_ns = timeout.map(|timeout| {
             monotonic_time()
                 .as_nanos()
@@ -366,7 +381,7 @@ impl WaitQueue {
             if !condition()? {
                 return Ok(false);
             }
-            let task = task.clone();
+            let task = task();
             let park = match scheduler::begin_current_park().map_err(map_park_error)? {
                 CurrentParkStart::Notified => {
                     let deadline_expired = deadline_ns.is_some_and(|deadline| {
@@ -1332,14 +1347,15 @@ pub(crate) fn futex_keys_follow_mm_and_backing_identity_for_test() -> bool {
 }
 
 #[cfg(axtest)]
-pub(crate) fn false_wait_condition_allocations_for_test() -> usize {
+pub(crate) fn false_wait_condition_short_circuits_for_test() -> bool {
     let queue = WaitQueue::new();
-    let task = current_user_task();
-    assert_eq!(
-        queue.wait_if_with_cleanup_nofault(&task, u32::MAX, None, None, || Ok(false)),
-        Ok(false)
-    );
-    0
+    queue.wait_if_with_cleanup_nofault_with_task(
+        || panic!("false futex condition attempted to clone a user task"),
+        u32::MAX,
+        None,
+        None,
+        || Ok(false),
+    ) == Ok(false)
 }
 
 #[cfg(axtest)]

@@ -11,7 +11,6 @@ use linux_raw_sys::general::*;
 use scope_local::Scope;
 use starry_process::{Pid, Process};
 use starry_signal::Signo;
-use starry_vm::{VmMutPtr, VmPtr};
 
 use super::schedule_abi::fork_schedule_policy;
 #[cfg(target_arch = "riscv64")]
@@ -20,7 +19,7 @@ use crate::task::prepare_user_thread_with_fp_state_and_policy;
 use crate::task::prepare_user_thread_with_policy;
 use crate::{
     file::{FD_TABLE, FileLike, PidFd, add_file_like, close_file_like_if},
-    mm::copy_from_kernel,
+    mm::{VmMutPtr, VmPtr, copy_from_kernel},
     task::{
         ProcessData, ProcessDataInit, ProcessImage, Thread, allocate_user_tid, new_user_task,
         notify_members_changed, register_prepared_task,
@@ -268,24 +267,30 @@ impl Drop for LocalPidReservations {
     }
 }
 
-struct UserWriteRollback<T>
+struct UserWriteRollback<'task, T>
 where
     T: AnyBitPattern + NoUninit + Copy + PartialEq,
 {
+    task: &'task crate::task::UserTaskRef,
     pointer: *mut T,
     previous: T,
     installed: T,
     committed: bool,
 }
 
-impl<T> UserWriteRollback<T>
+impl<'task, T> UserWriteRollback<'task, T>
 where
     T: AnyBitPattern + NoUninit + Copy + PartialEq,
 {
-    fn install(pointer: *mut T, installed: T) -> AxResult<Self> {
-        let previous = pointer.vm_read()?;
-        pointer.vm_write(installed)?;
+    fn install(
+        current: &'task crate::task::UserTaskRef,
+        pointer: *mut T,
+        installed: T,
+    ) -> AxResult<Self> {
+        let previous = pointer.vm_read(current)?;
+        pointer.vm_write(current, installed)?;
         Ok(Self {
+            task: current,
             pointer,
             previous,
             installed,
@@ -298,15 +303,15 @@ where
     }
 }
 
-impl<T> Drop for UserWriteRollback<T>
+impl<T> Drop for UserWriteRollback<'_, T>
 where
     T: AnyBitPattern + NoUninit + Copy + PartialEq,
 {
     fn drop(&mut self) {
-        if self.committed || self.pointer.vm_read() != Ok(self.installed) {
+        if self.committed || self.pointer.vm_read(self.task) != Ok(self.installed) {
             return;
         }
-        if self.pointer.vm_write(self.previous).is_err() {
+        if self.pointer.vm_write(self.task, self.previous).is_err() {
             warn!("clone rollback could not restore a parent-visible word");
         }
     }
@@ -751,10 +756,10 @@ impl CloneArgs {
         let installed_pidfd = pidfd_file.map(InstalledPidFd::install).transpose()?;
         let pidfd_write = installed_pidfd
             .as_ref()
-            .map(|installed| UserWriteRollback::install(pidfd as *mut i32, installed.fd()))
+            .map(|installed| UserWriteRollback::install(current, pidfd as *mut i32, installed.fd()))
             .transpose()?;
         let parent_tid_write = (flags.contains(CloneFlags::PARENT_SETTID) && parent_tid_ptr != 0)
-            .then(|| UserWriteRollback::install(parent_tid_ptr as *mut Pid, tid))
+            .then(|| UserWriteRollback::install(current, parent_tid_ptr as *mut Pid, tid))
             .transpose()?;
 
         let mut cgroup_guard = if flags.contains(CloneFlags::THREAD) {

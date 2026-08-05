@@ -5,7 +5,6 @@ use ax_runtime::hal::{
 };
 use starry_process::Pid;
 use starry_signal::{FPE_INTDIV, SEGV_ACCERR, SEGV_MAPERR, SignalInfo, Signo};
-use starry_vm::{VmMutPtr, VmPtr};
 use syscalls::Sysno;
 
 #[cfg(target_arch = "loongarch64")]
@@ -15,7 +14,10 @@ use super::{
     poll_process_timers, ptrace_stop_current, ptrace_syscall_stop_current, raise_signal_fatal,
     set_timer_state, wait_existing_ptrace_stop_current,
 };
-use crate::syscall::{handle_syscall, syscall_allows_signal_restart};
+use crate::{
+    mm::{VmMutPtr, VmPtr},
+    syscall::{handle_syscall, syscall_allows_signal_restart},
+};
 
 fn handle_user_page_fault(
     thread: &Thread,
@@ -65,7 +67,7 @@ pub fn new_user_task(
         let curr = current_user_task();
 
         if let Some(tid) = (set_child_tid as *mut Pid).nullable() {
-            tid.vm_write(curr.as_thread().tid() as Pid).ok();
+            tid.vm_write(&curr, curr.as_thread().tid() as Pid).ok();
         }
 
         info!("Enter user space: ip={:#x}, sp={:#x}", uctx.ip(), uctx.sp());
@@ -87,7 +89,7 @@ pub fn new_user_task(
             // `block_on_user` consumes the interruption that aborted the stop.
             // Re-scan pending signals before the first user instruction so an
             // un-interceptable SIGKILL cannot be replaced by a racing `_exit(0)`.
-            while check_signals(thr, &mut uctx, None, None) {}
+            while check_signals(&curr, &mut uctx, None, None) {}
         }
         while !thr.pending_exit() {
             let tid = thr.tid();
@@ -370,7 +372,7 @@ pub fn new_user_task(
                         poll_process_timers(&thr.proc_data);
                         poll_timer = false;
                     }
-                    while check_signals(thr, &mut uctx, None, pending_restart) {
+                    while check_signals(&curr, &mut uctx, None, pending_restart) {
                         pending_restart = None;
                     }
                     thr.acknowledge_interrupt(interrupt_snapshot);

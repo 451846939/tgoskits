@@ -382,10 +382,14 @@ impl TpuDevice {
     }
 
     /// 提交 DMA buffer 任务：解析 fd → 入队 → 唤醒 worker → 立即返回。
-    fn submit_dmabuf(&self, arg: usize) -> Result<usize, TpuError> {
+    fn submit_dmabuf(
+        &self,
+        current: &crate::task::UserTaskRef,
+        arg: usize,
+    ) -> Result<usize, TpuError> {
         // SAFETY: the ioctl record contains only integer fields. Copy it into
         // kernel storage so no user reference survives validation or blocking.
-        let submit_arg = unsafe { UserConstPtr::<CviSubmitDmaArg>::from(arg).read_abi() }
+        let submit_arg = unsafe { UserConstPtr::<CviSubmitDmaArg>::from(arg).read_abi(current) }
             .map_err(|_| TpuError::InvalidDmabuf)?;
 
         debug!(
@@ -420,7 +424,7 @@ impl TpuDevice {
         );
 
         let task = TpuTask {
-            tid: crate::task::current_user_task().id().as_u64(),
+            tid: current.id().as_u64(),
             seq_no: submit_arg.seq_no,
             vaddr: buffer.cpu_ptr().as_ptr() as usize,
             paddr: buffer.dma_addr().as_u64(),
@@ -438,13 +442,17 @@ impl TpuDevice {
     /// 等待 DMA buffer 完成：按 `(tid, seq_no)` 睡 `DONE_WQ`，被 worker 唤醒后
     /// 取结果。用调用线程 tid 与用户 seq_no 组成复合键，隔离跨进程/线程的相同
     /// seq_no——否则两个进程都从 seq 0 开始会互相取走对方的完成项。
-    fn wait_dmabuf(&self, arg: usize) -> Result<usize, TpuError> {
+    fn wait_dmabuf(
+        &self,
+        current: &crate::task::UserTaskRef,
+        arg: usize,
+    ) -> Result<usize, TpuError> {
         // SAFETY: the ioctl record contains only integer fields. In particular,
         // do not retain a mutable user reference while the wait queue sleeps.
-        let wait_arg = unsafe { UserConstPtr::<CviWaitDmaArg>::from(arg).read_abi() }
+        let wait_arg = unsafe { UserConstPtr::<CviWaitDmaArg>::from(arg).read_abi(current) }
             .map_err(|_| TpuError::InvalidDmabuf)?;
         let seq_no = wait_arg.seq_no;
-        let tid = crate::task::current_user_task().id().as_u64();
+        let tid = current.id().as_u64();
 
         // 睡在 DONE_WQ 上直到对应 (tid, seq_no) 出现在完成队列（或超时）。
         // wait_timeout_until 睡前复检谓词，等价 Linux wait_event。
@@ -480,24 +488,32 @@ impl TpuDevice {
             }
         };
         UserPtr::<i32>::from(arg + core::mem::offset_of!(CviWaitDmaArg, ret))
-            .write(ret)
+            .write(current, ret)
             .map_err(|_| TpuError::InvalidDmabuf)?;
         result
     }
 
     /// 刷新 DMA buffer 缓存 (通过物理地址)
-    fn cache_flush(&self, arg: usize) -> Result<usize, TpuError> {
+    fn cache_flush(
+        &self,
+        current: &crate::task::UserTaskRef,
+        arg: usize,
+    ) -> Result<usize, TpuError> {
         // SAFETY: the ioctl record contains only integer fields.
-        let flush_arg = unsafe { UserConstPtr::<CviCacheOpArg>::from(arg).read_abi() }
+        let flush_arg = unsafe { UserConstPtr::<CviCacheOpArg>::from(arg).read_abi(current) }
             .map_err(|_| TpuError::InvalidDmabuf)?;
         self.hw.cache_flush_paddr(flush_arg.paddr, flush_arg.size)?;
         Ok(0)
     }
 
     /// 无效化 DMA buffer 缓存 (通过物理地址)
-    fn cache_invalidate(&self, arg: usize) -> Result<usize, TpuError> {
+    fn cache_invalidate(
+        &self,
+        current: &crate::task::UserTaskRef,
+        arg: usize,
+    ) -> Result<usize, TpuError> {
         // SAFETY: the ioctl record contains only integer fields.
-        let invalidate_arg = unsafe { UserConstPtr::<CviCacheOpArg>::from(arg).read_abi() }
+        let invalidate_arg = unsafe { UserConstPtr::<CviCacheOpArg>::from(arg).read_abi(current) }
             .map_err(|_| TpuError::InvalidDmabuf)?;
         self.hw
             .cache_invalidate_paddr(invalidate_arg.paddr, invalidate_arg.size)?;
@@ -555,16 +571,21 @@ impl DeviceOps for TpuDevice {
         Ok(0)
     }
 
-    fn ioctl(&self, cmd: u32, arg: usize) -> axfs_ng_vfs::VfsResult<usize> {
+    fn ioctl(
+        &self,
+        current: &crate::task::UserTaskRef,
+        cmd: u32,
+        arg: usize,
+    ) -> axfs_ng_vfs::VfsResult<usize> {
         debug!("TPU ioctl: cmd=0x{:x}, arg=0x{:x}", cmd, arg);
 
         let result = match cmd {
-            CVITPU_SUBMIT_DMABUF => self.submit_dmabuf(arg),
+            CVITPU_SUBMIT_DMABUF => self.submit_dmabuf(current, arg),
             CVITPU_DMABUF_FLUSH_FD => self.dmabuf_flush_fd(arg),
             CVITPU_DMABUF_INVLD_FD => self.dmabuf_invld_fd(arg),
-            CVITPU_DMABUF_FLUSH => self.cache_flush(arg),
-            CVITPU_DMABUF_INVLD => self.cache_invalidate(arg),
-            CVITPU_WAIT_DMABUF => self.wait_dmabuf(arg),
+            CVITPU_DMABUF_FLUSH => self.cache_flush(current, arg),
+            CVITPU_DMABUF_INVLD => self.cache_invalidate(current, arg),
+            CVITPU_WAIT_DMABUF => self.wait_dmabuf(current, arg),
             CVITPU_PIO_MODE => {
                 warn!("TPU PIO mode not implemented");
                 Ok(0)

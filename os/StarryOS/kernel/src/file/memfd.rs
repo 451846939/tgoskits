@@ -515,8 +515,8 @@ impl FileLike for Memfd {
         self.inner.file_mmap()
     }
 
-    fn ioctl(&self, cmd: u32, arg: usize) -> AxResult<usize> {
-        self.inner.ioctl(cmd, arg)
+    fn ioctl(&self, current: &crate::task::UserTaskRef, cmd: u32, arg: usize) -> AxResult<usize> {
+        self.inner.ioctl(current, cmd, arg)
     }
 
     fn open_flags(&self) -> u32 {

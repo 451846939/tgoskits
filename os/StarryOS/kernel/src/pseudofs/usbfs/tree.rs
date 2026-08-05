@@ -4,7 +4,6 @@ use core::{any::Any, task::Context};
 use ax_errno::AxError;
 use axfs_ng_vfs::{NodeFlags, NodeType, VfsResult};
 use axpoll::{IoEvents, Pollable};
-use starry_vm::VmMutPtr;
 
 use super::{
     descriptor::{
@@ -14,7 +13,10 @@ use super::{
     },
     manager::UsbFsManager,
 };
-use crate::pseudofs::{Device, DeviceOps, NodeOpsMux, SimpleDir, SimpleDirOps, SimpleFs};
+use crate::{
+    mm::VmMutPtr,
+    pseudofs::{Device, DeviceOps, NodeOpsMux, SimpleDir, SimpleDirOps, SimpleFs},
+};
 
 pub(super) struct UsbRootDir {
     pub(super) fs: Arc<SimpleFs>,
@@ -131,27 +133,30 @@ impl DeviceOps for UsbDeviceOps {
         Err(AxError::InvalidInput)
     }
 
-    fn ioctl(&self, cmd: u32, arg: usize) -> VfsResult<usize> {
+    fn ioctl(&self, current: &crate::task::UserTaskRef, cmd: u32, arg: usize) -> VfsResult<usize> {
         let snapshot = self
             .manager
             .device_snapshot(self.bus_num, self.device_num)
             .ok_or(AxError::NotFound)?;
         match cmd {
             USBDEVFS_CONNECTINFO => {
-                (arg as *mut UsbdevfsConnectInfo).vm_write(UsbdevfsConnectInfo {
-                    devnum: snapshot.device_num as u32,
-                    slow: 0,
-                    _padding: [0; 3],
-                })?;
+                (arg as *mut UsbdevfsConnectInfo).vm_write(
+                    current,
+                    UsbdevfsConnectInfo {
+                        devnum: snapshot.device_num as u32,
+                        slow: 0,
+                        _padding: [0; 3],
+                    },
+                )?;
                 Ok(0)
             }
             USBDEVFS_GET_CAPABILITIES => {
-                (arg as *mut u32).vm_write(USBDEVFS_CAP_BULK_CONTINUATION)?;
+                (arg as *mut u32).vm_write(current, USBDEVFS_CAP_BULK_CONTINUATION)?;
                 Ok(0)
             }
             USBDEVFS_CONTROL => {
                 self.manager
-                    .snapshot_device_ioctl(self.bus_num, self.device_num, cmd, arg)
+                    .snapshot_device_ioctl(current, self.bus_num, self.device_num, cmd, arg)
             }
             _ => Err(AxError::Unsupported),
         }

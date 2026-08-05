@@ -39,15 +39,21 @@ pub fn sys_gettid(current: &crate::task::UserTaskRef) -> AxResult<isize> {
 /// glibc's `sched_getcpu` and NUMA-aware allocators query this. We report the
 /// current CPU id and node 0 (single NUMA node); the obsolete `tcache` arg is
 /// ignored. Either pointer may be NULL.
-pub fn sys_getcpu(cpu: *mut u32, node: *mut u32, _tcache: usize) -> AxResult<isize> {
+pub fn sys_getcpu(
+    current: &crate::task::UserTaskRef,
+    cpu: *mut u32,
+    node: *mut u32,
+    _tcache: usize,
+) -> AxResult<isize> {
     use ax_runtime::hal::percpu::this_cpu_id;
-    use starry_vm::VmMutPtr;
+
+    use crate::mm::VmMutPtr;
 
     if !cpu.is_null() {
-        cpu.vm_write(this_cpu_id() as u32)?;
+        cpu.vm_write(current, this_cpu_id() as u32)?;
     }
     if !node.is_null() {
-        node.vm_write(0)?;
+        node.vm_write(current, 0)?;
     }
     Ok(0)
 }
@@ -90,11 +96,12 @@ pub fn sys_set_tid_address(
 
 #[cfg(target_arch = "x86_64")]
 pub fn sys_arch_prctl(
+    current: &crate::task::UserTaskRef,
     uctx: &mut ax_runtime::hal::cpu::uspace::UserContext,
     code: i32,
     addr: usize,
 ) -> AxResult<isize> {
-    use starry_vm::VmMutPtr;
+    use crate::mm::VmMutPtr;
 
     let code = ArchPrctlCode::try_from(code).map_err(|_| AxError::InvalidInput)?;
     debug!("sys_arch_prctl: code = {code:?}, addr = {addr:#x}");
@@ -103,7 +110,7 @@ pub fn sys_arch_prctl(
         // According to Linux implementation, SetFs & SetGs does not return
         // error at all
         ArchPrctlCode::GetFs => {
-            (addr as *mut usize).vm_write(uctx.tls())?;
+            (addr as *mut usize).vm_write(current, uctx.tls())?;
             Ok(0)
         }
         ArchPrctlCode::SetFs => {
@@ -111,7 +118,7 @@ pub fn sys_arch_prctl(
             Ok(0)
         }
         ArchPrctlCode::GetGs => {
-            (addr as *mut usize).vm_write(uctx.gs_base as _)?;
+            (addr as *mut usize).vm_write(current, uctx.gs_base as _)?;
             Ok(0)
         }
         ArchPrctlCode::SetGs => {

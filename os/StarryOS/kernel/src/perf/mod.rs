@@ -396,7 +396,7 @@ impl FileLike for PerfEvent {
         "anon_inode:[perf_event]".into()
     }
 
-    fn ioctl(&self, cmd: u32, arg: usize) -> AxResult<usize> {
+    fn ioctl(&self, current: &crate::task::UserTaskRef, cmd: u32, arg: usize) -> AxResult<usize> {
         // Several perf ioctls carry a `_IOC` direction/size in the high bits
         // (`PERF_EVENT_IOC_ID` is `_IOR`, `SET_OUTPUT` is `_IO`), so match on the
         // `('$', nr)` pair rather than the full encoded value. These are absent
@@ -409,7 +409,7 @@ impl FileLike for PerfEvent {
                 // `mmap` to build its id→event map; rejecting it makes perf abort
                 // with the misleading "failed to mmap" error.
                 PERF_IOC_NR_ID => {
-                    VmBytesMut::new(arg as *mut u8, core::mem::size_of::<u64>())
+                    VmBytesMut::new(current, arg as *mut u8, core::mem::size_of::<u64>())
                         .write(&self.id.to_ne_bytes())?;
                     return Ok(0);
                 }
@@ -497,6 +497,7 @@ impl FileLike for PerfEvent {
 /// and trampolines into [`perf_event_open`], which holds the dispatcher
 /// across kprobe / tracepoint / software / uprobe / hardware types.
 pub fn sys_perf_event_open(
+    current: &crate::task::UserTaskRef,
     attr_uptr: usize,
     pid: i32,
     cpu: i32,
@@ -504,7 +505,7 @@ pub fn sys_perf_event_open(
     flags: u64,
 ) -> AxResult<isize> {
     let mut buf = vec![0u8; core::mem::size_of::<perf_event_attr>()];
-    VmBytes::new(attr_uptr as *mut u8, buf.len()).read(&mut buf)?;
+    VmBytes::new(current, attr_uptr as *mut u8, buf.len()).read(&mut buf)?;
     // SAFETY: perf_event_attr is a `repr(C)` POD; the user buffer is copied
     // bytewise above and we treat the result as the structure.
     let attr = unsafe { &*(buf.as_ptr() as *const perf_event_attr) };
@@ -678,7 +679,9 @@ pub(crate) fn control_callback_runs_preemptible_for_test() -> bool {
     }))
     .expect("failed to create perf control test event");
     event
-        .ioctl(PerfEventIoc::Enable as u32, 0)
+        .event
+        .lock()
+        .enable()
         .expect("failed to enable perf control test event");
     preemptible.load(Ordering::Acquire)
 }
