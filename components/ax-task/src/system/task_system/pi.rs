@@ -3,7 +3,9 @@
 use core::{fmt, marker::PhantomData};
 
 use super::*;
-use crate::{PiMutexRef, PiMutexWaiters, PiWaitStateError, ThreadWakeHandle};
+use crate::{PiMutexRef, PiMutexWaiters, PiWaitStateError, lock::PreemptScope};
+
+const PI_RELEASE_WAKE_INVARIANT: u32 = 0x5049_574b;
 
 impl TaskSystemState {
     fn replace_owner_lock_top(
@@ -356,54 +358,71 @@ impl TaskSystem {
         Ok(())
     }
 
-    /// Publishes an ownerless handoff and returns the selected wake target.
+    /// Publishes an ownerless handoff and wakes the selected waiter.
+    ///
+    /// This is one Linux rtmutex-style transaction: preemption remains
+    /// disabled from owner deboost through wake publication, while scheduler
+    /// and mutex metadata locks are released before the wake path acquires the
+    /// selected thread and target-rq locks.
     pub fn pi_mutex_release(
         &self,
         lock: PiMutexRef<'_>,
         old_owner: ThreadId,
-    ) -> Result<ThreadWakeHandle, TaskError> {
-        let mut state = self.state.lock();
-        let core = lock.core();
-        let lock_state = lock.lock_state();
-        let snapshot = core.owner_snapshot();
-        if snapshot.owner() != Some(old_owner) || !snapshot.has_waiters() {
-            return Err(TaskError::InvalidPiState);
+    ) -> Result<(), TaskError> {
+        let _preempt = PreemptScope::enter();
+        let selected = {
+            let mut state = self.state.lock();
+            let core = lock.core();
+            let lock_state = lock.lock_state();
+            let snapshot = core.owner_snapshot();
+            if snapshot.owner() != Some(old_owner) || !snapshot.has_waiters() {
+                return Err(TaskError::InvalidPiState);
+            }
+            let selected_key = lock_state
+                .waiters
+                .first()
+                .ok_or(TaskError::InvalidPiState)?;
+            let selected = selected_key.thread;
+            let registration = state
+                .thread_record(selected)?
+                .blocked_on
+                .filter(|registration| registration.lock.id() == lock.id())
+                .ok_or(TaskError::InvalidPiState)?;
+            if !state
+                .thread_record(selected)?
+                .core
+                .pi_wait_state()
+                .can_select(registration.generation)
+                || !state
+                    .thread_record(old_owner)?
+                    .pi_donors
+                    .contains(selected_key)
+            {
+                return Err(TaskError::InvalidPiState);
+            }
+            let selected_core = Arc::clone(&state.thread_record(selected)?.core);
+            let old_recompute =
+                state.prepare_pi_recompute_chain(old_owner, self.config.pi_chain_limit())?;
+            let top = lock_state.waiters.first();
+            state.replace_owner_lock_top(old_owner, top, None)?;
+            state
+                .thread_record(selected)?
+                .core
+                .pi_wait_state()
+                .select(registration.generation)?;
+            core.publish_ownerless();
+            state.apply_pi_recompute_chain(old_recompute, self.config.fair_slice_ns());
+            selected_core
+        };
+
+        let selected_id = selected.id();
+        match self.wake_thread_direct(selected, None) {
+            WakeResult::Notified | WakeResult::AlreadyPending => Ok(()),
+            WakeResult::Exited | WakeResult::Unavailable => task_runtime::fatal_invariant(
+                PI_RELEASE_WAKE_INVARIANT,
+                selected_id.as_u64() as usize,
+            ),
         }
-        let selected_key = lock_state
-            .waiters
-            .first()
-            .ok_or(TaskError::InvalidPiState)?;
-        let selected = selected_key.thread;
-        let registration = state
-            .thread_record(selected)?
-            .blocked_on
-            .filter(|registration| registration.lock.id() == lock.id())
-            .ok_or(TaskError::InvalidPiState)?;
-        if !state
-            .thread_record(selected)?
-            .core
-            .pi_wait_state()
-            .can_select(registration.generation)
-            || !state
-                .thread_record(old_owner)?
-                .pi_donors
-                .contains(selected_key)
-        {
-            return Err(TaskError::InvalidPiState);
-        }
-        let wake = ThreadWakeHandle::from_core(Arc::clone(&state.thread_record(selected)?.core));
-        let old_recompute =
-            state.prepare_pi_recompute_chain(old_owner, self.config.pi_chain_limit())?;
-        let top = lock_state.waiters.first();
-        state.replace_owner_lock_top(old_owner, top, None)?;
-        state
-            .thread_record(selected)?
-            .core
-            .pi_wait_state()
-            .select(registration.generation)?;
-        core.publish_ownerless();
-        state.apply_pi_recompute_chain(old_recompute, self.config.fair_slice_ns());
-        Ok(wake)
     }
 
     /// Claims an ownerless handoff selected for this waiter.

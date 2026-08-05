@@ -7,7 +7,7 @@ use ax_task::{
     CurrentThreadToken, PiMutexAcquire, PiMutexCore, PiMutexLockResult, PiMutexOwnedRelease,
     PiMutexRef, PiWaitStateError, PiWaitToken, TaskError, ThreadId,
     current_needs_reschedule_pinned, current_thread_token, pi_block_current, pi_mutex_claim,
-    pi_mutex_lock_slow, pi_mutex_release_owned, pi_wake, validate_blocking_context,
+    pi_mutex_lock_slow, pi_mutex_release_owned, validate_blocking_context,
 };
 #[cfg(test)]
 use ax_task::{ThreadHandle, current_thread_handle};
@@ -257,16 +257,13 @@ impl RawMutex {
     }
 
     unsafe fn unlock_contended(&self, owner: ThreadId) {
-        // Keep this CPU pinned from owner deboost through the deferred targeted
-        // wake, matching Linux's rtmutex wake_q handoff.
-        let _preempt_guard = PreemptGuard::new();
-        let wake = task_result(
+        task_result(
             // SAFETY: `unlock_pi` received owner authority from lock_api and
-            // task preemption remains disabled through the following wake.
+            // the scheduler release transaction retains preemption exclusion
+            // from owner deboost through its internal wake publication.
             unsafe { pi_mutex_release_owned(self.mutex_ref(), owner) },
-            "release PI mutex",
+            "release PI mutex and wake selected waiter",
         );
-        task_result(pi_wake(&wake), "wake selected PI mutex waiter");
     }
 
     #[cfg(feature = "lockdep")]
@@ -531,11 +528,9 @@ mod tests {
         system.enqueue(cpu.as_mut(), waiter_thread.id()).unwrap();
         let token = commit_pi_wait(&system, &raw.core, waiter_thread.id(), owner.id()).unwrap();
         assert!(!token.is_selected());
-        drop(
-            system
-                .pi_mutex_release(raw.mutex_ref(), owner.id())
-                .unwrap(),
-        );
+        system
+            .pi_mutex_release(raw.mutex_ref(), owner.id())
+            .unwrap();
         assert!(token.is_selected());
         assert!(token.can_claim());
         assert!(!token.is_granted());

@@ -63,17 +63,17 @@ pub fn pi_wait_cancel(token: PiWaitToken<'_>) -> Result<(), TaskError> {
     runtime_task_system()?.pi_wait_cancel(token)
 }
 
-/// Publishes a raw-mutex-owner PI handoff and returns its wake target.
+/// Publishes a raw-mutex-owner PI handoff and wakes the selected waiter.
 ///
 /// # Safety
 ///
 /// `old_owner` must come from [`PiMutexCore::try_release_owned`] on `lock`, and
-/// the caller must retain task-preemption exclusion until the returned wake is
-/// published outside scheduler metadata locks.
+/// the caller must retain the higher-level raw-mutex owner authority until this
+/// complete release transaction returns.
 pub unsafe fn pi_mutex_release_owned(
     lock: PiMutexRef<'_>,
     old_owner: ThreadId,
-) -> Result<ThreadWakeHandle, TaskError> {
+) -> Result<(), TaskError> {
     runtime_task_system()?.pi_mutex_release(lock, old_owner)
 }
 
@@ -86,12 +86,4 @@ pub fn pi_mutex_claim(
         return Err(TaskError::InvalidPiState);
     }
     runtime_task_system()?.pi_mutex_claim(token)
-}
-
-/// Publishes a targeted task-context wake after PI metadata handoff.
-pub fn pi_wake(wake: &ThreadWakeHandle) -> Result<(), TaskError> {
-    match wake.wake_from_task() {
-        WakeResult::Notified | WakeResult::AlreadyPending | WakeResult::Exited => Ok(()),
-        WakeResult::Unavailable => Err(TaskError::NotInitialized),
-    }
 }

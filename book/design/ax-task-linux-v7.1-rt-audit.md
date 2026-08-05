@@ -180,7 +180,7 @@ USB/vsock 控制器协议属于外围驱动；除非它们违反上述调度交�
 | task deadline | `hrtimer`、`sched/deadline.c` | IRQ 只处理 generation-bearing 值记录；CBS 状态机是唯一期限真值 | Deadline 已改为 class-owned 有序 AVL rq，并在节点内增广最早 CBS 事件；pick/dequeue/rekey 为 O(log n)；CBS 记账与物理入队同属目标 rq 事务；CBS 生命周期改为互斥状态，删除 `base_deadline` 镜像 |
 | clockevent/nohz | `clockevents_program_event()`、`clockevents_shutdown()`、`hrtimer_interrupt()`、`tick_nohz_idle_enter()`、`tick_nohz_stop_tick()`、`tick_nohz_idle_exit()` | 每 CPU 单一物理 owner；CPU 生命周期与 firing 带 epoch；早到/陈旧边不得进入 scheduler；idle 无调度事件时停止 tick；无期限用 `Option` | scheduler tick 建模为 `Running/Stopped`；online/offline 推进 CPU epoch；IRQ 只有在当前 arm 已到期时才能取得 move-only firing token，旧 pending edge 只重编程当前 arm；idle IRQ-off 提交时撤销 tick，只保留 task deadline |
 | switch tail | `finish_task_switch()` | 清 outgoing `on_cpu` 后才能回收；已提交的 raw switch 不可重试 | `on_switch_in` 已移到 current publication、runtime tail、handoff consumption 之后的 move-only completion，并在释放 `CpuLocal` borrow 后执行；task placement 仍镜像 switch-tail 暂态，待收敛到 CPU handoff |
-| PI/锁 | `rtmutex`、`spinlock_rt.c` | raw rq/IRQ gate、sleeping PI、task-local pin 四层分离；每把锁拥有有序 waiter tree，owner 只接收各锁 top waiter；deboost/grant 后锁外 wake | `PiMutexCore` 唯一拥有 generation-bearing owner word 与 allocation-free AVL waiter tree；线程预备 lock/owner 两套 linkage，owner donor tree 只保存每把已持有锁的 top waiter；ax-sync 不再保存第二份 owner、selected 或 waiter 容器；registration、release、claim 由 ax-task 在同一调度事务内完成，锁外执行 block/wake |
+| PI/锁 | `rtmutex`、`spinlock_rt.c`、`wake_q` | raw rq/IRQ gate、sleeping PI、task-local pin 四层分离；每把锁拥有有序 waiter tree，owner 只接收各锁 top waiter；解锁核心在同一 preempt-disabled 事务内选择 waiter、deboost、发布 ownerless 状态并加入 wake_q，释放元数据锁后由核心完成 wake | `PiMutexCore` 唯一拥有 generation-bearing owner word 与 allocation-free AVL waiter tree；线程预备 lock/owner 两套 linkage，owner donor tree 只保存每把已持有锁的 top waiter；ax-sync 不再保存第二份 owner、selected、waiter 容器或可丢弃 wake handle；registration、release、claim 与 release 后 wake 均由 ax-task 持有完整事务，外层不能遗漏 handoff wake |
 | 阻塞等待 | `do_lock_file_wait()`、`wait_event_interruptible()`、`locks_delete_block()` | wake 只是重试提示；条件与临时阻塞关系由领域层拥有，返回前必须先注销 | scheduler notification 与 nofault access retry 已类型化分离，fcntl/futex 外层负责重试 |
 | IRQ waiter | `__free_irq()`、`synchronize_irq()` | 撤销后 grace，再释放 | token/drain 类型状态与同地址 ABA 防护已实现 |
 | signal | `recalc_sigpending_tsk()` | scan 后只能确认已观察 generation | 单调 interruption generation 已实现 |
@@ -2085,6 +2085,47 @@ doorbell；两个 overload source 同时存在时，旧 fan-out 一次发送 2 �
 当前 `cargo test -p ax-task --quiet` 的 336 个 unit、21 个 loom 及全部 integration/doc test，
 `cargo xtask clippy --package ax-task` 的 2 项和 `cargo xtask clippy --package ax-runtime` 的
 27 项 feature/configuration matrix 均通过。
+
+### 2026-08-06 PI 解锁与 wake_q 单一事务
+
+再次逐行核对 Linux v7.1 `kernel/locking/rtmutex.c::mark_wakeup_next_waiter()`、
+`rt_mutex_slowunlock()`、`rt_mutex_wake_up_q()` 和
+`include/linux/sched/wake_q.h` 后，确认旧 facade 把一个 Linux 内部不可分割的解锁事务拆成了
+两个可独立调用的公开步骤。`TaskSystem::pi_mutex_release()` 只提交 waiter 选择、旧 owner deboost
+与 ownerless publication，然后把 `ThreadWakeHandle` 交给 ax-sync；ax-sync 必须另外调用
+`pi_wake()`。这个 handle 可以被正常 drop，类型系统允许已经提交 handoff 的 waiter永久停留在
+Blocked 状态。调用方额外建立的 `NoPreempt` guard 还把核心真正依赖的调度约束泄漏到了锁实现层，
+形成了两套 preemption 生命周期。
+
+Linux 的主路径没有这个可选边界：`rtmutex->wait_lock` 与 owner `pi_lock` 内选择 top waiter、
+完成 deboost、把锁发布为 ownerless/has-waiters 后，`mark_wakeup_next_waiter()` 在仍禁止抢占时把
+任务放入 task-embedded `wake_q`；随后释放元数据锁，由 rtmutex 核心执行 `wake_up_q()`，最后才
+恢复抢占。wake_q 只把实际 rq 激活延迟到锁外，不把“是否 wake”授权给外层调用方。
+
+当前实现据此直接删除旧分层，不保留兼容入口或失败兜底：
+
+- 新的 move-only `PreemptScope` 是 ax-task 内部事务 guard，覆盖旧 owner deboost、元数据锁释放、
+  `wake_thread_direct()` publication，直到 release 返回；`PreemptTicketLock` 复用同一 guard，
+  facade 不再维护第二个 `RuntimePreemptGuard`；
+- `TaskSystem::pi_mutex_release()` 和 facade `pi_mutex_release_owned()` 只返回 `Result<()>`，
+  ax-sync 不再接触 wake handle，也没有 `pi_wake()` 可调用或遗漏；
+- waiter 选择、owner donation tree 更新和 ownerless publication 仍在 PI metadata 临界区内，
+  rq wake 严格发生在所有 metadata guard drop 之后；
+- handoff publication 一旦提交，selected waiter 变为 exited 或在 registry 中 unavailable 都是
+  ax-task 内部不变量破坏。Linux 的 waiter tree 持有稳定 task 引用，退出前必须撤销等待关系；这里
+  同样不能回滚已经完成的 owner/deboost 状态，也不能虚构第二条重试路径，因此直接触发 fatal
+  invariant，并记录 selected waiter 的 generation-bearing identity；
+- 原测试中 offline CPU 上的 Ready waiter和 `New` waiter都不是合法 release 前置状态。测试 fixture
+  改为先上线 CPU 并建立可调度 Ready waiter，而不是在生产路径增加 Linux 中不存在的 offline/New
+  fallback。
+
+确定性回归 `pi_release_wakes_the_selected_waiter_before_returning` 在旧实现上稳定观察到 release
+返回后 waiter 仍为 Blocked；新实现要求同一次 release 返回时 waiter 已经 Ready，从接口层证明 wake
+不能被调用方遗漏。本检查点的 ax-task 337 个 unit、21 个 loom 及全部 integration/doc test、
+ax-sync 全部 unit test 已通过；`cargo xtask clippy --package ax-task` 2 项、
+`--package ax-sync` 3 项和 `--package ax-runtime` 27 项 feature/configuration matrix 全部通过。
+这一步消除了重复的 facade/preempt 进入，但尚未重新测量 x86_64 Starry 完整耗时或 Linux RT
+wake-latency，不能据结构收敛声称端到端性能变化。
 
 ## 模块化结果
 

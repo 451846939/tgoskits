@@ -5200,6 +5200,11 @@ fn failed_pi_release_preserves_the_unselected_wait_transaction() {
 #[test]
 fn pi_release_atomically_selects_and_preserves_the_wait_transaction() {
     let system = TaskSystem::new(TaskSystemConfig::new(1)).unwrap();
+    let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
+    system
+        .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
+        .unwrap();
+    system.bring_cpu_online(cpu.as_mut()).unwrap();
     let owner = system
         .create_thread(ThreadSpec::new(SchedulePolicy::default()))
         .unwrap();
@@ -5208,14 +5213,13 @@ fn pi_release_atomically_selects_and_preserves_the_wait_transaction() {
             RtPriority::new(90).unwrap(),
         )))
         .unwrap();
+    system.make_ready(waiter.id()).unwrap();
     let lock = PiMutexCore::new();
     let token = commit_pi_wait(&system, &lock, waiter.id(), owner.id()).unwrap();
 
-    drop(
-        system
-            .pi_mutex_release(lock.mutex_ref().unwrap(), owner.id())
-            .unwrap(),
-    );
+    system
+        .pi_mutex_release(lock.mutex_ref().unwrap(), owner.id())
+        .unwrap();
 
     assert!(!token.is_granted());
     assert!(token.is_selected());
@@ -5246,6 +5250,50 @@ fn pi_release_atomically_selects_and_preserves_the_wait_transaction() {
     system.pi_mutex_claim(&token).unwrap();
     assert!(token.is_granted());
     assert!(release_pi_for_thread(&lock, waiter.id()).unwrap());
+}
+
+#[test]
+fn pi_release_wakes_the_selected_waiter_before_returning() {
+    let system = TaskSystem::new(TaskSystemConfig::new(1)).unwrap();
+    let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
+    system
+        .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
+        .unwrap();
+    system.bring_cpu_online(cpu.as_mut()).unwrap();
+    let owner = system
+        .create_thread(ThreadSpec::new(SchedulePolicy::default()))
+        .unwrap();
+    let waiter = system
+        .create_thread(ThreadSpec::new(SchedulePolicy::fifo(
+            RtPriority::new(90).unwrap(),
+        )))
+        .unwrap();
+    system.make_ready(waiter.id()).unwrap();
+    system.enqueue_at(cpu.as_mut(), waiter.id(), 0).unwrap();
+    assert_eq!(
+        system.schedule_at(cpu.as_mut(), 0).unwrap().next(),
+        waiter.id()
+    );
+    system.complete_context_switch(cpu.as_mut()).unwrap();
+    system.block_current_at(cpu.as_mut(), 1).unwrap();
+    system.complete_context_switch(cpu.as_mut()).unwrap();
+    assert_eq!(waiter.state(), ThreadState::Blocked);
+
+    let lock = PiMutexCore::new();
+    let token = commit_pi_wait(&system, &lock, waiter.id(), owner.id()).unwrap();
+    system
+        .pi_mutex_release(lock.mutex_ref().unwrap(), owner.id())
+        .unwrap();
+
+    let state_after_release = waiter.state();
+    system.pi_mutex_claim(&token).unwrap();
+    assert!(release_pi_for_thread(&lock, waiter.id()).unwrap());
+    assert_eq!(
+        state_after_release,
+        ThreadState::Ready,
+        "Linux rtmutex unlock owns wake_q completion; callers cannot be required to publish a \
+         second wake after metadata handoff"
+    );
 }
 
 #[test]

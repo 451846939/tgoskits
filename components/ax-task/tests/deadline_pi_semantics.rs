@@ -41,11 +41,9 @@ fn pi_orders_equal_relative_deadlines_by_the_active_absolute_job_deadline() {
         Some(early.id())
     );
 
-    drop(
-        system
-            .pi_mutex_release(lock.mutex_ref().unwrap(), owner.id())
-            .unwrap(),
-    );
+    system
+        .pi_mutex_release(lock.mutex_ref().unwrap(), owner.id())
+        .unwrap();
     assert!(early_wait.is_selected());
     system.pi_mutex_claim(&early_wait).unwrap();
     assert!(early_wait.is_granted());

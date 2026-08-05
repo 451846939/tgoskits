@@ -12,10 +12,11 @@ use crate::{
     ThreadWakeHandle, WaitQueue, WakeResult,
     executor::CoroutineHeader,
     inbox::PublishResult,
+    lock::PreemptScope,
     runtime::{
-        IrqGuardToken, MonotonicDeadline, MonotonicInstant, PreemptGuardToken, RuntimeCpuId,
-        RuntimeScheduleOrigin, RuntimeSchedulerEntry, RuntimeSchedulerReturn, RuntimeStatus,
-        SchedSwitchRecord, task_runtime,
+        IrqGuardToken, MonotonicDeadline, MonotonicInstant, RuntimeCpuId, RuntimeScheduleOrigin,
+        RuntimeSchedulerEntry, RuntimeSchedulerReturn, RuntimeStatus, SchedSwitchRecord,
+        task_runtime,
     },
     timer::{ExpiredTaskDeadline, TaskDeadlineKind},
 };
@@ -38,11 +39,10 @@ pub(crate) use deadline::{
 };
 pub use pi::{
     pi_block_current, pi_mutex_claim, pi_mutex_lock_slow, pi_mutex_release_owned, pi_wait_cancel,
-    pi_wake,
 };
 use runtime_cpu::{
-    RuntimeCpuPin, RuntimePreemptGuard, RuntimeSchedulerFrameGuard, runtime_current_cpu,
-    validate_schedule_context, validate_task_context,
+    RuntimeCpuPin, RuntimeSchedulerFrameGuard, runtime_current_cpu, validate_schedule_context,
+    validate_task_context,
 };
 pub(crate) use runtime_cpu::{
     RuntimeIrqGuard, current_cpu_remote, runtime_current_cpu_mut, runtime_task_system,
@@ -76,7 +76,7 @@ pub use task_work::{
 pub fn current_thread_handle() -> Result<ThreadHandle, TaskError> {
     #[cfg(feature = "qperf-metrics")]
     crate::metrics::record_current_thread_handle_query();
-    let _pin = RuntimePreemptGuard::enter();
+    let _pin = PreemptScope::enter();
     // SAFETY: `_pin` prevents the architecture-selected current context from
     // changing until `acquire_handle` has cloned its owner-side strong Arc.
     let publication = unsafe { current_thread_publication_pinned()? };
@@ -90,7 +90,7 @@ pub fn current_thread_id() -> Result<ThreadId, TaskError> {
 
 /// Captures the scheduler thread executing this task context.
 pub fn current_thread_token() -> Result<CurrentThreadToken, TaskError> {
-    let _pin = RuntimePreemptGuard::enter();
+    let _pin = PreemptScope::enter();
     // SAFETY: `_pin` prevents task migration until the generation-bearing
     // current identity has been copied from the CPU's remote publication.
     let thread = unsafe { current_thread_id_pinned()? };
@@ -348,7 +348,7 @@ pub fn thread_nice(thread: ThreadId) -> Result<Option<Nice>, TaskError> {
 
 /// Tests the sticky reschedule state of the calling CPU.
 pub fn current_cpu_needs_resched() -> Result<bool, TaskError> {
-    let _pin = RuntimePreemptGuard::enter();
+    let _pin = PreemptScope::enter();
     // SAFETY: `_pin` prevents migration through the remote reschedule-state
     // observation. Stronger IRQ/scheduler owner scopes are inherited.
     unsafe { current_needs_reschedule_pinned() }

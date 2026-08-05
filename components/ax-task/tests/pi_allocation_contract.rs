@@ -4,7 +4,9 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use ax_task::{CpuLocal, PiMutexCore, SchedulePolicy, TaskSystem, TaskSystemConfig, ThreadSpec};
+use ax_task::{
+    CpuId, CpuLocal, PiMutexCore, SchedulePolicy, TaskSystem, TaskSystemConfig, ThreadSpec,
+};
 
 pub mod support;
 
@@ -34,6 +36,11 @@ static GLOBAL_ALLOCATOR: CountingAllocator = CountingAllocator;
 fn pi_registration_release_claim_and_cancel_do_not_allocate() {
     retain_fake_runtime_helpers();
     let system = TaskSystem::new(TaskSystemConfig::new(1)).unwrap();
+    let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
+    system
+        .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
+        .unwrap();
+    system.bring_cpu_online(cpu.as_mut()).unwrap();
     let owner = system
         .create_thread(ThreadSpec::new(SchedulePolicy::default()))
         .unwrap();
@@ -43,6 +50,8 @@ fn pi_registration_release_claim_and_cancel_do_not_allocate() {
     let cancelled = system
         .create_thread(ThreadSpec::new(SchedulePolicy::default()))
         .unwrap();
+    system.make_ready(selected.id()).unwrap();
+    system.make_ready(cancelled.id()).unwrap();
     let lock = PiMutexCore::new();
 
     let selected_wait = assert_no_alloc("register selected waiter", || {
@@ -55,11 +64,9 @@ fn pi_registration_release_claim_and_cancel_do_not_allocate() {
         system.pi_wait_cancel(cancelled_wait).unwrap()
     });
     assert_no_alloc("commit release and claim", || {
-        drop(
-            system
-                .pi_mutex_release(lock.mutex_ref().unwrap(), owner.id())
-                .unwrap(),
-        );
+        system
+            .pi_mutex_release(lock.mutex_ref().unwrap(), owner.id())
+            .unwrap();
         system.pi_mutex_claim(&selected_wait).unwrap();
     });
     assert!(selected_wait.is_granted());

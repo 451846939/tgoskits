@@ -24,11 +24,11 @@ impl<T> PreemptTicketLock<T> {
 
     /// Prevents task migration and acquires the cross-CPU ticket lock.
     pub(crate) fn lock(&self) -> PreemptTicketGuard<'_, T> {
-        let token = task_runtime::preempt_guard_enter();
+        let scope = PreemptScope::enter();
         let raw = self.raw.lock();
         PreemptTicketGuard {
             raw: Some(raw),
-            token,
+            scope: Some(scope),
             _not_send: PhantomData,
         }
     }
@@ -36,27 +36,53 @@ impl<T> PreemptTicketLock<T> {
     /// Attempts acquisition and restores preemption state on failure.
     #[cfg(test)]
     pub(crate) fn try_lock(&self) -> Option<PreemptTicketGuard<'_, T>> {
-        let token = task_runtime::preempt_guard_enter();
+        let scope = PreemptScope::enter();
         match self.raw.try_lock() {
             Some(raw) => Some(PreemptTicketGuard {
                 raw: Some(raw),
-                token,
+                scope: Some(scope),
                 _not_send: PhantomData,
             }),
-            None => {
-                // SAFETY: this consumes the token just returned on the same
-                // task context; no lock guard escaped the failed acquisition.
-                unsafe { task_runtime::preempt_guard_exit(token) };
-                None
-            }
+            None => None,
         }
+    }
+}
+
+/// Task-preemption exclusion owned by one complete scheduler transaction.
+///
+/// Unlike a lock guard, this scope can remain live after metadata locks are
+/// released, for example while an rtmutex-style wake queue is published. A
+/// stronger IRQ or scheduler owner scope is represented by a runtime `NONE`
+/// token and therefore needs no synthetic exit.
+pub(crate) struct PreemptScope {
+    token: PreemptGuardToken,
+    _not_send: PhantomData<*mut ()>,
+}
+
+impl PreemptScope {
+    pub(crate) fn enter() -> Self {
+        Self {
+            token: task_runtime::preempt_guard_enter(),
+            _not_send: PhantomData,
+        }
+    }
+}
+
+impl Drop for PreemptScope {
+    fn drop(&mut self) {
+        if self.token.is_none() {
+            return;
+        }
+        // SAFETY: this !Send scope consumes the token returned on the same
+        // task context after every protected publication is complete.
+        unsafe { task_runtime::preempt_guard_exit(self.token) };
     }
 }
 
 /// Preemption-disabled access to a task-only scheduler object.
 pub(crate) struct PreemptTicketGuard<'a, T> {
     raw: Option<RawTicketGuard<'a, T>>,
-    token: PreemptGuardToken,
+    scope: Option<PreemptScope>,
     _not_send: PhantomData<*mut ()>,
 }
 
@@ -83,13 +109,7 @@ impl<T> Drop for PreemptTicketGuard<'_, T> {
         // Publish the protected state before the final preemption exit can
         // enter the scheduler and expose it to another CPU.
         drop(self.raw.take());
-        if self.token.is_none() {
-            return;
-        }
-        // SAFETY: construction received this token on the current task
-        // context, the !Send marker prevents migration, and Drop consumes it
-        // exactly once. The runtime accepts non-LIFO nested exits.
-        unsafe { task_runtime::preempt_guard_exit(self.token) };
+        drop(self.scope.take());
     }
 }
 
