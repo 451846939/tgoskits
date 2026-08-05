@@ -104,6 +104,7 @@ std::thread_local! {
     static LAST_DEADLINE_GENERATION: Cell<u64> = const { Cell::new(0) };
     static LAST_DEFERRED_WORK: Cell<bool> = const { Cell::new(false) };
     static MONOTONIC_NS: Cell<u64> = const { Cell::new(0) };
+    static SCHEDULER_NS: Cell<u64> = const { Cell::new(0) };
 }
 
 struct IntegrationRuntime;
@@ -365,7 +366,13 @@ impl_trait! {
         fn validate_owner_cpu_context() -> RuntimeStatus {
             RuntimeStatus::Success
         }
-        fn monotonic_ns() -> u64 { MONOTONIC_NS.with(Cell::get) }
+        fn monotonic_now() -> MonotonicInstant {
+            MonotonicInstant::from_nanos(MONOTONIC_NS.with(Cell::get))
+                .expect("test monotonic clock must remain in the ktime domain")
+        }
+        fn scheduler_now() -> ax_task::SchedulerTimestamp {
+            ax_task::SchedulerTimestamp::from_nanos(SCHEDULER_NS.with(Cell::get))
+        }
         fn publish_task_deadline(update: TaskDeadlineUpdate) {
             LAST_ONESHOT_NS.with(|deadline| {
                 deadline.set(update.deadline().map_or(0, MonotonicDeadline::as_nanos))
@@ -659,6 +666,10 @@ pub fn set_monotonic_ns(now_ns: u64) {
     MONOTONIC_NS.with(|now| now.set(now_ns));
 }
 
+pub fn set_scheduler_ns(now_ns: u64) {
+    SCHEDULER_NS.with(|now| now.set(now_ns));
+}
+
 pub fn reset_resource_release_counts() {
     DESTROYED_CONTEXTS.with(|count| count.set(0));
     DESTROYED_ADDRESS_SPACES.with(|count| count.set(0));
@@ -686,5 +697,6 @@ pub fn clear_handles() {
     LAST_DEFERRED_WORK.with(|pending| pending.set(false));
     let _cleared_oneshot = last_oneshot_ns();
     set_monotonic_ns(0);
+    set_scheduler_ns(0);
     let _reset_counts = resource_release_counts();
 }

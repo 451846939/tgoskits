@@ -418,7 +418,12 @@ impl TaskSystem {
                             owner,
                         );
                     }
-                    Self::refresh_owner_deadline_timers_locked(&core, &mut sched, cpu.as_mut());
+                    self.refresh_owner_deadline_timers_locked(
+                        &core,
+                        &mut sched,
+                        cpu.as_mut(),
+                        now_ns,
+                    )?;
                 }
                 continue;
             }
@@ -638,7 +643,7 @@ impl TaskSystem {
                 if applied {
                     self.recompute_pi_after_policy_update(core.id())?;
                 }
-                Self::assign_owner_inactive_deadline_bandwidth(&core, cpu.as_mut());
+                self.assign_owner_inactive_deadline_bandwidth(&core, cpu.as_mut(), now_ns)?;
             }
         }
         if pending {

@@ -39,7 +39,7 @@ impl TaskSystem {
             target_remote.cancel_idle_pull(reservation);
             return Ok(false);
         }
-        let now_ns = task_runtime::monotonic_ns();
+        let now_ns = task_runtime::scheduler_now().as_nanos();
         let target = cpu.owner();
         let source = self
             .cpu_remotes
@@ -138,7 +138,7 @@ impl TaskSystem {
         {
             return Ok(None);
         }
-        let now_ns = task_runtime::monotonic_ns();
+        let now_ns = task_runtime::scheduler_now().as_nanos();
         let Some(selection) = self.select_rt_deadline_balance_transfer(
             cpu.as_ref().get_ref(),
             source_summary.runnable_count(),
@@ -489,12 +489,12 @@ impl TaskSystem {
                         sched.policy.base_entity = sched.policy.effective_entity;
                     }
                     sched.deadline.replenish_pending = true;
-                    Self::mark_owner_deadline_non_contending_locked(
+                    self.mark_owner_deadline_non_contending_locked(
                         core,
                         &mut sched,
                         cpu.as_mut(),
                         now_ns,
-                    );
+                    )?;
                     sched.transition(core, ThreadState::Blocked)?;
                     let mut run_queue = cpu.lock_run_queue();
                     if run_queue.is_linked_current(core.id()) {

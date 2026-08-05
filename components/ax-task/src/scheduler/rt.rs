@@ -1,5 +1,7 @@
 //! Per-CPU fixed-priority real-time bandwidth accounting.
 
+use super::{SchedulerTimestamp, scheduler_time_advance, scheduler_time_reached};
+
 /// Per-CPU RT quota state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RtBandwidth {
@@ -25,20 +27,30 @@ impl RtBandwidth {
     /// Returns `true` exactly when this charge exhausts the current period's
     /// quota. Later charges in the same exhausted period return `false`.
     pub fn charge(&mut self, now_ns: u64, runtime_ns: u64) -> bool {
-        let interval_start_ns = now_ns.saturating_sub(runtime_ns);
+        assert!(runtime_ns < super::SCHEDULER_TIME_HALF_RANGE);
+        let interval_start_ns = now_ns.wrapping_sub(runtime_ns);
         self.advance_period(interval_start_ns);
         let was_exhausted = self.consumed_ns >= self.runtime_ns;
-        let period_end_ns = self.period_start_ns.saturating_add(self.period_ns);
-        if now_ns < period_end_ns || self.period_ns == 0 {
-            self.consumed_ns = self.consumed_ns.saturating_add(runtime_ns);
+        let period_end_ns = scheduler_time_advance(self.period_start_ns, self.period_ns);
+        if !scheduler_time_reached(now_ns, period_end_ns) || self.period_ns == 0 {
+            self.consumed_ns = self
+                .consumed_ns
+                .checked_add(runtime_ns)
+                .expect("one RT bandwidth period cannot accumulate u64 runtime");
             return !was_exhausted && self.consumed_ns >= self.runtime_ns;
         }
 
-        let periods = (now_ns - self.period_start_ns) / self.period_ns;
-        self.period_start_ns = self
-            .period_start_ns
-            .saturating_add(periods.saturating_mul(self.period_ns));
-        self.consumed_ns = now_ns.saturating_sub(self.period_start_ns);
+        let elapsed = SchedulerTimestamp::from_nanos(now_ns)
+            .since(SchedulerTimestamp::from_nanos(self.period_start_ns));
+        let periods = elapsed / self.period_ns;
+        self.period_start_ns = scheduler_time_advance(
+            self.period_start_ns,
+            periods
+                .checked_mul(self.period_ns)
+                .expect("elapsed RT time bounds the period advance"),
+        );
+        self.consumed_ns = SchedulerTimestamp::from_nanos(now_ns)
+            .since(SchedulerTimestamp::from_nanos(self.period_start_ns));
         self.consumed_ns >= self.runtime_ns
     }
 
@@ -54,7 +66,7 @@ impl RtBandwidth {
     /// Returns the end of the active quota period.
     pub fn next_period_ns(&mut self, now_ns: u64) -> u64 {
         self.advance_period(now_ns);
-        self.period_start_ns.saturating_add(self.period_ns)
+        scheduler_time_advance(self.period_start_ns, self.period_ns)
     }
 
     /// Returns whether ordinary RT work is currently throttled.
@@ -77,11 +89,17 @@ impl RtBandwidth {
         if self.period_ns == 0 {
             return;
         }
-        if now_ns >= self.period_start_ns.saturating_add(self.period_ns) {
-            let periods = (now_ns - self.period_start_ns) / self.period_ns;
-            self.period_start_ns = self
-                .period_start_ns
-                .saturating_add(periods.saturating_mul(self.period_ns));
+        let period_end = scheduler_time_advance(self.period_start_ns, self.period_ns);
+        if scheduler_time_reached(now_ns, period_end) {
+            let elapsed = SchedulerTimestamp::from_nanos(now_ns)
+                .since(SchedulerTimestamp::from_nanos(self.period_start_ns));
+            let periods = elapsed / self.period_ns;
+            self.period_start_ns = scheduler_time_advance(
+                self.period_start_ns,
+                periods
+                    .checked_mul(self.period_ns)
+                    .expect("elapsed RT time bounds the period advance"),
+            );
             self.consumed_ns = 0;
         }
     }
@@ -117,5 +135,16 @@ mod tests {
         assert!(!bandwidth.charge(94, 94));
         assert!(bandwidth.charge(95, 1));
         assert!(!bandwidth.charge(96, 1));
+    }
+
+    #[test]
+    fn quota_period_uses_linux_scheduler_clock_wrap_ordering() {
+        let mut bandwidth = RtBandwidth::new(10, 5);
+        bandwidth.period_start_ns = u64::MAX - 5;
+
+        assert_eq!(bandwidth.next_period_ns(u64::MAX - 1), 4);
+        assert!(!bandwidth.is_throttled(u64::MAX - 1));
+        assert!(bandwidth.may_run(4, false));
+        assert_eq!(bandwidth.period_start_ns, 4);
     }
 }

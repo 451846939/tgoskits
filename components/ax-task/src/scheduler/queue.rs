@@ -727,7 +727,7 @@ impl RunQueue {
             }
             SchedulePolicy::Deadline(_) => {
                 if entry.entity.deadline().is_none_or(|deadline| {
-                    deadline.absolute_deadline_ns() == 0 || deadline.is_throttled()
+                    deadline.absolute_deadline_ns().is_none() || deadline.is_throttled()
                 }) {
                     return Err(TaskError::NotReady);
                 }
@@ -1326,6 +1326,31 @@ mod tests {
     }
 
     #[test]
+    fn deadline_runqueue_orders_across_linux_rq_clock_wrap() {
+        let mut queue = RunQueue::new();
+        let earlier_policy =
+            SchedulePolicy::deadline(DeadlinePolicy::new(1, 4, 20, DeadlineFlags::NONE).unwrap());
+        let later_policy =
+            SchedulePolicy::deadline(DeadlinePolicy::new(1, 10, 20, DeadlineFlags::NONE).unwrap());
+        let earlier_id = ThreadId::from_parts(0, 1);
+        let later_id = ThreadId::from_parts(1, 1);
+        let now = u64::MAX - 5;
+
+        for (id, policy) in [(later_id, later_policy), (earlier_id, earlier_policy)] {
+            let mut entity = SchedulingEntity::new(policy, 1, 0);
+            entity.activate_deadline(now);
+            queue
+                .enqueue_test(id, policy, entity, now, EnqueueReason::Wake)
+                .unwrap();
+        }
+
+        assert_eq!(
+            queue.pick_next(RtEligibility::Ordinary).unwrap().id,
+            earlier_id
+        );
+    }
+
+    #[test]
     fn kernel_stopper_runs_before_deadline_even_when_rt_is_throttled() {
         let mut queue = RunQueue::new();
         let stopper = SchedulePolicy::kernel_stop();
@@ -1731,7 +1756,7 @@ mod tests {
             .unwrap();
 
         let deadline = queue.dequeue(thread).unwrap().entity.deadline().unwrap();
-        assert_eq!(deadline.absolute_deadline_ns(), 8);
+        assert_eq!(deadline.absolute_deadline_ns(), Some(8));
         assert_eq!(deadline.remaining_runtime_ns(), 3);
     }
 

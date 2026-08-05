@@ -6,13 +6,29 @@
 //! ax-task and let the owning CPU reconcile them here.
 
 #[cfg(feature = "irq")]
+pub(crate) fn monotonic_now() -> ax_task::runtime::MonotonicInstant {
+    ax_task::runtime::MonotonicInstant::from_nanos(ax_hal::time::monotonic_time_nanos())
+        .expect("platform monotonic clock exceeded the signed ktime domain")
+}
+
+#[cfg(feature = "irq")]
 fn ticks_per_sec() -> u64 {
     crate::build_info::TICKS_PER_SEC as u64
 }
 
 #[cfg(feature = "irq")]
 fn periodic_interval_nanos() -> u64 {
-    (ax_hal::time::NANOS_PER_SEC / ticks_per_sec()).max(1)
+    let ticks_per_sec = ticks_per_sec();
+    assert_ne!(
+        ticks_per_sec, 0,
+        "scheduler tick frequency must be non-zero"
+    );
+    let interval = ax_hal::time::NANOS_PER_SEC / ticks_per_sec;
+    assert_ne!(
+        interval, 0,
+        "scheduler tick frequency exceeds nanosecond resolution"
+    );
+    interval
 }
 
 #[cfg(feature = "irq")]
@@ -134,8 +150,8 @@ fn unclaimed_irq_action(
 
 #[cfg(feature = "irq")]
 impl ClockEventFiringGuard {
-    fn begin(now_ns: u64) -> Option<Self> {
-        let claim = with_local_clock_event_mut(|clockevent| clockevent.claim_irq(now_ns));
+    fn begin(now: ax_task::runtime::MonotonicInstant) -> Option<Self> {
+        let claim = with_local_clock_event_mut(|clockevent| clockevent.claim_irq(now));
         if let Some(action) = unclaimed_irq_action(&claim) {
             apply_clock_event_action(action);
         }
@@ -145,7 +161,7 @@ impl ClockEventFiringGuard {
             crate::clock_event::ClockEventIrqClaim::Firing(token) => token,
         };
         let _scheduler_tick = with_local_clock_event_mut(|clockevent| {
-            clockevent.advance_periodic(now_ns, periodic_interval_nanos())
+            clockevent.advance_periodic(now, periodic_interval_nanos())
         });
         Some(Self {
             token: Some(token),
@@ -170,9 +186,7 @@ impl ClockEventFiringGuard {
             if let Some(update) = task_update {
                 let _ = clockevent.publish_task(
                     update.generation(),
-                    update
-                        .deadline()
-                        .map(ax_task::runtime::MonotonicDeadline::as_nanos),
+                    update.deadline(),
                     update.deferred_work(),
                 );
             }
@@ -182,10 +196,10 @@ impl ClockEventFiringGuard {
     }
 
     #[cfg(feature = "multitask")]
-    fn begin_if_due(now_ns: u64) -> Option<Self> {
+    fn begin_if_due(now: ax_task::runtime::MonotonicInstant) -> Option<Self> {
         let (token, scheduler_tick) = with_local_clock_event_mut(|clockevent| {
-            let token = clockevent.claim_due(now_ns)?;
-            let scheduler_tick = clockevent.advance_periodic(now_ns, periodic_interval_nanos());
+            let token = clockevent.claim_due(now)?;
+            let scheduler_tick = clockevent.advance_periodic(now, periodic_interval_nanos());
             Some((token, scheduler_tick))
         })?;
         Some(Self {
@@ -212,10 +226,12 @@ impl Drop for ClockEventFiringGuard {
 }
 
 #[cfg(all(feature = "irq", feature = "multitask"))]
-pub(crate) fn local_clock_event_has_immediate_work(now_ns: u64) -> bool {
+pub(crate) fn local_clock_event_has_immediate_work(
+    now: ax_task::runtime::MonotonicInstant,
+) -> bool {
     commit_local_clock_event(|clockevent| {
         (
-            clockevent.has_immediate_work(now_ns),
+            clockevent.has_immediate_work(now),
             crate::clock_event::ClockEventAction::None,
         )
     })
@@ -227,21 +243,21 @@ pub(crate) fn stop_current_scheduler_tick_for_idle() {
 }
 
 #[cfg(all(feature = "irq", feature = "multitask"))]
-pub(crate) fn restart_current_scheduler_tick_after_idle(now_ns: u64) {
+pub(crate) fn restart_current_scheduler_tick_after_idle(now: ax_task::runtime::MonotonicInstant) {
     commit_local_clock_event(|clockevent| {
         (
             (),
-            clockevent.restart_scheduler_tick_after_idle(now_ns, periodic_interval_nanos()),
+            clockevent.restart_scheduler_tick_after_idle(now, periodic_interval_nanos()),
         )
     });
 }
 
 #[cfg(all(feature = "irq", feature = "multitask"))]
-pub(crate) fn recover_overdue_local_clock_event(now_ns: u64) -> bool {
-    let Some(firing) = ClockEventFiringGuard::begin_if_due(now_ns) else {
+pub(crate) fn recover_overdue_local_clock_event(now: ax_task::runtime::MonotonicInstant) -> bool {
+    let Some(firing) = ClockEventFiringGuard::begin_if_due(now) else {
         return false;
     };
-    let task_update = crate::task::recover_clock_event(now_ns, firing.scheduler_tick());
+    let task_update = crate::task::recover_clock_event(now, firing.scheduler_tick());
     firing.finish(task_update);
     true
 }
@@ -253,9 +269,7 @@ pub(crate) fn publish_local_task_deadline(update: ax_task::runtime::TaskDeadline
             (),
             clockevent.publish_task(
                 update.generation(),
-                update
-                    .deadline()
-                    .map(ax_task::runtime::MonotonicDeadline::as_nanos),
+                update.deadline(),
                 update.deferred_work(),
             ),
         )
@@ -267,8 +281,8 @@ pub(crate) fn init_timer() {
     run_clock_event_transaction(
         ax_kernel_guard::IrqSave::new,
         || {
-            let now_ns = ax_hal::time::monotonic_time_nanos();
-            let periodic = initial_periodic_deadline(now_ns, periodic_interval_nanos());
+            let now = monotonic_now();
+            let periodic = initial_periodic_deadline(now, periodic_interval_nanos());
             let action = with_local_clock_event_mut(|clockevent| clockevent.online(periodic));
             ((), action)
         },
@@ -277,39 +291,44 @@ pub(crate) fn init_timer() {
 }
 
 #[cfg(any(feature = "irq", test))]
-const fn initial_periodic_deadline(
-    now_ns: u64,
+pub(crate) fn initial_periodic_deadline(
+    now: ax_task::runtime::MonotonicInstant,
     interval_ns: u64,
 ) -> Option<crate::clock_event::ClockDeadline> {
-    match now_ns.checked_add(interval_ns) {
-        Some(deadline_ns) => crate::clock_event::ClockDeadline::from_nanos(deadline_ns),
-        None => None,
+    assert_ne!(
+        interval_ns, 0,
+        "periodic clockevent interval must be non-zero"
+    );
+    let deadline = now.deadline_after(core::time::Duration::from_nanos(interval_ns));
+    if now.reached(deadline) {
+        None
+    } else {
+        Some(crate::clock_event::ClockDeadline::from_monotonic(deadline))
     }
 }
 
 #[cfg(any(feature = "irq", test))]
-pub(crate) const fn next_periodic_deadline(
-    deadline_ns: u64,
-    now_ns: u64,
+pub(crate) fn next_periodic_deadline(
+    deadline: crate::clock_event::ClockDeadline,
+    now: ax_task::runtime::MonotonicInstant,
     interval_ns: u64,
-) -> Option<u64> {
-    if now_ns == u64::MAX {
-        return None;
-    }
-    if deadline_ns > now_ns {
-        return Some(deadline_ns);
+) -> Option<crate::clock_event::ClockDeadline> {
+    assert_ne!(
+        interval_ns, 0,
+        "periodic clockevent interval must be non-zero"
+    );
+    if !now.reached(deadline.as_monotonic()) {
+        return Some(deadline);
     }
 
-    let interval_ns = if interval_ns == 0 { 1 } else { interval_ns };
+    let deadline_ns = deadline.as_nanos();
+    let now_ns = now.as_nanos();
     let elapsed_ns = (now_ns - deadline_ns) as u128;
     let interval_ns = interval_ns as u128;
     let periods = elapsed_ns / interval_ns + 1;
     let next = deadline_ns as u128 + periods * interval_ns;
-    if next >= u64::MAX as u128 {
-        None
-    } else {
-        Some(next as u64)
-    }
+    let next = u64::try_from(next).ok()?;
+    crate::clock_event::ClockDeadline::from_nanos(next)
 }
 
 #[cfg(feature = "irq")]
@@ -320,12 +339,12 @@ pub(crate) fn timer_irq_handler(ctx: ax_hal::irq::IrqContext) -> ax_hal::irq::Ir
         // scheduler-clock publication for this complete stamp.
         unsafe { ax_hal::time::scheduler_clock_tick() }
             .expect("current CPU scheduler clock must be online before timer IRQs");
-        let now_ns = ax_hal::time::monotonic_time_nanos();
-        let Some(firing) = ClockEventFiringGuard::begin(now_ns) else {
+        let now = monotonic_now();
+        let Some(firing) = ClockEventFiringGuard::begin(now) else {
             return ax_hal::irq::IrqReturn::Handled;
         };
         #[cfg(feature = "multitask")]
-        let task_update = crate::task::on_clock_event(now_ns, firing.scheduler_tick());
+        let task_update = crate::task::on_clock_event(now, firing.scheduler_tick());
         firing.finish(
             #[cfg(feature = "multitask")]
             task_update,
@@ -338,6 +357,14 @@ pub(crate) fn timer_irq_handler(ctx: ax_hal::irq::IrqContext) -> ax_hal::irq::Ir
 mod tests {
     #[cfg(feature = "irq")]
     use core::cell::Cell;
+
+    fn instant(nanos: u64) -> ax_task::runtime::MonotonicInstant {
+        ax_task::runtime::MonotonicInstant::from_nanos(nanos).unwrap()
+    }
+
+    fn deadline(nanos: u64) -> crate::clock_event::ClockDeadline {
+        crate::clock_event::ClockDeadline::from_nanos(nanos).unwrap()
+    }
 
     #[cfg(feature = "irq")]
     struct TestIrqGuard<'state> {
@@ -435,25 +462,35 @@ mod tests {
 
     #[test]
     fn periodic_deadline_catches_up_without_accumulating_drift() {
-        assert_eq!(super::next_periodic_deadline(100, 100, 25), Some(125));
-        assert_eq!(super::next_periodic_deadline(100, 149, 25), Some(150));
-        assert_eq!(super::next_periodic_deadline(100, 150, 25), Some(175));
+        assert_eq!(
+            super::next_periodic_deadline(deadline(100), instant(100), 25),
+            Some(deadline(125))
+        );
+        assert_eq!(
+            super::next_periodic_deadline(deadline(100), instant(149), 25),
+            Some(deadline(150))
+        );
+        assert_eq!(
+            super::next_periodic_deadline(deadline(100), instant(150), 25),
+            Some(deadline(175))
+        );
     }
 
     #[test]
     fn initial_periodic_deadline_becomes_idle_at_the_monotonic_limit() {
-        assert_eq!(super::initial_periodic_deadline(u64::MAX - 1, 2), None);
-        assert_eq!(super::initial_periodic_deadline(u64::MAX - 1, 1), None);
+        let now = instant(ax_task::runtime::KTIME_MAX_NANOS - 1);
+        assert_eq!(super::initial_periodic_deadline(now, 2), None);
+        assert_eq!(super::initial_periodic_deadline(now, 1), None);
     }
 
     #[test]
     fn periodic_deadline_saturates_at_the_monotonic_limit() {
         assert_eq!(
-            super::next_periodic_deadline(u64::MAX - 5, u64::MAX - 1, 10),
-            None
-        );
-        assert_eq!(
-            super::next_periodic_deadline(u64::MAX - 5, u64::MAX, 10),
+            super::next_periodic_deadline(
+                deadline(ax_task::runtime::KTIME_SAFE_MAX_NANOS),
+                instant(ax_task::runtime::KTIME_MAX_NANOS - 1),
+                1_000_000_000,
+            ),
             None
         );
     }

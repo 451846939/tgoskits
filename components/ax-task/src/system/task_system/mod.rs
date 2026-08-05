@@ -69,7 +69,8 @@ use crate::{
     lock::{IrqScope, IrqTicketLock, PreemptTicketLock, SequenceCounter},
     runtime::{
         AddressSpaceDestroyOutcome, AddressSpaceReclaimArmOutcome, ContextThreadBinding,
-        CpuRemoteHandle, CurrentThreadPublication, RuntimeCpuId, RuntimeStatus, task_runtime,
+        CpuRemoteHandle, CurrentThreadPublication, MonotonicDeadline, MonotonicInstant,
+        RuntimeCpuId, RuntimeStatus, task_runtime,
     },
     system::cpu::{
         CpuRunQueueState, CurrentDispatch, CurrentDispatchState, CurrentSchedule,
@@ -198,12 +199,14 @@ fn validate_config(config: TaskSystemConfig) -> Result<(), TaskError> {
 
 fn deadline_zero_lag_ns(deadline: DeadlineEntity) -> u64 {
     let policy = deadline.policy();
-    let lag_ns = (deadline.remaining_runtime_ns() as u128)
-        .saturating_mul(policy.period_ns() as u128)
+    let lag_ns = deadline.remaining_runtime_ns() as u128 * policy.period_ns() as u128
         / policy.runtime_ns() as u128;
+    let lag_ns = u64::try_from(lag_ns)
+        .expect("Deadline zero-lag interval cannot exceed one scheduler period");
     deadline
         .absolute_deadline_ns()
-        .saturating_sub(u64::try_from(lag_ns).unwrap_or(u64::MAX))
+        .expect("an active Deadline entity must own a zero-lag anchor")
+        .wrapping_sub(lag_ns)
 }
 
 fn ensure_runtime_success(status: RuntimeStatus) -> Result<(), TaskError> {

@@ -13,7 +13,9 @@ use ax_errno::{AxError, AxResult};
 use ax_kspin::SpinNoPreempt;
 use ax_memory_addr::VirtAddr;
 use ax_runtime::hal::time::monotonic_time;
-use ax_std::os::arceos::task::{self as scheduler, CurrentParkStart, ThreadWakeBatch};
+use ax_std::os::arceos::task::{
+    self as scheduler, CurrentParkStart, MonotonicInstant, ThreadWakeBatch,
+};
 use ax_sync::{LockdepMutexExt, PiMutex};
 
 use crate::{
@@ -24,6 +26,14 @@ use crate::{
 const NESTED_FUTEX_BUCKET_LOCK_SUBCLASS: u32 = 1;
 const FUTEX_BUCKET_COUNT: usize = 64;
 type WakeBatch = ThreadWakeBatch;
+
+fn scheduler_monotonic_now() -> MonotonicInstant {
+    MonotonicInstant::from_nanos(
+        u64::try_from(monotonic_time().as_nanos())
+            .expect("platform monotonic clock exceeds the nanosecond representation"),
+    )
+    .expect("platform monotonic clock exceeds the signed ktime domain")
+}
 
 fn wake_batch(wakes: WakeBatch) -> usize {
     wakes.wake_all()
@@ -369,12 +379,7 @@ impl WaitQueue {
         cleanup: Option<FutexWaitCleanup>,
         condition: impl FnOnce() -> Result<bool, FutexAccessError> + Unpin,
     ) -> Result<bool, FutexWaitError> {
-        let deadline_ns = timeout.map(|timeout| {
-            monotonic_time()
-                .as_nanos()
-                .saturating_add(timeout.as_nanos())
-                .min(u64::MAX as u128) as u64
-        });
+        let deadline = timeout.map(|timeout| scheduler_monotonic_now().deadline_after(timeout));
 
         let (task, generation, mut park) = {
             let mut inner = self.inner.lock();
@@ -384,9 +389,8 @@ impl WaitQueue {
             let task = task();
             let park = match scheduler::begin_current_park().map_err(map_park_error)? {
                 CurrentParkStart::Notified => {
-                    let deadline_expired = deadline_ns.is_some_and(|deadline| {
-                        monotonic_time().as_nanos().min(u64::MAX as u128) as u64 >= deadline
-                    });
+                    let deadline_expired = deadline
+                        .is_some_and(|deadline| scheduler_monotonic_now().reached(deadline));
                     return match classify_park_notification(
                         task.take_interrupt(),
                         deadline_expired,
@@ -414,8 +418,8 @@ impl WaitQueue {
         };
 
         loop {
-            if let Some(deadline_ns) = deadline_ns
-                && let Err(error) = park.arm_deadline(deadline_ns)
+            if let Some(deadline) = deadline
+                && let Err(error) = park.arm_deadline(deadline)
             {
                 Self::cancel_waiter(self, &task, generation);
                 park.cancel().map_err(map_park_error)?;
@@ -438,9 +442,7 @@ impl WaitQueue {
                 return Err(FutexAccessError::Operation(AxError::Interrupted).into());
             }
             if resume.deadline_expired()
-                || deadline_ns.is_some_and(|deadline| {
-                    monotonic_time().as_nanos().min(u64::MAX as u128) as u64 >= deadline
-                })
+                || deadline.is_some_and(|deadline| scheduler_monotonic_now().reached(deadline))
             {
                 Self::cancel_waiter(self, &task, generation);
                 return Err(FutexAccessError::Operation(AxError::TimedOut).into());
@@ -459,9 +461,8 @@ impl WaitQueue {
                 }
                 CurrentParkStart::Notified => {
                     Self::cancel_waiter(self, &task, generation);
-                    let deadline_expired = deadline_ns.is_some_and(|deadline| {
-                        monotonic_time().as_nanos().min(u64::MAX as u128) as u64 >= deadline
-                    });
+                    let deadline_expired = deadline
+                        .is_some_and(|deadline| scheduler_monotonic_now().reached(deadline));
                     return match classify_park_notification(false, deadline_expired)? {
                         ParkNotificationAction::RecheckCondition => {
                             Err(FutexWaitError::SchedulerNotification)
@@ -875,12 +876,7 @@ impl ResolvedFutex {
         timeout: Option<Duration>,
         condition: impl FnOnce() -> Result<bool, FutexAccessError> + Unpin,
     ) -> Result<bool, FutexWaitError> {
-        let deadline_ns = timeout.map(|timeout| {
-            monotonic_time()
-                .as_nanos()
-                .saturating_add(timeout.as_nanos())
-                .min(u64::MAX as u128) as u64
-        });
+        let deadline = timeout.map(|timeout| scheduler_monotonic_now().deadline_after(timeout));
         let task = task.clone();
         let (_, bucket) = self.domain.domain().bucket(&self.key);
         let (generation, mut park) = {
@@ -890,9 +886,8 @@ impl ResolvedFutex {
             }
             let park = match scheduler::begin_current_park().map_err(map_park_error)? {
                 CurrentParkStart::Notified => {
-                    let deadline_expired = deadline_ns.is_some_and(|deadline| {
-                        monotonic_time().as_nanos().min(u64::MAX as u128) as u64 >= deadline
-                    });
+                    let deadline_expired = deadline
+                        .is_some_and(|deadline| scheduler_monotonic_now().reached(deadline));
                     return match classify_park_notification(
                         task.take_interrupt(),
                         deadline_expired,
@@ -923,8 +918,8 @@ impl ResolvedFutex {
         };
 
         loop {
-            if let Some(deadline_ns) = deadline_ns
-                && let Err(error) = park.arm_deadline(deadline_ns)
+            if let Some(deadline) = deadline
+                && let Err(error) = park.arm_deadline(deadline)
             {
                 cancel_futex_waiter(&task, generation);
                 park.cancel().map_err(map_park_error)?;
@@ -947,9 +942,7 @@ impl ResolvedFutex {
                 return Err(FutexAccessError::Operation(AxError::Interrupted).into());
             }
             if resume.deadline_expired()
-                || deadline_ns.is_some_and(|deadline| {
-                    monotonic_time().as_nanos().min(u64::MAX as u128) as u64 >= deadline
-                })
+                || deadline.is_some_and(|deadline| scheduler_monotonic_now().reached(deadline))
             {
                 cancel_futex_waiter(&task, generation);
                 return Err(FutexAccessError::Operation(AxError::TimedOut).into());
@@ -968,9 +961,8 @@ impl ResolvedFutex {
                 }
                 Ok(CurrentParkStart::Notified) => {
                     cancel_futex_waiter(&task, generation);
-                    let deadline_expired = deadline_ns.is_some_and(|deadline| {
-                        monotonic_time().as_nanos().min(u64::MAX as u128) as u64 >= deadline
-                    });
+                    let deadline_expired = deadline
+                        .is_some_and(|deadline| scheduler_monotonic_now().reached(deadline));
                     return match classify_park_notification(false, deadline_expired)? {
                         ParkNotificationAction::RecheckCondition => {
                             Err(FutexWaitError::SchedulerNotification)

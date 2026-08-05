@@ -3,6 +3,7 @@ use core::pin::Pin;
 use ax_task::{
     CpuId, ThreadId,
     inbox::{InboxKind, InboxMessage, InboxNode, PublishResult, SchedulerInbox},
+    runtime::{MonotonicDeadline, MonotonicInstant},
     timer::{
         ExpiredTaskDeadline, TaskDeadlineExpireRequest, TaskDeadlineKind, TaskDeadlineNode,
         TaskDeadlineQueue,
@@ -20,7 +21,7 @@ fn timer_irq_work_is_bounded() {
             queue
                 .arm(
                     node.as_ref(),
-                    10,
+                    MonotonicDeadline::from_nanos(10).unwrap(),
                     TaskDeadlineKind::park_timeout(generation as u64 + 1),
                 )
                 .unwrap()
@@ -28,7 +29,10 @@ fn timer_irq_work_is_bounded() {
         .collect::<Vec<_>>();
     let mut output = [ExpiredTaskDeadline::EMPTY; 3];
 
-    let batch = queue.expire(TaskDeadlineExpireRequest::new(10, 2), &mut output);
+    let batch = queue.expire(
+        TaskDeadlineExpireRequest::new(MonotonicInstant::from_nanos(10).unwrap(), 2),
+        &mut output,
+    );
 
     assert_eq!(batch.processed(), 2);
     assert_eq!(batch.expired(), 2);

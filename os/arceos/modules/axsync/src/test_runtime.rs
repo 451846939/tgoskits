@@ -176,8 +176,12 @@ impl_task_runtime! {
             }
         }
         fn validate_owner_cpu_context() -> RuntimeStatus { RuntimeStatus::Success }
-        fn monotonic_ns() -> u64 { 0 }
-        fn timer_resolution_ns() -> u64 { 1 }
+        fn monotonic_now() -> ax_task::runtime::MonotonicInstant {
+            ax_task::runtime::MonotonicInstant::from_nanos(0).unwrap()
+        }
+        fn scheduler_now() -> ax_task::SchedulerTimestamp {
+            ax_task::SchedulerTimestamp::from_nanos(0)
+        }
         fn publish_task_deadline(_update: TaskDeadlineUpdate) {}
         fn send_scheduler_ipi(_cpu: RuntimeCpuId) -> RuntimeStatus {
             RuntimeStatus::Success

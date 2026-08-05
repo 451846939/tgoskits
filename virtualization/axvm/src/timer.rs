@@ -22,7 +22,7 @@ use ax_kspin::SpinNoIrq;
 use ax_lazyinit::LazyInit;
 use ax_timer_list::{TimeValue, TimerEvent, TimerList};
 
-use crate::host::task::IrqNotification;
+use crate::host::task::{IrqNotification, MonotonicDeadline};
 #[cfg(not(test))]
 use crate::host::{HostTime, default_host};
 
@@ -233,7 +233,7 @@ fn current_host_time() -> TimeValue {
 
 fn timer_worker(notification: Arc<IrqNotification>) -> ! {
     loop {
-        let next_deadline = check_events();
+        let next_deadline = check_events().map(MonotonicDeadline::from_duration);
         notification.wait_until(next_deadline);
     }
 }

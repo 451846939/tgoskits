@@ -46,7 +46,9 @@ std::thread_local! {
     static IRQ_EXIT_SCHEDULE_ACTIVE: Cell<bool> = const { Cell::new(false) };
     static LOCAL_SCHEDULER_WORK_PUBLICATIONS: Cell<usize> = const { Cell::new(0) };
     static MONOTONIC_NS: Cell<u64> = const { Cell::new(0) };
+    static SCHEDULER_NS: Cell<u64> = const { Cell::new(0) };
     static MONOTONIC_READS: Cell<usize> = const { Cell::new(0) };
+    static SCHEDULER_READS: Cell<usize> = const { Cell::new(0) };
     static LAST_TASK_DEADLINE_UPDATE: Cell<Option<TaskDeadlineUpdate>> = const { Cell::new(None) };
     static CPU_ONLINE_STATUS: Cell<RuntimeStatus> = const { Cell::new(RuntimeStatus::Success) };
     static CPU_OFFLINE_STATUS: Cell<RuntimeStatus> = const { Cell::new(RuntimeStatus::Success) };
@@ -344,10 +346,16 @@ impl TaskRuntime for UnitTestRuntime {
             RuntimeStatus::UnsafeContext
         }
     }
-    fn monotonic_ns() -> u64 {
+    fn monotonic_now() -> crate::runtime::MonotonicInstant {
         run_hook_reentry_query();
         MONOTONIC_READS.with(|reads| reads.set(reads.get() + 1));
-        MONOTONIC_NS.with(Cell::get)
+        crate::runtime::MonotonicInstant::from_nanos(MONOTONIC_NS.with(Cell::get))
+            .expect("test monotonic clock must remain in the ktime domain")
+    }
+    fn scheduler_now() -> crate::SchedulerTimestamp {
+        run_hook_reentry_query();
+        SCHEDULER_READS.with(|reads| reads.set(reads.get() + 1));
+        crate::SchedulerTimestamp::from_nanos(SCHEDULER_NS.with(Cell::get))
     }
     fn publish_task_deadline(update: TaskDeadlineUpdate) {
         run_hook_reentry_query();
@@ -714,7 +722,9 @@ pub(crate) fn clear_task_handles() {
     install_task_handles(0, 0);
     reset_cpu_handle_reads();
     MONOTONIC_NS.with(|now| now.set(0));
+    SCHEDULER_NS.with(|now| now.set(0));
     MONOTONIC_READS.with(|reads| reads.set(0));
+    SCHEDULER_READS.with(|reads| reads.set(0));
     LAST_TASK_DEADLINE_UPDATE.with(|observed| observed.set(None));
     CPU_LIFECYCLE_EVENTS.with(|events| events.borrow_mut().clear());
     configure_cpu_lifecycle(RuntimeStatus::Success, RuntimeStatus::Success);
@@ -724,12 +734,24 @@ pub(crate) fn set_monotonic_ns(now_ns: u64) {
     MONOTONIC_NS.with(|now| now.set(now_ns));
 }
 
+pub(crate) fn set_scheduler_ns(now_ns: u64) {
+    SCHEDULER_NS.with(|now| now.set(now_ns));
+}
+
 pub(crate) fn reset_monotonic_reads() {
     MONOTONIC_READS.with(|reads| reads.set(0));
 }
 
 pub(crate) fn monotonic_reads() -> usize {
     MONOTONIC_READS.with(Cell::get)
+}
+
+pub(crate) fn reset_scheduler_reads() {
+    SCHEDULER_READS.with(|reads| reads.set(0));
+}
+
+pub(crate) fn scheduler_reads() -> usize {
+    SCHEDULER_READS.with(Cell::get)
 }
 
 pub(crate) fn take_task_deadline_update() -> Option<TaskDeadlineUpdate> {

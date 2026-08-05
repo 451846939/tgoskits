@@ -32,7 +32,6 @@ irq = [
 ]
 multitask = [
   "irq",
-  "dep:ax-task",
   "ax-kernel-guard/preempt",
 ]
 qperf-metrics = ["multitask", "ax-task/qperf-metrics"]
@@ -115,7 +114,7 @@ ax-net = {workspace = true, optional = true}
 ax-percpu.workspace = true
 ax-plat = {workspace = true}
 ax-sync = {workspace = true, features = ["multitask"], optional = true}
-ax-task = {workspace = true, optional = true}
+ax-task.workspace = true
 axbacktrace = {workspace = true}
 axpoll = {workspace = true, optional = true}
 axklib.workspace = true

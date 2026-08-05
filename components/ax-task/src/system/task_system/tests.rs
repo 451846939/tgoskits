@@ -798,7 +798,7 @@ fn rt_placement_does_not_select_a_cpu_running_deadline_work() {
 }
 
 #[test]
-fn wide_affinity_deadline_placement_uses_latest_cpu_deadline() {
+fn first_deadline_placement_does_not_invent_an_absolute_deadline() {
     let system = TaskSystem::new(TaskSystemConfig::new(2)).unwrap();
     let mut cpu0 = system.create_cpu_local(CpuId::new(0)).unwrap();
     let mut cpu1 = system.create_cpu_local(CpuId::new(1)).unwrap();
@@ -848,8 +848,8 @@ fn wide_affinity_deadline_placement_uses_latest_cpu_deadline() {
             .lock()
             .placement
             .committed_migration_target(),
-        Some(CpuId::new(1)),
-        "Deadline placement must choose the allowed CPU whose earliest runnable deadline is latest"
+        None,
+        "a new Deadline task has no absolute deadline before its first target-rq enqueue"
     );
 }
 
@@ -1552,7 +1552,7 @@ fn unsuccessful_fair_balance_backs_off_from_scheduler_completion_time() {
         .unwrap();
     system.bring_cpu_online_at(cpu.as_mut(), 0).unwrap();
     let _runtime_handles = InstalledTaskHandles::new(system.as_ref(), cpu.as_mut());
-    crate::test_runtime::set_monotonic_ns(COMPLETION_NOW_NS);
+    crate::test_runtime::set_scheduler_ns(COMPLETION_NOW_NS);
 
     assert!(cpu.fair_balance_due(ENTRY_NOW_NS));
     assert_eq!(system.balance_fair(cpu.as_mut(), ENTRY_NOW_NS), Ok(None));
@@ -1596,12 +1596,12 @@ fn affinity_constrained_fair_balance_keeps_backing_off() {
     system.make_ready(pinned.id()).unwrap();
     system.enqueue(cpu0.as_mut(), pinned.id(), 0).unwrap();
 
-    crate::test_runtime::set_monotonic_ns(INTERVAL_NS);
+    crate::test_runtime::set_scheduler_ns(INTERVAL_NS);
     assert_eq!(system.balance_fair(cpu0.as_mut(), INTERVAL_NS), Ok(None));
     let second_balance_ns = INTERVAL_NS.saturating_mul(3);
     assert!(cpu0.fair_balance_due(second_balance_ns));
 
-    crate::test_runtime::set_monotonic_ns(second_balance_ns);
+    crate::test_runtime::set_scheduler_ns(second_balance_ns);
     assert_eq!(
         system.balance_fair(cpu0.as_mut(), second_balance_ns),
         Ok(None)
@@ -3468,6 +3468,43 @@ fn future_deadline_members_do_not_create_scheduler_work() {
 }
 
 #[test]
+fn elapsed_deadline_event_is_reconciled_without_a_physical_timer_node() {
+    let system = TaskSystem::new(TaskSystemConfig::new(1)).unwrap();
+    let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
+    system
+        .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
+        .unwrap();
+    system.bring_cpu_online(cpu.as_mut()).unwrap();
+
+    let policy =
+        SchedulePolicy::deadline(DeadlinePolicy::new(1, 10, 100, DeadlineFlags::NONE).unwrap());
+    let thread = system.create_thread(ThreadSpec::new(policy)).unwrap();
+    system.make_ready(thread.id()).unwrap();
+    system.enqueue(cpu.as_mut(), thread.id(), 0).unwrap();
+    let core = {
+        let state = system.state.lock();
+        Arc::clone(&state.thread_record(thread.id()).unwrap().core)
+    };
+
+    crate::test_runtime::set_monotonic_ns(10);
+    {
+        let mut sched = core.sched().lock();
+        system
+            .refresh_owner_deadline_timers_locked(&core, &mut sched, cpu.as_mut(), 10)
+            .unwrap();
+        assert!(
+            sched.deadline.cbs_timer.is_none(),
+            "Linux start_dl_timer() does not arm an already elapsed scheduler deadline"
+        );
+        assert_eq!(
+            sched.policy.base_entity.deadline().unwrap().misses(),
+            1,
+            "the owner must reconcile the elapsed CBS state in the same scheduler transaction"
+        );
+    }
+}
+
+#[test]
 fn forced_yield_clears_slice_expiration_accounted_by_that_schedule() {
     let system = TaskSystem::new(TaskSystemConfig::new(1)).unwrap();
     let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
@@ -3585,13 +3622,16 @@ fn dequeue_removes_obsolete_scheduler_clockevent() {
     system.enqueue(cpu.as_mut(), contender.id(), 0).unwrap();
 
     assert!(
-        cpu.as_mut().next_oneshot_deadline_ns(0).is_some(),
+        cpu.as_mut()
+            .next_oneshot_deadline(0, MonotonicInstant::from_nanos(0).unwrap())
+            .is_some(),
         "two fair entities require a scheduler clockevent"
     );
     system.dequeue(cpu.as_mut(), contender.id()).unwrap();
 
     assert_eq!(
-        cpu.as_mut().next_oneshot_deadline_ns(0),
+        cpu.as_mut()
+            .next_oneshot_deadline(0, MonotonicInstant::from_nanos(0).unwrap()),
         None,
         "removing the only queued contender must remove the obsolete scheduler clockevent"
     );

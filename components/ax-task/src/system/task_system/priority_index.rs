@@ -268,11 +268,11 @@ impl DeadlineCpuHeap {
         }
 
         // Match Linux cpudl_find(): once no free allowed CPU exists, only the
-        // max-heap root is a valid constant-time candidate. If affinity or a
-        // concurrent lifecycle transition rejects that CPU, owner-side push
-        // and the ordinary fallback placement repair the racy hint.
+        // max-heap root is a valid constant-time candidate. A rejected root
+        // leaves select_task_rq semantics on the task's current CPU.
         let entry = self.entries.first()?;
-        (entry.absolute_deadline_ns > absolute_deadline_ns
+        (crate::scheduler_time_cmp(entry.absolute_deadline_ns, absolute_deadline_ns)
+            == core::cmp::Ordering::Greater
             && self.online.contains(entry.cpu)
             && affinity.contains(entry.cpu)
             && accepts(entry.cpu))
@@ -283,9 +283,13 @@ impl DeadlineCpuHeap {
         if let Some(index) = self.indices[cpu.as_usize()] {
             let previous = self.entries[index].absolute_deadline_ns;
             self.entries[index].absolute_deadline_ns = absolute_deadline_ns;
-            if absolute_deadline_ns > previous {
+            if crate::scheduler_time_cmp(absolute_deadline_ns, previous)
+                == core::cmp::Ordering::Greater
+            {
                 self.sift_up(index);
-            } else if absolute_deadline_ns < previous {
+            } else if crate::scheduler_time_cmp(absolute_deadline_ns, previous)
+                == core::cmp::Ordering::Less
+            {
                 self.sift_down(index);
             }
             return;
@@ -309,8 +313,10 @@ impl DeadlineCpuHeap {
         self.indices[cpu.as_usize()] = None;
         if index < self.entries.len() {
             if index != 0
-                && self.entries[index].absolute_deadline_ns
-                    > self.entries[(index - 1) / 2].absolute_deadline_ns
+                && crate::scheduler_time_cmp(
+                    self.entries[index].absolute_deadline_ns,
+                    self.entries[(index - 1) / 2].absolute_deadline_ns,
+                ) == core::cmp::Ordering::Greater
             {
                 self.sift_up(index);
             } else {
@@ -322,7 +328,10 @@ impl DeadlineCpuHeap {
     fn sift_up(&mut self, mut index: usize) {
         while index != 0 {
             let parent = (index - 1) / 2;
-            if self.entries[parent].absolute_deadline_ns >= self.entries[index].absolute_deadline_ns
+            if crate::scheduler_time_cmp(
+                self.entries[parent].absolute_deadline_ns,
+                self.entries[index].absolute_deadline_ns,
+            ) != core::cmp::Ordering::Less
             {
                 break;
             }
@@ -339,15 +348,19 @@ impl DeadlineCpuHeap {
             }
             let right = left + 1;
             let largest = if right < self.entries.len()
-                && self.entries[right].absolute_deadline_ns
-                    > self.entries[left].absolute_deadline_ns
+                && crate::scheduler_time_cmp(
+                    self.entries[right].absolute_deadline_ns,
+                    self.entries[left].absolute_deadline_ns,
+                ) == core::cmp::Ordering::Greater
             {
                 right
             } else {
                 left
             };
-            if self.entries[index].absolute_deadline_ns
-                >= self.entries[largest].absolute_deadline_ns
+            if crate::scheduler_time_cmp(
+                self.entries[index].absolute_deadline_ns,
+                self.entries[largest].absolute_deadline_ns,
+            ) != core::cmp::Ordering::Less
             {
                 break;
             }

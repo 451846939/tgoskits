@@ -124,10 +124,10 @@ pub(crate) type ArceOsWaitQueue = runtime_task::WaitQueue;
 pub(crate) type ArceOsIrqError = modules::ax_hal::irq::IrqError;
 pub(crate) type ArceOsWaitQueueHandle = api::task::AxWaitQueueHandle;
 pub(crate) use runtime_task::{
-    CpuId as ArceOsCpuId, CpuSet as ArceOsCpuSet, SchedulePolicy as ArceOsSchedulePolicy,
-    SwitchReason as ArceOsSwitchReason, TaskError as ArceOsTaskError,
-    ThreadExtension as ArceOsThreadExtension, ThreadExtensionOps as ArceOsThreadExtensionOps,
-    ThreadId as ArceOsThreadId,
+    CpuId as ArceOsCpuId, CpuSet as ArceOsCpuSet, MonotonicDeadline as ArceOsMonotonicDeadline,
+    SchedulePolicy as ArceOsSchedulePolicy, SwitchReason as ArceOsSwitchReason,
+    TaskError as ArceOsTaskError, ThreadExtension as ArceOsThreadExtension,
+    ThreadExtensionOps as ArceOsThreadExtensionOps, ThreadId as ArceOsThreadId,
 };
 
 /// Hard-IRQ-safe event consumed by one fixed ArceOS service thread.
@@ -165,7 +165,7 @@ impl ArceOsIrqNotification {
     /// Waits for one event or an optional absolute monotonic deadline.
     ///
     /// Returns `true` only when the task deadline won the wake race.
-    pub(crate) fn wait_until(&self, deadline: Option<Duration>) -> bool {
+    pub(crate) fn wait_until(&self, deadline: Option<ArceOsMonotonicDeadline>) -> bool {
         let current = current_thread();
         let waiter = self.waiter.call_once(|| ArceOsIrqWaiter {
             owner: current.id(),

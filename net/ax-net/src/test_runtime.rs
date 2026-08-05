@@ -124,8 +124,15 @@ impl_task_runtime! {
             RuntimeStatus::Success
         }
         fn validate_owner_cpu_context() -> RuntimeStatus { RuntimeStatus::Success }
-        fn monotonic_ns() -> u64 { ax_hal::time::monotonic_time_nanos() }
-        fn timer_resolution_ns() -> u64 { 1 }
+        fn monotonic_now() -> ax_task::runtime::MonotonicInstant {
+            ax_task::runtime::MonotonicInstant::from_nanos(
+                ax_hal::time::monotonic_time_nanos(),
+            )
+            .expect("platform monotonic clock exceeded the ktime domain")
+        }
+        fn scheduler_now() -> ax_task::SchedulerTimestamp {
+            ax_task::SchedulerTimestamp::from_nanos(ax_hal::time::monotonic_time_nanos())
+        }
         fn publish_task_deadline(_update: TaskDeadlineUpdate) {}
         fn send_scheduler_ipi(_cpu: RuntimeCpuId) -> RuntimeStatus { RuntimeStatus::Success }
         fn wait_for_interrupt() {}

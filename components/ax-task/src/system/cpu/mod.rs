@@ -25,7 +25,7 @@ use load::{
     SUMMARY_PUSHABLE_PRESENT,
 };
 pub use local::CpuLocal;
-use local::{earliest, nonzero_deadline};
+use local::earliest;
 #[cfg(feature = "qperf-metrics")]
 pub(crate) use remote::WakePreemptionDecision;
 pub use remote::{CpuLifecycleState, CpuLocalOwnerBorrow, CpuRemote};
@@ -39,7 +39,10 @@ use crate::{
     SchedulingKey, TaskError, TaskSystemConfig, ThreadHandle, ThreadId, ThreadState,
     inbox::{InboxKind, InboxMessage, InboxNode, PublishResult, SchedulerInbox},
     lock::{IrqScope, IrqTicketGuard, IrqTicketLock},
-    runtime::{MonotonicDeadline, RuntimeCpuId, RuntimeStatus, TaskDeadlineUpdate, task_runtime},
+    runtime::{
+        MonotonicDeadline, MonotonicInstant, RuntimeCpuId, RuntimeStatus, TaskDeadlineUpdate,
+        task_runtime,
+    },
     thread::ThreadCore,
     timer::{
         ExpiredTaskDeadline, TaskDeadlineExpireBatch, TaskDeadlineExpireRequest, TaskDeadlineQueue,

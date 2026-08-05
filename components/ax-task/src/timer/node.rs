@@ -3,7 +3,7 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::TaskDeadlineError;
-use crate::ThreadId;
+use crate::{ThreadId, runtime::MonotonicDeadline};
 
 pub(super) const TASK_DEADLINE_CLASS_COUNT: usize = 3;
 static NEXT_TASK_DEADLINE_NODE_ID: AtomicU64 = AtomicU64::new(1);
@@ -210,7 +210,7 @@ impl TaskDeadlineKind {
 pub struct TaskDeadlineRegistration {
     thread: ThreadId,
     token: TaskDeadlineToken,
-    deadline_ns: u64,
+    deadline: MonotonicDeadline,
     kind: TaskDeadlineKind,
 }
 
@@ -218,13 +218,13 @@ impl TaskDeadlineRegistration {
     pub(super) const fn new(
         thread: ThreadId,
         token: TaskDeadlineToken,
-        deadline_ns: u64,
+        deadline: MonotonicDeadline,
         kind: TaskDeadlineKind,
     ) -> Self {
         Self {
             thread,
             token,
-            deadline_ns,
+            deadline,
             kind,
         }
     }
@@ -240,8 +240,8 @@ impl TaskDeadlineRegistration {
     }
 
     /// Returns the absolute monotonic deadline owned by this registration.
-    pub const fn deadline_ns(&self) -> u64 {
-        self.deadline_ns
+    pub const fn deadline(&self) -> MonotonicDeadline {
+        self.deadline
     }
 
     /// Returns the typed scheduler event.
@@ -255,7 +255,7 @@ impl TaskDeadlineRegistration {
 pub struct ExpiredTaskDeadline {
     thread: ThreadId,
     token: TaskDeadlineToken,
-    deadline_ns: u64,
+    deadline: MonotonicDeadline,
     valid: bool,
     kind: TaskDeadlineKind,
 }
@@ -265,7 +265,7 @@ impl ExpiredTaskDeadline {
     pub const EMPTY: Self = Self {
         thread: ThreadId::from_parts(0, 0),
         token: TaskDeadlineToken::NONE,
-        deadline_ns: 0,
+        deadline: MonotonicDeadline::ORIGIN,
         valid: false,
         kind: TaskDeadlineKind::ParkTimeout { park_generation: 0 },
     };
@@ -273,13 +273,13 @@ impl ExpiredTaskDeadline {
     pub(super) const fn new(
         thread: ThreadId,
         token: TaskDeadlineToken,
-        deadline_ns: u64,
+        deadline: MonotonicDeadline,
         kind: TaskDeadlineKind,
     ) -> Self {
         Self {
             thread,
             token,
-            deadline_ns,
+            deadline,
             valid: true,
             kind,
         }
@@ -296,8 +296,12 @@ impl ExpiredTaskDeadline {
     }
 
     /// Returns the absolute requested deadline.
-    pub const fn deadline_ns(self) -> u64 {
-        self.deadline_ns
+    pub const fn deadline(self) -> Option<MonotonicDeadline> {
+        if self.valid {
+            Some(self.deadline)
+        } else {
+            None
+        }
     }
 
     /// Returns the typed scheduler event, or `None` for an empty buffer slot.

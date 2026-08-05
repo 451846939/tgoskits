@@ -413,6 +413,7 @@ pub(crate) struct ThreadCore {
     base_policy: AtomicPolicy,
     effective_policy: AtomicPolicy,
     effective_key_sequence: AtomicUsize,
+    effective_deadline_active: AtomicBool,
     effective_deadline_ns: AtomicU64,
     state: AtomicU8,
     reap_signal: Arc<ThreadReapSignal>,
@@ -466,6 +467,7 @@ impl ThreadCore {
             base_policy: AtomicPolicy::new(policy),
             effective_policy: AtomicPolicy::new(policy),
             effective_key_sequence: AtomicUsize::new(0),
+            effective_deadline_active: AtomicBool::new(false),
             effective_deadline_ns: AtomicU64::new(0),
             state: AtomicU8::new(ThreadState::New as u8),
             reap_signal,
@@ -848,9 +850,11 @@ impl ThreadCore {
         self.effective_policy.store(policy);
         let absolute_deadline_ns = entity
             .deadline()
-            .map_or(0, |deadline| deadline.absolute_deadline_ns());
+            .and_then(crate::DeadlineEntity::absolute_deadline_ns);
+        self.effective_deadline_active
+            .store(absolute_deadline_ns.is_some(), Ordering::Relaxed);
         self.effective_deadline_ns
-            .store(absolute_deadline_ns, Ordering::Relaxed);
+            .store(absolute_deadline_ns.unwrap_or(0), Ordering::Relaxed);
         self.effective_key_sequence.fetch_add(1, Ordering::Release);
     }
 
@@ -869,13 +873,17 @@ impl ThreadCore {
                 continue;
             }
             let policy = self.effective_policy.load();
+            let deadline_active = self.effective_deadline_active.load(Ordering::Relaxed);
             let absolute_deadline_ns = self.effective_deadline_ns.load(Ordering::Relaxed);
             if self.effective_key_sequence.load(Ordering::Acquire) != sequence {
                 continue;
             }
             return match policy {
-                SchedulePolicy::Deadline(_) if absolute_deadline_ns != 0 => {
+                SchedulePolicy::Deadline(_) if deadline_active => {
                     SchedulingKey::new(policy.class_rank(), absolute_deadline_ns, self.id.as_u64())
+                }
+                SchedulePolicy::Deadline(_) => {
+                    panic!("an inactive Deadline entity has no effective scheduler key")
                 }
                 _ => policy.scheduling_key(self.id.as_u64()),
             };

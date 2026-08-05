@@ -631,27 +631,129 @@ pub struct SchedSwitchRecord {
     pub reason: u32,
 }
 
-/// Absolute finite, non-zero deadline measured by the runtime's monotonic clock.
+/// Largest value in Linux's signed `ktime_t` domain.
+pub const KTIME_MAX_NANOS: u64 = i64::MAX as u64;
+
+/// Whole-second saturation target used by Linux `ktime_add_safe()`.
+pub const KTIME_SAFE_MAX_NANOS: u64 = KTIME_MAX_NANOS / 1_000_000_000 * 1_000_000_000;
+
+/// One finite sample of the runtime monotonic clock.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[repr(transparent)]
+pub struct MonotonicInstant(u64);
+
+impl MonotonicInstant {
+    /// Validates one sample against the signed `ktime_t` domain.
+    pub const fn from_nanos(now_ns: u64) -> Option<Self> {
+        if now_ns <= KTIME_MAX_NANOS {
+            Some(Self(now_ns))
+        } else {
+            None
+        }
+    }
+
+    /// Returns the absolute sample in nanoseconds.
+    pub const fn as_nanos(self) -> u64 {
+        self.0
+    }
+
+    /// Reports whether an absolute monotonic deadline has elapsed.
+    pub const fn reached(self, deadline: MonotonicDeadline) -> bool {
+        self.0 >= deadline.0
+    }
+
+    /// Adds a relative timeout with Linux `ktime_add_safe()` saturation.
+    pub fn deadline_after(self, timeout: core::time::Duration) -> MonotonicDeadline {
+        let timeout_ns = timeout.as_nanos();
+        let sum = self.0 as u128 + timeout_ns;
+        if sum >= KTIME_MAX_NANOS as u128 {
+            MonotonicDeadline(KTIME_SAFE_MAX_NANOS)
+        } else {
+            MonotonicDeadline(sum as u64)
+        }
+    }
+}
+
+/// Absolute finite deadline measured by the runtime's monotonic clock.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 #[repr(transparent)]
 pub struct MonotonicDeadline(u64);
 
 impl MonotonicDeadline {
+    /// The monotonic clock origin, which is necessarily already due once the
+    /// clock has advanced.
+    pub const ORIGIN: Self = Self(0);
+
     /// Creates a representable physical clockevent deadline.
     ///
-    /// Zero is the uninitialized sentinel and `u64::MAX` represents no finite
-    /// deadline; neither may cross the runtime hardware boundary.
+    /// Zero is a valid already-due deadline. Absence is represented only by
+    /// `Option::None`; like Linux `ktime_t`, `KTIME_MAX` remains a finite value.
     pub const fn from_nanos(deadline_ns: u64) -> Option<Self> {
-        if deadline_ns == 0 || deadline_ns == u64::MAX {
-            None
-        } else {
+        if deadline_ns <= KTIME_MAX_NANOS {
             Some(Self(deadline_ns))
+        } else {
+            None
         }
+    }
+
+    /// Converts a duration-valued absolute timestamp using Linux
+    /// `timespec64_to_ktime()` saturation.
+    pub fn from_duration(deadline: core::time::Duration) -> Self {
+        const NANOS_PER_SECOND: u64 = 1_000_000_000;
+        const KTIME_SEC_MAX: u64 = KTIME_MAX_NANOS / NANOS_PER_SECOND;
+
+        if deadline.as_secs() >= KTIME_SEC_MAX {
+            return Self(KTIME_MAX_NANOS);
+        }
+        Self(deadline.as_secs() * NANOS_PER_SECOND + u64::from(deadline.subsec_nanos()))
     }
 
     /// Returns the absolute deadline in nanoseconds.
     pub const fn as_nanos(self) -> u64 {
         self.0
+    }
+}
+
+#[cfg(test)]
+mod monotonic_time_tests {
+    use super::*;
+
+    #[test]
+    fn zero_is_a_finite_already_due_deadline_not_an_absence_sentinel() {
+        let deadline = MonotonicDeadline::from_nanos(0).unwrap();
+
+        assert_eq!(deadline, MonotonicDeadline::ORIGIN);
+        assert!(MonotonicInstant::from_nanos(1).unwrap().reached(deadline));
+    }
+
+    #[test]
+    fn option_not_ktime_max_represents_no_deadline() {
+        assert!(MonotonicInstant::from_nanos(KTIME_MAX_NANOS - 1).is_some());
+        assert!(MonotonicDeadline::from_nanos(KTIME_MAX_NANOS - 1).is_some());
+        assert!(MonotonicInstant::from_nanos(KTIME_MAX_NANOS).is_some());
+        assert_eq!(
+            MonotonicDeadline::from_nanos(KTIME_MAX_NANOS),
+            Some(MonotonicDeadline(KTIME_MAX_NANOS))
+        );
+        assert!(MonotonicDeadline::from_nanos(KTIME_MAX_NANOS + 1).is_none());
+    }
+
+    #[test]
+    fn duration_conversion_matches_linux_ktime_saturation() {
+        assert_eq!(
+            MonotonicDeadline::from_duration(core::time::Duration::MAX),
+            MonotonicDeadline::from_nanos(KTIME_MAX_NANOS).unwrap()
+        );
+    }
+
+    #[test]
+    fn relative_timeout_uses_linux_ktime_add_safe_saturation() {
+        let now = MonotonicInstant::from_nanos(KTIME_MAX_NANOS - 2).unwrap();
+
+        assert_eq!(
+            now.deadline_after(core::time::Duration::from_nanos(2)),
+            MonotonicDeadline::from_nanos(KTIME_SAFE_MAX_NANOS).unwrap()
+        );
     }
 }
 
@@ -917,8 +1019,15 @@ pub trait TaskRuntime {
     /// otherwise re-enter over a live mutable [`crate::CpuLocal`] borrow.
     fn validate_owner_cpu_context() -> RuntimeStatus;
 
-    /// Returns monotonic time in nanoseconds.
-    fn monotonic_ns() -> u64;
+    /// Returns one sample from the finite monotonic `ktime` domain.
+    fn monotonic_now() -> MonotonicInstant;
+
+    /// Returns one sample from the wrapping scheduler `rq_clock` domain.
+    ///
+    /// The runtime may derive both clocks from the same hardware counter, but
+    /// it must publish them through distinct capabilities. Scheduler absolute
+    /// values must never be compared directly with monotonic deadlines.
+    fn scheduler_now() -> crate::SchedulerTimestamp;
 
     /// Commits the current CPU's complete task-deadline state.
     ///

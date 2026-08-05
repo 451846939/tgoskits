@@ -60,7 +60,7 @@ fn reclaim_starts_only_after_the_blocked_reservation_zero_lag_time() {
     // The donor has q=2 and d=8, so zero-lag is 8 - 2*8/4 = 4.
     let activity = system.deadline_activity(donor.id()).unwrap();
     assert_eq!(activity.activity(), DeadlineActivity::ActiveNonContending);
-    assert_eq!(activity.zero_lag_ns(), 4);
+    assert_eq!(activity.zero_lag_ns(), Some(4));
     assert_eq!(cpu.deadline_bandwidth().this_bw_scaled(), 750_000_000);
     assert_eq!(cpu.deadline_bandwidth().running_bw_scaled(), 750_000_000);
     assert!(
@@ -72,7 +72,7 @@ fn reclaim_starts_only_after_the_blocked_reservation_zero_lag_time() {
     );
     let activity = system.deadline_activity(donor.id()).unwrap();
     assert_eq!(activity.activity(), DeadlineActivity::Inactive);
-    assert_eq!(activity.zero_lag_ns(), 0);
+    assert_eq!(activity.zero_lag_ns(), None);
     assert_eq!(cpu.deadline_bandwidth().inactive_bw_scaled(), 500_000_000);
     assert_eq!(
         system
@@ -120,7 +120,7 @@ fn deadline_yield_does_not_publish_immediate_reclaimable_runtime() {
     );
     let activity = system.deadline_activity(donor.id()).unwrap();
     assert_eq!(activity.activity(), DeadlineActivity::ActiveNonContending);
-    assert_eq!(activity.zero_lag_ns(), 8);
+    assert_eq!(activity.zero_lag_ns(), Some(8));
     assert_eq!(cpu.deadline_bandwidth().inactive_bw_scaled(), 0);
     assert!(
         !system
@@ -165,12 +165,12 @@ fn wake_before_zero_lag_cancels_the_pending_inactive_transition() {
         DeadlineActivity::ActiveContending,
         "remote wake must account CBS activity in the same target-rq transaction"
     );
-    assert_eq!(activity.zero_lag_ns(), 0);
+    assert_eq!(activity.zero_lag_ns(), None);
     assert_eq!(cpu.deadline_bandwidth().inactive_bw_scaled(), 0);
     system.drain_policy_updates(cpu.as_mut(), 3).unwrap();
     let activity = system.deadline_activity(thread.id()).unwrap();
     assert_eq!(activity.activity(), DeadlineActivity::ActiveContending);
-    assert_eq!(activity.zero_lag_ns(), 0);
+    assert_eq!(activity.zero_lag_ns(), None);
     assert_eq!(cpu.deadline_bandwidth().inactive_bw_scaled(), 0);
 
     assert_eq!(

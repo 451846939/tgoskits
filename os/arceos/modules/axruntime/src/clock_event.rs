@@ -1,17 +1,26 @@
-/// Absolute finite, non-zero deadline accepted by the physical clockevent.
+use ax_task::runtime::{MonotonicDeadline, MonotonicInstant};
+
+/// Absolute finite deadline accepted by the physical clockevent.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) struct ClockDeadline(u64);
+pub(crate) struct ClockDeadline(MonotonicDeadline);
 
 impl ClockDeadline {
     pub(crate) const fn from_nanos(deadline_ns: u64) -> Option<Self> {
-        if deadline_ns == 0 || deadline_ns == u64::MAX {
-            None
-        } else {
-            Some(Self(deadline_ns))
+        match MonotonicDeadline::from_nanos(deadline_ns) {
+            Some(deadline) => Some(Self(deadline)),
+            None => None,
         }
     }
 
+    pub(crate) const fn from_monotonic(deadline: MonotonicDeadline) -> Self {
+        Self(deadline)
+    }
+
     pub(crate) const fn as_nanos(self) -> u64 {
+        self.0.as_nanos()
+    }
+
+    pub(crate) const fn as_monotonic(self) -> MonotonicDeadline {
         self.0
     }
 }
@@ -117,7 +126,7 @@ impl LocalClockEvent {
     #[cfg(feature = "multitask")]
     pub(crate) fn restart_scheduler_tick_after_idle(
         &mut self,
-        now_ns: u64,
+        now: MonotonicInstant,
         interval_ns: u64,
     ) -> ClockEventAction {
         assert!(!matches!(
@@ -128,15 +137,10 @@ impl LocalClockEvent {
             return ClockEventAction::None;
         };
         let next = match resume_from {
-            Some(previous) => crate::clock_event_runtime::next_periodic_deadline(
-                previous.as_nanos(),
-                now_ns,
-                interval_ns,
-            )
-            .and_then(ClockDeadline::from_nanos),
-            None => now_ns
-                .checked_add(interval_ns.max(1))
-                .and_then(ClockDeadline::from_nanos),
+            Some(previous) => {
+                crate::clock_event_runtime::next_periodic_deadline(previous, now, interval_ns)
+            }
+            None => crate::clock_event_runtime::initial_periodic_deadline(now, interval_ns),
         };
         self.scheduler_tick = SchedulerTickState::Running { next };
         self.reconcile_arm()
@@ -167,14 +171,14 @@ impl LocalClockEvent {
     pub(crate) fn publish_task(
         &mut self,
         generation: u64,
-        deadline_ns: Option<u64>,
+        deadline: Option<MonotonicDeadline>,
         deferred_work: bool,
     ) -> ClockEventAction {
         if generation <= self.task_generation {
             return ClockEventAction::None;
         }
         self.task_generation = generation;
-        self.task_deadline = deadline_ns.and_then(ClockDeadline::from_nanos);
+        self.task_deadline = deadline.map(ClockDeadline::from_monotonic);
         self.deferred_work = deferred_work;
         self.reconcile_arm()
     }
@@ -184,7 +188,7 @@ impl LocalClockEvent {
     /// A pending edge from an older offline cycle can be delivered after the
     /// timer has been armed for a new epoch. If the new deadline is not due,
     /// the edge only re-arms that deadline and must not enter ax-task.
-    pub(crate) fn claim_irq(&mut self, now_ns: u64) -> ClockEventIrqClaim {
+    pub(crate) fn claim_irq(&mut self, now: MonotonicInstant) -> ClockEventIrqClaim {
         match self.phase {
             ClockEventPhase::Offline | ClockEventPhase::Idle | ClockEventPhase::Firing => {
                 return ClockEventIrqClaim::Ignored;
@@ -194,7 +198,7 @@ impl LocalClockEvent {
         let armed = self
             .armed_deadline
             .expect("armed clockevent must retain its physical deadline");
-        if now_ns < armed.as_nanos() {
+        if !now.reached(armed.as_monotonic()) {
             return ClockEventIrqClaim::Rearm(armed);
         }
         self.armed_deadline = None;
@@ -211,11 +215,11 @@ impl LocalClockEvent {
     /// edge, so merely refusing to sleep would otherwise livelock the idle
     /// loop forever on the stale `Armed` state.
     #[cfg(feature = "multitask")]
-    pub(crate) fn claim_due(&mut self, now_ns: u64) -> Option<ClockEventFiringToken> {
+    pub(crate) fn claim_due(&mut self, now: MonotonicInstant) -> Option<ClockEventFiringToken> {
         if self.phase != ClockEventPhase::Armed
             || !self
                 .armed_deadline
-                .is_some_and(|deadline| deadline.as_nanos() <= now_ns)
+                .is_some_and(|deadline| now.reached(deadline.as_monotonic()))
         {
             return None;
         }
@@ -230,22 +234,17 @@ impl LocalClockEvent {
     ///
     /// A periodic clockevent is only one physical wakeup source. Whether the
     /// current thread must be preempted remains an ax-task policy decision.
-    pub(crate) fn advance_periodic(&mut self, now_ns: u64, interval_ns: u64) -> bool {
+    pub(crate) fn advance_periodic(&mut self, now: MonotonicInstant, interval_ns: u64) -> bool {
         let SchedulerTickState::Running { next } = &mut self.scheduler_tick else {
             return false;
         };
         let Some(current) = *next else {
             return false;
         };
-        if now_ns < current.as_nanos() {
+        if !now.reached(current.as_monotonic()) {
             return false;
         }
-        *next = crate::clock_event_runtime::next_periodic_deadline(
-            current.as_nanos(),
-            now_ns,
-            interval_ns,
-        )
-        .and_then(ClockDeadline::from_nanos);
+        *next = crate::clock_event_runtime::next_periodic_deadline(current, now, interval_ns);
         true
     }
 
@@ -311,11 +310,11 @@ impl LocalClockEvent {
     }
 
     #[cfg(feature = "multitask")]
-    pub(crate) fn has_immediate_work(&self, now_ns: u64) -> bool {
+    pub(crate) fn has_immediate_work(&self, now: MonotonicInstant) -> bool {
         self.deferred_work
             || self
                 .selected_deadline()
-                .is_some_and(|deadline| deadline.as_nanos() <= now_ns)
+                .is_some_and(|deadline| now.reached(deadline.as_monotonic()))
     }
 
     fn selected_deadline(&self) -> Option<ClockDeadline> {
@@ -375,6 +374,8 @@ impl LocalClockEvent {
 
 #[cfg(all(test, feature = "multitask"))]
 mod tests {
+    use ax_task::runtime::{MonotonicDeadline, MonotonicInstant};
+
     use super::{
         ClockDeadline, ClockEventAction, ClockEventFiringToken, ClockEventIrqClaim,
         ClockEventPhase, LocalClockEvent,
@@ -384,16 +385,33 @@ mod tests {
         ClockDeadline::from_nanos(nanos).unwrap()
     }
 
+    fn instant(nanos: u64) -> MonotonicInstant {
+        MonotonicInstant::from_nanos(nanos).unwrap()
+    }
+
+    fn task_deadline(nanos: u64) -> MonotonicDeadline {
+        MonotonicDeadline::from_nanos(nanos).unwrap()
+    }
+
     fn claim_due(event: &mut LocalClockEvent, now_ns: u64) -> ClockEventFiringToken {
-        match event.claim_irq(now_ns) {
+        match event.claim_irq(instant(now_ns)) {
             ClockEventIrqClaim::Firing(token) => token,
             claim => panic!("due clockevent was not claimed: {claim:?}"),
         }
     }
 
     #[test]
-    fn numeric_infinity_is_not_a_physical_deadline() {
+    fn values_outside_linux_ktime_are_not_physical_deadlines() {
         assert_eq!(ClockDeadline::from_nanos(u64::MAX), None);
+        assert_eq!(
+            ClockDeadline::from_nanos(ax_task::runtime::KTIME_MAX_NANOS),
+            Some(deadline(ax_task::runtime::KTIME_MAX_NANOS))
+        );
+    }
+
+    #[test]
+    fn zero_is_a_valid_already_due_physical_deadline() {
+        assert_eq!(ClockDeadline::from_nanos(0), Some(deadline(0)));
     }
 
     #[test]
@@ -428,7 +446,7 @@ mod tests {
         // Model an interrupt edge that was pending before the CPU completed
         // the offline/online cycle. It must not consume the new epoch's arm.
         assert_eq!(
-            event.claim_irq(150),
+            event.claim_irq(instant(150)),
             ClockEventIrqClaim::Rearm(deadline(200))
         );
 
@@ -468,7 +486,7 @@ mod tests {
             ClockEventAction::Program(deadline(100))
         );
         assert_eq!(
-            event.publish_task(1, Some(1_000), false),
+            event.publish_task(1, Some(task_deadline(1_000)), false),
             ClockEventAction::None
         );
 
@@ -486,7 +504,7 @@ mod tests {
         assert_eq!(event.stop_scheduler_tick_for_idle(), ClockEventAction::Stop);
 
         assert_eq!(
-            event.restart_scheduler_tick_after_idle(149, 25),
+            event.restart_scheduler_tick_after_idle(instant(149), 25),
             ClockEventAction::Program(deadline(150))
         );
         assert_eq!(event.armed_deadline(), Some(deadline(150)));
@@ -506,7 +524,7 @@ mod tests {
     fn stale_task_generation_cannot_cross_an_offline_cycle() {
         let mut event = LocalClockEvent::offline();
         assert_eq!(
-            event.publish_task(7, Some(90), true),
+            event.publish_task(7, Some(task_deadline(90)), true),
             ClockEventAction::None
         );
         assert_eq!(
@@ -515,7 +533,7 @@ mod tests {
         );
         assert_eq!(event.take_offline(), ClockEventAction::Stop);
         assert_eq!(
-            event.publish_task(6, Some(50), true),
+            event.publish_task(6, Some(task_deadline(50)), true),
             ClockEventAction::None
         );
         assert_eq!(
@@ -531,11 +549,11 @@ mod tests {
     fn periodic_overflow_becomes_idle_instead_of_programming_infinity() {
         let mut event = LocalClockEvent::offline();
         assert_eq!(
-            event.online(Some(deadline(u64::MAX - 5))),
-            ClockEventAction::Program(deadline(u64::MAX - 5))
+            event.online(Some(deadline(ax_task::runtime::KTIME_MAX_NANOS - 5))),
+            ClockEventAction::Program(deadline(ax_task::runtime::KTIME_MAX_NANOS - 5))
         );
-        let firing = claim_due(&mut event, u64::MAX - 1);
-        assert!(event.advance_periodic(u64::MAX - 1, 10));
+        let firing = claim_due(&mut event, ax_task::runtime::KTIME_MAX_NANOS - 1);
+        assert!(event.advance_periodic(instant(ax_task::runtime::KTIME_MAX_NANOS - 1), 10));
         assert_eq!(event.finish_firing(firing), ClockEventAction::None);
         assert_eq!(event.phase(), ClockEventPhase::Idle);
         assert_eq!(event.armed_deadline(), None);
@@ -549,11 +567,11 @@ mod tests {
             ClockEventAction::Program(deadline(500))
         );
         assert_eq!(
-            event.publish_task(1, Some(300), false),
+            event.publish_task(1, Some(task_deadline(300)), false),
             ClockEventAction::Program(deadline(300))
         );
         assert_eq!(
-            event.publish_task(2, Some(400), false),
+            event.publish_task(2, Some(task_deadline(400)), false),
             ClockEventAction::Program(deadline(400))
         );
         assert_eq!(event.armed_deadline(), Some(deadline(400)));
@@ -569,7 +587,7 @@ mod tests {
         let mut event = LocalClockEvent::offline();
         assert_eq!(event.online(None), ClockEventAction::None);
         assert_eq!(
-            event.publish_task(1, Some(300), false),
+            event.publish_task(1, Some(task_deadline(300)), false),
             ClockEventAction::Program(deadline(300))
         );
         assert_eq!(event.publish_task(2, None, false), ClockEventAction::Stop);
@@ -581,11 +599,11 @@ mod tests {
     fn stale_generation_is_ignored() {
         let mut event = LocalClockEvent::offline();
         assert_eq!(
-            event.publish_task(7, Some(200), false),
+            event.publish_task(7, Some(task_deadline(200)), false),
             ClockEventAction::None
         );
         assert_eq!(
-            event.publish_task(6, Some(100), true),
+            event.publish_task(6, Some(task_deadline(100)), true),
             ClockEventAction::None
         );
         assert_eq!(event.task_generation(), 7);
@@ -603,11 +621,11 @@ mod tests {
         let firing = claim_due(&mut event, 500);
         assert_eq!(event.phase(), ClockEventPhase::Firing);
         assert_eq!(
-            event.publish_task(1, Some(450), false),
+            event.publish_task(1, Some(task_deadline(450)), false),
             ClockEventAction::None
         );
         assert_eq!(
-            event.publish_task(2, Some(250), true),
+            event.publish_task(2, Some(task_deadline(250)), true),
             ClockEventAction::None
         );
         assert_eq!(
@@ -623,8 +641,8 @@ mod tests {
         let mut event = LocalClockEvent::offline();
         event.online(Some(deadline(100)));
         let firing = claim_due(&mut event, 100);
-        assert!(event.advance_periodic(100, 25));
-        event.publish_task(1, Some(140), false);
+        assert!(event.advance_periodic(instant(100), 25));
+        event.publish_task(1, Some(task_deadline(140)), false);
         assert_eq!(
             event.finish_firing(firing),
             ClockEventAction::Program(deadline(125))
@@ -639,12 +657,12 @@ mod tests {
             ClockEventAction::Program(deadline(100))
         );
         assert_eq!(
-            event.publish_task(1, Some(100), false),
+            event.publish_task(1, Some(task_deadline(100)), false),
             ClockEventAction::None
         );
 
         let firing = claim_due(&mut event, 100);
-        assert!(event.advance_periodic(100, 25));
+        assert!(event.advance_periodic(instant(100), 25));
         assert_eq!(event.publish_task(2, None, false), ClockEventAction::None);
 
         assert_eq!(
@@ -662,12 +680,12 @@ mod tests {
             ClockEventAction::Program(deadline(500))
         );
         assert_eq!(
-            event.publish_task(1, Some(100), false),
+            event.publish_task(1, Some(task_deadline(100)), false),
             ClockEventAction::Program(deadline(100))
         );
 
         assert_eq!(
-            event.claim_irq(50),
+            event.claim_irq(instant(50)),
             ClockEventIrqClaim::Rearm(deadline(100))
         );
         assert_eq!(event.phase(), ClockEventPhase::Armed);
@@ -679,7 +697,7 @@ mod tests {
         let mut event = LocalClockEvent::offline();
         assert_eq!(event.online(None), ClockEventAction::None);
 
-        assert_eq!(event.claim_irq(100), ClockEventIrqClaim::Ignored);
+        assert_eq!(event.claim_irq(instant(100)), ClockEventIrqClaim::Ignored);
         assert_eq!(event.phase(), ClockEventPhase::Idle);
         assert_eq!(event.armed_deadline(), None);
     }
@@ -689,10 +707,10 @@ mod tests {
         let mut event = LocalClockEvent::offline();
         event.online(Some(deadline(500)));
         assert_eq!(
-            event.publish_task(1, Some(90), false),
+            event.publish_task(1, Some(task_deadline(90)), false),
             ClockEventAction::Program(deadline(90))
         );
-        assert!(event.has_immediate_work(100));
+        assert!(event.has_immediate_work(instant(100)));
 
         let firing = claim_due(&mut event, 100);
         assert_eq!(event.publish_task(2, None, false), ClockEventAction::None);
@@ -700,7 +718,7 @@ mod tests {
             event.finish_firing(firing),
             ClockEventAction::Program(deadline(500))
         );
-        assert!(!event.has_immediate_work(100));
+        assert!(!event.has_immediate_work(instant(100)));
     }
 
     #[test]
@@ -711,10 +729,12 @@ mod tests {
             ClockEventAction::Program(deadline(100))
         );
 
-        let firing = event.claim_due(100).expect("overdue arm must be claimed");
+        let firing = event
+            .claim_due(instant(100))
+            .expect("overdue arm must be claimed");
         assert_eq!(event.phase(), ClockEventPhase::Firing);
-        assert!(event.claim_due(100).is_none());
-        assert!(event.advance_periodic(100, 25));
+        assert!(event.claim_due(instant(100)).is_none());
+        assert!(event.advance_periodic(instant(100), 25));
         assert_eq!(
             event.finish_firing(firing),
             ClockEventAction::Program(deadline(125))
@@ -730,7 +750,7 @@ mod tests {
         );
         let firing = claim_due(&mut event, 500);
         assert_eq!(
-            event.publish_task(1, Some(250), true),
+            event.publish_task(1, Some(task_deadline(250)), true),
             ClockEventAction::None
         );
 

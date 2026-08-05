@@ -1,6 +1,7 @@
 //! Pure scheduler policy state and owner-CPU run queues.
 
 mod admission;
+mod clock;
 mod entity;
 mod fair;
 mod fair_queue;
@@ -8,6 +9,7 @@ mod queue;
 mod rt;
 
 pub use admission::*;
+pub use clock::*;
 pub use entity::*;
 pub use fair::*;
 pub(crate) use queue::*;

@@ -2,7 +2,12 @@
 
 use core::cmp::Ordering;
 
-use crate::{DEFAULT_RR_QUANTUM_NS, TaskError};
+use crate::{
+    DEFAULT_RR_QUANTUM_NS, SCHEDULER_TIME_HALF_RANGE, SchedulerTimestamp, TaskError,
+    scheduler_time_cmp,
+};
+
+const DEADLINE_CLASS_RANK: u8 = 1;
 
 /// Linux-compatible nice value in the inclusive range `-20..=19`.
 #[repr(transparent)]
@@ -128,7 +133,11 @@ impl DeadlinePolicy {
         period_ns: u64,
         flags: DeadlineFlags,
     ) -> Result<Self, TaskError> {
-        if runtime_ns > 0 && runtime_ns <= deadline_ns && deadline_ns <= period_ns {
+        if runtime_ns > 0
+            && runtime_ns <= deadline_ns
+            && deadline_ns <= period_ns
+            && period_ns < SCHEDULER_TIME_HALF_RANGE
+        {
             Ok(Self {
                 runtime_ns,
                 deadline_ns,
@@ -331,8 +340,8 @@ impl Default for SchedulePolicy {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DeadlineEntity {
     policy: DeadlinePolicy,
-    absolute_deadline_ns: u64,
-    next_period_ns: u64,
+    absolute_deadline: Option<SchedulerTimestamp>,
+    next_period: Option<SchedulerTimestamp>,
     remaining_runtime_ns: i128,
     state: DeadlineJobState,
     miss_recorded: bool,
@@ -360,8 +369,8 @@ impl DeadlineEntity {
     pub const fn new(policy: DeadlinePolicy) -> Self {
         Self {
             policy,
-            absolute_deadline_ns: 0,
-            next_period_ns: 0,
+            absolute_deadline: None,
+            next_period: None,
             remaining_runtime_ns: 0,
             state: DeadlineJobState::Inactive,
             miss_recorded: false,
@@ -372,8 +381,13 @@ impl DeadlineEntity {
 
     /// Applies the CBS wake-up rule and activates a fresh job when required.
     pub fn activate(&mut self, now_ns: u64) {
-        if matches!(self.state, DeadlineJobState::Inactive) || now_ns >= self.next_period_ns {
-            self.start_fresh_job(now_ns);
+        let now = SchedulerTimestamp::from_nanos(now_ns);
+        if matches!(self.state, DeadlineJobState::Inactive)
+            || self
+                .next_period
+                .is_some_and(|next_period| next_period.is_reached_by(now))
+        {
+            self.start_fresh_job(now);
             return;
         }
         if self.is_throttled() {
@@ -381,7 +395,10 @@ impl DeadlineEntity {
         }
 
         let constrained = self.policy.deadline_ns() < self.policy.period_ns();
-        if constrained && now_ns >= self.absolute_deadline_ns {
+        let absolute_deadline = self
+            .absolute_deadline
+            .expect("an active Deadline job must own an absolute deadline");
+        if constrained && absolute_deadline.is_reached_by(now) {
             self.remaining_runtime_ns = 0;
             self.state = DeadlineJobState::Throttled(DeadlineThrottleReason::ConstrainedWake);
             return;
@@ -390,7 +407,7 @@ impl DeadlineEntity {
             self.state = DeadlineJobState::Throttled(DeadlineThrottleReason::RuntimeExhausted);
             return;
         }
-        let time_to_deadline_ns = self.absolute_deadline_ns - now_ns;
+        let time_to_deadline_ns = absolute_deadline.since(now);
         if !density_exceeds_reservation(
             self.remaining_runtime_ns as u128,
             time_to_deadline_ns,
@@ -405,7 +422,7 @@ impl DeadlineEntity {
                 self.state = DeadlineJobState::Throttled(DeadlineThrottleReason::ConstrainedWake);
             }
         } else {
-            self.start_fresh_job(now_ns);
+            self.start_fresh_job(now);
         }
     }
 
@@ -438,23 +455,31 @@ impl DeadlineEntity {
         let DeadlineJobState::Throttled(reason) = self.state else {
             return;
         };
+        let now = SchedulerTimestamp::from_nanos(now_ns);
         if reason == DeadlineThrottleReason::Yielded {
-            if now_ns < self.next_period_ns {
+            let next_period = self
+                .next_period
+                .expect("a yielded Deadline job must retain its next release");
+            if !next_period.is_reached_by(now) {
                 return;
             }
-            let elapsed = now_ns - self.next_period_ns;
+            let elapsed = now.since(next_period);
             let periods = elapsed / self.policy.period_ns();
-            let release_ns = self
-                .next_period_ns
-                .saturating_add(periods.saturating_mul(self.policy.period_ns()));
-            self.absolute_deadline_ns = release_ns.saturating_add(self.policy.deadline_ns());
-            self.next_period_ns = release_ns.saturating_add(self.policy.period_ns());
+            let release_advance = periods
+                .checked_mul(self.policy.period_ns())
+                .expect("elapsed scheduler time bounds the release advance");
+            let release = next_period.advance(release_advance);
+            self.absolute_deadline = Some(release.advance(self.policy.deadline_ns()));
+            self.next_period = Some(release.advance(self.policy.period_ns()));
             self.remaining_runtime_ns = self.policy.runtime_ns() as i128;
         } else {
-            if now_ns < self.next_period_ns {
+            let next_period = self
+                .next_period
+                .expect("a throttled Deadline job must retain its next release");
+            if !next_period.is_reached_by(now) {
                 return;
             }
-            if !self.advance_depleted_job(now_ns) {
+            if !self.advance_depleted_job(now) {
                 return;
             }
         }
@@ -471,10 +496,11 @@ impl DeadlineEntity {
 
     /// Records and reports whether the active job missed its deadline.
     pub fn observe_time(&mut self, now_ns: u64) -> bool {
-        if self.absolute_deadline_ns != 0
-            && matches!(self.state, DeadlineJobState::Runnable)
+        if matches!(self.state, DeadlineJobState::Runnable)
             && !self.miss_recorded
-            && now_ns >= self.absolute_deadline_ns
+            && self.absolute_deadline.is_some_and(|deadline| {
+                deadline.is_reached_by(SchedulerTimestamp::from_nanos(now_ns))
+            })
         {
             self.miss_recorded = true;
             self.misses = self.misses.saturating_add(1);
@@ -485,8 +511,11 @@ impl DeadlineEntity {
     }
 
     /// Returns the current absolute deadline.
-    pub const fn absolute_deadline_ns(self) -> u64 {
-        self.absolute_deadline_ns
+    pub const fn absolute_deadline_ns(self) -> Option<u64> {
+        match self.absolute_deadline {
+            Some(deadline) => Some(deadline.as_nanos()),
+            None => None,
+        }
     }
 
     /// Returns the immutable reservation parameters backing this CBS state.
@@ -506,17 +535,20 @@ impl DeadlineEntity {
     }
 
     /// Returns the next CBS replenishment boundary.
-    pub const fn next_period_ns(self) -> u64 {
-        self.next_period_ns
+    pub const fn next_period_ns(self) -> Option<u64> {
+        match self.next_period {
+            Some(next_period) => Some(next_period.as_nanos()),
+            None => None,
+        }
     }
 
-    pub(crate) const fn next_scheduler_event_ns(self) -> u64 {
+    pub(crate) const fn next_scheduler_event_ns(self) -> Option<u64> {
         if self.is_throttled() {
-            self.next_period_ns
+            self.next_period_ns()
         } else if self.miss_recorded {
-            0
+            None
         } else {
-            self.absolute_deadline_ns
+            self.absolute_deadline_ns()
         }
     }
 
@@ -557,50 +589,49 @@ impl DeadlineEntity {
 
     /// Builds urgency without a thread-identity or queue-order tie-break.
     pub const fn scheduling_urgency(self) -> SchedulingUrgency {
-        let deadline = if self.absolute_deadline_ns == 0 {
-            self.policy.deadline_ns()
-        } else {
-            self.absolute_deadline_ns
+        let deadline = match self.absolute_deadline_ns() {
+            Some(deadline) => deadline,
+            None => panic!("an inactive Deadline entity has no scheduler urgency"),
         };
         SchedulingUrgency::new(SchedulePolicy::Deadline(self.policy).class_rank(), deadline)
     }
 
-    fn start_fresh_job(&mut self, now_ns: u64) {
-        self.absolute_deadline_ns = now_ns.saturating_add(self.policy.deadline_ns());
-        self.next_period_ns = now_ns.saturating_add(self.policy.period_ns());
+    fn start_fresh_job(&mut self, now: SchedulerTimestamp) {
+        self.absolute_deadline = Some(now.advance(self.policy.deadline_ns()));
+        self.next_period = Some(now.advance(self.policy.period_ns()));
         self.remaining_runtime_ns = self.policy.runtime_ns() as i128;
         self.state = DeadlineJobState::Runnable;
         self.miss_recorded = false;
     }
 
-    fn advance_depleted_job(&mut self, now_ns: u64) -> bool {
+    fn advance_depleted_job(&mut self, now: SchedulerTimestamp) -> bool {
         if self.remaining_runtime_ns > 0 {
             return false;
         }
         let runtime_ns = self.policy.runtime_ns() as u128;
         let debt_ns = self.remaining_runtime_ns.unsigned_abs();
         let periods = debt_ns / runtime_ns + 1;
-        let Some(deadline_advance) = periods.checked_mul(self.policy.period_ns() as u128) else {
-            return false;
-        };
-        let Some(new_deadline) = (self.absolute_deadline_ns as u128).checked_add(deadline_advance)
-        else {
-            return false;
-        };
-        let Ok(new_deadline) = u64::try_from(new_deadline) else {
-            return false;
-        };
+        let deadline_advance = periods
+            .checked_mul(self.policy.period_ns() as u128)
+            .expect("Deadline overrun debt multiplication overflowed u128");
+        assert!(
+            deadline_advance < SCHEDULER_TIME_HALF_RANGE as u128,
+            "Deadline overrun debt exceeded the scheduler clock comparison window"
+        );
+        let new_deadline = self
+            .absolute_deadline
+            .expect("a depleted Deadline job must retain its deadline")
+            .advance(deadline_advance as u64);
         let replenished_runtime = periods * runtime_ns - debt_ns;
 
-        if new_deadline < now_ns {
-            self.start_fresh_job(now_ns);
+        if new_deadline.is_before(now) {
+            self.start_fresh_job(now);
             return true;
         }
 
-        self.absolute_deadline_ns = new_deadline;
-        self.next_period_ns = new_deadline
-            .saturating_sub(self.policy.deadline_ns())
-            .saturating_add(self.policy.period_ns());
+        self.absolute_deadline = Some(new_deadline);
+        self.next_period =
+            Some(new_deadline.advance(self.policy.period_ns() - self.policy.deadline_ns()));
         self.remaining_runtime_ns = replenished_runtime as i128;
         true
     }
@@ -611,13 +642,13 @@ fn density_exceeds_reservation(
     time_to_deadline_ns: u64,
     policy: DeadlinePolicy,
 ) -> bool {
-    remaining_runtime_ns.saturating_mul(policy.deadline_ns() as u128)
-        > (policy.runtime_ns() as u128).saturating_mul(time_to_deadline_ns as u128)
+    remaining_runtime_ns * policy.deadline_ns() as u128
+        > policy.runtime_ns() as u128 * time_to_deadline_ns as u128
 }
 
 fn revised_wakeup_runtime(time_to_deadline_ns: u64, policy: DeadlinePolicy) -> i128 {
-    let runtime_ns = (policy.runtime_ns() as u128).saturating_mul(time_to_deadline_ns as u128)
-        / policy.deadline_ns() as u128;
+    let runtime_ns =
+        (policy.runtime_ns() as u128 * time_to_deadline_ns as u128) / policy.deadline_ns() as u128;
     runtime_ns as i128
 }
 
@@ -650,9 +681,13 @@ impl SchedulingUrgency {
 
 impl Ord for SchedulingUrgency {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.class_rank
-            .cmp(&other.class_rank)
-            .then_with(|| self.primary.cmp(&other.primary))
+        self.class_rank.cmp(&other.class_rank).then_with(|| {
+            if self.class_rank == DEADLINE_CLASS_RANK {
+                scheduler_time_cmp(self.primary, other.primary)
+            } else {
+                self.primary.cmp(&other.primary)
+            }
+        })
     }
 }
 
@@ -700,7 +735,13 @@ impl Ord for SchedulingKey {
     fn cmp(&self, other: &Self) -> Ordering {
         self.class_rank
             .cmp(&other.class_rank)
-            .then_with(|| self.primary.cmp(&other.primary))
+            .then_with(|| {
+                if self.class_rank == DEADLINE_CLASS_RANK {
+                    scheduler_time_cmp(self.primary, other.primary)
+                } else {
+                    self.primary.cmp(&other.primary)
+                }
+            })
             .then_with(|| self.sequence.cmp(&other.sequence))
     }
 }
@@ -746,7 +787,7 @@ mod tests {
         let policy = DeadlinePolicy::new(10, 20, 30, DeadlineFlags::NONE).unwrap();
         let mut entity = DeadlineEntity::new(policy);
         entity.activate(100);
-        assert_eq!(entity.absolute_deadline_ns(), 120);
+        assert_eq!(entity.absolute_deadline_ns(), Some(120));
         assert!(entity.charge(10, 0));
         assert!(entity.is_throttled());
         entity.replenish(130);
@@ -772,7 +813,7 @@ mod tests {
 
         entity.activate(4);
 
-        assert_eq!(entity.absolute_deadline_ns(), 8);
+        assert_eq!(entity.absolute_deadline_ns(), Some(8));
         assert_eq!(entity.remaining_runtime_ns(), 2);
     }
 
@@ -785,7 +826,7 @@ mod tests {
 
         entity.activate(3);
 
-        assert_eq!(entity.absolute_deadline_ns(), 8);
+        assert_eq!(entity.absolute_deadline_ns(), Some(8));
         assert_eq!(entity.remaining_runtime_ns(), 2);
     }
 
@@ -799,14 +840,14 @@ mod tests {
         entity.activate(9);
 
         assert!(entity.is_throttled());
-        assert_eq!(entity.absolute_deadline_ns(), 8);
-        assert_eq!(entity.next_scheduler_event_ns(), 10);
+        assert_eq!(entity.absolute_deadline_ns(), Some(8));
+        assert_eq!(entity.next_scheduler_event_ns(), Some(10));
         assert_eq!(entity.remaining_runtime_ns(), 0);
 
         entity.activate(10);
 
         assert!(!entity.is_throttled());
-        assert_eq!(entity.absolute_deadline_ns(), 18);
+        assert_eq!(entity.absolute_deadline_ns(), Some(18));
         assert_eq!(entity.remaining_runtime_ns(), 4);
     }
 
@@ -831,7 +872,7 @@ mod tests {
         assert!(entity.charge(7, 0));
         entity.replenish(20);
 
-        assert_eq!(entity.absolute_deadline_ns(), 30);
+        assert_eq!(entity.absolute_deadline_ns(), Some(30));
         assert_eq!(entity.remaining_runtime_ns(), 3);
         assert!(!entity.is_throttled());
     }
@@ -843,14 +884,14 @@ mod tests {
         entity.activate(0);
         assert!(entity.charge(2, 0));
 
-        assert_eq!(entity.next_scheduler_event_ns(), 10);
+        assert_eq!(entity.next_scheduler_event_ns(), Some(10));
         entity.replenish(5);
         assert!(entity.is_throttled());
         assert_eq!(entity.remaining_runtime_ns(), 0);
 
         entity.replenish(10);
         assert!(!entity.is_throttled());
-        assert_eq!(entity.absolute_deadline_ns(), 15);
+        assert_eq!(entity.absolute_deadline_ns(), Some(15));
         assert_eq!(entity.remaining_runtime_ns(), 2);
     }
 
@@ -864,21 +905,31 @@ mod tests {
         entity.replenish(30);
 
         assert!(!entity.is_throttled());
-        assert_eq!(entity.absolute_deadline_ns(), 35);
-        assert_eq!(entity.next_period_ns(), 40);
+        assert_eq!(entity.absolute_deadline_ns(), Some(35));
+        assert_eq!(entity.next_period_ns(), Some(40));
         assert_eq!(entity.remaining_runtime_ns(), 2);
     }
 
     #[test]
-    fn saturated_cbs_deadline_does_not_unthrottle_with_unpaid_overrun_debt() {
-        let policy = DeadlinePolicy::new(1, 1, u64::MAX, DeadlineFlags::NONE).unwrap();
+    fn deadline_parameters_reserve_the_msb_for_linux_wrap_ordering() {
+        let half_range = 1_u64 << 63;
+
+        assert!(DeadlinePolicy::new(1, 1, half_range - 1, DeadlineFlags::NONE).is_ok());
+        assert!(DeadlinePolicy::new(1, 1, half_range, DeadlineFlags::NONE).is_err());
+        assert!(DeadlinePolicy::new(1, half_range, half_range, DeadlineFlags::NONE).is_err());
+    }
+
+    #[test]
+    fn deadline_entity_uses_linux_rq_clock_wrap_semantics() {
+        let policy = DeadlinePolicy::new(1, 10, 20, DeadlineFlags::NONE).unwrap();
         let mut entity = DeadlineEntity::new(policy);
-        entity.activate(1);
-        assert!(entity.charge(u64::MAX, 0));
+        let now = u64::MAX - 5;
 
-        entity.replenish(u64::MAX);
+        entity.activate(now);
 
-        assert!(entity.is_throttled());
-        assert_eq!(entity.remaining_runtime_ns(), 0);
+        assert_eq!(entity.absolute_deadline_ns(), Some(4));
+        assert_eq!(entity.next_period_ns(), Some(14));
+        assert!(!entity.observe_time(u64::MAX - 1));
+        assert!(entity.observe_time(4));
     }
 }

@@ -215,7 +215,7 @@ impl TaskSystem {
             let applied = self.apply_owner_policy_generation(
                 &core,
                 generation,
-                task_runtime::monotonic_ns(),
+                task_runtime::scheduler_now().as_nanos(),
                 None,
                 false,
             )?;

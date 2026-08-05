@@ -1,4 +1,7 @@
 use super::*;
+use crate::{
+    SchedulerClockEvent, scheduler_clock_event, scheduler_time_advance, scheduler_time_reached,
+};
 
 mod deadline_state;
 mod dispatch_state;
@@ -394,10 +397,14 @@ impl CpuLocal {
         // bandwidth periods and querying its next local event.
         unsafe { self.get_unchecked_mut() }
             .scheduler_deadline_ns(now_ns)
-            .is_some_and(|deadline| deadline <= now_ns)
+            .is_some_and(|deadline| scheduler_time_reached(now_ns, deadline))
     }
 
-    pub(crate) fn next_oneshot_deadline_ns(self: Pin<&mut Self>, now_ns: u64) -> Option<u64> {
+    pub(crate) fn next_oneshot_deadline(
+        self: Pin<&mut Self>,
+        scheduler_now_ns: u64,
+        monotonic_now: MonotonicInstant,
+    ) -> Option<MonotonicDeadline> {
         // SAFETY: clockevent selection is an owner-only transition. The
         // mutable queue/scheduler projections cannot move CpuLocal.
         let this = unsafe { self.get_unchecked_mut() };
@@ -405,7 +412,7 @@ impl CpuLocal {
             && this
                 .task_deadlines
                 .queue
-                .has_immediately_actionable_entry(now_ns);
+                .has_immediately_actionable_entry(monotonic_now);
         let timer = if deferred_timer_backlog {
             // A bounded hard-IRQ pass already published sticky owner work and
             // need_resched. Re-arming the overdue heap head at the hardware
@@ -415,10 +422,13 @@ impl CpuLocal {
             // source remain the failsafe clockevent.
             None
         } else {
-            this.task_deadlines.queue.next_deadline_ns()
+            this.task_deadlines.queue.next_deadline()
         };
-        let scheduler = match this.scheduler_deadline_ns(now_ns) {
-            Some(deadline) if deadline <= now_ns => {
+        let scheduler = match this
+            .scheduler_deadline_ns(scheduler_now_ns)
+            .map(|deadline| scheduler_clock_event(scheduler_now_ns, monotonic_now, deadline))
+        {
+            Some(SchedulerClockEvent::Due) => {
                 // Linux does not start a scheduler hrtimer whose expiry has
                 // already passed: the owning runqueue handles that state
                 // immediately. The owner state remains the only deadline
@@ -427,7 +437,7 @@ impl CpuLocal {
                 this.remote.request_scheduler_work();
                 None
             }
-            Some(deadline) => Some(deadline),
+            Some(SchedulerClockEvent::Future(deadline)) => Some(deadline),
             None => None,
         };
         match (timer, scheduler) {
@@ -440,9 +450,12 @@ impl CpuLocal {
 
     pub(crate) fn next_task_deadline_update(
         mut self: Pin<&mut Self>,
-        now_ns: u64,
+        scheduler_now_ns: u64,
+        monotonic_now: MonotonicInstant,
     ) -> Result<TaskDeadlineUpdate, TaskError> {
-        let publication = self.as_mut().task_deadline_publication(now_ns);
+        let publication = self
+            .as_mut()
+            .task_deadline_publication(scheduler_now_ns, monotonic_now);
         let task_deadlines = self.task_deadline_state_mut();
         if task_deadlines.publication == Some(publication) {
             return TaskDeadlineUpdate::try_new(
@@ -457,9 +470,12 @@ impl CpuLocal {
 
     pub(crate) fn next_task_deadline_update_if_changed(
         mut self: Pin<&mut Self>,
-        now_ns: u64,
+        scheduler_now_ns: u64,
+        monotonic_now: MonotonicInstant,
     ) -> Result<Option<TaskDeadlineUpdate>, TaskError> {
-        let publication = self.as_mut().task_deadline_publication(now_ns);
+        let publication = self
+            .as_mut()
+            .task_deadline_publication(scheduler_now_ns, monotonic_now);
         let task_deadlines = self.task_deadline_state_mut();
         if task_deadlines.publication == Some(publication) {
             return Ok(None);
@@ -469,12 +485,12 @@ impl CpuLocal {
 
     fn task_deadline_publication(
         mut self: Pin<&mut Self>,
-        now_ns: u64,
+        scheduler_now_ns: u64,
+        monotonic_now: MonotonicInstant,
     ) -> TaskDeadlinePublicationState {
         let deadline = self
             .as_mut()
-            .next_oneshot_deadline_ns(now_ns)
-            .and_then(MonotonicDeadline::from_nanos);
+            .next_oneshot_deadline(scheduler_now_ns, monotonic_now);
         TaskDeadlinePublicationState {
             deadline,
             deferred_work: self.remote.deadline_work_pending(),
@@ -507,10 +523,14 @@ impl CpuLocal {
         self.remote.deadline_work_pending()
     }
 
-    pub(crate) fn task_deadline_expiry_due(&self, now_ns: u64) -> bool {
+    pub(crate) fn has_task_deadlines(&self) -> bool {
+        !self.task_deadlines.queue.is_empty()
+    }
+
+    pub(crate) fn task_deadline_expiry_due(&self, now: MonotonicInstant) -> bool {
         self.task_deadlines
             .queue
-            .has_immediately_actionable_entry(now_ns)
+            .has_immediately_actionable_entry(now)
     }
 
     #[cfg(test)]
@@ -544,7 +564,7 @@ impl CpuLocal {
                 let deadline = if remaining == 0 {
                     self.dispatch.rt_bandwidth.next_period_ns(now_ns)
                 } else {
-                    now_ns.saturating_add(remaining)
+                    scheduler_time_advance(now_ns, remaining)
                 };
                 next_deadline_ns = earliest(next_deadline_ns, deadline);
             }
@@ -560,8 +580,9 @@ impl CpuLocal {
                 .len()
                 .saturating_add(usize::from(current_non_idle))
                 > 1
+            && let Some(deadline) = self.remote.fair_balance_deadline_ns()
         {
-            next_deadline_ns = earliest(next_deadline_ns, self.remote.fair_balance_deadline_ns());
+            next_deadline_ns = earliest(next_deadline_ns, deadline);
         }
         next_deadline_ns
     }
@@ -619,7 +640,7 @@ impl CpuLocal {
     /// Expires one bounded timer batch without allocation or callbacks.
     pub fn expire_task_deadlines(
         self: Pin<&mut Self>,
-        now_ns: u64,
+        now: MonotonicInstant,
         budget: usize,
     ) -> TaskDeadlineExpireBatch {
         // SAFETY: hard-IRQ expiry owns this pinned CPU-local state. These
@@ -635,8 +656,7 @@ impl CpuLocal {
             .expired_buffer
             .len()
             .saturating_sub(task_deadlines.expired_count);
-        let request =
-            TaskDeadlineExpireRequest::new(now_ns, budget.min(batch_limit).min(available));
+        let request = TaskDeadlineExpireRequest::new(now, budget.min(batch_limit).min(available));
         let output = &mut task_deadlines.expired_buffer[task_deadlines.expired_count..];
         let batch = task_deadlines.queue.expire(request, output);
         task_deadlines.expired_count += batch.expired();
@@ -709,7 +729,7 @@ impl CpuLocal {
             .any(|event| {
                 event.thread() == Some(registration.thread())
                     && event.token() == registration.token()
-                    && event.deadline_ns() == registration.deadline_ns()
+                    && event.deadline() == Some(registration.deadline())
                     && event.kind() == Some(registration.kind())
             })
     }
@@ -757,10 +777,6 @@ impl CpuLocal {
     }
 }
 
-pub(super) fn nonzero_deadline(deadline_ns: u64) -> Option<u64> {
-    (deadline_ns != 0).then_some(deadline_ns)
-}
-
 pub(super) fn earliest(current: Option<u64>, candidate: u64) -> Option<u64> {
-    Some(current.map_or(candidate, |current| current.min(candidate)))
+    crate::earliest_scheduler_time(current, Some(candidate))
 }

@@ -10,21 +10,24 @@ use crate::{
     CurrentParkStart, TaskError, ThreadId, ThreadWakeHandle,
     facade::{acquire_blocking_permit, begin_current_park_with_permit},
     lock::PreemptTicketLock,
-    runtime::task_runtime,
+    runtime::{MonotonicDeadline, task_runtime},
 };
 
 /// Sleeps the calling scheduler thread for at least `duration`.
 #[track_caller]
 pub fn sleep(duration: Duration) {
-    let deadline_ns = deadline_after(duration);
-    sleep_until_ns(deadline_ns);
+    sleep_until(task_runtime::monotonic_now().deadline_after(duration));
 }
 
 /// Sleeps until an absolute deadline measured against the monotonic clock.
 #[track_caller]
-pub fn sleep_until(deadline: Duration) {
-    let deadline_ns = deadline.as_nanos().min(u64::MAX as u128) as u64;
-    sleep_until_ns(deadline_ns);
+pub fn sleep_until(deadline: MonotonicDeadline) {
+    let queue = WaitQueue::new();
+    while !task_runtime::monotonic_now().reached(deadline) {
+        queue
+            .wait_once(Some(deadline))
+            .expect("timed sleep must satisfy scheduler invariants");
+    }
 }
 
 /// A FIFO of scheduler threads that may sleep in ordinary task context.
@@ -96,18 +99,18 @@ impl WaitQueue {
     /// notification that already selected this waiter wins over the deadline.
     #[track_caller]
     pub fn wait_timeout(&self, timeout: Duration) -> bool {
-        let deadline_ns = deadline_after(timeout);
+        let deadline = task_runtime::monotonic_now().deadline_after(timeout);
         loop {
-            if task_runtime::monotonic_ns() >= deadline_ns {
+            if task_runtime::monotonic_now().reached(deadline) {
                 return true;
             }
             let outcome = self
-                .wait_once(Some(deadline_ns))
+                .wait_once(Some(deadline))
                 .expect("timed wait must satisfy scheduler invariants");
             if outcome == WaitOutcome::Notified {
                 return false;
             }
-            if task_runtime::monotonic_ns() >= deadline_ns {
+            if task_runtime::monotonic_now().reached(deadline) {
                 return true;
             }
         }
@@ -121,7 +124,10 @@ impl WaitQueue {
     where
         F: Fn() -> bool,
     {
-        self.wait_until_deadline(Duration::from_nanos(deadline_after(timeout)), condition)
+        self.wait_until_deadline(
+            task_runtime::monotonic_now().deadline_after(timeout),
+            condition,
+        )
     }
 
     /// Blocks until `condition` becomes true or an absolute deadline elapses.
@@ -131,17 +137,16 @@ impl WaitQueue {
     /// spurious wake, so repeated notifications cannot extend the wait.
     /// Returns `true` for timeout and `false` when the condition wins.
     #[track_caller]
-    pub fn wait_until_deadline<F>(&self, deadline: Duration, condition: F) -> bool
+    pub fn wait_until_deadline<F>(&self, deadline: MonotonicDeadline, condition: F) -> bool
     where
         F: Fn() -> bool,
     {
-        let deadline_ns = deadline.as_nanos().min(u64::MAX as u128) as u64;
         loop {
-            if task_runtime::monotonic_ns() >= deadline_ns {
+            if task_runtime::monotonic_now().reached(deadline) {
                 return !condition();
             }
             let condition_met = self
-                .wait_once_if(Some(deadline_ns), &condition)
+                .wait_once_if(Some(deadline), &condition)
                 .unwrap_or_else(|error| {
                     panic!("timed conditional wait must satisfy scheduler invariants: {error:?}")
                 });
@@ -171,16 +176,16 @@ impl WaitQueue {
         while self.notify_one() {}
     }
 
-    fn wait_once(&self, deadline_ns: Option<u64>) -> Result<WaitOutcome, TaskError> {
-        self.wait_once_inner(deadline_ns, None)
+    fn wait_once(&self, deadline: Option<MonotonicDeadline>) -> Result<WaitOutcome, TaskError> {
+        self.wait_once_inner(deadline, None)
     }
 
     fn wait_once_if(
         &self,
-        deadline_ns: Option<u64>,
+        deadline: Option<MonotonicDeadline>,
         condition: &dyn Fn() -> bool,
     ) -> Result<bool, TaskError> {
-        match self.wait_once_inner(deadline_ns, Some(condition))? {
+        match self.wait_once_inner(deadline, Some(condition))? {
             WaitOutcome::Condition => Ok(true),
             WaitOutcome::Notified | WaitOutcome::OtherWake => Ok(false),
         }
@@ -188,7 +193,7 @@ impl WaitQueue {
 
     fn wait_once_inner(
         &self,
-        deadline_ns: Option<u64>,
+        deadline: Option<MonotonicDeadline>,
         condition: Option<&dyn Fn() -> bool>,
     ) -> Result<WaitOutcome, TaskError> {
         // Validate sleepability before taking the queue's non-sleeping
@@ -216,8 +221,8 @@ impl WaitQueue {
             };
             let thread = park.thread_id();
             waiters.push_back(Waiter::new(thread, park.wake_handle()));
-            if let Some(deadline_ns) = deadline_ns
-                && let Err(error) = park.arm_deadline(deadline_ns)
+            if let Some(deadline) = deadline
+                && let Err(error) = park.arm_deadline(deadline)
             {
                 remove_waiter(&mut waiters, thread);
                 park.cancel()?;
@@ -286,24 +291,6 @@ fn remove_waiter(waiters: &mut VecDeque<Waiter>, thread: ThreadId) -> bool {
     true
 }
 
-fn deadline_after(timeout: Duration) -> u64 {
-    let timeout_ns = timeout.as_nanos().min(u64::MAX as u128) as u64;
-    task_runtime::monotonic_ns().saturating_add(timeout_ns)
-}
-
-fn sleep_until_ns(deadline_ns: u64) {
-    let queue = WaitQueue::new();
-    loop {
-        let now_ns = task_runtime::monotonic_ns();
-        if now_ns >= deadline_ns {
-            return;
-        }
-        if queue.wait_timeout(Duration::from_nanos(deadline_ns - now_ns)) {
-            return;
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use alloc::boxed::Box;
@@ -368,10 +355,11 @@ mod tests {
         let queue = WaitQueue::new();
         let predicate_can_take_unrelated_state = core::cell::Cell::new(false);
 
-        let timed_out = queue.wait_until_deadline(Duration::from_nanos(10), || {
-            predicate_can_take_unrelated_state.set(queue.waiters.try_lock().is_some());
-            false
-        });
+        let timed_out =
+            queue.wait_until_deadline(MonotonicDeadline::from_nanos(10).unwrap(), || {
+                predicate_can_take_unrelated_state.set(queue.waiters.try_lock().is_some());
+                false
+            });
 
         assert!(timed_out);
         assert!(

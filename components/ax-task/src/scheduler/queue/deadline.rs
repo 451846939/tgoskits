@@ -11,17 +11,33 @@ use crate::{SchedulingEntity, ThreadId};
 /// The key is copied into the top-level membership table. This mirrors Linux's
 /// embedded `rb_node`: dequeue and policy updates reach the linked entity
 /// directly instead of rediscovering it by scanning the runnable set.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct DeadlineQueueKey {
     absolute_deadline_ns: u64,
     sequence: u64,
     thread: ThreadId,
 }
 
+impl Ord for DeadlineQueueKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        crate::scheduler_time_cmp(self.absolute_deadline_ns, other.absolute_deadline_ns)
+            .then_with(|| self.sequence.cmp(&other.sequence))
+            .then_with(|| self.thread.cmp(&other.thread))
+    }
+}
+
+impl PartialOrd for DeadlineQueueKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 impl DeadlineQueueKey {
     fn for_thread(thread: &QueuedThread) -> Self {
         Self {
-            absolute_deadline_ns: deadline_entity(thread).absolute_deadline_ns(),
+            absolute_deadline_ns: deadline_entity(thread)
+                .absolute_deadline_ns()
+                .expect("a queued Deadline entity must own an absolute deadline"),
             sequence: thread.sequence,
             thread: thread.id,
         }
@@ -221,7 +237,7 @@ impl DeadlineRunQueue {
 
     pub(super) fn earliest_deadline_ns(&self) -> Option<u64> {
         self.first()
-            .map(|thread| deadline_entity(thread).absolute_deadline_ns())
+            .and_then(|thread| deadline_entity(thread).absolute_deadline_ns())
     }
 
     fn return_removed(mut removed: Box<DeadlineNode>) -> QueuedThread {
@@ -263,16 +279,11 @@ fn deadline_entity(thread: &QueuedThread) -> crate::DeadlineEntity {
 }
 
 fn scheduler_event(thread: &QueuedThread) -> Option<u64> {
-    let event = deadline_entity(thread).next_scheduler_event_ns();
-    (event != 0).then_some(event)
+    deadline_entity(thread).next_scheduler_event_ns()
 }
 
 fn earliest(left: Option<u64>, right: Option<u64>) -> Option<u64> {
-    match (left, right) {
-        (Some(left), Some(right)) => Some(left.min(right)),
-        (Some(value), None) | (None, Some(value)) => Some(value),
-        (None, None) => None,
-    }
+    crate::earliest_scheduler_time(left, right)
 }
 
 fn link_height(link: &DeadlineLink) -> usize {

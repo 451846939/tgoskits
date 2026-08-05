@@ -179,7 +179,8 @@ impl TaskSystem {
                 let mut sched = record.sched.lock();
                 sched.transition(&core, ThreadState::Ready)?;
                 sched.transition(&core, ThreadState::Running)?;
-                let dispatch = Self::owner_dispatch(&core, &sched, task_runtime::monotonic_ns())?;
+                let dispatch =
+                    Self::owner_dispatch(&core, &sched, task_runtime::scheduler_now().as_nanos())?;
                 sched.placement.activate(cpu.owner());
                 sched.placement.set_next_task(cpu.owner());
                 core.set_wake_cpu_hint(cpu.owner());

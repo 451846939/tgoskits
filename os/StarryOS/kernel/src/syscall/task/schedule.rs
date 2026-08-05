@@ -78,9 +78,11 @@ pub fn sys_sched_rr_get_interval_time64(
 fn sleep_until(current: &crate::task::UserTaskRef, deadline: SleepDeadline) -> AxResult<()> {
     debug!("sleep_until <= {deadline:?}");
     let outcome = match deadline {
-        SleepDeadline::Monotonic(deadline) => {
-            block_on_user_until(current, Some(deadline), core::future::pending::<()>())
-        }
+        SleepDeadline::Monotonic(deadline) => block_on_user_until(
+            current,
+            Some(crate::task::future::monotonic_deadline_from_time(deadline)),
+            core::future::pending::<()>(),
+        ),
         SleepDeadline::Realtime(deadline) => {
             block_on_user_until_wall(current, Some(deadline), core::future::pending::<()>())
         }

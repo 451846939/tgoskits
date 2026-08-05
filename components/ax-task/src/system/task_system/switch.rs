@@ -124,7 +124,6 @@ impl TaskSystem {
                     sched.policy.base_entity = sched.policy.effective_entity;
                 }
                 sched.deadline.replenish_pending = true;
-                Self::refresh_owner_deadline_timers_locked(&core, &mut sched, cpu.as_mut());
             }
             sched.transition(&core, ThreadState::Blocked)?;
             if retained_current {
@@ -137,6 +136,7 @@ impl TaskSystem {
                 sched.placement.block_current(owner);
             }
             cpu.as_mut().clear_current();
+            self.refresh_owner_deadline_timers_locked(&core, &mut sched, cpu.as_mut(), now_ns)?;
             return Ok(None);
         }
 
@@ -154,7 +154,7 @@ impl TaskSystem {
             // retained RT/DL path. Complete it before mutating runqueue or
             // placement ownership, like Linux prepares class state before
             // the rq-locked put-prev/set-next commit.
-            Self::refresh_owner_deadline_timers_locked(&core, &mut sched, cpu.as_mut());
+            self.refresh_owner_deadline_timers_locked(&core, &mut sched, cpu.as_mut(), now_ns)?;
         }
 
         // Hide the outgoing dispatch while queue placement computes EEVDF
@@ -243,7 +243,7 @@ impl TaskSystem {
         affinity: &CpuSet,
         preferred: Option<CpuId>,
         excluded: Option<CpuId>,
-        now_ns: u64,
+        _now_ns: u64,
     ) -> Option<CpuId> {
         let accepts = |cpu: CpuId| {
             Some(cpu) != excluded
@@ -257,19 +257,17 @@ impl TaskSystem {
             SchedulePolicy::Fifo { priority } | SchedulePolicy::RoundRobin { priority, .. } => self
                 .root_domain
                 .find_lowest_rt_cpu(priority, affinity, preferred, accepts),
-            SchedulePolicy::Deadline(deadline_policy) => {
-                let absolute_deadline_ns = entity
-                    .deadline()
-                    .map(DeadlineEntity::absolute_deadline_ns)
-                    .filter(|deadline| *deadline != 0)
-                    .unwrap_or_else(|| now_ns.saturating_add(deadline_policy.deadline_ns()));
-                self.root_domain.find_later_deadline_cpu(
-                    absolute_deadline_ns,
-                    affinity,
-                    preferred,
-                    accepts,
-                )
-            }
+            SchedulePolicy::Deadline(_) => entity
+                .deadline()
+                .and_then(DeadlineEntity::absolute_deadline_ns)
+                .and_then(|absolute_deadline_ns| {
+                    self.root_domain.find_later_deadline_cpu(
+                        absolute_deadline_ns,
+                        affinity,
+                        preferred,
+                        accepts,
+                    )
+                }),
             SchedulePolicy::Fair { .. } => None,
         };
         indexed

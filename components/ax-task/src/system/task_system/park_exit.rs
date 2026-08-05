@@ -156,12 +156,12 @@ impl TaskSystem {
                 // A wake cannot cross this point while the thread lock is
                 // held; all following rq and placement changes are one owner
                 // commit and cannot return a partial block.
-                Self::mark_owner_deadline_non_contending_locked(
+                self.mark_owner_deadline_non_contending_locked(
                     &previous_core,
                     &mut sched,
                     cpu.as_mut(),
                     now_ns,
-                );
+                )?;
                 let timing_granularity_ns = self.config.timing_granularity_ns();
                 if let Some(fair) = sched.policy.effective_entity.fair() {
                     let virtual_time = cpu.lock_run_queue().virtual_time_for_mode(fair.mode());
@@ -578,7 +578,7 @@ impl TaskSystem {
             migration.commit();
         }
         if wake_after_tail {
-            self.finish_switch_tail_wake(&previous_core, task_runtime::monotonic_ns());
+            self.finish_switch_tail_wake(&previous_core, task_runtime::scheduler_now().as_nanos());
         }
         self.publish_owner_cpu_load_summary(cpu.as_mut());
         if previous_exited {

@@ -1,7 +1,12 @@
 #[track_caller]
 pub fn ax_sleep_until(deadline: crate::time::AxTimeValue) {
     #[cfg(feature = "multitask")]
-    ax_runtime::task::sleep_until(deadline);
+    ax_runtime::task::sleep_until(
+        u64::try_from(deadline.as_nanos())
+            .ok()
+            .and_then(ax_runtime::task::MonotonicDeadline::from_nanos)
+            .expect("absolute sleep deadline exceeds the kernel monotonic time domain"),
+    );
     #[cfg(not(feature = "multitask"))]
     ax_hal::time::busy_wait_until(deadline);
 }
@@ -176,7 +181,13 @@ cfg_task! {
         until_condition: impl Fn() -> bool,
     ) -> bool {
         #[cfg(feature = "irq")]
-        return wq.0.wait_until_deadline(deadline, until_condition);
+        return wq.0.wait_until_deadline(
+            u64::try_from(deadline.as_nanos())
+                .ok()
+                .and_then(ax_runtime::task::MonotonicDeadline::from_nanos)
+                .expect("wait deadline exceeds the kernel monotonic time domain"),
+            until_condition,
+        );
 
         #[cfg(not(feature = "irq"))]
         {

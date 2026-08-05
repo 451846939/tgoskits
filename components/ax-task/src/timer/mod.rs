@@ -12,6 +12,7 @@ use self::{
     heap::{TimerEntry, TimerHeap},
     node::{TASK_DEADLINE_CLASS_COUNT, TaskDeadlineNodeId},
 };
+use crate::runtime::{MonotonicDeadline, MonotonicInstant};
 
 /// Failure returned while arming a fixed-capacity timer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -19,9 +20,6 @@ pub enum TaskDeadlineError {
     /// Every preallocated heap slot is occupied by an active task deadline.
     #[error("per-CPU timer capacity is exhausted")]
     Capacity,
-    /// `u64::MAX` represents no finite task deadline and cannot be queued.
-    #[error("task deadline is not finite")]
-    InvalidDeadline,
     /// The node identity or arm generation space has been exhausted.
     #[error("timer identity or generation space is exhausted")]
     GenerationExhausted,
@@ -30,43 +28,17 @@ pub enum TaskDeadlineError {
     KindMismatch,
 }
 
-/// Absolute task deadline that is finite in the monotonic-clock domain.
-///
-/// Zero remains a valid, immediately due logical deadline. `u64::MAX` is the
-/// explicit no-deadline sentinel and is rejected before a heap slot or
-/// generation is consumed.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-#[repr(transparent)]
-pub(super) struct FiniteTaskDeadline(u64);
-
-impl FiniteTaskDeadline {
-    const fn from_nanos(deadline_ns: u64) -> Option<Self> {
-        if deadline_ns == u64::MAX {
-            None
-        } else {
-            Some(Self(deadline_ns))
-        }
-    }
-
-    pub(super) const fn as_nanos(self) -> u64 {
-        self.0
-    }
-}
-
 /// Bounded timer-IRQ expiration request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TaskDeadlineExpireRequest {
-    now_ns: u64,
+    now: MonotonicInstant,
     batch_limit: usize,
 }
 
 impl TaskDeadlineExpireRequest {
     /// Creates one bounded timer expiration request.
-    pub const fn new(now_ns: u64, batch_limit: usize) -> Self {
-        Self {
-            now_ns,
-            batch_limit,
-        }
+    pub const fn new(now: MonotonicInstant, batch_limit: usize) -> Self {
+        Self { now, batch_limit }
     }
 }
 
@@ -76,7 +48,7 @@ pub struct TaskDeadlineExpireBatch {
     processed: usize,
     expired: usize,
     pending: bool,
-    next_deadline_ns: Option<u64>,
+    next_deadline: Option<MonotonicDeadline>,
 }
 
 impl TaskDeadlineExpireBatch {
@@ -96,8 +68,8 @@ impl TaskDeadlineExpireBatch {
     }
 
     /// Returns the next logical task deadline.
-    pub const fn next_deadline_ns(self) -> Option<u64> {
-        self.next_deadline_ns
+    pub const fn next_deadline(self) -> Option<MonotonicDeadline> {
+        self.next_deadline
     }
 }
 
@@ -164,8 +136,6 @@ impl TaskDeadlineQueue {
     ///
     /// # Errors
     ///
-    /// Returns [`TaskDeadlineError::InvalidDeadline`] before consuming a heap
-    /// slot or generation when `deadline_ns` is the no-deadline sentinel.
     /// Returns [`TaskDeadlineError::Capacity`] without changing the queue or
     /// consuming an arm generation if no heap slot remains. A node may retain
     /// the lazily assigned identity used for this capacity check. Returns
@@ -178,21 +148,19 @@ impl TaskDeadlineQueue {
     pub fn arm(
         &mut self,
         node: &TaskDeadlineNode,
-        deadline_ns: u64,
+        deadline: MonotonicDeadline,
         kind: TaskDeadlineKind,
     ) -> Result<TaskDeadlineRegistration, TaskDeadlineError> {
-        let plan = self.prepare_arm(node, deadline_ns, kind)?;
+        let plan = self.prepare_arm(node, deadline, kind)?;
         Ok(self.commit_arm(plan))
     }
 
     pub(crate) fn prepare_arm(
         &self,
         node: &TaskDeadlineNode,
-        deadline_ns: u64,
+        deadline: MonotonicDeadline,
         kind: TaskDeadlineKind,
     ) -> Result<TaskDeadlineArmPlan, TaskDeadlineError> {
-        let deadline = FiniteTaskDeadline::from_nanos(deadline_ns)
-            .ok_or(TaskDeadlineError::InvalidDeadline)?;
         let thread = node.thread();
         let class = kind.class();
         if node.class() != class {
@@ -231,7 +199,7 @@ impl TaskDeadlineQueue {
         TaskDeadlineRegistration::new(
             entry.thread(),
             entry.token(),
-            entry.deadline_ns(),
+            entry.deadline(),
             entry.kind(),
         )
     }
@@ -276,15 +244,15 @@ impl TaskDeadlineQueue {
     }
 
     /// Returns the earliest logical task deadline without mutating the queue.
-    pub fn next_deadline_ns(&self) -> Option<u64> {
-        self.heap.peek().map(TimerEntry::deadline_ns)
+    pub fn next_deadline(&self) -> Option<MonotonicDeadline> {
+        self.heap.peek().map(TimerEntry::deadline)
     }
 
-    pub(crate) fn has_immediately_actionable_entry(&self, now_ns: u64) -> bool {
+    pub(crate) fn has_immediately_actionable_entry(&self, now: MonotonicInstant) -> bool {
         let Some(entry) = self.heap.peek() else {
             return false;
         };
-        entry.deadline_ns() <= now_ns
+        now.reached(entry.deadline())
     }
 
     /// Expires timers into caller-provided storage without allocating or invoking
@@ -301,7 +269,7 @@ impl TaskDeadlineQueue {
             let Some(entry) = self.heap.peek() else {
                 break;
             };
-            if entry.deadline_ns() > request.now_ns {
+            if !request.now.reached(entry.deadline()) {
                 break;
             }
             if expired == output.len() {
@@ -317,18 +285,18 @@ impl TaskDeadlineQueue {
             output[expired] = ExpiredTaskDeadline::new(
                 entry.thread(),
                 entry.token(),
-                entry.deadline_ns(),
+                entry.deadline(),
                 entry.kind(),
             );
             expired += 1;
         }
 
-        let (pending, next_deadline_ns) = self.next_wakeup(request);
+        let (pending, next_deadline) = self.next_wakeup(request);
         TaskDeadlineExpireBatch {
             processed,
             expired,
             pending,
-            next_deadline_ns,
+            next_deadline,
         }
     }
 
@@ -347,13 +315,13 @@ impl TaskDeadlineQueue {
         self.heap.is_empty()
     }
 
-    fn next_wakeup(&self, request: TaskDeadlineExpireRequest) -> (bool, Option<u64>) {
+    fn next_wakeup(&self, request: TaskDeadlineExpireRequest) -> (bool, Option<MonotonicDeadline>) {
         let Some(entry) = self.heap.peek() else {
             return (false, None);
         };
         (
-            entry.deadline_ns() <= request.now_ns,
-            Some(entry.deadline_ns()),
+            request.now.reached(entry.deadline()),
+            Some(entry.deadline()),
         )
     }
 }

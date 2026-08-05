@@ -4,6 +4,7 @@ use super::arceos;
 
 pub(crate) type ThreadHandle = arceos::ArceOsThreadHandle;
 pub(crate) type IrqNotification = arceos::ArceOsIrqNotification;
+pub(crate) type MonotonicDeadline = arceos::ArceOsMonotonicDeadline;
 pub(crate) type ThreadExtensionBorrow<'thread> =
     ax_std::os::arceos::task::ThreadOsExtensionBorrow<'thread>;
 pub(crate) type WaitQueue = arceos::ArceOsWaitQueue;

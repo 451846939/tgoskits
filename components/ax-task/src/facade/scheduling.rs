@@ -1,5 +1,5 @@
 use super::*;
-use crate::runtime::ContextSwitch;
+use crate::{SchedulerTimestamp, runtime::ContextSwitch};
 
 /// Runs one scheduler decision at a task/IRQ-return safe point.
 ///
@@ -53,35 +53,43 @@ fn schedule_current_cpu_with_entry(
     let mut scheduler_frame =
         RuntimeSchedulerFrameGuard::enter(RuntimeScheduleOrigin::Preempt, entry)?;
     let system = runtime_task_system()?;
-    let initial_now_ns = task_runtime::monotonic_ns();
-    let fast_outcome = {
+    let (fast_outcome, deadline_service_now) = {
         let mut cpu = runtime_current_cpu_mut(&mut scheduler_frame)?;
-        if cpu.deadline_work_pending() || cpu.task_deadline_expiry_due(initial_now_ns) {
-            None
+        let deadline_work_pending = cpu.deadline_work_pending();
+        let monotonic_now =
+            (deadline_work_pending || cpu.has_task_deadlines()).then(task_runtime::monotonic_now);
+        if deadline_work_pending
+            || monotonic_now.is_some_and(|now| cpu.task_deadline_expiry_due(now))
+        {
+            (None, monotonic_now)
         } else {
-            Some(schedule_cpu_after_deadline_service(
-                system,
-                cpu.as_mut(),
-                initial_now_ns,
-            )?)
+            let scheduler_now_ns = task_runtime::scheduler_now().as_nanos();
+            (
+                Some((
+                    schedule_cpu_after_deadline_service(system, cpu.as_mut(), scheduler_now_ns)?,
+                    scheduler_now_ns,
+                )),
+                None,
+            )
         }
     };
-    let (outcome, now_ns) = if let Some(outcome) = fast_outcome {
-        (outcome, initial_now_ns)
+    let (outcome, scheduler_now_ns) = if let Some(outcome) = fast_outcome {
+        outcome
     } else {
-        let now_ns = service_scheduler_safe_point_deadlines_at(
+        let scheduler_now_ns = service_scheduler_safe_point_deadlines_at(
             system,
             &mut scheduler_frame,
-            initial_now_ns,
-        )?;
+            deadline_service_now.expect("deadline slow path must retain its physical clock sample"),
+        )?
+        .as_nanos();
         let mut cpu = runtime_current_cpu_mut(&mut scheduler_frame)?;
         (
-            schedule_cpu_after_deadline_service(system, cpu.as_mut(), now_ns)?,
-            now_ns,
+            schedule_cpu_after_deadline_service(system, cpu.as_mut(), scheduler_now_ns)?,
+            scheduler_now_ns,
         )
     };
     if let Some(decision) = outcome.decision() {
-        execute_switch_plan(&mut scheduler_frame, decision, now_ns);
+        execute_switch_plan(&mut scheduler_frame, decision, scheduler_now_ns);
     }
     Ok(outcome)
 }
@@ -142,25 +150,25 @@ pub(super) fn service_scheduler_safe_point_deadlines(
     system: &TaskSystem,
     pin: &mut impl RuntimeCpuPin,
 ) -> Result<u64, TaskError> {
-    let now_ns = task_runtime::monotonic_ns();
-    service_scheduler_safe_point_deadlines_at(system, pin, now_ns)
+    service_scheduler_safe_point_deadlines_at(system, pin, task_runtime::monotonic_now())
+        .map(SchedulerTimestamp::as_nanos)
 }
 
 fn service_scheduler_safe_point_deadlines_at(
     system: &TaskSystem,
     pin: &mut impl RuntimeCpuPin,
-    now_ns: u64,
-) -> Result<u64, TaskError> {
+    now: MonotonicInstant,
+) -> Result<SchedulerTimestamp, TaskError> {
     let should_run = {
         let mut cpu = runtime_current_cpu_mut(pin)?;
-        let expiry_due = cpu.task_deadline_expiry_due(now_ns);
+        let expiry_due = cpu.task_deadline_expiry_due(now);
         if !cpu.deadline_work_pending() && !expiry_due {
-            return Ok(now_ns);
+            return Ok(task_runtime::scheduler_now());
         }
         cpu.as_mut().begin_deadline_work() || expiry_due
     };
     if !should_run {
-        return Ok(now_ns);
+        return Ok(task_runtime::scheduler_now());
     }
 
     let result = (|| {
@@ -171,18 +179,17 @@ fn service_scheduler_safe_point_deadlines_at(
         let mut drained = drain_current_expired_timers(system, pin)?;
         let batch_pending = {
             let mut cpu = runtime_current_cpu_mut(pin)?;
-            if cpu.task_deadline_expiry_due(now_ns) {
+            if cpu.task_deadline_expiry_due(now) {
                 let budget = cpu.batch_limit();
-                cpu.as_mut().expire_task_deadlines(now_ns, budget).pending()
+                cpu.as_mut().expire_task_deadlines(now, budget).pending()
             } else {
                 false
             }
         };
         drained += drain_current_expired_timers(system, pin)?;
         let mut cpu = runtime_current_cpu_mut(pin)?;
-        let pending = batch_pending
-            || cpu.has_expired_task_deadlines()
-            || cpu.task_deadline_expiry_due(now_ns);
+        let pending =
+            batch_pending || cpu.has_expired_task_deadlines() || cpu.task_deadline_expiry_due(now);
         cpu.as_mut().finish_deadline_work(pending);
         Ok(drained)
     })();
@@ -190,16 +197,13 @@ fn service_scheduler_safe_point_deadlines_at(
         let mut cpu = runtime_current_cpu_mut(pin)?;
         cpu.as_mut().finish_deadline_work(true);
     }
-    let drained = result?;
-    let scheduler_events = {
+    let _drained = result?;
+    let scheduler_now = task_runtime::scheduler_now();
+    let _scheduler_events = {
         let mut cpu = runtime_current_cpu_mut(pin)?;
-        system.service_pending_deadline_timers(cpu.as_mut(), now_ns)?
+        system.service_pending_deadline_timers(cpu.as_mut(), scheduler_now.as_nanos())?
     };
-    if drained + scheduler_events == 0 {
-        Ok(now_ns)
-    } else {
-        Ok(task_runtime::monotonic_ns().max(now_ns))
-    }
+    Ok(scheduler_now)
 }
 
 /// Yields the calling thread and executes the resulting context switch.
@@ -210,7 +214,7 @@ pub fn yield_current_cpu() -> Result<ScheduleDecision, TaskError> {
         RuntimeSchedulerEntry::Task,
     )?;
     let system = runtime_task_system()?;
-    let now_ns = task_runtime::monotonic_ns();
+    let now_ns = task_runtime::scheduler_now().as_nanos();
     let decision = {
         let mut cpu = runtime_current_cpu_mut(&mut scheduler_frame)?;
         system.yield_current(cpu.as_mut(), now_ns)?
@@ -237,7 +241,7 @@ pub fn prepare_current_exit() -> Result<ExitPermit, TaskError> {
     validate_schedule_context(RuntimeScheduleOrigin::Exit)?;
     let mut irq = RuntimeIrqGuard::enter();
     let system = runtime_task_system()?;
-    let now_ns = task_runtime::monotonic_ns();
+    let now_ns = task_runtime::scheduler_now().as_nanos();
     let mut cpu = runtime_current_cpu_mut(&mut irq)?;
     let system = system.prepare_current_exit(cpu.as_mut(), now_ns)?;
     Ok(ExitPermit {
@@ -257,7 +261,7 @@ pub fn commit_current_exit(permit: ExitPermit) -> ! {
             .unwrap_or_else(|_| task_runtime::fatal_invariant(0x4558_0010, thread.as_u64() as _));
     let system = runtime_task_system()
         .unwrap_or_else(|_| task_runtime::fatal_invariant(0x4558_0011, thread.as_u64() as _));
-    let now_ns = task_runtime::monotonic_ns();
+    let now_ns = task_runtime::scheduler_now().as_nanos();
     let decision = {
         let mut cpu = runtime_current_cpu_mut(&mut scheduler_frame)
             .unwrap_or_else(|_| task_runtime::fatal_invariant(0x4558_0013, thread.as_u64() as _));

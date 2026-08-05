@@ -185,13 +185,13 @@ fn cbs_accounts_reclaim_throttle_replenishment_and_miss() {
     let reclaim_policy = deadline_policy(10, 20, 30, DeadlineFlags::RECLAIM);
     let mut reclaim = DeadlineEntity::new(reclaim_policy);
     reclaim.activate(100);
-    assert_eq!(reclaim.absolute_deadline_ns(), 120);
+    assert_eq!(reclaim.absolute_deadline_ns(), Some(120));
     assert!(!reclaim.charge(6, 4));
     assert_eq!(reclaim.remaining_runtime_ns(), 8);
     assert!(reclaim.charge(8, 0));
     assert_eq!(reclaim.overruns(), 1);
     reclaim.replenish(130);
-    assert_eq!(reclaim.absolute_deadline_ns(), 150);
+    assert_eq!(reclaim.absolute_deadline_ns(), Some(150));
     assert!(reclaim.observe_time(151));
     assert_eq!(reclaim.misses(), 1);
     reclaim.yield_job();
@@ -312,42 +312,11 @@ fn constrained_deadline_wake_after_deadline_waits_for_next_release() {
 }
 
 #[test]
-fn saturated_deadline_timer_does_not_enqueue_an_unreplenished_job() {
-    let system = TaskSystem::new(TaskSystemConfig::new(1)).unwrap();
-    let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
-    let idle = system
-        .register_idle_thread(
-            cpu.as_mut(),
-            ThreadSpec::new(SchedulePolicy::fair(Nice::ZERO, FairMode::Idle)),
-        )
-        .unwrap();
-    system.bring_cpu_online(cpu.as_mut()).unwrap();
-    let deadline = ready_thread(
-        &system,
-        SchedulePolicy::deadline(deadline_policy(1, 1, u64::MAX, DeadlineFlags::NONE)),
-    );
-    system.enqueue(cpu.as_mut(), deadline.id(), 1).unwrap();
-    assert_eq!(
-        system.schedule(cpu.as_mut(), 1).unwrap().next(),
-        deadline.id()
-    );
+fn deadline_policy_rejects_the_linux_wrap_comparison_msb() {
     assert!(
-        system
-            .charge_current(cpu.as_mut(), u64::MAX, u64::MAX, 0)
-            .unwrap()
-            .slice_expired()
+        DeadlinePolicy::new(1, 1, 1_u64 << 63, DeadlineFlags::NONE).is_err(),
+        "SCHED_DEADLINE relative intervals must stay inside the signed comparison window"
     );
-
-    assert_eq!(
-        system.schedule(cpu.as_mut(), u64::MAX).unwrap().next(),
-        idle.id()
-    );
-    assert_eq!(deadline.state(), ThreadState::Blocked);
-    assert_eq!(
-        system.schedule(cpu.as_mut(), u64::MAX).unwrap().next(),
-        idle.id()
-    );
-    assert_eq!(deadline.state(), ThreadState::Blocked);
 }
 
 #[test]

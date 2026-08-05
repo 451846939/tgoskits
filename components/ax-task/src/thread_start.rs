@@ -274,7 +274,7 @@ where
     let handle = system.create_thread(thread_spec)?;
 
     let mut irq_guard = RuntimeIrqGuard::enter();
-    let now_ns = task_runtime::monotonic_ns();
+    let now_ns = task_runtime::scheduler_now().as_nanos();
     let result = runtime_current_cpu_mut(&mut irq_guard).and_then(|mut cpu| {
         system.make_ready(handle.id())?;
         system.place_ready(cpu.as_mut(), handle.id(), now_ns)

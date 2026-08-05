@@ -13,9 +13,9 @@ use crate::{
     executor::CoroutineHeader,
     inbox::PublishResult,
     runtime::{
-        IrqGuardToken, PreemptGuardToken, RuntimeCpuId, RuntimeScheduleOrigin,
-        RuntimeSchedulerEntry, RuntimeSchedulerReturn, RuntimeStatus, SchedSwitchRecord,
-        task_runtime,
+        IrqGuardToken, MonotonicDeadline, MonotonicInstant, PreemptGuardToken, RuntimeCpuId,
+        RuntimeScheduleOrigin, RuntimeSchedulerEntry, RuntimeSchedulerReturn, RuntimeStatus,
+        SchedSwitchRecord, task_runtime,
     },
     timer::{ExpiredTaskDeadline, TaskDeadlineKind},
 };
@@ -233,7 +233,7 @@ pub fn thread_policy(thread: ThreadId) -> Result<SchedulePolicy, TaskError> {
 
 /// Returns a cumulative charged-runtime snapshot for a live thread.
 pub fn thread_runtime(thread: ThreadId) -> Result<ThreadRuntimeSnapshot, TaskError> {
-    runtime_task_system()?.thread_runtime(thread, task_runtime::monotonic_ns())
+    runtime_task_system()?.thread_runtime(thread, task_runtime::scheduler_now().as_nanos())
 }
 
 /// Returns cumulative non-idle runtime charged by one online CPU.
@@ -312,7 +312,7 @@ pub fn set_current_thread_affinity(affinity: CpuSet) -> Result<(), TaskError> {
         let thread = cpu.current().unwrap_or_else(|| {
             task_runtime::fatal_invariant(0x4558_0020, 0);
         });
-        let now_ns = task_runtime::monotonic_ns();
+        let now_ns = task_runtime::scheduler_now().as_nanos();
         let decision = system
             .yield_current(cpu.as_mut(), now_ns)
             .unwrap_or_else(|_| {

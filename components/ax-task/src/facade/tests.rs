@@ -16,6 +16,14 @@ mod tests {
     static REENTRANT_EXIT_CALLBACKS_IN_IRQ_EXIT: AtomicUsize = AtomicUsize::new(0);
     static SWITCH_IN_CALLBACKS: AtomicUsize = AtomicUsize::new(0);
 
+    fn instant(nanos: u64) -> MonotonicInstant {
+        MonotonicInstant::from_nanos(nanos).unwrap()
+    }
+
+    fn deadline(nanos: u64) -> MonotonicDeadline {
+        MonotonicDeadline::from_nanos(nanos).unwrap()
+    }
+
     fn owner_snapshot(system: &TaskSystem, cpu: Pin<&CpuLocal>) -> crate::CpuSnapshot {
         let _irq = RuntimeIrqGuard::enter();
         system.snapshot(cpu).unwrap()
@@ -34,11 +42,11 @@ mod tests {
             .task_deadlines()
             .arm(
                 unrelated.sleep_timer(),
-                now_ns,
+                deadline(now_ns),
                 TaskDeadlineKind::park_timeout(0),
             )
             .unwrap();
-        assert_eq!(on_clock_event(now_ns, 1).unwrap().expired(), 1);
+        assert_eq!(on_clock_event(instant(now_ns), 1).unwrap().expired(), 1);
         unrelated
     }
 
@@ -167,9 +175,9 @@ mod tests {
             panic!("fresh park must publish PARKING");
         };
         let _ = permit;
-        arm_current_park_deadline(&running, &mut ticket, 0).unwrap();
+        arm_current_park_deadline(&running, &mut ticket, deadline(0)).unwrap();
 
-        assert_eq!(on_clock_event(0, 64).unwrap().expired(), 1);
+        assert_eq!(on_clock_event(instant(0), 64).unwrap().expired(), 1);
         let mut irq = RuntimeIrqGuard::enter();
         assert_eq!(
             drain_current_expired_timers(system.as_ref().get_ref(), &mut irq).unwrap(),
@@ -255,7 +263,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_safe_point_reuses_its_idle_clock_snapshot() {
+    fn scheduler_fast_path_does_not_read_the_physical_clock_without_task_deadlines() {
         let system = Box::pin(TaskSystem::new(crate::TaskSystemConfig::new(1)).unwrap());
         let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
         system
@@ -271,8 +279,8 @@ mod tests {
         ));
         assert_eq!(
             test_runtime::monotonic_reads(),
-            1,
-            "an idle deadline pass and its scheduler decision must share one clock sample"
+            0,
+            "a scheduler fast path without task deadlines must only sample the runqueue clock"
         );
     }
 
@@ -288,7 +296,9 @@ mod tests {
 
         let initial = {
             let _irq = RuntimeIrqGuard::enter();
-            cpu.as_mut().next_task_deadline_update(0).unwrap()
+            cpu.as_mut()
+                .next_task_deadline_update(0, instant(0))
+                .unwrap()
         };
         task_runtime::publish_task_deadline(initial);
         assert!(test_runtime::take_task_deadline_update().is_some());
@@ -348,13 +358,19 @@ mod tests {
         let _ = permit;
         assert_eq!(running.wake_handle().wake(), crate::WakeResult::Notified);
         test_runtime::reset_monotonic_reads();
+        test_runtime::reset_scheduler_reads();
 
         commit_current_park(&mut ticket).unwrap();
 
         assert_eq!(
             test_runtime::monotonic_reads(),
+            0,
+            "park commit must not read the physical clock when no timer publication changes"
+        );
+        assert_eq!(
+            test_runtime::scheduler_reads(),
             1,
-            "park commit must use one owner-transition clock sample"
+            "park commit must use one runqueue-clock sample"
         );
         let mut expired = [ExpiredTaskDeadline::EMPTY; 1];
         assert_eq!(take_current_expired_task_deadlines(&mut expired).unwrap(), 1);
@@ -363,31 +379,6 @@ mod tests {
             Some(unrelated.id()),
             "park commit must not consume another thread's deadline work"
         );
-    }
-
-    #[test]
-    fn saturated_park_deadline_remains_notification_only() {
-        let system = Box::pin(TaskSystem::new(crate::TaskSystemConfig::new(1)).unwrap());
-        let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
-        let running = system
-            .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
-            .unwrap();
-        system.bring_cpu_online(cpu.as_mut()).unwrap();
-        let _runtime_handles = InstalledTaskHandles::new(system.as_ref(), cpu.as_mut());
-        let permit = acquire_blocking_permit().unwrap();
-        let ParkPrepare::Prepared(mut ticket) = prepare_current_park(&permit).unwrap() else {
-            panic!("fresh park must publish PARKING");
-        };
-        let _ = permit;
-
-        arm_current_park_deadline(&running, &mut ticket, u64::MAX).unwrap();
-
-        assert!(
-            !ticket.has_deadline(),
-            "the no-deadline sentinel must not own a queue registration"
-        );
-        assert!(cpu.as_mut().task_deadlines().is_empty());
-        cancel_current_park(&mut ticket).unwrap();
     }
 
     #[test]
@@ -404,7 +395,7 @@ mod tests {
             panic!("fresh park must publish PARKING");
         };
         let _ = permit;
-        arm_current_park_deadline(&running, &mut ticket, 10).unwrap();
+        arm_current_park_deadline(&running, &mut ticket, deadline(10)).unwrap();
 
         test_runtime::set_monotonic_ns(10);
         assert!(
@@ -437,7 +428,8 @@ mod tests {
         let _runtime_handles = InstalledTaskHandles::new(system.as_ref(), cpu.as_mut());
 
         assert!(!current_cpu_needs_resched().unwrap());
-        let outcome = on_clock_event(10, 64).unwrap();
+        test_runtime::set_scheduler_ns(10);
+        let outcome = on_clock_event(instant(10), 64).unwrap();
 
         assert!(outcome.slice_expired());
         assert_eq!(outcome.expired(), 0);
@@ -486,15 +478,25 @@ mod tests {
         let _first_registration = cpu
             .as_mut()
             .task_deadlines()
-            .arm(first.sleep_timer(), 10, TaskDeadlineKind::park_timeout(0))
+            .arm(
+                first.sleep_timer(),
+                deadline(10),
+                TaskDeadlineKind::park_timeout(0),
+            )
             .unwrap();
         let _second_registration = cpu
             .as_mut()
             .task_deadlines()
-            .arm(second.sleep_timer(), 10, TaskDeadlineKind::park_timeout(0))
+            .arm(
+                second.sleep_timer(),
+                deadline(10),
+                TaskDeadlineKind::park_timeout(0),
+            )
             .unwrap();
 
-        let outcome = on_clock_event(10, 1).unwrap();
+        test_runtime::set_monotonic_ns(10);
+        test_runtime::set_scheduler_ns(10);
+        let outcome = on_clock_event(instant(10), 1).unwrap();
 
         assert_eq!(outcome.expired(), 1);
         assert!(outcome.pending());
@@ -538,15 +540,23 @@ mod tests {
         let _first_registration = cpu
             .as_mut()
             .task_deadlines()
-            .arm(first.sleep_timer(), 10, TaskDeadlineKind::park_timeout(1))
+            .arm(
+                first.sleep_timer(),
+                deadline(10),
+                TaskDeadlineKind::park_timeout(1),
+            )
             .unwrap();
         let _second_registration = cpu
             .as_mut()
             .task_deadlines()
-            .arm(second.sleep_timer(), 10, TaskDeadlineKind::park_timeout(1))
+            .arm(
+                second.sleep_timer(),
+                deadline(10),
+                TaskDeadlineKind::park_timeout(1),
+            )
             .unwrap();
 
-        assert_eq!(on_clock_event(10, 2).unwrap().expired(), 2);
+        assert_eq!(on_clock_event(instant(10), 2).unwrap().expired(), 2);
         let mut first_event = [ExpiredTaskDeadline::EMPTY; 1];
         assert_eq!(
             take_current_expired_task_deadlines(&mut first_event).unwrap(),
@@ -590,13 +600,18 @@ mod tests {
             .map(|thread| {
                 cpu.as_mut()
                     .task_deadlines()
-                    .arm(thread.sleep_timer(), 10, TaskDeadlineKind::park_timeout(1))
+                    .arm(
+                        thread.sleep_timer(),
+                        deadline(10),
+                        TaskDeadlineKind::park_timeout(1),
+                    )
                     .unwrap()
             })
             .collect::<alloc::vec::Vec<_>>();
 
         test_runtime::set_monotonic_ns(10);
-        let irq = on_clock_event(10, 1).unwrap();
+        test_runtime::set_scheduler_ns(10);
+        let irq = on_clock_event(instant(10), 1).unwrap();
         assert_eq!(irq.expired(), 1);
         assert!(irq.pending());
         assert!(schedule_current_cpu().is_ok());
@@ -620,7 +635,7 @@ mod tests {
             panic!("fresh park must publish PARKING");
         };
         let _ = permit;
-        arm_current_park_deadline(&running, &mut ticket, 10).unwrap();
+        arm_current_park_deadline(&running, &mut ticket, deadline(10)).unwrap();
         let token = ticket
             .deadline()
             .expect("armed park deadline token")
@@ -641,8 +656,8 @@ mod tests {
             "a retryable owner mismatch must not consume the move-only deadline token"
         );
         assert_eq!(
-            cpu.as_mut().task_deadlines().next_deadline_ns(),
-            Some(10),
+            cpu.as_mut().task_deadlines().next_deadline(),
+            Some(deadline(10)),
             "a failed cancellation must leave the physical queue entry intact"
         );
 
@@ -651,7 +666,7 @@ mod tests {
             .register_sleep_timer(CpuId::new(0), token.generation());
         assert!(cancel_current_park_deadline(&running, &mut ticket).unwrap());
         assert!(!ticket.has_deadline());
-        assert_eq!(cpu.as_mut().task_deadlines().next_deadline_ns(), None);
+        assert_eq!(cpu.as_mut().task_deadlines().next_deadline(), None);
         cancel_current_park(&mut ticket).unwrap();
     }
 
@@ -670,8 +685,8 @@ mod tests {
             panic!("fresh park must publish PARKING");
         };
         let _ = first_permit;
-        arm_current_park_deadline(&running, &mut first, 10).unwrap();
-        assert_eq!(on_clock_event(10, 1).unwrap().expired(), 1);
+        arm_current_park_deadline(&running, &mut first, deadline(10)).unwrap();
+        assert_eq!(on_clock_event(instant(10), 1).unwrap().expired(), 1);
         assert!(!cancel_current_park_deadline(&running, &mut first).unwrap());
         cancel_current_park(&mut first).unwrap();
 
@@ -681,7 +696,7 @@ mod tests {
             panic!("the next park generation must be independently prepared");
         };
         let _ = second_permit;
-        arm_current_park_deadline(&running, &mut second, 100).unwrap();
+        arm_current_park_deadline(&running, &mut second, deadline(100)).unwrap();
 
         test_runtime::set_monotonic_ns(10);
         schedule_current_cpu().unwrap();
@@ -711,12 +726,12 @@ mod tests {
         cpu.as_mut().set_task_deadline_generation_for_test(u64::MAX);
 
         assert_eq!(
-            arm_current_park_deadline(&running, &mut ticket, 10),
+            arm_current_park_deadline(&running, &mut ticket, deadline(10)),
             Err(TaskError::InvalidConfiguration)
         );
         assert!(!ticket.has_deadline());
         assert_eq!(running.core.sleep_timer_cpu(), None);
-        assert_eq!(cpu.as_mut().task_deadlines().next_deadline_ns(), None);
+        assert_eq!(cpu.as_mut().task_deadlines().next_deadline(), None);
 
         cancel_current_park(&mut ticket).unwrap();
     }
@@ -735,7 +750,7 @@ mod tests {
             panic!("fresh park must publish PARKING");
         };
         let _ = permit;
-        arm_current_park_deadline(&running, &mut ticket, 10).unwrap();
+        arm_current_park_deadline(&running, &mut ticket, deadline(10)).unwrap();
         cpu.as_mut().set_task_deadline_generation_for_test(u64::MAX);
 
         assert_eq!(
@@ -748,8 +763,8 @@ mod tests {
         );
         assert_eq!(running.core.sleep_timer_cpu(), Some(CpuId::new(0)));
         assert_eq!(
-            cpu.as_mut().task_deadlines().next_deadline_ns(),
-            Some(10)
+            cpu.as_mut().task_deadlines().next_deadline(),
+            Some(deadline(10))
         );
 
         cpu.as_mut().set_task_deadline_generation_for_test(1);
@@ -1353,9 +1368,11 @@ mod tests {
         let unrelated =
             publish_unrelated_expired_deadline(system.as_ref().get_ref(), cpu.as_mut(), 10);
         test_runtime::set_monotonic_ns(10);
+        test_runtime::set_scheduler_ns(10);
         let permit = prepare_current_exit().unwrap();
         let _context_switch = test_runtime::allow_context_switch();
         test_runtime::reset_monotonic_reads();
+        test_runtime::reset_scheduler_reads();
 
         let exit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             commit_current_exit(permit)
@@ -1367,8 +1384,13 @@ mod tests {
         );
         assert_eq!(
             test_runtime::monotonic_reads(),
-            2,
-            "exit commit needs one transition timestamp and one completion-time clockevent recheck"
+            1,
+            "exit commit must read the physical clock only when publishing the clockevent"
+        );
+        assert_eq!(
+            test_runtime::scheduler_reads(),
+            1,
+            "exit commit must use one runqueue-clock transition sample"
         );
         let mut expired = [ExpiredTaskDeadline::EMPTY; 1];
         assert_eq!(take_current_expired_task_deadlines(&mut expired).unwrap(), 1);
@@ -1437,7 +1459,7 @@ mod tests {
         };
         test_runtime::reset_cpu_handle_reads();
 
-        park.arm_deadline(10).unwrap();
+        park.arm_deadline(deadline(10)).unwrap();
 
         let owner_claims = test_runtime::cpu_owner_claims();
         park.cancel().unwrap();
@@ -1579,7 +1601,7 @@ mod tests {
         );
 
         test_runtime::reenter_current_thread_from_next_hook();
-        let _now = task_runtime::monotonic_ns();
+        let _now = task_runtime::monotonic_now();
         assert_eq!(
             test_runtime::take_hook_reentry_error(),
             None,

@@ -350,6 +350,7 @@ fn idle_pull_uses_weighted_demand_not_task_count_within_fair_class() {
     );
 
     support::set_monotonic_ns(DEFAULT_BALANCE_INTERVAL_NS);
+    support::set_scheduler_ns(DEFAULT_BALANCE_INTERVAL_NS);
     assert!(system.request_idle_pull(cpus[2].as_ref()).unwrap());
     for cpu in &mut cpus {
         system
@@ -451,6 +452,7 @@ fn fair_balance_deadline_is_relative_to_cpu_online_time() {
 
     support::clear_handles();
     support::set_monotonic_ns(BOOT_NOW_NS);
+    support::set_scheduler_ns(BOOT_NOW_NS);
     let config = TaskSystemConfig::new(4);
     let fair_slice_ns = config.fair_slice_ns();
     let system = TaskSystem::new(config).unwrap();
@@ -492,6 +494,8 @@ fn fair_balance_deadline_is_relative_to_cpu_online_time() {
     }
 
     let balance_now = BOOT_NOW_NS + DEFAULT_BALANCE_INTERVAL_NS;
+    support::set_monotonic_ns(balance_now);
+    support::set_scheduler_ns(balance_now);
     let _second = system.schedule(cpus[0].as_mut(), balance_now).unwrap();
     assert_eq!(
         support::last_oneshot_ns(),

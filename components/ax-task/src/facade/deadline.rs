@@ -62,14 +62,14 @@ impl PreparedCurrentPark {
             .generation()
     }
 
-    /// Arms an absolute task deadline measured in runtime monotonic nanoseconds.
-    pub fn arm_deadline(&mut self, deadline_ns: u64) -> Result<(), TaskError> {
+    /// Arms an absolute deadline in the runtime's finite monotonic domain.
+    pub fn arm_deadline(&mut self, deadline: MonotonicDeadline) -> Result<(), TaskError> {
         let thread = self.thread.clone();
         let ticket = self
             .ticket
             .as_mut()
             .expect("prepared park ticket remains owned");
-        arm_current_park_deadline(&thread, ticket, deadline_ns)
+        arm_current_park_deadline(&thread, ticket, deadline)
     }
 
     /// Commits the scheduler park and returns after this thread is runnable again.
@@ -152,8 +152,11 @@ pub(crate) fn begin_current_park_with_permit(
 }
 
 /// Performs one bounded task-clockevent pass without allocation or callbacks.
-pub fn on_clock_event(now_ns: u64, budget: usize) -> Result<TaskClockEventOutcome, TaskError> {
-    on_clock_event_with_scheduler_tick(now_ns, budget, false)
+pub fn on_clock_event(
+    now: MonotonicInstant,
+    budget: usize,
+) -> Result<TaskClockEventOutcome, TaskError> {
+    on_clock_event_with_scheduler_tick(now, budget, false)
 }
 
 /// Performs one bounded task-clockevent pass and records a periodic scheduler tick.
@@ -161,24 +164,28 @@ pub fn on_clock_event(now_ns: u64, budget: usize) -> Result<TaskClockEventOutcom
 /// Scheduler-tick extension work, when enabled, is deferred to the dedicated
 /// task-work service and never invoked from this hard-IRQ path.
 pub fn on_clock_event_with_scheduler_tick(
-    now_ns: u64,
+    now: MonotonicInstant,
     budget: usize,
     scheduler_tick: bool,
 ) -> Result<TaskClockEventOutcome, TaskError> {
     let system = runtime_task_system()?;
     let mut irq = RuntimeIrqGuard::enter();
     let mut cpu = runtime_current_cpu_mut(&mut irq)?;
-    let charge = system.charge_current_until(cpu.as_mut(), now_ns, 0)?;
+    let scheduler_now_ns = task_runtime::scheduler_now().as_nanos();
+    let charge = system.charge_current_until(cpu.as_mut(), scheduler_now_ns, 0)?;
     if scheduler_tick {
-        system.publish_current_scheduler_tick_work(&cpu, now_ns);
+        system.publish_current_scheduler_tick_work(&cpu, scheduler_now_ns);
     }
-    let batch = cpu.as_mut().expire_task_deadlines(now_ns, budget);
-    let scheduler_due = cpu.as_mut().scheduler_deadline_due(now_ns);
+    let batch = cpu.as_mut().expire_task_deadlines(now, budget);
+    let scheduler_due = cpu.as_mut().scheduler_deadline_due(scheduler_now_ns);
     let pending = batch.pending() || scheduler_due;
     if charge.slice_expired() || charge.deadline_overrun() || batch.expired() != 0 || pending {
         cpu.request_reschedule();
     }
-    let update = cpu.as_mut().next_task_deadline_update(now_ns)?;
+    let monotonic_now = task_runtime::monotonic_now();
+    let update = cpu
+        .as_mut()
+        .next_task_deadline_update(scheduler_now_ns, monotonic_now)?;
     Ok(TaskClockEventOutcome {
         slice_expired: charge.slice_expired(),
         deadline_overrun: charge.deadline_overrun(),
@@ -213,7 +220,7 @@ pub(crate) fn commit_current_park(ticket: &mut crate::ParkTicket) -> Result<(), 
         RuntimeSchedulerEntry::Task,
     )?;
     let system = runtime_task_system()?;
-    let now_ns = task_runtime::monotonic_ns();
+    let now_ns = task_runtime::scheduler_now().as_nanos();
     let commit = {
         let mut cpu = runtime_current_cpu_mut(&mut scheduler_frame)?;
         system.commit_park(cpu.as_mut(), ticket, now_ns)?
@@ -236,7 +243,7 @@ pub(crate) fn cancel_current_park(ticket: &mut crate::ParkTicket) -> Result<(), 
 pub(crate) fn arm_current_park_deadline(
     thread: &ThreadHandle,
     ticket: &mut crate::ParkTicket,
-    deadline_ns: u64,
+    deadline: MonotonicDeadline,
 ) -> Result<(), TaskError> {
     let mut irq = RuntimeIrqGuard::enter();
     let mut cpu = runtime_current_cpu_mut(&mut irq)?;
@@ -247,13 +254,6 @@ pub(crate) fn arm_current_park_deadline(
     {
         return Err(TaskError::StaleThreadId);
     }
-    if deadline_ns == u64::MAX {
-        // Saturated relative waits have no representable finite expiry. Keep
-        // them as ordinary notification-only parks instead of consuming a
-        // queue slot that the physical clockevent can never arm.
-        return Ok(());
-    }
-    let now_ns = task_runtime::monotonic_ns();
     let (registration, update) = {
         let owner = cpu.owner();
         let registration = cpu
@@ -261,18 +261,22 @@ pub(crate) fn arm_current_park_deadline(
             .task_deadlines()
             .arm(
                 thread.sleep_timer(),
-                deadline_ns,
+                deadline,
                 TaskDeadlineKind::park_timeout(ticket.generation()),
             )
             .map_err(|error| match error {
                 crate::timer::TaskDeadlineError::Capacity => TaskError::TimerCapacity,
-                crate::timer::TaskDeadlineError::InvalidDeadline
-                | crate::timer::TaskDeadlineError::GenerationExhausted
+                crate::timer::TaskDeadlineError::GenerationExhausted
                 | crate::timer::TaskDeadlineError::KindMismatch => TaskError::InvalidConfiguration,
             })?;
         let token = registration.token();
         thread.core.register_sleep_timer(owner, token.generation());
-        let update = match cpu.as_mut().next_task_deadline_update(now_ns) {
+        let scheduler_now_ns = task_runtime::scheduler_now().as_nanos();
+        let monotonic_now = task_runtime::monotonic_now();
+        let update = match cpu
+            .as_mut()
+            .next_task_deadline_update(scheduler_now_ns, monotonic_now)
+        {
             Ok(update) => update,
             Err(error) => {
                 let removed = cpu.as_mut().task_deadlines().cancel(&registration);
@@ -320,7 +324,6 @@ pub(crate) fn cancel_current_park_deadline(
             actual: actual.as_u32(),
         });
     }
-    let now_ns = task_runtime::monotonic_ns();
     let (cancellation, update) = {
         let registration = ticket
             .deadline()
@@ -339,7 +342,12 @@ pub(crate) fn cancel_current_park_deadline(
                 task_runtime::fatal_invariant(0x5444_0006, thread.id().as_u64() as usize);
             }
         };
-        let update = match cpu.as_mut().next_task_deadline_update(now_ns) {
+        let scheduler_now_ns = task_runtime::scheduler_now().as_nanos();
+        let monotonic_now = task_runtime::monotonic_now();
+        let update = match cpu
+            .as_mut()
+            .next_task_deadline_update(scheduler_now_ns, monotonic_now)
+        {
             Ok(update) => update,
             Err(error) => {
                 cancellation.rollback(cpu.as_mut().task_deadlines());
@@ -388,11 +396,8 @@ impl TaskClockEventOutcome {
     pub const fn update(self) -> crate::runtime::TaskDeadlineUpdate {
         self.update
     }
-    /// Returns the next representable task deadline.
-    pub const fn next_deadline_ns(self) -> Option<u64> {
-        match self.update.deadline() {
-            Some(deadline) => Some(deadline.as_nanos()),
-            None => None,
-        }
+    /// Returns the next finite task-owned deadline.
+    pub const fn next_deadline(self) -> Option<MonotonicDeadline> {
+        self.update.deadline()
     }
 }

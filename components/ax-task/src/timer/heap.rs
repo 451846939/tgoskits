@@ -2,12 +2,12 @@
 
 use alloc::vec::Vec;
 
-use super::{FiniteTaskDeadline, TaskDeadlineKind, TaskDeadlineNodeId, TaskDeadlineToken};
-use crate::ThreadId;
+use super::{TaskDeadlineKind, TaskDeadlineNodeId, TaskDeadlineToken};
+use crate::{ThreadId, runtime::MonotonicDeadline};
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct TimerEntry {
-    deadline: FiniteTaskDeadline,
+    deadline: MonotonicDeadline,
     thread: ThreadId,
     token: TaskDeadlineToken,
     kind: TaskDeadlineKind,
@@ -15,7 +15,7 @@ pub(super) struct TimerEntry {
 
 impl TimerEntry {
     pub(super) const fn new(
-        deadline: FiniteTaskDeadline,
+        deadline: MonotonicDeadline,
         thread: ThreadId,
         token: TaskDeadlineToken,
         kind: TaskDeadlineKind,
@@ -28,8 +28,8 @@ impl TimerEntry {
         }
     }
 
-    pub(super) const fn deadline_ns(self) -> u64 {
-        self.deadline.as_nanos()
+    pub(super) const fn deadline(self) -> MonotonicDeadline {
+        self.deadline
     }
 
     pub(super) const fn thread(self) -> ThreadId {

@@ -30,6 +30,7 @@ fn contended_fair_dispatch_programs_its_remaining_service_request() {
     let second = ready_thread(&system, SchedulePolicy::default());
     system.enqueue(cpu.as_mut(), first.id(), 100).unwrap();
     system.enqueue(cpu.as_mut(), second.id(), 100).unwrap();
+    support::set_monotonic_ns(100);
 
     let selected = system.schedule(cpu.as_mut(), 100).unwrap().next();
     assert!(selected == first.id() || selected == second.id());
@@ -49,6 +50,7 @@ fn round_robin_dispatch_programs_its_remaining_quantum() {
         SchedulePolicy::round_robin(RtPriority::new(40).unwrap()),
     );
     system.enqueue(cpu.as_mut(), rr.id(), 100).unwrap();
+    support::set_monotonic_ns(100);
 
     assert_eq!(system.schedule(cpu.as_mut(), 100).unwrap().next(), rr.id());
     assert_eq!(support::last_oneshot_ns(), 100 + DEFAULT_RR_QUANTUM_NS);
@@ -62,6 +64,7 @@ fn deadline_dispatch_programs_budget_before_its_absolute_deadline() {
         SchedulePolicy::deadline(DeadlinePolicy::new(2, 10, 100, DeadlineFlags::NONE).unwrap()),
     );
     system.enqueue(cpu.as_mut(), deadline.id(), 100).unwrap();
+    support::set_monotonic_ns(100);
 
     assert_eq!(
         system.schedule(cpu.as_mut(), 100).unwrap().next(),
@@ -71,37 +74,24 @@ fn deadline_dispatch_programs_budget_before_its_absolute_deadline() {
 }
 
 #[test]
-fn scheduler_boundary_is_published_in_the_logical_clock_domain() {
+fn scheduler_boundary_is_translated_by_delta_into_the_monotonic_clock_domain() {
     let (system, mut cpu) = online_system();
     let deadline = ready_thread(
         &system,
         SchedulePolicy::deadline(DeadlinePolicy::new(2, 10, 100, DeadlineFlags::NONE).unwrap()),
     );
     system.enqueue(cpu.as_mut(), deadline.id(), 100).unwrap();
+    support::set_monotonic_ns(10);
 
     assert_eq!(
         system.schedule(cpu.as_mut(), 100).unwrap().next(),
         deadline.id()
     );
-    assert_eq!(support::last_oneshot_ns(), 102);
-}
-
-#[test]
-fn saturated_time_does_not_program_a_zero_delay_scheduler_oneshot() {
-    let (system, mut cpu) = online_system();
-    let deadline = ready_thread(
-        &system,
-        SchedulePolicy::deadline(DeadlinePolicy::new(1, 2, 2, DeadlineFlags::NONE).unwrap()),
-    );
-    system
-        .enqueue(cpu.as_mut(), deadline.id(), u64::MAX)
-        .unwrap();
-
     assert_eq!(
-        system.schedule(cpu.as_mut(), u64::MAX).unwrap().next(),
-        deadline.id()
+        support::last_oneshot_ns(),
+        12,
+        "a scheduler deadline must move by its 2ns forward delta, not copy its 102ns rq epoch"
     );
-    assert_eq!(support::last_oneshot_ns(), 0);
 }
 
 #[test]
@@ -109,6 +99,7 @@ fn fifo_dispatch_programs_the_rt_quota_exhaustion_boundary() {
     let (system, mut cpu) = online_system();
     let fifo = ready_thread(&system, SchedulePolicy::fifo(RtPriority::new(40).unwrap()));
     system.enqueue(cpu.as_mut(), fifo.id(), 100).unwrap();
+    support::set_monotonic_ns(100);
 
     assert_eq!(
         system.schedule(cpu.as_mut(), 100).unwrap().next(),
@@ -128,6 +119,7 @@ fn blocking_fifo_reprograms_the_fair_successor_deadline() {
     system
         .enqueue(cpu.as_mut(), fair_contender.id(), 100)
         .unwrap();
+    support::set_monotonic_ns(100);
 
     assert_eq!(
         system.schedule(cpu.as_mut(), 100).unwrap().next(),
@@ -171,6 +163,7 @@ fn exiting_fifo_reprograms_the_fair_successor_deadline() {
     system
         .enqueue(cpu.as_mut(), fair_contender.id(), 100)
         .unwrap();
+    support::set_monotonic_ns(100);
 
     assert_eq!(
         system.schedule(cpu.as_mut(), 100).unwrap().next(),
@@ -209,7 +202,9 @@ fn constrained_deadline_replenishment_preemption_is_seen_in_the_same_safe_point(
             .unwrap()
             .slice_expired()
     );
+    support::set_monotonic_ns(1);
     assert_eq!(system.schedule(cpu.as_mut(), 1).unwrap().next(), fair.id());
+    support::set_monotonic_ns(2);
     let _consumed_prior_request = system.schedule_if_requested(cpu.as_mut(), 2).unwrap();
     assert!(
         system
@@ -224,6 +219,7 @@ fn constrained_deadline_replenishment_preemption_is_seen_in_the_same_safe_point(
         "budget depletion must arm the next release rather than the earlier relative deadline",
     );
 
+    support::set_monotonic_ns(100);
     let decision = system
         .schedule_if_requested(cpu.as_mut(), 100)
         .unwrap()
@@ -245,6 +241,7 @@ fn yielded_deadline_rearms_replenishment_after_earlier_zero_lag_event() {
         deadline.id()
     );
 
+    support::set_monotonic_ns(1);
     system.yield_current(cpu.as_mut(), 1).unwrap();
     assert_eq!(support::last_oneshot_ns(), 10, "zero-lag must fire first");
 
@@ -253,7 +250,12 @@ fn yielded_deadline_rearms_replenishment_after_earlier_zero_lag_event() {
         cpu.as_mut(),
     );
     support::set_monotonic_ns(10);
-    let event = ax_task::on_clock_event(10, 64).unwrap();
+    support::set_scheduler_ns(10);
+    let event = ax_task::on_clock_event(
+        ax_task::runtime::MonotonicInstant::from_nanos(10).unwrap(),
+        64,
+    )
+    .unwrap();
     assert_eq!(
         event.expired(),
         1,

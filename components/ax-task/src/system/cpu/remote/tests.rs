@@ -3,7 +3,7 @@ mod scheduler_ipi_tests {
     use std::{sync::mpsc, thread, time::Duration};
 
     use super::*;
-    use crate::{TaskSystem, ThreadSpec};
+    use crate::{TaskSystem, ThreadSpec, runtime::MonotonicInstant};
 
     #[test]
     fn overdue_scheduler_deadline_becomes_sticky_work_instead_of_a_resolution_timer() {
@@ -21,7 +21,13 @@ mod scheduler_ipi_tests {
         let deadline = cpu.remote().fair_balance_deadline_ns();
 
         assert_eq!(
-            cpu.as_mut().next_oneshot_deadline_ns(deadline),
+            cpu.as_mut().next_oneshot_deadline(
+                deadline.expect("online fair balancing must own a scheduler deadline"),
+                MonotonicInstant::from_nanos(
+                    deadline.expect("online fair balancing must own a scheduler deadline"),
+                )
+                .unwrap(),
+            ),
             None,
             "an overdue scheduler event must not be rearmed at timer resolution"
         );

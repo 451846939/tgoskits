@@ -397,9 +397,8 @@ impl TaskSystem {
         carrier.commit();
         self.publish_owner_cpu_load_summary(cpu.as_mut());
         if migrated_fair && reason != BalanceReason::FairPeriodic {
-            let completion_now_ns = Self::scheduler_completion_now_ns(now_ns);
             cpu.as_mut()
-                .reset_fair_balance(completion_now_ns, self.config.balance_interval_ns());
+                .reset_fair_balance(now_ns, self.config.balance_interval_ns());
         }
         Ok(BalanceTransferOutcome::Migrated(core.id()))
     }
@@ -528,7 +527,11 @@ impl TaskSystem {
         } else {
             FairBalanceResult::Balanced
         };
-        let completion_now_ns = Self::scheduler_completion_now_ns(now_ns);
+        // Linux records a completed balance pass from the clock observed at
+        // the end of the pass (`sd->last_balance = jiffies`). Do not reuse the
+        // entry sample: a long owner-side scan would otherwise publish an
+        // already-expired retry deadline.
+        let completion_now_ns = task_runtime::scheduler_now().as_nanos();
         let minimum_interval_ns = self.config.balance_interval_ns();
         match result {
             FairBalanceResult::Migrated(_) => {

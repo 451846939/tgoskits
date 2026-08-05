@@ -19,7 +19,7 @@ use ax_errno::{AxError, AxResult};
 use ax_runtime::hal::time::{TimeValue, epochoffset_nanos, monotonic_time};
 use ax_std::os::arceos::task::{
     self as scheduler, IrqRegisterResult, IrqWaitCell, IrqWaitRegistration, LocalExecutor,
-    WaitQueue,
+    MonotonicDeadline, MonotonicInstant, WaitQueue,
 };
 use ax_sync::PiMutex;
 use axpoll::{IoEvents, Pollable};
@@ -69,15 +69,23 @@ pub fn block_on_user_timeout<F: IntoFuture>(
     duration: Option<Duration>,
     future: F,
 ) -> UserWaitOutcome<F::Output> {
-    let deadline = duration.and_then(|duration| monotonic_time().checked_add(duration));
-    block_on_user_until(task, deadline, future)
+    let deadline = duration.map(|duration| scheduler_monotonic_now().deadline_after(duration));
+    block_on_user_until_deadline(task, deadline, future)
 }
 
 /// Polls a user future until completion, interruption, or a monotonic deadline.
 #[track_caller]
 pub fn block_on_user_until<F: IntoFuture>(
     task: &UserTaskRef,
-    deadline: Option<TimeValue>,
+    deadline: Option<MonotonicDeadline>,
+    future: F,
+) -> UserWaitOutcome<F::Output> {
+    block_on_user_until_deadline(task, deadline, future)
+}
+
+fn block_on_user_until_deadline<F: IntoFuture>(
+    task: &UserTaskRef,
+    deadline: Option<MonotonicDeadline>,
     future: F,
 ) -> UserWaitOutcome<F::Output> {
     let executor = user_executor(task);
@@ -96,12 +104,16 @@ pub fn block_on_user_until_wall<F: IntoFuture>(
     deadline: Option<TimeValue>,
     future: F,
 ) -> UserWaitOutcome<F::Output> {
-    block_on_user_until(task, deadline.map(wall_deadline_to_monotonic), future)
+    block_on_user_until(
+        task,
+        deadline.map(wall_deadline_to_monotonic_deadline),
+        future,
+    )
 }
 
 async fn user_wait_future<F: IntoFuture>(
     task: &UserTaskRef,
-    deadline: Option<TimeValue>,
+    deadline: Option<MonotonicDeadline>,
     future: F,
 ) -> UserWaitOutcome<F::Output> {
     let mut future = pin!(future.into_future());
@@ -110,7 +122,7 @@ async fn user_wait_future<F: IntoFuture>(
         let interrupted = future.is_pending() && task.poll_interrupt(context).is_ready();
         let timed_out = future.is_pending()
             && !interrupted
-            && deadline.is_some_and(|deadline| monotonic_time() >= deadline);
+            && deadline.is_some_and(|deadline| scheduler_monotonic_now().reached(deadline));
         resolve_user_wait(future, interrupted, timed_out)
     })
     .await
@@ -119,7 +131,7 @@ async fn user_wait_future<F: IntoFuture>(
 fn block_on_with_abort<F, A>(
     future: F,
     executor: LocalExecutor,
-    deadline: Option<TimeValue>,
+    deadline: Option<MonotonicDeadline>,
     should_abort: A,
 ) -> F::Output
 where
@@ -137,6 +149,18 @@ where
     });
     drop(executor);
     output
+}
+
+fn scheduler_monotonic_now() -> MonotonicInstant {
+    MonotonicInstant::from_nanos(
+        u64::try_from(monotonic_time().as_nanos())
+            .expect("platform monotonic clock exceeds the nanosecond representation"),
+    )
+    .expect("platform monotonic clock exceeds the signed ktime domain")
+}
+
+pub(crate) fn monotonic_deadline_from_time(deadline: TimeValue) -> MonotonicDeadline {
+    MonotonicDeadline::from_duration(deadline)
 }
 
 fn user_executor(task: &UserTaskRef) -> LocalExecutor {
@@ -498,6 +522,10 @@ fn wall_deadline_to_monotonic(deadline: TimeValue) -> TimeValue {
     let realtime_now = monotonic_now.saturating_add(TimeValue::from_nanos(epochoffset_nanos()));
     SleepDeadline::Realtime(deadline)
         .resolve_monotonic(SleepClockSnapshot::new(monotonic_now, realtime_now))
+}
+
+fn wall_deadline_to_monotonic_deadline(deadline: TimeValue) -> MonotonicDeadline {
+    monotonic_deadline_from_time(wall_deadline_to_monotonic(deadline))
 }
 
 #[cfg(test)]

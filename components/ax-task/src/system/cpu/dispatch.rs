@@ -1,6 +1,7 @@
 //! Owner-local dispatch accounting and switch-tail handoff.
 
 use super::*;
+use crate::{DeadlineEntity, scheduler_time_advance};
 
 /// State committed before an architecture switch and consumed by switch tail.
 #[derive(Debug)]
@@ -89,7 +90,7 @@ impl CurrentSchedule {
 
     pub(crate) const fn absolute_deadline_ns(self) -> Option<u64> {
         match self.entity.deadline() {
-            Some(deadline) => Some(deadline.absolute_deadline_ns()),
+            Some(deadline) => deadline.absolute_deadline_ns(),
             None => None,
         }
     }
@@ -335,16 +336,19 @@ impl CurrentDispatch {
         match self.entity {
             SchedulingEntity::KernelStop => None,
             SchedulingEntity::Fair(fair) => {
-                Some(now_ns.saturating_add(fair.remaining_request_ns()))
+                Some(scheduler_time_advance(now_ns, fair.remaining_request_ns()))
             }
             SchedulingEntity::Fifo => None,
             SchedulingEntity::RoundRobin {
                 remaining_quantum_ns,
-            } => Some(now_ns.saturating_add(remaining_quantum_ns)),
+            } => Some(scheduler_time_advance(now_ns, remaining_quantum_ns)),
             SchedulingEntity::Deadline(deadline) => {
-                let mut next = nonzero_deadline(deadline.next_scheduler_event_ns());
+                let mut next = deadline.next_scheduler_event_ns();
                 if !self.pi_critical_rescue {
-                    next = earliest(next, now_ns.saturating_add(deadline.remaining_runtime_ns()));
+                    next = earliest(
+                        next,
+                        scheduler_time_advance(now_ns, deadline.remaining_runtime_ns()),
+                    );
                 }
                 next
             }
@@ -377,7 +381,8 @@ fn grub_charge_ns(
 fn deadline_key(entity: SchedulingEntity) -> u64 {
     entity
         .deadline()
-        .map_or(u64::MAX, |deadline| deadline.absolute_deadline_ns())
+        .and_then(DeadlineEntity::absolute_deadline_ns)
+        .expect("a runnable Deadline entity must own an absolute deadline")
 }
 
 /// Result of one allocation-free local dispatch charge.

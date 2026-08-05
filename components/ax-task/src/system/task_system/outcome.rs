@@ -180,7 +180,7 @@ pub struct DeadlineRuntimeSnapshot {
 pub struct DeadlineActivitySnapshot {
     pub(super) activity: DeadlineActivity,
     pub(super) bandwidth_cpu: Option<CpuId>,
-    pub(super) zero_lag_ns: u64,
+    pub(super) zero_lag_ns: Option<u64>,
 }
 
 impl DeadlineActivitySnapshot {
@@ -194,8 +194,8 @@ impl DeadlineActivitySnapshot {
         self.bandwidth_cpu
     }
 
-    /// Returns the pending zero-lag boundary, or zero when no timer is armed.
-    pub const fn zero_lag_ns(self) -> u64 {
+    /// Returns the pending zero-lag boundary.
+    pub const fn zero_lag_ns(self) -> Option<u64> {
         self.zero_lag_ns
     }
 }

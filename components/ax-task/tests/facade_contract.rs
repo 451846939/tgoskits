@@ -7,7 +7,8 @@ use ax_task::{
     CpuId, FairMode, Nice, SchedulePolicy, SchedulerTickGate, SchedulerTickWorkDisposition,
     TaskError, TaskSystem, TaskSystemConfig, ThreadExtension, ThreadExtensionOps, ThreadId,
     ThreadSpec, ThreadState, WakeResult, current_cpu_needs_resched, current_thread_extension,
-    current_thread_id, on_clock_event_with_scheduler_tick, schedule_current_cpu,
+    current_thread_id, on_clock_event_with_scheduler_tick, runtime::MonotonicInstant,
+    schedule_current_cpu,
 };
 
 mod support;
@@ -18,6 +19,20 @@ static SCHEDULER_TICK_OBSERVED_NS: AtomicU64 = AtomicU64::new(0);
 static SCHEDULER_TICK_RETRIES: AtomicUsize = AtomicUsize::new(0);
 static BLOCKING_TICK_ENTERED: AtomicBool = AtomicBool::new(false);
 static RELEASE_BLOCKING_TICK: AtomicBool = AtomicBool::new(false);
+
+fn instant(nanos: u64) -> MonotonicInstant {
+    MonotonicInstant::from_nanos(nanos).unwrap()
+}
+
+fn publish_scheduler_tick(now_ns: u64) {
+    publish_scheduler_tick_at(now_ns, now_ns);
+}
+
+fn publish_scheduler_tick_at(scheduler_now_ns: u64, monotonic_now_ns: u64) {
+    support::set_scheduler_ns(scheduler_now_ns);
+    support::set_monotonic_ns(monotonic_now_ns);
+    on_clock_event_with_scheduler_tick(instant(monotonic_now_ns), 1, true).unwrap();
+}
 
 #[test]
 fn facade_reports_uninitialized_then_uses_runtime_owned_objects() {
@@ -113,7 +128,7 @@ fn scheduler_tick_extension_work_is_deferred_out_of_hard_irq() {
     );
 
     support::set_hard_irq(true);
-    on_clock_event_with_scheduler_tick(1, 1, true).unwrap();
+    publish_scheduler_tick(1);
     support::set_hard_irq(false);
     assert_eq!(
         SCHEDULER_TICK_CALLBACKS.load(Ordering::Acquire),
@@ -131,7 +146,7 @@ fn scheduler_tick_extension_work_is_deferred_out_of_hard_irq() {
 }
 
 #[test]
-fn scheduler_tick_os_work_is_deferred_with_latest_irq_timestamp() {
+fn scheduler_tick_os_work_uses_the_latest_runqueue_clock_timestamp() {
     let _test_lock = TEST_LOCK.lock().expect("facade test lock poisoned");
     support::clear_handles();
     SCHEDULER_TICK_CALLBACKS.store(0, Ordering::Relaxed);
@@ -157,9 +172,9 @@ fn scheduler_tick_os_work_is_deferred_with_latest_irq_timestamp() {
         cpu.as_mut(),
     );
 
-    for now_ns in 1..=3 {
+    for monotonic_now_ns in 1..=3 {
         support::set_hard_irq(true);
-        on_clock_event_with_scheduler_tick(now_ns, 1, true).unwrap();
+        publish_scheduler_tick_at(100 + monotonic_now_ns, monotonic_now_ns);
         support::set_hard_irq(false);
     }
     assert_eq!(SCHEDULER_TICK_CALLBACKS.load(Ordering::Acquire), 0);
@@ -172,8 +187,9 @@ fn scheduler_tick_os_work_is_deferred_with_latest_irq_timestamp() {
     assert_eq!(SCHEDULER_TICK_CALLBACKS.load(Ordering::Acquire), 1);
     assert_eq!(
         SCHEDULER_TICK_OBSERVED_NS.load(Ordering::Acquire),
-        3,
-        "coalesced work must receive the latest IRQ observation boundary"
+        103,
+        "coalesced work must receive the latest runqueue-clock boundary, not the physical IRQ \
+         timestamp"
     );
 
     support::clear_handles();
@@ -205,7 +221,7 @@ fn scheduler_tick_gate_does_not_replay_work_from_an_old_enable_epoch() {
         cpu.as_mut(),
     );
 
-    on_clock_event_with_scheduler_tick(1, 1, true).unwrap();
+    publish_scheduler_tick(1);
     gate.set_enabled(false);
     gate.set_enabled(true);
     assert_eq!(system.service_deferred_task_work(1).unwrap().processed(), 1);
@@ -215,8 +231,8 @@ fn scheduler_tick_gate_does_not_replay_work_from_an_old_enable_epoch() {
         "a publication from an earlier enabled epoch must not cross a disable boundary"
     );
 
-    on_clock_event_with_scheduler_tick(2, 1, true).unwrap();
-    on_clock_event_with_scheduler_tick(3, 1, true).unwrap();
+    publish_scheduler_tick(2);
+    publish_scheduler_tick(3);
     assert_eq!(system.service_deferred_task_work(1).unwrap().processed(), 1);
     assert_eq!(
         SCHEDULER_TICK_CALLBACKS.load(Ordering::Acquire),
@@ -255,7 +271,7 @@ fn scheduler_tick_retry_republishes_one_bounded_task_work_attempt() {
         cpu.as_mut(),
     );
 
-    on_clock_event_with_scheduler_tick(7, 1, true).unwrap();
+    publish_scheduler_tick(7);
     let first = system.service_deferred_task_work(1).unwrap();
     assert_eq!(first.processed(), 1);
     assert_eq!(first.scheduler_tick_callbacks(), 1);
@@ -305,7 +321,7 @@ fn scheduler_tick_retry_defers_until_a_later_service_pass() {
         cpu.as_mut(),
     );
 
-    on_clock_event_with_scheduler_tick(17, 1, true).unwrap();
+    publish_scheduler_tick(17);
     let first = system
         .service_deferred_task_work(ax_task::DEFAULT_BATCH_LIMIT)
         .unwrap();
@@ -364,13 +380,13 @@ fn newer_tick_owns_delivery_when_it_races_a_callback_retry() {
         cpu.as_mut(),
     );
 
-    on_clock_event_with_scheduler_tick(5, 1, true).unwrap();
+    publish_scheduler_tick(5);
     std::thread::scope(|scope| {
         let worker = scope.spawn(|| system.service_deferred_task_work(1).unwrap());
         while !BLOCKING_TICK_ENTERED.load(Ordering::Acquire) {
             std::thread::yield_now();
         }
-        on_clock_event_with_scheduler_tick(11, 1, true).unwrap();
+        publish_scheduler_tick(11);
         RELEASE_BLOCKING_TICK.store(true, Ordering::Release);
         assert_eq!(worker.join().unwrap().processed(), 1);
     });
@@ -423,7 +439,7 @@ fn scheduler_tick_retry_cannot_cross_a_gate_disable_epoch() {
         cpu.as_mut(),
     );
 
-    on_clock_event_with_scheduler_tick(5, 1, true).unwrap();
+    publish_scheduler_tick(5);
     std::thread::scope(|scope| {
         let worker = scope.spawn(|| system.service_deferred_task_work(1).unwrap());
         while !BLOCKING_TICK_ENTERED.load(Ordering::Acquire) {
@@ -440,7 +456,7 @@ fn scheduler_tick_retry_cannot_cross_a_gate_disable_epoch() {
         "Retry must not replay work from the disabled generation"
     );
 
-    on_clock_event_with_scheduler_tick(13, 1, true).unwrap();
+    publish_scheduler_tick(13);
     assert_eq!(system.service_deferred_task_work(1).unwrap().processed(), 1);
     assert_eq!(SCHEDULER_TICK_CALLBACKS.load(Ordering::Acquire), 2);
     assert_eq!(SCHEDULER_TICK_OBSERVED_NS.load(Ordering::Acquire), 13);
@@ -481,7 +497,7 @@ fn scheduler_tick_delivery_pins_extension_across_thread_exit() {
         cpu.as_mut(),
     );
 
-    on_clock_event_with_scheduler_tick(1, 1, true).unwrap();
+    publish_scheduler_tick(1);
     system.block_current(cpu.as_mut(), 1).unwrap();
     system.complete_context_switch(cpu.as_mut()).unwrap();
 

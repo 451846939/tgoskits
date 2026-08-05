@@ -216,8 +216,15 @@ impl_task_runtime! {
             crate::guard::validate_owner_cpu_context()
         }
 
-        fn monotonic_ns() -> u64 {
-            ax_hal::time::monotonic_time_nanos()
+        fn monotonic_now() -> ax_task::runtime::MonotonicInstant {
+            ax_task::runtime::MonotonicInstant::from_nanos(
+                ax_hal::time::monotonic_time_nanos(),
+            )
+            .expect("platform monotonic clock exceeded the signed ktime domain")
+        }
+
+        fn scheduler_now() -> ax_task::SchedulerTimestamp {
+            ax_task::SchedulerTimestamp::from_nanos(ax_hal::time::monotonic_time_nanos())
         }
 
         fn publish_task_deadline(update: ax_task::runtime::TaskDeadlineUpdate) {
@@ -252,14 +259,14 @@ impl_task_runtime! {
 
         fn wait_for_interrupt() {
             ax_hal::asm::disable_irqs();
-            let mut now_ns = ax_hal::time::monotonic_time_nanos();
-            let _ = crate::clock_event_runtime::recover_overdue_local_clock_event(now_ns);
+            let mut now = crate::clock_event_runtime::monotonic_now();
+            let _ = crate::clock_event_runtime::recover_overdue_local_clock_event(now);
             let mut needs_reschedule = ax_task::current_cpu_needs_resched()
                 .expect("idle handoff requires an initialized current CPU");
             if needs_reschedule
-                || crate::clock_event_runtime::local_clock_event_has_immediate_work(now_ns)
+                || crate::clock_event_runtime::local_clock_event_has_immediate_work(now)
             {
-                crate::clock_event_runtime::restart_current_scheduler_tick_after_idle(now_ns);
+                crate::clock_event_runtime::restart_current_scheduler_tick_after_idle(now);
                 ax_hal::asm::enable_irqs();
                 return;
             }
@@ -269,13 +276,13 @@ impl_task_runtime! {
             // same physical clockevent and are reprogrammed in this IRQ-off
             // transaction.
             crate::clock_event_runtime::stop_current_scheduler_tick_for_idle();
-            now_ns = ax_hal::time::monotonic_time_nanos();
+            now = crate::clock_event_runtime::monotonic_now();
             needs_reschedule = ax_task::current_cpu_needs_resched()
                 .expect("idle handoff requires an initialized current CPU");
             if needs_reschedule
-                || crate::clock_event_runtime::local_clock_event_has_immediate_work(now_ns)
+                || crate::clock_event_runtime::local_clock_event_has_immediate_work(now)
             {
-                crate::clock_event_runtime::restart_current_scheduler_tick_after_idle(now_ns);
+                crate::clock_event_runtime::restart_current_scheduler_tick_after_idle(now);
                 ax_hal::asm::enable_irqs();
                 return;
             }
@@ -287,13 +294,13 @@ impl_task_runtime! {
             // Work that makes the idle thread yield restarts the tick before
             // the scheduler can select a non-idle thread.
             let irq_guard = ax_kernel_guard::IrqSave::new();
-            now_ns = ax_hal::time::monotonic_time_nanos();
+            now = crate::clock_event_runtime::monotonic_now();
             needs_reschedule = ax_task::current_cpu_needs_resched()
                 .expect("idle wake requires an initialized current CPU");
             if needs_reschedule
-                || crate::clock_event_runtime::local_clock_event_has_immediate_work(now_ns)
+                || crate::clock_event_runtime::local_clock_event_has_immediate_work(now)
             {
-                crate::clock_event_runtime::restart_current_scheduler_tick_after_idle(now_ns);
+                crate::clock_event_runtime::restart_current_scheduler_tick_after_idle(now);
             }
             drop(irq_guard);
         }

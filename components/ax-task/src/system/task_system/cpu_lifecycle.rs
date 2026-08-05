@@ -92,13 +92,13 @@ impl TaskSystem {
 
     /// Completes CPU registration and publishes it in the online root domain.
     pub fn bring_cpu_online(&self, cpu: Pin<&mut CpuLocal>) -> Result<(), TaskError> {
-        self.bring_cpu_online_at(cpu, task_runtime::monotonic_ns())
+        self.bring_cpu_online_at(cpu, task_runtime::scheduler_now().as_nanos())
     }
 
     /// Completes CPU registration at `now_ns` and publishes it online.
     ///
-    /// The explicit clock sample keeps deterministic scheduler models and OS
-    /// runtimes on the same absolute monotonic time base. In particular, the
+    /// The explicit runqueue-clock sample keeps deterministic scheduler models
+    /// and OS runtimes on the same wrapping scheduler time base. In particular, the
     /// first fair-balance deadline is one interval after online publication,
     /// rather than one interval after an unrelated zero epoch.
     pub fn bring_cpu_online_at(

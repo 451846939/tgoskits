@@ -138,13 +138,20 @@ fn hard_irq_contract_is_zero_alloc_zero_free_and_zero_poll() {
     let _timer_registration = timer_queue
         .arm(
             timer.as_ref().get_ref(),
-            10,
+            ax_task::runtime::MonotonicDeadline::from_nanos(10).unwrap(),
             TaskDeadlineKind::park_timeout(1),
         )
         .expect("preallocated timer slot must be available");
     let mut expired = [ExpiredTaskDeadline::EMPTY; 1];
-    let timer_audit =
-        audit(|| timer_queue.expire(TaskDeadlineExpireRequest::new(10, 1), &mut expired));
+    let timer_audit = audit(|| {
+        timer_queue.expire(
+            TaskDeadlineExpireRequest::new(
+                ax_task::runtime::MonotonicInstant::from_nanos(10).unwrap(),
+                1,
+            ),
+            &mut expired,
+        )
+    });
     assert_eq!(timer_audit.value.expired(), 1);
     assert_zero_allocator_activity(timer_audit);
     support::set_hard_irq(false);

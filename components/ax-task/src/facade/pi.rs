@@ -44,7 +44,7 @@ pub(super) fn prepare_pi_park_attempt(
 ) -> Result<PiParkAttempt, TaskError> {
     let _permit = acquire_blocking_permit()?;
     let mut irq = RuntimeIrqGuard::enter();
-    let now_ns = task_runtime::monotonic_ns();
+    let now_ns = task_runtime::scheduler_now().as_nanos();
     let mut cpu = runtime_current_cpu_mut(&mut irq)?;
     if cpu.current() != Some(token.thread_id()) {
         return Err(TaskError::InvalidPiState);

@@ -152,9 +152,12 @@ pub(super) fn record_scheduler_ipi_send() {
 
 /// Performs bounded task accounting and publishes a sticky reschedule request.
 #[cfg(feature = "irq")]
-pub(crate) fn on_clock_event(now_ns: u64, scheduler_tick: bool) -> Option<TaskDeadlineUpdate> {
+pub(crate) fn on_clock_event(
+    now: ax_task::runtime::MonotonicInstant,
+    scheduler_tick: bool,
+) -> Option<TaskDeadlineUpdate> {
     TASK_TIMER_IRQ_COUNT.fetch_add(1, Ordering::Relaxed);
-    account_clock_event(now_ns, scheduler_tick)
+    account_clock_event(now, scheduler_tick)
 }
 
 /// Performs the same bounded accounting when idle recovers a missed edge.
@@ -162,14 +165,20 @@ pub(crate) fn on_clock_event(now_ns: u64, scheduler_tick: bool) -> Option<TaskDe
 /// This is not a physical interrupt and therefore must not inflate the IRQ
 /// counter used by timer diagnostics.
 #[cfg(feature = "irq")]
-pub(crate) fn recover_clock_event(now_ns: u64, scheduler_tick: bool) -> Option<TaskDeadlineUpdate> {
-    account_clock_event(now_ns, scheduler_tick)
+pub(crate) fn recover_clock_event(
+    now: ax_task::runtime::MonotonicInstant,
+    scheduler_tick: bool,
+) -> Option<TaskDeadlineUpdate> {
+    account_clock_event(now, scheduler_tick)
 }
 
 #[cfg(feature = "irq")]
-fn account_clock_event(now_ns: u64, scheduler_tick: bool) -> Option<TaskDeadlineUpdate> {
+fn account_clock_event(
+    now: ax_task::runtime::MonotonicInstant,
+    scheduler_tick: bool,
+) -> Option<TaskDeadlineUpdate> {
     match ax_task::on_clock_event_with_scheduler_tick(
-        now_ns,
+        now,
         TASK_CLOCK_EVENT_IRQ_BUDGET,
         scheduler_tick,
     ) {

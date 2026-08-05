@@ -75,7 +75,11 @@ impl SchedulingEntity {
         match self {
             Self::Deadline(entity) => {
                 entity.activate(now_ns);
-                (!entity.is_throttled()).then(|| entity.absolute_deadline_ns())
+                if entity.is_throttled() {
+                    None
+                } else {
+                    entity.absolute_deadline_ns()
+                }
             }
             _ => None,
         }
@@ -205,5 +209,25 @@ mod tests {
         later.activate_deadline(200);
 
         assert!(earlier.scheduling_key(policy, 2) < later.scheduling_key(policy, 1));
+    }
+
+    #[test]
+    fn deadline_urgency_orders_across_linux_rq_clock_wrap() {
+        let earlier_policy =
+            SchedulePolicy::deadline(DeadlinePolicy::new(1, 4, 20, DeadlineFlags::NONE).unwrap());
+        let later_policy =
+            SchedulePolicy::deadline(DeadlinePolicy::new(1, 10, 20, DeadlineFlags::NONE).unwrap());
+        let mut earlier = SchedulingEntity::new(earlier_policy, 1, 0);
+        let mut later = SchedulingEntity::new(later_policy, 1, 0);
+        let now = u64::MAX - 5;
+        earlier.activate_deadline(now);
+        later.activate_deadline(now);
+
+        assert_eq!(
+            earlier.deadline().unwrap().absolute_deadline_ns(),
+            Some(u64::MAX - 1)
+        );
+        assert_eq!(later.deadline().unwrap().absolute_deadline_ns(), Some(4));
+        assert!(earlier.scheduling_key(earlier_policy, 2) < later.scheduling_key(later_policy, 1));
     }
 }

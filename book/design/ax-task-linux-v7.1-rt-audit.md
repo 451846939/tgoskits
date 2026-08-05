@@ -558,6 +558,34 @@ root。Starry 的 `SchedulerAddressSpaceLease` 因此把“scheduler slot 已解
 
 ## Task deadline 与 clockevent
 
+时间值分为两个不能直接比较的域：
+
+- scheduler `rq_clock` 使用无符号回绕时间戳，所有相对参数必须小于半区间，先用有符号差
+  判断先后；Deadline、RT period、Fair request 只能保存这个域的值；
+- 物理 timer 使用 Linux `ktime_t` 的有限有符号域。`MonotonicInstant` 与
+  `MonotonicDeadline` 只在 runtime/clockevent 边界出现，`KTIME_MAX` 仍是有限时间，
+  只有 `Option::None` 表示没有期限。
+
+两域只能在 owner rq 已取得一致 scheduler clock 样本时转换：先计算 scheduler future
+相对当前 rq clock 的正向 delta，再把 delta 加到同一事务采样的 monotonic instant。
+禁止把 scheduler 绝对值和物理绝对值直接 `min`、比较或共同存进 raw `u64` 缓存。
+这对应 Linux v7.1 `start_dl_timer()`：`rq_clock()` 空间的 release/deadline 通过 delta
+映射到 `ktime_get()`，而不是假定两者绝对纪元相同。
+
+`TaskRuntime` 因而分别提供 `scheduler_now()` 与 `monotonic_now()` 两个 capability。平台
+当前可以让两者读取同一个硬件 counter，但调用方不能据此合并接口或依赖相同 epoch。
+timer IRQ 使用入口的 monotonic 样本提升物理 task deadline，另取 scheduler 样本完成
+runtime charge、scheduler tick 与 CBS 状态转换，最后再取 monotonic 样本把下一 scheduler
+delta 映射到物理 clockevent。普通 `__schedule` 等价 fast path 在 task deadline heap 为空且
+没有 sticky deadline work 时只读取 scheduler clock，不额外触碰物理 timer clock。
+
+`start_dl_timer()` 对已经过去的 scheduler deadline 返回 false，不建立 hrtimer。当前
+实现同样只给 `Future` 建 `TaskDeadlineQueue` 节点；`Due` 由 owner 在持有线程 scheduler
+状态和目标 rq 所有权的同一个事务内直接完成 miss 观察、CBS replenish、unthrottle、
+enqueue 或 zero-lag bandwidth 释放。不得把 `Due` 改写成 physical-now 节点，也不得等待
+下一次偶然 timer IRQ 才推进。确定性回归要求：已过期 CBS refresh 后没有物理 timer
+registration，并且调度状态已经在本次 owner 事务中完成转换。
+
 `ax-task::TaskDeadlineQueue` 只接受：
 
 - sleep/park/wait timeout；
@@ -595,7 +623,10 @@ level/pending source，EOI 后会立即重入并形成 IRQ storm。RISC-V net-lo
 task deadline、periodic advance 或硬件动作。这样 offline 前已经 pending 的 IRQ 即使在
 re-online 后才交付，也不能把新 CPU 周期提前推进到 `Firing`。
 
-无期限用 `Option<MonotonicDeadline>`，不能用 `u64::MAX` 直接下发硬件。ns 到 tick 使用向上取整和饱和转换；已过期值钳制到设备最小非零 delta。
+无期限用 `Option<MonotonicDeadline>`，不能用 `u64::MAX` 直接下发硬件。用户绝对时间按
+Linux `timespec64_to_ktime()` 规则饱和到有限 `KTIME_MAX`；相对 timeout 按
+`ktime_add_safe()` 饱和。ns 到 tick 使用向上取整和饱和转换；已过期值只在物理设备边界
+按 clockevent 的最小非零 delta 编程，不回写逻辑 deadline。
 
 物理 timer 是加速路径，不是唯一正确性来源。scheduler safe point 会有界提升已经过期的 task deadline，避免丢失或过晚的硬件边永久挂起 sleeper。
 

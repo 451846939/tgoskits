@@ -26,6 +26,7 @@ pub(super) struct RemoteLoadState {
     current_sequence: AtomicU64,
     pushable_primary: AtomicU64,
     pushable_sequence: AtomicU64,
+    fair_balance_armed: AtomicBool,
     fair_balance_deadline_ns: AtomicU64,
 }
 
@@ -43,7 +44,8 @@ impl RemoteLoadState {
             current_sequence: AtomicU64::new(0),
             pushable_primary: AtomicU64::new(0),
             pushable_sequence: AtomicU64::new(0),
-            fair_balance_deadline_ns: AtomicU64::new(u64::MAX),
+            fair_balance_armed: AtomicBool::new(false),
+            fair_balance_deadline_ns: AtomicU64::new(0),
         }
     }
 }
@@ -231,23 +233,32 @@ impl CpuRemote {
     }
 
     pub(crate) fn fair_balance_due(&self, now_ns: u64) -> bool {
-        now_ns >= self.load.fair_balance_deadline_ns.load(Ordering::Acquire)
+        self.load.fair_balance_armed.load(Ordering::Acquire)
+            && crate::scheduler_time_reached(
+                now_ns,
+                self.load.fair_balance_deadline_ns.load(Ordering::Relaxed),
+            )
     }
 
     pub(crate) fn defer_fair_balance(&self, now_ns: u64, interval_ns: u64) {
-        self.load
-            .fair_balance_deadline_ns
-            .store(now_ns.saturating_add(interval_ns.max(1)), Ordering::Release);
+        let interval_ns = interval_ns.max(1);
+        assert!(interval_ns < crate::SCHEDULER_TIME_HALF_RANGE);
+        self.load.fair_balance_deadline_ns.store(
+            crate::scheduler_time_advance(now_ns, interval_ns),
+            Ordering::Relaxed,
+        );
+        self.load.fair_balance_armed.store(true, Ordering::Release);
     }
 
-    pub(in crate::system::cpu) fn fair_balance_deadline_ns(&self) -> u64 {
-        self.load.fair_balance_deadline_ns.load(Ordering::Acquire)
+    pub(in crate::system::cpu) fn fair_balance_deadline_ns(&self) -> Option<u64> {
+        self.load
+            .fair_balance_armed
+            .load(Ordering::Acquire)
+            .then(|| self.load.fair_balance_deadline_ns.load(Ordering::Relaxed))
     }
 
     pub(super) fn reset_fair_balance_for_offline(&self) {
-        self.load
-            .fair_balance_deadline_ns
-            .store(u64::MAX, Ordering::Relaxed);
+        self.load.fair_balance_armed.store(false, Ordering::Release);
     }
 
     #[cfg(test)]
