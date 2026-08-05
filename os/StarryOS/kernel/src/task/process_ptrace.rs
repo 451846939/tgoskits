@@ -269,6 +269,7 @@ impl ProcessData {
     }
 
     /// Returns the original syscall number associated with a syscall stop.
+    #[cfg(target_arch = "x86_64")]
     pub fn ptrace_stop_syscall_number_for(&self, tid: u32) -> Option<usize> {
         self.ptrace.stops.lock().get(&tid)?.syscall_no
     }
@@ -378,6 +379,7 @@ impl ProcessData {
     }
 
     /// Replaces the original syscall number held for a stopped tracee.
+    #[cfg(target_arch = "x86_64")]
     pub fn set_ptrace_stop_syscall_number_for(&self, tid: u32, syscall_no: usize) -> bool {
         let mut stops = self.ptrace.stops.lock();
         let Some(stop) = stops.get_mut(&tid) else {
@@ -388,13 +390,6 @@ impl ProcessData {
         }
         stop.syscall_no = Some(syscall_no);
         true
-    }
-
-    /// Resumes the selected stop, optionally injecting a signal.
-    pub fn resume_ptrace_stop_with_signal(&self, signo: u32) {
-        if let Some(tid) = self.selected_ptrace_stop_tid() {
-            self.resume_ptrace_stop_with_signal_for(tid, signo);
-        }
     }
 
     pub fn resume_ptrace_stop_with_signal_for(&self, tid: u32, signo: u32) {

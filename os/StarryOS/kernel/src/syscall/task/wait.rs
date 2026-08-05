@@ -9,8 +9,7 @@ use linux_raw_sys::general::{
 use starry_process::{Pid, Process};
 use starry_signal::{SignalInfo, Signo};
 
-use super::ptrace::PTRACE_EVENT_STOP;
-use super::wait_scan::WaitCandidateScan;
+use super::{ptrace::PTRACE_EVENT_STOP, wait_scan::WaitCandidateScan};
 use crate::{
     file::{PidFd, get_file_like},
     mm::{VmMutPtr, VmPtr},

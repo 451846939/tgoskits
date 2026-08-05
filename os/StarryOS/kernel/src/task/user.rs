@@ -135,12 +135,8 @@ pub fn new_user_task(
                 ReturnReason::Syscall => {
                     let ptrace_trace = thr.proc_data.ptrace.syscall_trace_if_active(tid);
                     if matches!(ptrace_trace, Some(SyscallTraceState::Entry))
-                        && let Some(resume_signo) = ptrace_syscall_stop_current(
-                            thr,
-                            Signo::SIGTRAP,
-                            &mut uctx,
-                            saved_sysno,
-                        )
+                        && let Some(resume_signo) =
+                            ptrace_syscall_stop_current(thr, Signo::SIGTRAP, &mut uctx, saved_sysno)
                     {
                         enqueue_ptrace_syscall_resume_signal(thr, resume_signo);
                     }
@@ -150,12 +146,8 @@ pub fn new_user_task(
                     let syscall_no = uctx.sysno();
                     let syscall_arg0 = uctx.arg0();
                     if ptrace_trace.is_some()
-                        && let Some(exit_code) =
-                            ptrace_exit_event_code(syscall_no, syscall_arg0)
-                        && crate::syscall::ptrace_notify_exit(
-                            thr.proc_data.proc.pid(),
-                            exit_code,
-                        )
+                        && let Some(exit_code) = ptrace_exit_event_code(syscall_no, syscall_arg0)
+                        && crate::syscall::ptrace_notify_exit(thr.proc_data.proc.pid(), exit_code)
                     {
                         let _ = ptrace_stop_current(thr, Signo::SIGTRAP, &mut uctx);
                     }
@@ -407,5 +399,5 @@ fn enqueue_ptrace_syscall_resume_signal(thr: &super::Thread, resume_signo: Optio
     // A PTRACE_SYSCALL resume signal is delivered after the matching syscall
     // exit stop. Do not arm the ptrace bypass: the tracer must observe its
     // subsequent signal-delivery stop.
-    let _ = thr.signal.send_signal(SignalInfo::new_kernel(signo));
+    let _ = thr.signal().send_signal(SignalInfo::new_kernel(signo));
 }
