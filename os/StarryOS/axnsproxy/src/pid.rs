@@ -174,16 +174,27 @@ impl PidNamespace {
         self.state.lock().is_shutting_down()
     }
 
-    /// Returns published task IDs other than the namespace init thread.
-    pub fn published_members_excluding(&self, init_global_tid: u64) -> Vec<u64> {
+    /// Returns the published tasks that namespace shutdown must terminate.
+    ///
+    /// The last live thread of the namespace init may be a non-leader. Its
+    /// thread PID remains published until its exit path returns, so treating it
+    /// as a victim would make the reaper wait for its own post-exit cleanup.
+    pub fn published_shutdown_victims(
+        &self,
+        init_global_tid: u64,
+        reaper_global_tid: u64,
+    ) -> Vec<u64> {
         self.state
             .lock()
-            .published_members_excluding(init_global_tid)
+            .published_shutdown_victims(init_global_tid, reaper_global_tid)
     }
 
-    /// Returns whether any reservation outside the namespace init remains.
-    pub fn has_members_excluding(&self, init_global_tid: u64) -> bool {
-        self.state.lock().has_members_excluding(init_global_tid)
+    /// Returns whether namespace shutdown still owns a task or unpublished
+    /// reservation that must retire before the reaper can publish exit.
+    pub fn has_shutdown_victims(&self, init_global_tid: u64, reaper_global_tid: u64) -> bool {
+        self.state
+            .lock()
+            .has_shutdown_victims(init_global_tid, reaper_global_tid)
     }
 
     /// Releases one namespace-local thread ID after scheduler-visible exit.
@@ -345,6 +356,7 @@ impl PidNamespaceState {
     }
 
     /// Returns published task IDs other than the namespace init thread.
+    #[cfg(test)]
     fn published_members_excluding(&self, init_global_tid: u64) -> Vec<u64> {
         self.pid_map
             .iter()
@@ -355,11 +367,29 @@ impl PidNamespaceState {
             .collect()
     }
 
+    fn published_shutdown_victims(&self, init_global_tid: u64, reaper_global_tid: u64) -> Vec<u64> {
+        self.pid_map
+            .iter()
+            .filter_map(|(global_tid, entry)| {
+                (*global_tid != init_global_tid
+                    && *global_tid != reaper_global_tid
+                    && entry.publication == PidPublication::Published)
+                    .then_some(*global_tid)
+            })
+            .collect()
+    }
+
     /// Returns whether any reservation outside the namespace init remains.
     fn has_members_excluding(&self, init_global_tid: u64) -> bool {
         self.pid_map
             .keys()
             .any(|global_tid| *global_tid != init_global_tid)
+    }
+
+    fn has_shutdown_victims(&self, init_global_tid: u64, reaper_global_tid: u64) -> bool {
+        self.pid_map
+            .keys()
+            .any(|global_tid| *global_tid != init_global_tid && *global_tid != reaper_global_tid)
     }
 
     /// Releases one namespace-local thread ID after scheduler-visible exit.
@@ -442,6 +472,12 @@ mod tests {
             .unwrap()
     }
 
+    fn reserve_thread(namespace: &mut PidNamespaceState, global_tid: u64) -> u32 {
+        namespace
+            .reserve_local_pid(global_tid, PidReservationKind::Thread, false)
+            .unwrap()
+    }
+
     #[test]
     fn unpublished_pid_reservation_restores_namespace_state() {
         let mut namespace = new_child_state();
@@ -503,6 +539,26 @@ mod tests {
         assert!(namespace.release_process_pid(42));
         assert!(namespace.is_shutting_down() == false);
         assert_eq!(namespace.init_global_tid(), Some(42));
+    }
+
+    #[test]
+    fn shutdown_reaper_thread_is_not_its_own_victim() {
+        let mut namespace = new_child_state();
+        let init = reserve_process(&mut namespace, 42, true);
+        namespace.publish_reserved_pid(42, init).unwrap();
+        let reaper_thread = reserve_thread(&mut namespace, 43);
+        namespace.publish_reserved_pid(43, reaper_thread).unwrap();
+        let child = reserve_process(&mut namespace, 44, false);
+        namespace.publish_reserved_pid(44, child).unwrap();
+
+        assert!(namespace.begin_shutdown(42));
+        assert_eq!(namespace.published_shutdown_victims(42, 43), [44]);
+        assert!(namespace.has_shutdown_victims(42, 43));
+        assert!(namespace.release_process_pid(44));
+        assert!(
+            !namespace.has_shutdown_victims(42, 43),
+            "the final namespace-reaper thread must not wait for its own post-exit PID release"
+        );
     }
 
     #[test]

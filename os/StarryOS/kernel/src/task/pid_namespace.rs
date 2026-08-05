@@ -34,14 +34,16 @@ pub(crate) fn begin_shutdown(
 pub(crate) fn published_victim_tids(
     namespace: &PidNamespaceRef,
     init_global_pid: u64,
+    reaper_global_tid: u64,
 ) -> alloc::vec::Vec<u64> {
-    namespace.published_members_excluding(init_global_pid)
+    namespace.published_shutdown_victims(init_global_pid, reaper_global_tid)
 }
 
 /// Services newly reparented zombies until every non-init identity is gone.
 pub(crate) fn wait_for_victims(
     namespace: &PidNamespaceRef,
     init_global_pid: u64,
+    reaper_global_tid: u64,
     mut service_zombies: impl FnMut(),
 ) {
     loop {
@@ -50,12 +52,12 @@ pub(crate) fn wait_for_victims(
         // epoch checked by the predicate.
         let observed = MEMBER_EPOCH.load(Ordering::Acquire);
         service_zombies();
-        if !namespace.has_members_excluding(init_global_pid) {
+        if !namespace.has_shutdown_victims(init_global_pid, reaper_global_tid) {
             return;
         }
         MEMBERS_CHANGED.wait_until(|| {
             MEMBER_EPOCH.load(Ordering::Acquire) != observed
-                || !namespace.has_members_excluding(init_global_pid)
+                || !namespace.has_shutdown_victims(init_global_pid, reaper_global_tid)
         });
     }
 }

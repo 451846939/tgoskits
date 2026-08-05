@@ -526,11 +526,13 @@ fn reap_shutdown_children(init: &Arc<ProcessData>, namespace: &crate::task::PidN
 fn terminate_pid_namespace_members(
     init: &Arc<ProcessData>,
     namespace: &crate::task::PidNamespaceRef,
+    reaper_tid: Pid,
 ) {
     let init_pid = init.proc.pid() as u64;
+    let reaper_tid = reaper_tid as u64;
 
     let signal = SignalInfo::new_kernel(Signo::SIGKILL);
-    for global_tid in published_victim_tids(namespace, init_pid) {
+    for global_tid in published_victim_tids(namespace, init_pid, reaper_tid) {
         let Ok(tid) = Pid::try_from(global_tid) else {
             continue;
         };
@@ -538,7 +540,7 @@ fn terminate_pid_namespace_members(
         let _ = zap_thread(tid);
     }
 
-    wait_for_victims(namespace, init_pid, || {
+    wait_for_victims(namespace, init_pid, reaper_tid, || {
         reap_shutdown_children(init, namespace)
     });
 }
@@ -671,7 +673,7 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
         };
 
         if let Some(namespace) = shutting_down_pid_namespace.as_ref() {
-            terminate_pid_namespace_members(&thr.proc_data, namespace);
+            terminate_pid_namespace_members(&thr.proc_data, namespace, thr.tid());
         }
 
         crate::syscall::clear_proc_shm(process.pid(), &thr.proc_data.aspace());
