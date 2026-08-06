@@ -329,10 +329,10 @@ fn find_uefi_firmware(target: LoaderSmokeTarget) -> anyhow::Result<PathBuf> {
 
 fn firmware_candidate_paths(target: LoaderSmokeTarget) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
+    candidates.extend(target.firmware_candidates.iter().map(PathBuf::from));
     if target.cargo_target == DEFAULT_UEFI_TARGET {
         candidates.push(ostool_x86_64_ovmf_code_path());
     }
-    candidates.extend(target.firmware_candidates.iter().map(PathBuf::from));
     candidates
 }
 
@@ -696,15 +696,16 @@ mod tests {
     }
 
     #[test]
-    fn x86_64_firmware_candidates_prefer_ostool_ovmf_cache() {
+    fn x86_64_http_smoke_prefers_system_ovmf_with_network_stack() {
         let target = smoke_target("x86_64-unknown-uefi").unwrap();
         let candidates = firmware_candidate_paths(target);
 
-        assert_eq!(candidates[0], ostool_x86_64_ovmf_code_path());
+        assert_eq!(candidates[0], Path::new("/usr/share/OVMF/OVMF_CODE_4M.fd"));
         assert!(
             candidates
                 .iter()
-                .any(|path| { path == Path::new("/usr/share/OVMF/OVMF_CODE_4M.fd") })
+                .position(|path| { path == &ostool_x86_64_ovmf_code_path() })
+                .is_some_and(|index| index > 0)
         );
     }
 
