@@ -350,29 +350,6 @@ jobs:
             require_kvm: true
             timeout_minutes: 20
             command: |
-              echo "=== axloader HTTP smoke runner diagnostics ==="
-              uname -a || true
-              id || true
-              groups || true
-              lscpu | grep -E '^(Architecture|CPU op-mode|Vendor ID|Model name|Hypervisor vendor|Virtualization|Flags):' || true
-              command -v qemu-system-x86_64 || true
-              which -a qemu-system-x86_64 || true
-              ls -l /opt/qemu-10.2.1/bin/qemu-system-x86_64 /usr/bin/qemu-system-x86_64 2>/dev/null || true
-              qemu-system-x86_64 --version || true
-              qemu-system-x86_64 -accel help || true
-              qemu-system-x86_64 -machine help | grep -E '^(pc |q35 |microvm )' || true
-              qemu-system-x86_64 -netdev help || true
-              qemu-system-x86_64 -device help | grep -E 'e1000|virtio-net|rtl8139|vmxnet3' || true
-              qemu-system-x86_64 -device e1000,help || true
-              env | sort | grep -E '^(HTTP_PROXY|HTTPS_PROXY|NO_PROXY|QEMU|OVMF|AXLOADER|AXVISOR|PATH)=' || true
-              ls -l /tmp/ostool/ovmf/x64 /usr/share/OVMF /usr/share/qemu 2>/dev/null || true
-              stat -c '%n size=%s mtime=%y' /tmp/ostool/ovmf/x64/code.fd /tmp/ostool/ovmf/x64/vars.fd 2>/dev/null || true
-              sha256sum /tmp/ostool/ovmf/x64/code.fd /tmp/ostool/ovmf/x64/vars.fd 2>/dev/null || true
-              strings /tmp/ostool/ovmf/x64/code.fd 2>/dev/null | grep -Ei 'E1000|Virtio|HTTP|SNP|MNP|IP4|DHCP|TCP4' | head -100 || true
-              lsmod | grep -E '^(kvm|kvm_intel|tun|tap|bridge|vhost)' || true
-              ss -ltnup || true
-              ip addr || true
-              ip route || true
               rustup target add x86_64-unknown-uefi
               cargo axloader test qemu --target x86_64-unknown-uefi
             cache_key: ""
