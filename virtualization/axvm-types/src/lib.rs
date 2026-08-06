@@ -701,6 +701,8 @@ pub enum EmulatedDeviceType {
 
     /// A minimal virtual PCI host bridge with ECAM configuration space.
     VirtualPciHost      = 0x80,
+    /// An ivshmem-like PCI endpoint exposed through a virtual PCI host bridge.
+    IvshmemPci          = 0x81,
 
     // Arch-specific interrupt controller devices.
     // 0x20 - 0x22: GPPT (GIC Partial Passthrough) devices.
@@ -903,6 +905,7 @@ impl Display for EmulatedDeviceType {
             // EmulatedDeviceType::GICR => write!(f, "interrupt controller gicr"),
             EmulatedDeviceType::IVCChannel => write!(f, "ivc channel"),
             EmulatedDeviceType::VirtualPciHost => write!(f, "virtual pci host"),
+            EmulatedDeviceType::IvshmemPci => write!(f, "ivshmem pci"),
             EmulatedDeviceType::Dummy => write!(f, "meta device"),
             EmulatedDeviceType::VirtioBlk => write!(f, "virtio block"),
             EmulatedDeviceType::VirtioNet => write!(f, "virtio net"),
@@ -913,13 +916,14 @@ impl Display for EmulatedDeviceType {
 
 impl EmulatedDeviceType {
     /// All known emulated device types.
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 19] = [
         EmulatedDeviceType::Dummy,
         EmulatedDeviceType::InterruptController,
         EmulatedDeviceType::Console,
         EmulatedDeviceType::FwCfg,
         EmulatedDeviceType::IVCChannel,
         EmulatedDeviceType::VirtualPciHost,
+        EmulatedDeviceType::IvshmemPci,
         EmulatedDeviceType::GPPTRedistributor,
         EmulatedDeviceType::GPPTDistributor,
         EmulatedDeviceType::GPPTITS,
@@ -965,6 +969,7 @@ impl EmulatedDeviceType {
             0x3 => Some(EmulatedDeviceType::FwCfg),
             0xA => Some(EmulatedDeviceType::IVCChannel),
             0x80 => Some(EmulatedDeviceType::VirtualPciHost),
+            0x81 => Some(EmulatedDeviceType::IvshmemPci),
             0x20 => Some(EmulatedDeviceType::GPPTRedistributor),
             0x21 => Some(EmulatedDeviceType::GPPTDistributor),
             0x22 => Some(EmulatedDeviceType::GPPTITS),

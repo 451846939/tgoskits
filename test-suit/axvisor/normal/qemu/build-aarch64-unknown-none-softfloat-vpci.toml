@@ -6,4 +6,5 @@ log = "Info"
 target = "aarch64-unknown-none-softfloat"
 vm_configs = [
     "test-suit/axvisor/normal/qemu/vpci/configs/linux-vpci-smoke.toml",
+    "test-suit/axvisor/normal/qemu/vpci/configs/linux-vpci-peer1.toml",
 ]

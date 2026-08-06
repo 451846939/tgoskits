@@ -264,10 +264,12 @@ impl FdtTree {
     }
 
     fn add_vpci_host_nodes(&mut self, devices: &[EmulatedDeviceConfig]) -> AxVmResult {
-        for device in devices
-            .iter()
-            .filter(|device| device.emu_type == EmulatedDeviceType::VirtualPciHost)
-        {
+        for device in devices.iter().filter(|device| {
+            matches!(
+                device.emu_type,
+                EmulatedDeviceType::VirtualPciHost | EmulatedDeviceType::IvshmemPci
+            )
+        }) {
             self.add_vpci_host_node(device)?;
         }
         Ok(())

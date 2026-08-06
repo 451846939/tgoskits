@@ -15,21 +15,27 @@
 //! Architecture-neutral FDT parsing and guest configuration enrichment.
 
 use alloc::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     format,
     string::{String, ToString},
     vec,
     vec::Vec,
 };
 
+use ax_kspin::SpinNoIrq as Mutex;
+use ax_memory_addr::PAGE_SIZE_4K;
 use axvmconfig::{
-    AxVMCrateConfig, PassThroughDeviceConfig, ReservedAddressConfig, VmMemConfig, VmMemMappingType,
+    AxVMCrateConfig, EmulatedDeviceConfig, EmulatedDeviceType, PassThroughDeviceConfig,
+    ReservedAddressConfig, VmMemConfig, VmMemMappingType,
 };
 use fdt_edit::{Fdt, Node, NodeType, PciRange, PciSpace};
 
-use crate::{AxVmResult, MappingFlags, ax_err_type, config::AxVMConfig};
+use crate::{
+    AxVmError, AxVmResult, HostPagingHandler, MappingFlags, ax_err_type, config::AxVMConfig,
+    host::PagingHandler,
+};
 
-const PAGE_SIZE_4K: usize = 0x1000;
+static IVSHMEM_BAR2_BACKINGS: Mutex<BTreeMap<(usize, usize), usize>> = Mutex::new(BTreeMap::new());
 
 pub fn try_get_host_fdt() -> Option<&'static [u8]> {
     let bootarg = super::super::host_fdt_bootarg();
@@ -512,11 +518,7 @@ fn add_device_address_config(
     }
 
     let addr_end = base_address.saturating_add(size);
-    if let Some(emu_dev) = vm_cfg.emu_devices().iter().find(|emu_dev| {
-        let emu_start = emu_dev.base_gpa;
-        let emu_end = emu_dev.base_gpa.saturating_add(emu_dev.length);
-        base_address < emu_end && emu_start < addr_end
-    }) {
+    if let Some(emu_dev) = overlapping_emulated_device(vm_cfg, base_address, size) {
         debug!(
             "Skipping passthrough mapping for node {} [{:#x}~{:#x}] because it overlaps emulated \
              device {} [{:#x}~{:#x}]",
@@ -559,6 +561,21 @@ fn add_pci_ranges_config(vm_cfg: &mut AxVMConfig, node_name: &str, range: &PciRa
         return;
     }
 
+    let addr_end = base_address.saturating_add(size);
+    if let Some(emu_dev) = overlapping_emulated_device(vm_cfg, base_address, size) {
+        debug!(
+            "Skipping passthrough PCI range for node {} [{:#x}~{:#x}] because it overlaps \
+             emulated device {} [{:#x}~{:#x}]",
+            node_name,
+            base_address,
+            addr_end,
+            emu_dev.name,
+            emu_dev.base_gpa,
+            emu_dev.base_gpa.saturating_add(emu_dev.length),
+        );
+        return;
+    }
+
     let prefix = match range.space {
         PciSpace::IO => "io",
         PciSpace::Memory32 => "mem32",
@@ -580,6 +597,131 @@ fn add_pci_ranges_config(vm_cfg: &mut AxVMConfig, node_name: &str, range: &PciRa
     });
 }
 
+fn overlapping_emulated_device(
+    vm_cfg: &AxVMConfig,
+    base_address: usize,
+    size: usize,
+) -> Option<&EmulatedDeviceConfig> {
+    vm_cfg
+        .emu_devices()
+        .iter()
+        .find(|emu_dev| emulated_device_overlaps(emu_dev, base_address, size))
+}
+
+fn emulated_device_overlaps(
+    emu_dev: &EmulatedDeviceConfig,
+    base_address: usize,
+    size: usize,
+) -> bool {
+    range_overlaps(base_address, size, emu_dev.base_gpa, emu_dev.length)
+        || matches!(
+            emu_dev.emu_type,
+            EmulatedDeviceType::VirtualPciHost | EmulatedDeviceType::IvshmemPci
+        ) && (emulated_cfg_range_overlaps(emu_dev, 7, 8, base_address, size)
+            || emulated_cfg_range_overlaps(emu_dev, 13, 14, base_address, size))
+}
+
+fn emulated_cfg_range_overlaps(
+    emu_dev: &EmulatedDeviceConfig,
+    base_index: usize,
+    size_index: usize,
+    base_address: usize,
+    size: usize,
+) -> bool {
+    emu_dev
+        .cfg_list
+        .get(base_index)
+        .zip(emu_dev.cfg_list.get(size_index))
+        .is_some_and(|(bar_base, bar_size)| {
+            range_overlaps(base_address, size, *bar_base, *bar_size)
+        })
+}
+
+fn range_overlaps(base_a: usize, size_a: usize, base_b: usize, size_b: usize) -> bool {
+    let end_a = base_a.saturating_add(size_a);
+    let end_b = base_b.saturating_add(size_b);
+    base_a < end_b && base_b < end_a
+}
+
+fn ivshmem_bar2_backing_hpa(link_id: usize, size: usize, explicit_hpa: usize) -> AxVmResult<usize> {
+    if explicit_hpa != 0 {
+        return Ok(explicit_hpa);
+    }
+
+    let key = (link_id, size);
+    let mut backings = IVSHMEM_BAR2_BACKINGS.lock();
+    if let Some(&base_hpa) = backings.get(&key) {
+        return Ok(base_hpa);
+    }
+
+    let pages = align_up_4k(size) / PAGE_SIZE_4K;
+    let base_hpa =
+        HostPagingHandler::alloc_frames(pages, PAGE_SIZE_4K).ok_or(AxVmError::OutOfMemory {
+            operation: "allocate ivshmem BAR2 backing",
+        })?;
+    unsafe {
+        HostPagingHandler::phys_to_virt(base_hpa)
+            .as_mut_ptr()
+            .write_bytes(0, pages * PAGE_SIZE_4K);
+    }
+    let base_hpa = base_hpa.as_usize();
+    backings.insert(key, base_hpa);
+    Ok(base_hpa)
+}
+
+fn add_ivshmem_bar2_backing_configs(vm_cfg: &mut AxVMConfig) -> AxVmResult {
+    let emu_devices = vm_cfg.emu_devices().to_vec();
+    for emu_dev in emu_devices
+        .iter()
+        .filter(|device| device.emu_type == EmulatedDeviceType::IvshmemPci)
+    {
+        let Some((&bar2_base, &bar2_size)) = emu_dev.cfg_list.get(13).zip(emu_dev.cfg_list.get(14))
+        else {
+            continue;
+        };
+        let Some(&bar2_hpa) = emu_dev.cfg_list.get(15) else {
+            continue;
+        };
+        if bar2_base == 0 || bar2_size == 0 || bar2_hpa == 0 {
+            if bar2_base == 0 || bar2_size == 0 {
+                continue;
+            }
+        }
+        let link_id = emu_dev.cfg_list.get(9).copied().unwrap_or(0);
+        let bar2_hpa = ivshmem_bar2_backing_hpa(link_id, bar2_size, bar2_hpa)?;
+        if bar2_hpa == 0 {
+            continue;
+        }
+
+        let name = format!("{}-bar2-backing", emu_dev.name);
+        if vm_cfg.pass_through_devices().iter().any(|device| {
+            device.name == name
+                && device.base_gpa == bar2_base
+                && device.base_hpa == bar2_hpa
+                && device.length == bar2_size
+        }) {
+            continue;
+        }
+
+        debug!(
+            "Adding ivshmem BAR2 backing mapping {} GPA [{:#x}~{:#x}] -> HPA [{:#x}~{:#x}]",
+            name,
+            bar2_base,
+            bar2_base.saturating_add(bar2_size),
+            bar2_hpa,
+            bar2_hpa.saturating_add(bar2_size),
+        );
+        vm_cfg.add_pass_through_device(PassThroughDeviceConfig {
+            name,
+            base_gpa: bar2_base,
+            base_hpa: bar2_hpa,
+            length: bar2_size,
+            irq_id: 0,
+        });
+    }
+    Ok(())
+}
+
 pub fn parse_passthrough_devices_address(
     vm_cfg: &mut AxVMConfig,
     crate_cfg: &AxVMCrateConfig,
@@ -597,6 +739,7 @@ pub fn parse_passthrough_devices_address(
                 None,
             );
         }
+        add_ivshmem_bar2_backing_configs(vm_cfg)?;
         return Ok(());
     }
 
@@ -658,6 +801,7 @@ pub fn parse_passthrough_devices_address(
             }
         }
     }
+    add_ivshmem_bar2_backing_configs(vm_cfg)?;
     Ok(())
 }
 

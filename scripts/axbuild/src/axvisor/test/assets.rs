@@ -18,6 +18,8 @@ const ARCEOS_IVC_GUEST_PACKAGES: &[&str] = &["arceos-ivc-publisher", "arceos-ivc
 const AXVISOR_IVC_LINUX_PUBLISHER_GUEST_PATH: &str = "/root/ivc-publish";
 const AXVISOR_IVC_LINUX_SUBSCRIBER_GUEST_PATH: &str = "/root/ivc-subscribe";
 const AXVISOR_IVC_ZEPHYR_PUBLISHER_GUEST_PATH: &str = "/guest/zephyr/zephyr-ivc-publisher.bin";
+const AXVISOR_VPCI_BAR2_SMOKE_GUEST_PATH: &str = "/root/vpci-bar2-smoke";
+const AXVISOR_VPCI_BAR2_INITRAMFS_GUEST_PATH: &str = "/guest/linux/vpci-bar2-initramfs.cpio";
 
 #[derive(Clone, Copy)]
 struct ArceosIvcGuestProfile {
@@ -215,6 +217,41 @@ pub(super) fn inject_zephyr_ivc_guest_images(
     result
 }
 
+pub(super) fn inject_linux_vpci_assets(
+    workspace_root: &Path,
+    request: &ResolvedAxvisorRequest,
+    case: &PreparedAxvisorQemuCase,
+    prepared_assets: &mut test_case::PreparedCaseAssets,
+) -> anyhow::Result<()> {
+    if !case_needs_linux_vpci_assets(request, case) {
+        return Ok(());
+    }
+
+    let out_dir = build_linux_vpci_assets(workspace_root, &request.arch)?;
+    let smoke = out_dir.join("vpci-bar2-smoke");
+    let initramfs = out_dir.join("vpci-bar2-initramfs.cpio");
+    ensure_file_exists(&smoke, "Linux vPCI BAR2 smoke test")?;
+    ensure_file_exists(&initramfs, "Linux vPCI BAR2 initramfs")?;
+
+    let (overlay_dir, temporary_overlay_run_dir) =
+        direct_overlay_dir(workspace_root, request, case)?;
+    copy_guest_overlay_file(
+        &smoke,
+        &overlay_dir,
+        AXVISOR_VPCI_BAR2_SMOKE_GUEST_PATH,
+        "Linux vPCI BAR2 smoke test",
+    )?;
+    copy_guest_overlay_file(
+        &initramfs,
+        &overlay_dir,
+        AXVISOR_VPCI_BAR2_INITRAMFS_GUEST_PATH,
+        "Linux vPCI BAR2 initramfs",
+    )?;
+    let result = crate::rootfs::inject::inject_overlay(&prepared_assets.rootfs_path, &overlay_dir);
+    test_case::remove_case_run_dir(temporary_overlay_run_dir.as_deref());
+    result
+}
+
 fn direct_overlay_dir(
     workspace_root: &Path,
     request: &ResolvedAxvisorRequest,
@@ -290,6 +327,18 @@ fn case_needs_zephyr_ivc_assets(
         })
 }
 
+fn case_needs_linux_vpci_assets(
+    request: &ResolvedAxvisorRequest,
+    case: &PreparedAxvisorQemuCase,
+) -> bool {
+    case.case.case.name.contains("vpci")
+        && request.vmconfigs.iter().any(|path| {
+            path.file_stem()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains("linux-vpci"))
+        })
+}
+
 fn build_linux_ivc_assets(workspace_root: &Path, arch: &str) -> anyhow::Result<PathBuf> {
     let source_dir = workspace_root.join("apps/linux/ivc");
     let build_script = source_dir.join("build.sh");
@@ -329,6 +378,83 @@ fn build_zephyr_ivc_publisher(workspace_root: &Path) -> anyhow::Result<PathBuf> 
         anyhow::bail!("Zephyr IVC publisher build failed with status {status}");
     }
     Ok(out_dir.join("zephyr-ivc-publisher.bin"))
+}
+
+fn build_linux_vpci_assets(workspace_root: &Path, arch: &str) -> anyhow::Result<PathBuf> {
+    let source_dir = workspace_root.join("apps/linux/vpci");
+    let build_script = source_dir.join("build.sh");
+    ensure_file_exists(&build_script, "Linux vPCI build script")?;
+
+    let out_dir = workspace_root.join("tmp/axbuild/vpci").join(arch);
+    let mut command = Command::new(&build_script);
+    command
+        .current_dir(&source_dir)
+        .env("AXVISOR_VPCI_ARCH", arch)
+        .env("AXVISOR_VPCI_OUT_DIR", &out_dir);
+
+    let status = command
+        .status()
+        .with_context(|| format!("failed to run {}", build_script.display()))?;
+    if !status.success() {
+        anyhow::bail!("Linux vPCI asset build failed with status {status}");
+    }
+    write_vpci_bar2_initramfs(
+        &out_dir.join("vpci-bar2-initramfs.cpio"),
+        &out_dir.join("vpci-bar2-smoke"),
+    )?;
+    Ok(out_dir)
+}
+
+fn write_vpci_bar2_initramfs(output: &Path, init_binary: &Path) -> anyhow::Result<()> {
+    let init = fs::read(init_binary)
+        .with_context(|| format!("failed to read {}", init_binary.display()))?;
+    let mut archive = Vec::new();
+
+    append_cpio_newc_entry(&mut archive, ".", 0o040755, &[], 1);
+    append_cpio_newc_entry(&mut archive, "init", 0o100755, &init, 2);
+    append_cpio_newc_entry(&mut archive, "TRAILER!!!", 0, &[], 3);
+
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::write(output, archive).with_context(|| format!("failed to write {}", output.display()))
+}
+
+fn append_cpio_newc_entry(
+    archive: &mut Vec<u8>,
+    name: &str,
+    mode: u32,
+    content: &[u8],
+    inode: u32,
+) {
+    let namesize = name.len() + 1;
+    let header = format!(
+        "070701{inode:08x}{mode:08x}{uid:08x}{gid:08x}{nlink:08x}{mtime:08x}{filesize:\
+         08x}{devmajor:08x}{devminor:08x}{rdevmajor:08x}{rdevminor:08x}{namesize:08x}{check:08x}",
+        uid = 0,
+        gid = 0,
+        nlink = 1,
+        mtime = 0,
+        filesize = content.len(),
+        devmajor = 0,
+        devminor = 0,
+        rdevmajor = 0,
+        rdevminor = 0,
+        check = 0,
+    );
+    archive.extend_from_slice(header.as_bytes());
+    archive.extend_from_slice(name.as_bytes());
+    archive.push(0);
+    pad_cpio_newc(archive);
+    archive.extend_from_slice(content);
+    pad_cpio_newc(archive);
+}
+
+fn pad_cpio_newc(archive: &mut Vec<u8>) {
+    while archive.len() % 4 != 0 {
+        archive.push(0);
+    }
 }
 
 pub(super) fn build_group_needs_arceos_x86_64_guest(request: &ResolvedAxvisorRequest) -> bool {

@@ -11,7 +11,7 @@ args = [
     "-drive",
     "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-aarch64-alpine.img",
     "-append",
-    "root=/dev/vda rw init=/bin/sh",
+    "console=ttyAMA0",
     "-m",
     "8g",
 ]
@@ -21,29 +21,10 @@ fail_regex = [
     "(?i)unhandled page fault",
     "(?i)page fault",
     "(?m)^vpci smoke failed\\s*$",
+    "(?m)^vpci bar2 smoke failed:",
 ]
 success_regex = [
-    "(?m)^vpci smoke pass!\\s*$",
+    "(?s)VM A writes BAR2.*VM A writes doorbell\\(target=B\\).*VM B observes doorbell event.*VM B reads same data.*VM B writes BAR2.*VM B writes doorbell\\(target=A\\).*VM A reads same data.*VM A observes doorbell event.*vpci bar2 shared memory pass",
 ]
-shell_prefix = "~ #"
-shell_init_cmd = '''
-echo "linux vpci smoke start"
-mkdir -p /sys
-mount -t sysfs sysfs /sys 2>/dev/null || true
-dev=/sys/bus/pci/devices/0000:00:05.0
-if [ -r "$dev/vendor" ] && [ -r "$dev/device" ] &&
-   [ "$(cat "$dev/vendor")" = "0xaaaa" ] &&
-   [ "$(cat "$dev/device")" = "0x0001" ]; then
-    echo 'vpci smoke pass!'
-else
-    echo "known pci devices:"
-    ls /sys/bus/pci/devices 2>/dev/null || true
-    for dev in /sys/bus/pci/devices/*; do
-        [ -r "$dev/vendor" ] || continue
-        echo "$dev vendor=$(cat "$dev/vendor") device=$(cat "$dev/device")"
-    done
-    echo 'vpci smoke failed'
-fi
-'''
 to_bin = true
 uefi = false
