@@ -182,10 +182,20 @@ fn run_http_smoke_test(workspace_root: &Path, target: &str) -> anyhow::Result<()
         efi_boot_dir.join(smoke_target.efi_output_file),
     )
     .context("failed to stage axloader EFI binary")?;
+    println!(
+        "axloader http smoke: staged ESP at {}",
+        temp.path().join("esp").display()
+    );
 
     let kernel = (smoke_target.kernel_elf)();
     let http_server = SmokeHttpServer::start(kernel.clone())?;
     let boot_line = format_boot_line(smoke_target.arch, kernel.len(), http_server.port());
+    println!(
+        "axloader http smoke: kernel URL http://{}:{}/kernel.elf size={}",
+        QEMU_HOST_GATEWAY,
+        http_server.port(),
+        kernel.len()
+    );
 
     println!("axloader http smoke: running QEMU ...");
     let mut child = spawn_axloader_qemu(smoke_target, &firmware, &temp.path().join("esp"))?;
@@ -337,8 +347,14 @@ fn spawn_axloader_qemu(
     firmware: &Path,
     esp_dir: &Path,
 ) -> anyhow::Result<Child> {
+    let args = (target.qemu_args)(firmware, esp_dir);
+    println!(
+        "axloader http smoke: QEMU command: {} {}",
+        target.qemu_program,
+        shell_words(&args)
+    );
     StdCommand::new(target.qemu_program)
-        .args((target.qemu_args)(firmware, esp_dir))
+        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -349,6 +365,22 @@ fn spawn_axloader_qemu(
                 target.qemu_program
             )
         })
+}
+
+fn shell_words(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| {
+            if arg
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._/=-,:+".contains(&byte))
+            {
+                arg.clone()
+            } else {
+                format!("'{}'", arg.replace('\'', "'\\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn x86_64_qemu_args(firmware: &Path, esp_dir: &Path) -> Vec<String> {
@@ -684,6 +716,20 @@ mod tests {
             args.windows(2)
                 .any(|pair| pair == ["-accel".to_string(), "kvm".to_string()]),
             "axloader HTTP smoke runs on KVM-labelled CI and must not silently fall back to TCG"
+        );
+    }
+
+    #[test]
+    fn shell_words_quotes_arguments_with_spaces() {
+        let args = vec![
+            "-drive".to_string(),
+            "format=raw,file=/tmp/esp dir".to_string(),
+            "plain_value".to_string(),
+        ];
+
+        assert_eq!(
+            shell_words(&args),
+            "-drive 'format=raw,file=/tmp/esp dir' plain_value"
         );
     }
 

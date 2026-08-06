@@ -4,14 +4,26 @@ use alloc::{vec, vec::Vec};
 use core::time::Duration;
 
 use uefi::{
-    Status,
+    Error, Guid, Status,
     boot::{self, OpenProtocolAttributes, OpenProtocolParams, SearchType},
-    proto::network::{
-        http::{HttpBinding, HttpHelper},
-        ip4config2::Ip4Config2,
+    proto::{
+        ProtocolPointer,
+        network::{
+            http::{Http, HttpBinding, HttpHelper},
+            ip4config2::Ip4Config2,
+            pxe::BaseCode,
+            snp::SimpleNetwork,
+        },
     },
 };
-use uefi_raw::protocol::network::http::HttpStatusCode;
+use uefi_raw::protocol::network::{
+    dhcp4::Dhcp4Protocol,
+    http::{HttpProtocol, HttpStatusCode},
+    ip4_config2::Ip4Config2Protocol,
+    pxe::PxeBaseCodeProtocol,
+    snp::SimpleNetworkProtocol,
+    tcp4::Tcp4Protocol,
+};
 
 const MAX_KERNEL_DOWNLOAD_SIZE: usize = 256 * 1024 * 1024;
 const HTTP_RETRY_LIMIT: usize = 8;
@@ -120,7 +132,9 @@ fn append_download_chunk(
 }
 
 fn prepare_network() {
+    log_network_protocol_snapshot("before_connect");
     connect_boot_controllers();
+    log_network_protocol_snapshot("after_connect");
 
     let handles = match boot::find_handles::<Ip4Config2>() {
         Ok(handles) => handles,
@@ -131,7 +145,7 @@ fn prepare_network() {
     };
 
     let mut last_error = None;
-    for handle in handles.iter().copied() {
+    for (index, handle) in handles.iter().copied().enumerate() {
         let mut protocol = match unsafe {
             boot::open_protocol::<Ip4Config2>(
                 OpenProtocolParams {
@@ -150,8 +164,18 @@ fn prepare_network() {
         };
 
         match protocol.ifup() {
-            Ok(()) => return,
-            Err(err) => last_error = Some(err.status()),
+            Ok(()) => {
+                crate::logln!("network_ifup_ok: handle={}", index);
+                return;
+            }
+            Err(err) => {
+                crate::logln!(
+                    "network_ifup_handle_failed: handle={} status={:?}",
+                    index,
+                    err.status()
+                );
+                last_error = Some(err.status());
+            }
         }
     }
 
@@ -159,6 +183,69 @@ fn prepare_network() {
         crate::logln!("network_ifup_failed: {status:?}");
     } else {
         crate::logln!("network_ifup_failed: no IPv4 config handle");
+    }
+}
+
+fn log_network_protocol_snapshot(phase: &str) {
+    let all_handles = handle_count(SearchType::AllHandles);
+    let simple_network = protocol_handle_count::<SimpleNetwork>();
+    let pxe_base_code = protocol_handle_count::<BaseCode>();
+    let ip4_config2 = protocol_handle_count::<Ip4Config2>();
+    let http = protocol_handle_count::<Http>();
+    let http_binding = protocol_handle_count::<HttpBinding>();
+    crate::logln!(
+        "network_protocols_{phase}: all_handles={} snp={} pxe={} ip4_config2={} http={} \
+         http_binding={}",
+        format_handle_count(all_handles),
+        format_handle_count(simple_network),
+        format_handle_count(pxe_base_code),
+        format_handle_count(ip4_config2),
+        format_handle_count(http),
+        format_handle_count(http_binding)
+    );
+    log_raw_network_protocol_snapshot(phase);
+}
+
+fn protocol_handle_count<P: ProtocolPointer + ?Sized>() -> Result<usize, Error> {
+    handle_count(SearchType::from_proto::<P>())
+}
+
+fn log_raw_network_protocol_snapshot(phase: &str) {
+    crate::logln!(
+        "network_raw_protocols_{phase}: snp={} pxe={} ip4_config2={} dhcp4={} dhcp4_binding={} \
+         tcp4={} tcp4_binding={} http={} http_binding={}",
+        format_handle_count(guid_handle_count(&SimpleNetworkProtocol::GUID)),
+        format_handle_count(guid_handle_count(&PxeBaseCodeProtocol::GUID)),
+        format_handle_count(guid_handle_count(&Ip4Config2Protocol::GUID)),
+        format_handle_count(guid_handle_count(&Dhcp4Protocol::GUID)),
+        format_handle_count(guid_handle_count(&Dhcp4Protocol::SERVICE_BINDING_GUID)),
+        format_handle_count(guid_handle_count(&Tcp4Protocol::GUID)),
+        format_handle_count(guid_handle_count(&Tcp4Protocol::SERVICE_BINDING_GUID)),
+        format_handle_count(guid_handle_count(&HttpProtocol::GUID)),
+        format_handle_count(guid_handle_count(&HttpProtocol::SERVICE_BINDING_GUID))
+    );
+}
+
+fn guid_handle_count(guid: &Guid) -> Result<usize, Error> {
+    handle_count(SearchType::ByProtocol(guid))
+}
+
+fn handle_count(search_type: SearchType<'_>) -> Result<usize, Error> {
+    boot::locate_handle_buffer(search_type).map(|handles| handles.len())
+}
+
+fn format_handle_count(result: Result<usize, Error>) -> HandleCountFormat {
+    HandleCountFormat(result)
+}
+
+struct HandleCountFormat(Result<usize, Error>);
+
+impl core::fmt::Display for HandleCountFormat {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match &self.0 {
+            Ok(count) => write!(formatter, "{count}"),
+            Err(err) => write!(formatter, "error({:?})", err.status()),
+        }
     }
 }
 
@@ -288,17 +375,48 @@ struct HttpClient {
 
 impl HttpClient {
     fn new() -> Result<Self, DownloadError> {
-        let handles =
-            boot::find_handles::<HttpBinding>().map_err(|_| DownloadError::HttpUnavailable)?;
-        let nic_handle = handles
-            .first()
-            .copied()
-            .ok_or(DownloadError::NoHttpBinding)?;
-        let mut helper = HttpHelper::new(nic_handle).map_err(|_| DownloadError::HttpUnavailable)?;
-        helper
-            .configure()
-            .map_err(|_| DownloadError::ConfigureFailed)?;
-        Ok(Self { helper })
+        let handles = match boot::find_handles::<HttpBinding>() {
+            Ok(handles) => handles,
+            Err(err) => {
+                crate::logln!("http_binding_find_failed: {:?}", err.status());
+                return Err(DownloadError::HttpUnavailable);
+            }
+        };
+        crate::logln!("http_binding_handles: count={}", handles.len());
+
+        let mut last_error = None;
+        for (index, nic_handle) in handles.iter().copied().enumerate() {
+            crate::logln!("http_helper_open: handle={}", index);
+            let mut helper = match HttpHelper::new(nic_handle) {
+                Ok(helper) => helper,
+                Err(err) => {
+                    crate::logln!(
+                        "http_helper_open_failed: handle={} status={:?}",
+                        index,
+                        err.status()
+                    );
+                    last_error = Some(DownloadError::HttpUnavailable);
+                    continue;
+                }
+            };
+
+            match helper.configure() {
+                Ok(()) => {
+                    crate::logln!("http_helper_configured: handle={}", index);
+                    return Ok(Self { helper });
+                }
+                Err(err) => {
+                    crate::logln!(
+                        "http_helper_configure_failed: handle={} status={:?}",
+                        index,
+                        err.status()
+                    );
+                    last_error = Some(DownloadError::ConfigureFailed);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or(DownloadError::NoHttpBinding))
     }
 
     fn request_get(&mut self, url: &str) -> Result<(), DownloadError> {
