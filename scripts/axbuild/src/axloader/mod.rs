@@ -393,6 +393,8 @@ fn x86_64_qemu_args(firmware: &Path, esp_dir: &Path) -> Vec<String> {
         "q35".into(),
         "-accel".into(),
         "kvm".into(),
+        "-boot".into(),
+        "strict=on".into(),
         "-display".into(),
         "none".into(),
         "-monitor".into(),
@@ -409,7 +411,12 @@ fn x86_64_qemu_args(firmware: &Path, esp_dir: &Path) -> Vec<String> {
             firmware.display()
         ),
         "-drive".into(),
-        format!("format=raw,if=ide,file=fat:rw:{}", esp_dir.display()),
+        format!(
+            "id=esp,format=raw,if=none,file=fat:rw:{}",
+            esp_dir.display()
+        ),
+        "-device".into(),
+        "ide-hd,drive=esp,bootindex=1".into(),
     ]
     .into()
 }
@@ -717,6 +724,26 @@ mod tests {
             args.windows(2)
                 .any(|pair| pair == ["-accel".to_string(), "kvm".to_string()]),
             "axloader HTTP smoke runs on KVM-labelled CI and must not silently fall back to TCG"
+        );
+    }
+
+    #[test]
+    fn x86_64_smoke_qemu_sets_esp_as_first_boot_device() {
+        let args = x86_64_qemu_args(Path::new("/ovmf.fd"), Path::new("/esp"));
+
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-boot".to_string(), "strict=on".to_string()]),
+            "axloader HTTP smoke must not let UEFI boot manager try slow network boot entries \
+             first"
+        );
+        assert!(
+            args.windows(2).any(|pair| pair
+                == [
+                    "-device".to_string(),
+                    "ide-hd,drive=esp,bootindex=1".to_string()
+                ]),
+            "the staged ESP must be the first firmware boot device"
         );
     }
 
