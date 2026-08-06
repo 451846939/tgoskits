@@ -169,7 +169,7 @@ impl TaskSystem {
             .requested_policy())
     }
 
-    /// Publishes a new base-policy generation for owner-CPU application.
+    /// Replaces a task's base policy in one synchronous owner-rq transaction.
     pub fn set_thread_policy(
         &self,
         thread: ThreadId,
@@ -179,73 +179,76 @@ impl TaskSystem {
         // Allocate the affinity snapshot before entering IRQ-disabled cold
         // domains. Copying into this fixed-topology buffer is allocation-free.
         let mut affinity = CpuSet::empty(self.config.cpu_count());
-        let (core, owner, generation, owner_publication) = {
+        let core = {
             let state = self.state.lock();
-            let mut root_domain = self.root_domain.lock();
-            let (core, sched_cell) = {
-                let record = state.thread_record(thread)?;
-                (Arc::clone(&record.core), Arc::clone(&record.sched))
-            };
-            let mut sched = sched_cell.lock();
-            if sched.lifecycle.state() == ThreadState::Exited {
-                return Err(TaskError::NotReady);
-            }
-            affinity.copy_from_set(&sched.affinity.affinity)?;
-            let applied_reservation = sched.deadline.bandwidth.reservation_scaled();
-            let pending_reservation = sched
-                .policy
-                .pending_update()
-                .map_or(0, |pending| pending.reservation_scaled);
-            let placement_owner = sched.placement.control_owner();
-            let reservation_owner = sched.deadline.bandwidth.reservation_owner();
-            if let (Some(placement_owner), Some(reservation_owner)) =
-                (placement_owner, reservation_owner)
-                && placement_owner != reservation_owner
-            {
-                task_runtime::fatal_invariant(0x444c_1201, core.id().as_u64() as usize);
-            }
-            // A sleeping Deadline task owns no physical rq entity, but policy
-            // replacement must still run on the rq that owns this_bw and its
-            // typed CBS timers. Keep that explicit reservation owner separate
-            // from SchedulerPlacement::control_owner().
-            let apply_owner = placement_owner.or(reservation_owner);
-            let owner_publication = apply_owner
-                .map(|owner| {
-                    self.cpu_remotes
-                        .get(owner.as_usize())
-                        .ok_or(TaskError::InvalidCpu(owner.as_u32()))?
-                        .begin_publication()
-                        .ok_or(TaskError::CpuOffline(owner.as_u32()))
-                })
-                .transpose()?;
-            let reservation = root_domain.deadline_reservation_for(policy, &affinity)?;
-            let pending = sched.policy.prepare_update(policy, reservation)?;
-            let old_held = applied_reservation.max(pending_reservation);
-            let new_held = applied_reservation.max(reservation);
-            root_domain.replace_deadline_utilization(old_held, new_held)?;
-            sched.policy.publish_update(pending);
-            (core, apply_owner, pending.generation, owner_publication)
+            Arc::clone(&state.thread_record(thread)?.core)
         };
+        // Serialize the complete policy/admission/rq transaction against
+        // current-thread exit. Linux holds the task's PI lifetime lock before
+        // task_rq_lock(); a policy writer that loses this edge must not mutate
+        // base policy or root-domain bandwidth for an exiting task.
+        let _activity = core.try_scheduler_activity().ok_or(TaskError::NotReady)?;
+        let state = self.state.lock();
+        let mut root_domain = self.root_domain.lock();
+        let record = state.thread_record(thread)?;
+        if !Arc::ptr_eq(&record.core, &core) {
+            return Err(TaskError::StaleThreadId);
+        }
+        let sched_cell = Arc::clone(&record.sched);
+        let mut sched = sched_cell.lock();
+        if sched.lifecycle.state() == ThreadState::Exited {
+            return Err(TaskError::NotReady);
+        }
+        affinity.copy_from_set(&sched.affinity.affinity)?;
+        let applied_reservation = sched.deadline.bandwidth.reservation_scaled();
+        let pending_reservation = sched
+            .policy
+            .pending_update()
+            .map_or(0, |pending| pending.reservation_scaled);
+        // Linux serializes sched_setscheduler() against PI and wakeup by
+        // retaining p->pi_lock through task_rq_lock() and the class change.
+        // Keeping this scheduler guard across the owner-rq transaction also
+        // serializes concurrent policy writers; no generation can consume a
+        // later writer's pending value.
+        let owner = sched
+            .placement
+            .assigned_cpu()
+            .ok_or(TaskError::InvalidPiState)?;
+        let reservation_owner = sched.deadline.bandwidth.reservation_owner();
+        if let Some(reservation_owner) = reservation_owner
+            && owner != reservation_owner
+        {
+            task_runtime::fatal_invariant(0x444c_1201, core.id().as_u64() as usize);
+        }
+        let remote = self
+            .cpu_remotes
+            .get(owner.as_usize())
+            .ok_or(TaskError::InvalidCpu(owner.as_u32()))?;
+        let reservation = root_domain.deadline_reservation_for(policy, &affinity)?;
+        let pending = sched.policy.prepare_update(policy, reservation)?;
+        let old_held = applied_reservation.max(pending_reservation);
+        let new_held = applied_reservation.max(reservation);
+        root_domain.replace_deadline_utilization(old_held, new_held)?;
+        sched.policy.publish_update(pending);
+        drop(state);
+
+        let applied = self
+            .apply_owner_policy_update_locked(remote, &core, &mut sched, pending.generation)
+            .unwrap_or_else(|_| {
+                task_runtime::fatal_invariant(0x5251_1208, core.id().as_u64() as usize)
+            });
         core.publish_base_policy(policy);
-        if let Some(owner_publication) = owner_publication {
-            self.publish_owner_policy_reserved(
-                &core,
-                owner.expect("a reserved policy publication must retain its owner"),
-                generation,
-                owner_publication,
-            );
-        } else {
-            let applied = self.apply_policy_generation(&core, generation, None, None, false)?;
-            debug_assert!(applied);
-            if applied {
-                // A blocked task has no rq owner, but its rtmutex waiter key
-                // is still ordered by the newly committed effective policy.
-                // Linux follows sched_setattr() with
-                // rt_mutex_adjust_prio_chain(); do the same after the task
-                // policy transaction is visible instead of leaving the lock
-                // waiter and owner donor trees on the old key.
-                self.recompute_pi_after_policy_update(core.id())?;
-            }
+        core.publish_effective_schedule(applied.effective_policy, &applied.effective_entity);
+        Self::finish_policy_admission_locked(&mut root_domain, &core, applied.commit);
+        drop(root_domain);
+        drop(sched);
+        Self::notify_policy_generation(&core, applied.commit, Some(applied.owner_now_ns));
+        self.recompute_pi_after_policy_update(core.id())
+            .unwrap_or_else(|_| {
+                task_runtime::fatal_invariant(0x5049_1216, core.id().as_u64() as usize)
+            });
+        if applied.preempts_current {
+            remote.request_remote_reschedule();
         }
         Ok(())
     }

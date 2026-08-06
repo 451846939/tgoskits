@@ -266,7 +266,24 @@ impl RunQueue {
             }
             _ => dispatch.charge(runtime_ns, now_ns, reclaimed_ns),
         };
-        Ok((charge, policy, current_entity, rt_quota_exempt))
+        let charged_entity = match membership {
+            Some(QueueMembershipClass::Deadline(key)) => self
+                .deadline
+                .get(key)
+                .map(QueuedThread::entity)
+                .ok_or(TaskError::InvalidConfiguration)?,
+            Some(QueueMembershipClass::Realtime(priority)) => self
+                .rt
+                .get(priority, id)
+                .map(QueuedThread::entity)
+                .ok_or(TaskError::InvalidConfiguration)?,
+            _ => self
+                .current
+                .as_ref()
+                .and_then(CurrentDispatch::owned_scheduling_entity)
+                .ok_or(TaskError::InvalidConfiguration)?,
+        };
+        Ok((charge, policy, charged_entity, rt_quota_exempt))
     }
 
     /// Reserves every class index before a thread becomes externally visible.
@@ -920,6 +937,31 @@ impl RunQueue {
             }
             _ => None,
         }
+    }
+
+    pub(crate) fn capture_linked_fair_migration(
+        &mut self,
+        id: ThreadId,
+        virtual_time: u64,
+        timing_granularity_ns: u64,
+    ) -> bool {
+        let active = match self.membership_class(id) {
+            Some(QueueMembershipClass::Deadline(key)) => {
+                self.deadline.get_mut(key).map(|thread| &mut thread.active)
+            }
+            Some(QueueMembershipClass::Realtime(priority)) => self
+                .rt
+                .get_mut(priority, id)
+                .map(|thread| &mut thread.active),
+            _ => None,
+        };
+        let Some(active) = active else {
+            return false;
+        };
+        active
+            .base_entity_mut()
+            .capture_fair_migration(virtual_time, timing_granularity_ns);
+        true
     }
 
     pub(crate) fn linked_current_entity(&self, id: ThreadId) -> Option<SchedulingEntity> {

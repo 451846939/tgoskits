@@ -19,6 +19,7 @@ use crate::{SchedulePolicy, SchedulingUrgency, ThreadCore, ThreadId};
 pub(crate) struct PiDonation {
     pub(crate) policy: SchedulePolicy,
     pub(crate) root: ThreadId,
+    pub(crate) boost_urgency: SchedulingUrgency,
     waiter_core: Weak<ThreadCore>,
     pub(crate) root_core: Weak<ThreadCore>,
 }
@@ -27,19 +28,23 @@ impl PiDonation {
     pub(crate) fn new(
         policy: SchedulePolicy,
         root: ThreadId,
+        boost_urgency: SchedulingUrgency,
         waiter_core: &Arc<ThreadCore>,
         root_core: &Arc<ThreadCore>,
     ) -> Self {
         Self {
             policy,
             root,
+            boost_urgency,
             waiter_core: Arc::downgrade(waiter_core),
             root_core: Arc::downgrade(root_core),
         }
     }
 
     pub(crate) fn same_source(&self, other: &Self) -> bool {
-        self.policy == other.policy && self.root == other.root
+        self.policy == other.policy
+            && self.root == other.root
+            && self.boost_urgency == other.boost_urgency
     }
 
     pub(crate) fn waiter_core(&self) -> Option<Arc<ThreadCore>> {
@@ -237,6 +242,28 @@ impl PiWaitTree {
         })
     }
 
+    /// Returns the least urgent-key entry other than `excluded` without
+    /// changing either intrusive linkage.
+    ///
+    /// PI owner updates use this to validate the prospective `pi_waiters`
+    /// top before replacing one lock's contribution, matching Linux's rule
+    /// that a failed `rt_mutex_setprio()` transaction cannot partially mutate
+    /// the owner tree.
+    pub(crate) fn first_entry_excluding(
+        &self,
+        excluded: Option<PiWaitKey>,
+    ) -> Option<(PiWaitKey, PiDonation)> {
+        let first = find_first_excluding(self.root.as_deref(), excluded)?;
+        Some((
+            first.key,
+            first
+                .donation
+                .as_ref()
+                .expect("linked PI waiter must retain its donation")
+                .clone(),
+        ))
+    }
+
     pub(crate) fn donation(&self, key: PiWaitKey) -> Option<PiDonation> {
         find_node(self.root.as_deref(), key).map(|node| {
             node.donation
@@ -426,6 +453,16 @@ fn find_first(node: Option<&PiWaitNode>) -> Option<&PiWaitNode> {
     Some(current)
 }
 
+fn find_first_excluding(
+    node: Option<&PiWaitNode>,
+    excluded: Option<PiWaitKey>,
+) -> Option<&PiWaitNode> {
+    let node = node?;
+    find_first_excluding(node.left.as_deref(), excluded)
+        .or_else(|| (Some(node.key) != excluded).then_some(node))
+        .or_else(|| find_first_excluding(node.right.as_deref(), excluded))
+}
+
 #[cfg(test)]
 fn validate_node(node: Option<&PiWaitNode>, previous: &mut Option<PiWaitKey>) -> (usize, usize) {
     let Some(node) = node else {
@@ -458,6 +495,7 @@ mod tests {
         PiDonation::new(
             SchedulePolicy::default(),
             ThreadId::from_parts(primary as u32 + 1, 1),
+            SchedulePolicy::default().scheduling_urgency(),
             core,
             core,
         )

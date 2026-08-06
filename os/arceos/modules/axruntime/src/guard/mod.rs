@@ -248,7 +248,7 @@ fn exit_lock_preempt(origin: PreemptExitOrigin) {
     }
 }
 
-#[cfg(any(feature = "multitask", test))]
+#[cfg(all(feature = "multitask", not(test)))]
 pub(crate) fn enter_preempt() {
     ax_hal::percpu::scheduler_enter_preempt_guard()
         .expect("architecture preemption state is invalid");
@@ -260,7 +260,7 @@ pub(crate) fn enter_preempt() {
 /// local IRQs disabled. Reusing that ownership matches Linux rq locking: one
 /// outer rq/IRQ transaction covers its internal task-state locks, so those
 /// locks must not repeatedly mutate the suspended task's preemption word.
-#[cfg(feature = "multitask")]
+#[cfg(all(feature = "multitask", not(test)))]
 pub(crate) fn enter_lock_preempt() -> bool {
     if !ax_hal::asm::irqs_enabled() && read_state().owns_cpu_context() {
         return false;
@@ -269,7 +269,7 @@ pub(crate) fn enter_lock_preempt() -> bool {
     true
 }
 
-#[cfg(any(feature = "multitask", test))]
+#[cfg(all(feature = "multitask", not(test)))]
 pub(crate) fn exit_preempt() {
     let exit = ax_hal::percpu::scheduler_prepare_preempt_guard_exit()
         .expect("architecture preemption state is invalid");

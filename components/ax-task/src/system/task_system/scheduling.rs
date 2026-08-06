@@ -163,14 +163,14 @@ impl TaskSystem {
         reclaimed_ns: u64,
     ) -> Result<ChargeOutcome, TaskError> {
         self.charge_current_until_with_clock(cpu, reclaimed_ns)
-            .map(|(charge, _clock)| charge)
+            .map(|(charge, _clock, _thread)| charge)
     }
 
     pub(crate) fn charge_current_until_with_clock(
         &self,
         cpu: Pin<&mut CpuLocal>,
         reclaimed_ns: u64,
-    ) -> Result<(ChargeOutcome, RunQueueClockSnapshot), TaskError> {
+    ) -> Result<(ChargeOutcome, RunQueueClockSnapshot, ThreadId), TaskError> {
         self.ensure_owner_cpu_context(&cpu)?;
         if !cpu.is_online() {
             return Err(TaskError::CpuOffline(cpu.owner().as_u32()));
@@ -178,10 +178,10 @@ impl TaskSystem {
         let remote = Arc::clone(cpu.remote());
         let mut transaction = OwnerRqTxn::begin(self, &remote);
         let clock = transaction.clock();
-        if transaction.current().is_none() {
+        let Some(thread) = transaction.current_thread() else {
             transaction.commit();
             return Err(TaskError::NoRunnableThread);
-        }
+        };
         let charge = transaction.settle_current(reclaimed_ns);
         transaction.commit();
         Ok((
@@ -190,6 +190,7 @@ impl TaskSystem {
                 deadline_overrun: charge.deadline_overrun,
             },
             clock,
+            thread,
         ))
     }
 

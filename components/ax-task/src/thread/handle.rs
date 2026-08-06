@@ -13,8 +13,8 @@ pub use wake_batch::ThreadWakeBatch;
 use crate::{
     CpuId, DeadlineFlags, DeadlinePolicy, FairMode, Nice, PiWaitNodeStorage, PiWaitState,
     RtPriority, RunQueueNodeStorage, SchedulePolicy, SchedulerTickWork, SchedulerTickWorkClaim,
-    SchedulingKey, SchedulingUrgency, TaskError, ThreadAffinityCompletion, ThreadExtensionView,
-    ThreadId, ThreadLifecycle, ThreadSchedCell, ThreadState,
+    SchedulerTimestamp, SchedulingKey, SchedulingUrgency, TaskError, ThreadAffinityCompletion,
+    ThreadExtensionView, ThreadId, ThreadLifecycle, ThreadSchedCell, ThreadState,
     inbox::{InboxKind, InboxNode},
     runtime::{PreemptGuardToken, task_runtime},
     task_work::TaskWorkDoorbell,
@@ -409,7 +409,6 @@ pub(crate) struct ThreadCore {
     wake_state: AtomicU8,
     park_generation: AtomicU64,
     wake_cpu_hint: AtomicU32,
-    policy_update_node: InboxNode,
     affinity_update_node: InboxNode,
     deadline_refresh_node: InboxNode,
     wake_batch_next: AtomicPtr<ThreadCore>,
@@ -464,7 +463,6 @@ impl ThreadCore {
             wake_state: AtomicU8::new(0),
             park_generation: AtomicU64::new(0),
             wake_cpu_hint: AtomicU32::new(u32::MAX),
-            policy_update_node: InboxNode::new(InboxKind::OwnerControl),
             affinity_update_node: InboxNode::new(InboxKind::OwnerControl),
             deadline_refresh_node: InboxNode::new(InboxKind::OwnerControl),
             wake_batch_next: AtomicPtr::new(core::ptr::null_mut()),
@@ -529,9 +527,11 @@ impl ThreadCore {
             let running = self.runtime_running.load(Ordering::Relaxed);
             if self.runtime_sequence.load(Ordering::Acquire) == sequence {
                 let residual = if running {
-                    running_now_ns
-                        .expect("a running thread snapshot must hold its runqueue clock")
-                        .saturating_sub(accounted_until)
+                    SchedulerTimestamp::from_nanos(
+                        running_now_ns
+                            .expect("a running thread snapshot must hold its runqueue clock"),
+                    )
+                    .since(SchedulerTimestamp::from_nanos(accounted_until))
                 } else {
                     0
                 };
@@ -935,10 +935,6 @@ impl ThreadCore {
         &self.pi_wait_state
     }
 
-    pub(crate) const fn policy_update_node(&self) -> &InboxNode {
-        &self.policy_update_node
-    }
-
     pub(crate) const fn affinity_update_node(&self) -> &InboxNode {
         &self.affinity_update_node
     }
@@ -1191,7 +1187,7 @@ mod tests {
         core.set_wake_cpu_hint(CpuId::new(1));
 
         assert_eq!(core.wake_cpu_hint(), Some(CpuId::new(1)));
-        assert_eq!(core.assigned_cpu(), None);
+        assert_eq!(core.assigned_cpu(), Some(CpuId::new(0)));
     }
 
     #[test]

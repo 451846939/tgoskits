@@ -7,6 +7,7 @@ pub(in crate::system) struct PiScheduleUpdate {
     pub(in crate::system) donor: Option<ThreadId>,
     pub(in crate::system) deadline_donor: Option<ThreadId>,
     pub(in crate::system) deadline_donor_core: Option<Weak<ThreadCore>>,
+    pub(in crate::system) deadline_donor_server: Option<DeadlineServer>,
     pub(in crate::system) generation: u64,
 }
 

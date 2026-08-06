@@ -1,6 +1,8 @@
-use core::ops::{Deref, DerefMut};
+use core::ops::Deref;
 
 use super::*;
+#[cfg(test)]
+use crate::FairEntity;
 use crate::SchedulerClass;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -8,6 +10,22 @@ pub(crate) enum WakePreemptionDecision {
     KeepCurrent,
     WakeeSelected,
     QueuedCandidateSelected,
+}
+
+/// Runtime-accounting outcome for the task currently installed in `rq`.
+///
+/// Dedicated idle is a separate scheduler class in Linux and must not flow
+/// through task utilization or RT bandwidth accounting. Encoding that split
+/// in the result prevents callers from reconstructing idle identity after the
+/// class hook has advanced its execution timestamp.
+pub(in crate::system::cpu) enum RqCurrentTick {
+    DedicatedIdle,
+    Task {
+        charge: DispatchCharge,
+        request_reschedule: bool,
+        realtime: bool,
+        rt_quota_exempt: bool,
+    },
 }
 
 impl WakePreemptionDecision {
@@ -58,6 +76,35 @@ impl CpuRunQueueState {
     pub(crate) fn update_clock(&mut self) -> RunQueueClockSnapshot {
         let sample = task_runtime::rq_clock_sample(RuntimeCpuId::new(self.owner.as_u32()));
         self.clock.update(sample)
+    }
+
+    /// Reserves class-node storage before the task is published.
+    ///
+    /// This changes only cold structural capacity, never runnable state, and
+    /// therefore deliberately precedes the first owner-rq transaction for the
+    /// new task. Linux obtains the same property by embedding class nodes in
+    /// `task_struct` before publication.
+    pub(crate) fn prepare_thread_slot(&mut self, slot: usize) {
+        self.queue.prepare_thread_slot(slot);
+    }
+
+    /// Grants the owner-rq transaction access to scheduler-class mutations.
+    ///
+    /// Visibility is intentionally limited to the CPU scheduler module: task
+    /// system code must express every runnable-state change through
+    /// `OwnerRqTxn` rather than a raw runqueue guard.
+    pub(in crate::system::cpu) fn owner_transaction_queue_mut(&mut self) -> &mut RunQueue {
+        &mut self.queue
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_virtual_time_for_test(&mut self, virtual_time: u64) {
+        self.queue.set_virtual_time_for_test(virtual_time);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn update_fair_virtual_time(&mut self, current: Option<FairEntity>) {
+        self.queue.update_fair_virtual_time(current);
     }
 
     pub(crate) const fn current(&self) -> Option<&CurrentDispatch> {
@@ -117,6 +164,41 @@ impl CpuRunQueueState {
                 .filter(|current| current.thread() == thread)
                 .and_then(CurrentDispatch::owned_base_scheduling_entity)
         })
+    }
+
+    /// Linux `update_entity_lag()` for a running task which is about to leave
+    /// this rq. Fair current is owned by `rq->curr`; an RT/DL current retains
+    /// its active state in the class structure. Both representations sample
+    /// the source weighted virtual time before either owner is detached.
+    pub(crate) fn capture_current_fair_migration(
+        &mut self,
+        thread: ThreadId,
+        timing_granularity_ns: u64,
+    ) {
+        let Some(fair) = self
+            .base_scheduling_entity(thread)
+            .and_then(|entity| entity.fair())
+        else {
+            return;
+        };
+        let virtual_time = self.queue.virtual_time_for_mode(fair.mode());
+        if self
+            .queue
+            .capture_linked_fair_migration(thread, virtual_time, timing_granularity_ns)
+        {
+            return;
+        }
+        let current = self
+            .queue
+            .current_mut()
+            .filter(|current| current.thread() == thread)
+            .unwrap_or_else(|| {
+                task_runtime::fatal_invariant(0x5251_100c, thread.as_u64() as usize)
+            });
+        current
+            .active_mut()
+            .base_entity_mut()
+            .capture_fair_migration(virtual_time, timing_granularity_ns);
     }
 
     pub(crate) fn update_base_deadline_entity(
@@ -251,12 +333,12 @@ impl CpuRunQueueState {
     /// Fair/stop entities remain in `CurrentDispatch`. A clock tick therefore
     /// never has to take the dispatch out of the rq and reinstall it merely to
     /// update runtime, matching Linux `update_curr_*()` ownership.
-    pub(crate) fn task_tick_current(
+    pub(in crate::system::cpu) fn task_tick_current(
         &mut self,
         runtime_ns: u64,
         reclaimed_ns: u64,
         deadline_extra_bw_scaled: u64,
-    ) -> Result<(DispatchCharge, bool, bool, bool), TaskError> {
+    ) -> Result<RqCurrentTick, TaskError> {
         let now_ns = self
             .clock
             .snapshot()
@@ -269,7 +351,7 @@ impl CpuRunQueueState {
                 .current_mut()
                 .expect("current identity must retain its dispatch")
                 .account_dedicated_idle_until(now_ns);
-            return Ok((DispatchCharge::default(), false, false, false));
+            return Ok(RqCurrentTick::DedicatedIdle);
         }
 
         let bandwidth = self.queue.deadline_bandwidth();
@@ -289,12 +371,12 @@ impl CpuRunQueueState {
         };
         self.queue.update_fair_virtual_time(current_entity.fair());
         let class_tick = SchedulerClass::for_policy(policy).task_tick(charge);
-        Ok((
+        Ok(RqCurrentTick::Task {
             charge,
-            class_tick.request_reschedule || deadline_replenish_reschedule,
-            class_tick.realtime,
+            request_reschedule: class_tick.request_reschedule || deadline_replenish_reschedule,
+            realtime: class_tick.realtime,
             rt_quota_exempt,
-        ))
+        })
     }
 
     #[cfg(test)]
@@ -470,11 +552,5 @@ impl Deref for CpuRunQueueState {
 
     fn deref(&self) -> &Self::Target {
         &self.queue
-    }
-}
-
-impl DerefMut for CpuRunQueueState {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.queue
     }
 }

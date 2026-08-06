@@ -310,7 +310,7 @@ fn constrained_deadline_replenishment_preemption_is_seen_in_the_same_safe_point(
 }
 
 #[test]
-fn yielded_deadline_rearms_replenishment_after_earlier_zero_lag_event() {
+fn yielded_deadline_arms_only_its_next_cbs_release() {
     let (system, mut cpu) = online_system();
     let deadline = ready_thread(
         &system,
@@ -324,34 +324,15 @@ fn yielded_deadline_rearms_replenishment_after_earlier_zero_lag_event() {
 
     support::set_monotonic_ns(1);
     system.yield_current_at(cpu.as_mut(), 1).unwrap();
-    assert_eq!(support::last_oneshot_ns(), 10, "zero-lag must fire first");
-
-    support::install_handles(
-        (&system as *const TaskSystem).expose_provenance(),
-        cpu.as_mut(),
-    );
-    support::set_monotonic_ns(10);
-    support::set_scheduler_ns(10);
-    let event = ax_task::on_clock_event(
-        ax_task::runtime::MonotonicInstant::from_nanos(10).unwrap(),
-        64,
-    )
-    .unwrap();
-    assert_eq!(
-        event.expired(),
-        1,
-        "zero-lag must arrive as one typed task deadline"
-    );
-    assert!(
-        !event.pending(),
-        "no second immediately due event remains after the bounded IRQ pass"
-    );
-    ax_task::runtime::task_runtime::publish_scheduler_deadline(event.update());
-    system.schedule_at(cpu.as_mut(), 10).unwrap();
+    system.complete_context_switch(cpu.as_mut()).unwrap();
     assert_eq!(
         support::last_oneshot_ns(),
         100,
-        "zero-lag servicing must preserve the later CBS replenishment",
+        "a yielded runnable task stays contending and waits only for its CBS release",
+    );
+    support::install_handles(
+        (&system as *const TaskSystem).expose_provenance(),
+        cpu.as_mut(),
     );
     support::set_monotonic_ns(100);
     support::set_scheduler_ns(100);

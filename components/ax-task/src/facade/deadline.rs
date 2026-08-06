@@ -156,26 +156,11 @@ pub fn on_clock_event(
     now: MonotonicInstant,
     budget: usize,
 ) -> Result<TaskClockEventOutcome, TaskError> {
-    on_clock_event_with_scheduler_tick(now, budget, false)
-}
-
-/// Performs one bounded task-clockevent pass and records a periodic scheduler tick.
-///
-/// Scheduler-tick extension work, when enabled, is deferred to the dedicated
-/// task-work service and never invoked from this hard-IRQ path.
-pub fn on_clock_event_with_scheduler_tick(
-    now: MonotonicInstant,
-    budget: usize,
-    scheduler_tick: bool,
-) -> Result<TaskClockEventOutcome, TaskError> {
     let system = runtime_task_system()?;
     let mut irq = RuntimeIrqGuard::enter();
     let mut cpu = runtime_current_cpu_mut(&mut irq)?;
-    let (charge, clock) = system.charge_current_until_with_clock(cpu.as_mut(), 0)?;
+    let (charge, clock, current) = system.charge_current_until_with_clock(cpu.as_mut(), 0)?;
     let rt_unthrottled = system.service_rt_period(&cpu, now);
-    if scheduler_tick {
-        system.publish_current_scheduler_tick_work(&cpu, clock.task().as_nanos());
-    }
     let mut hard_processed = 0;
     let mut hard_pending = false;
     while hard_processed < budget {
@@ -207,7 +192,32 @@ pub fn on_clock_event_with_scheduler_tick(
         expired: hard_processed.saturating_add(batch.expired()),
         pending,
         update,
+        scheduler_tick: SchedulerTickStamp {
+            cpu: cpu.owner(),
+            thread: current,
+            observed_ns: clock.task().as_nanos(),
+        },
     })
+}
+
+/// Publishes extension work for a periodic scheduler tick already accounted by
+/// [`on_clock_event`].
+///
+/// The opaque stamp binds this publication to the exact `rq->curr` and task
+/// clock sampled by the preceding owner-rq transaction. Physical clockevent
+/// sources therefore do not pass compatibility booleans into task deadline
+/// processing, and a delayed publication cannot silently target a new task.
+pub fn publish_scheduler_tick(stamp: SchedulerTickStamp) -> Result<(), TaskError> {
+    let system = runtime_task_system()?;
+    let mut irq = RuntimeIrqGuard::enter();
+    let cpu = runtime_current_cpu_mut(&mut irq)?;
+    if cpu.owner() != stamp.cpu {
+        return Err(TaskError::CpuOwnerMismatch {
+            expected: stamp.cpu.as_u32(),
+            actual: cpu.owner().as_u32(),
+        });
+    }
+    system.publish_current_scheduler_tick_work(&cpu, stamp.thread, stamp.observed_ns)
 }
 
 /// Copies the last IRQ's expired timer events for task-context processing.
@@ -339,15 +349,17 @@ pub(crate) fn cancel_current_park_deadline(
         let registration = ticket
             .deadline()
             .expect("the deadline registration remains owned until cancellation");
-        let cancellation = match {
+        let cancellation_state = {
             let mut deadline_base = cpu.lock_deadline_base();
             let cancellation = deadline_base.queue.begin_cancel(registration);
-            let buffered = cancellation
-                .is_none()
-                .then(|| deadline_base.owns_buffered_expiration(registration))
-                .unwrap_or(false);
+            let buffered = if cancellation.is_none() {
+                deadline_base.owns_buffered_expiration(registration)
+            } else {
+                false
+            };
             (cancellation, buffered)
-        } {
+        };
+        let cancellation = match cancellation_state {
             (Some(cancellation), _) => cancellation,
             (None, true) => {
                 if !thread.core.complete_sleep_timer(token.generation())
@@ -388,6 +400,15 @@ pub struct TaskClockEventOutcome {
     expired: usize,
     pending: bool,
     update: crate::runtime::SchedulerDeadlineUpdate,
+    scheduler_tick: SchedulerTickStamp,
+}
+
+/// Opaque owner-rq sample required to publish one periodic scheduler tick.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SchedulerTickStamp {
+    cpu: CpuId,
+    thread: ThreadId,
+    observed_ns: u64,
 }
 
 impl TaskClockEventOutcome {
@@ -410,6 +431,11 @@ impl TaskClockEventOutcome {
     /// Returns the complete generation-ordered task-deadline publication.
     pub const fn update(self) -> crate::runtime::SchedulerDeadlineUpdate {
         self.update
+    }
+    /// Returns the rq-bound stamp consumed when this physical edge was also a
+    /// periodic scheduler tick.
+    pub const fn scheduler_tick_stamp(self) -> SchedulerTickStamp {
+        self.scheduler_tick
     }
     /// Returns the next finite task-owned deadline.
     pub const fn next_deadline(self) -> Option<MonotonicDeadline> {

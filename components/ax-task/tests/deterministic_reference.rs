@@ -88,8 +88,13 @@ fn compare_scenario(seed: u64, scenario: Scenario) {
         let now_ns = event_index as u64 + 1;
         match random.next() & 3 {
             0 => {
-                cpu.request_reschedule();
-                reference.request_reschedule();
+                let next = system.schedule_at(cpu.as_mut(), now_ns).unwrap().next();
+                assert_eq!(
+                    next,
+                    reference.preempt(now_ns),
+                    "scenario={scenario:?} seed={seed:#x} event={event_index} \
+                     reference={reference:?}"
+                );
             }
             1 => {
                 let next = system.schedule_at(cpu.as_mut(), now_ns).unwrap().next();
@@ -148,7 +153,7 @@ fn compare_scenario(seed: u64, scenario: Scenario) {
         );
         assert_eq!(
             production.runnable(),
-            reference.ready.len(),
+            reference.ready.len() + 1,
             "scenario={scenario:?} seed={seed:#x} event={event_index}"
         );
         assert_eq!(
@@ -265,10 +270,6 @@ impl ReferenceScheduler {
             accounted_until_ns: 0,
             need_resched: false,
         }
-    }
-
-    fn request_reschedule(&mut self) {
-        self.need_resched = true;
     }
 
     fn preempt(&mut self, now_ns: u64) -> ThreadId {

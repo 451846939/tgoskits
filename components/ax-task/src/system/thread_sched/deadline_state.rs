@@ -111,7 +111,6 @@ impl DeadlineBandwidthState {
 pub(in crate::system) struct ThreadDeadlineState {
     pub(in crate::system) server: crate::DeadlineServer,
     pub(in crate::system) bandwidth: DeadlineBandwidthState,
-    pub(in crate::system) cleanup_pending: bool,
     pub(in crate::system) cbs_timer: Option<TaskDeadlineRegistration>,
     pub(in crate::system) zero_lag_timer: Option<TaskDeadlineRegistration>,
     pub(in crate::system) overrun_events: u64,
@@ -122,7 +121,6 @@ impl ThreadDeadlineState {
         Self {
             server,
             bandwidth: DeadlineBandwidthState::new(reservation),
-            cleanup_pending: false,
             cbs_timer: None,
             zero_lag_timer: None,
             overrun_events: 0,

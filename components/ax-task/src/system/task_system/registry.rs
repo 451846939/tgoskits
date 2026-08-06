@@ -242,7 +242,6 @@ impl TaskSystemState {
                 || sched.placement.on_cpu().is_some()
                 || sched.placement.has_pending_migration()
                 || sched.deadline.bandwidth.reservation_owner().is_some()
-                || sched.deadline.cleanup_pending
                 || sched.pi.blocked_on.is_some()
                 || record.callbacks.blocks_reap()
                 || record.core.scheduler_inbox_delivery_count() != 0
@@ -290,7 +289,6 @@ impl TaskSystemState {
             if sched.placement.on_cpu().is_some()
                 || sched.placement.has_pending_migration()
                 || sched.deadline.bandwidth.reservation_owner().is_some()
-                || sched.deadline.cleanup_pending
                 || sched.deadline.overrun_events != 0
                 || record.callbacks.blocks_reap()
                 || record.core.scheduler_inbox_delivery_count() != 0
@@ -468,50 +466,6 @@ impl TaskSystemState {
             core.cancel_scheduler_inbox_delivery();
         }
         Ok(())
-    }
-
-    pub(super) fn request_owner_reschedule(&self, owner: ThreadId) {
-        if let Ok(record) = self.thread_record(owner) {
-            let (cpu, generation) = {
-                let sched = record.sched.lock();
-                (
-                    sched
-                        .placement
-                        .execution_cpu()
-                        .or(sched.placement.queued_cpu())
-                        .or(sched.placement.assigned_cpu()),
-                    sched.policy.update_generation(),
-                )
-            };
-            let Some(cpu) = cpu else {
-                return;
-            };
-            let core = Arc::as_ptr(&record.core);
-            let Some(cpu_local) = self.cpu_remote(cpu) else {
-                return;
-            };
-            if !record.core.reserve_scheduler_inbox_delivery() {
-                return;
-            }
-            // SAFETY: this retained Arc count is transferred to the embedded
-            // policy-update node and released by the owner drain.
-            unsafe { Arc::increment_strong_count(core) };
-            // SAFETY: the retained Arc count keeps this embedded node pinned.
-            let node = unsafe { Pin::new_unchecked((*core).policy_update_node()) };
-            let message = InboxMessage::policy_update_with_payload(
-                owner,
-                cpu,
-                generation,
-                core.expose_provenance(),
-            );
-            let result = cpu_local.publish_owner_control(node, message);
-            if result != PublishResult::Published {
-                // SAFETY: rejected/coalesced publication did not consume the
-                // retained count allocated for this attempt.
-                unsafe { Arc::decrement_strong_count(core) };
-                record.core.cancel_scheduler_inbox_delivery();
-            }
-        }
     }
 
     pub(super) fn cpu_remote(&self, cpu: CpuId) -> Option<&CpuRemote> {

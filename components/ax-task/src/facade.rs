@@ -27,8 +27,8 @@ mod scheduling;
 mod task_work;
 
 pub use deadline::{
-    CurrentParkResume, CurrentParkStart, PreparedCurrentPark, TaskClockEventOutcome,
-    begin_current_park, on_clock_event, on_clock_event_with_scheduler_tick,
+    CurrentParkResume, CurrentParkStart, PreparedCurrentPark, SchedulerTickStamp,
+    TaskClockEventOutcome, begin_current_park, on_clock_event, publish_scheduler_tick,
     take_current_expired_task_deadlines,
 };
 #[cfg(test)]

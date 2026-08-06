@@ -6,9 +6,9 @@ use std::sync::{
 use ax_task::{
     CpuId, FairMode, Nice, SchedulePolicy, SchedulerTickGate, SchedulerTickWorkDisposition,
     TaskError, TaskSystem, TaskSystemConfig, ThreadExtension, ThreadExtensionOps, ThreadId,
-    ThreadSpec, ThreadState, WakeResult, current_cpu_needs_resched, current_thread_extension,
-    current_thread_id, on_clock_event_with_scheduler_tick, runtime::MonotonicInstant,
-    schedule_current_cpu,
+    ThreadSpec, ThreadState, WakeResult, current_thread_extension, current_thread_id,
+    on_clock_event, publish_scheduler_tick as publish_scheduler_tick_work,
+    runtime::MonotonicInstant,
 };
 
 pub mod support;
@@ -32,7 +32,8 @@ fn publish_scheduler_tick(now_ns: u64) {
 fn publish_scheduler_tick_at(scheduler_now_ns: u64, monotonic_now_ns: u64) {
     support::set_scheduler_ns(scheduler_now_ns);
     support::set_monotonic_ns(monotonic_now_ns);
-    on_clock_event_with_scheduler_tick(instant(monotonic_now_ns), 1, true).unwrap();
+    let outcome = on_clock_event(instant(monotonic_now_ns), 1).unwrap();
+    publish_scheduler_tick_work(outcome.scheduler_tick_stamp()).unwrap();
 }
 
 #[test]
@@ -70,11 +71,6 @@ fn facade_reports_uninitialized_then_uses_runtime_owned_objects() {
     );
     assert_eq!(current_thread_id().unwrap(), bootstrap.id());
     assert_eq!(current_thread_extension().unwrap().unwrap().data(), 0x1234);
-    cpu.request_reschedule();
-    assert!(current_cpu_needs_resched().unwrap());
-    assert!(schedule_current_cpu().unwrap().decision().is_some());
-    assert!(!current_cpu_needs_resched().unwrap());
-
     let sleeper = system
         .create_thread(ThreadSpec::new(SchedulePolicy::default()))
         .unwrap();

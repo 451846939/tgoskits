@@ -529,33 +529,61 @@ fn secondary_bootstrap_retires_before_entering_idle_loop() {
 
 #[test]
 fn entry_extension_lookup_does_not_pin_exited_thread() {
-    let extension_drops = AtomicUsize::new(0);
-    let system = TaskSystem::new(TaskSystemConfig::new(1)).unwrap();
-    let extension_data = (&extension_drops as *const AtomicUsize).expose_provenance();
-    // SAFETY: this test reaps the thread and runs the matching drop callback
-    // before the stack-owned counter leaves scope.
-    let extension = unsafe { ThreadExtension::new(extension_data, &TEST_EXTENSION_OPS) };
-    let spec = ThreadSpec::new(SchedulePolicy::default()).with_extension(extension);
-    let handle = system.create_thread(spec).unwrap();
-    let lease = system
-        .thread_extension_lease(handle.clone())
-        .unwrap()
+    std::thread::spawn(|| {
+        use core::mem::MaybeUninit;
+
+        use cpu_local::{CpuAreaPrefix, CpuAreaRef, CpuIndex, CurrentContext, CurrentThreadHeader};
+
+        let storage = Box::leak(Box::new(MaybeUninit::<CpuAreaPrefix>::uninit()));
+        let base = storage.as_mut_ptr() as usize;
+        storage.write(CpuAreaPrefix::initialize(CpuIndex::try_from(0).unwrap(), base).unwrap());
+        // SAFETY: the leaked prefix is initialized and remains mapped for the
+        // modeled CPU's complete process lifetime.
+        let area = unsafe { CpuAreaRef::from_initialized_base(base) }.unwrap();
+        // SAFETY: this fresh host thread owns its CPU-local register model.
+        unsafe { cpu_local::install_cpu_area(area) }.unwrap();
+        let current = Box::pin(CurrentThreadHeader::new(
+            CurrentContext::from_raw(1).unwrap(),
+        ));
+        // SAFETY: the modeled CPU is offline and the pinned header outlives
+        // every scheduler/runtime operation in this thread.
+        unsafe {
+            cpu_local::with_cpu_pin(|pin| {
+                cpu_local::install_bootstrap_thread(pin, current.as_ref()).unwrap();
+            })
+        }
         .unwrap();
 
-    assert_eq!(
-        extension_data_after_releasing_lease(lease, &TEST_EXTENSION_OPS).unwrap(),
-        extension_data
-    );
-    system.mark_exited(handle.id()).unwrap();
-    assert!(
-        system
-            .service_deferred_task_work(1)
+        let extension_drops = AtomicUsize::new(0);
+        let system = TaskSystem::new(TaskSystemConfig::new(1)).unwrap();
+        let extension_data = (&extension_drops as *const AtomicUsize).expose_provenance();
+        // SAFETY: this test reaps the thread and runs the matching drop
+        // callback before the stack-owned counter leaves scope.
+        let extension = unsafe { ThreadExtension::new(extension_data, &TEST_EXTENSION_OPS) };
+        let spec = ThreadSpec::new(SchedulePolicy::default()).with_extension(extension);
+        let handle = system.create_thread(spec).unwrap();
+        let lease = system
+            .thread_extension_lease(handle.clone())
             .unwrap()
-            .made_progress(),
-        "the exit callback must finish before the test isolates extension-lease ownership"
-    );
-    system.reap_thread_handle(handle).unwrap();
-    assert_eq!(extension_drops.load(Ordering::Acquire), 1);
+            .unwrap();
+
+        assert_eq!(
+            extension_data_after_releasing_lease(lease, &TEST_EXTENSION_OPS).unwrap(),
+            extension_data
+        );
+        system.mark_exited(handle.id()).unwrap();
+        assert!(
+            system
+                .service_deferred_task_work(1)
+                .unwrap()
+                .made_progress(),
+            "the exit callback must finish before the test isolates extension-lease ownership"
+        );
+        system.reap_thread_handle(handle).unwrap();
+        assert_eq!(extension_drops.load(Ordering::Acquire), 1);
+    })
+    .join()
+    .expect("modeled CPU fixture must finish without a current-register mismatch");
 }
 
 #[cfg(feature = "tls")]

@@ -422,8 +422,6 @@ struct DeadlineServerState {
     next_period: Option<SchedulerTimestamp>,
     remaining_runtime_ns: i128,
     state: DeadlineJobState,
-    miss_recorded: bool,
-    misses: u64,
     overruns: u64,
 }
 
@@ -504,11 +502,6 @@ impl DeadlineEntity {
             .with_execution_mut(DeadlineServerState::yield_job);
     }
 
-    pub(crate) fn observe_time(&self, now_ns: u64) -> bool {
-        self.local
-            .with_execution_mut(|state| state.observe_time(now_ns))
-    }
-
     pub fn absolute_deadline_ns(&self) -> Option<u64> {
         self.local
             .with_execution(DeadlineServerState::absolute_deadline_ns)
@@ -550,10 +543,6 @@ impl DeadlineEntity {
         self.local.with_execution(DeadlineServerState::is_throttled)
     }
 
-    pub fn misses(&self) -> u64 {
-        self.local.with_execution(|state| state.misses)
-    }
-
     pub fn overruns(&self) -> u64 {
         self.local.with_execution(|state| state.overruns)
     }
@@ -576,8 +565,6 @@ impl DeadlineServerState {
             next_period: None,
             remaining_runtime_ns: 0,
             state: DeadlineJobState::Inactive,
-            miss_recorded: false,
-            misses: 0,
             overruns: 0,
         }
     }
@@ -595,7 +582,6 @@ impl DeadlineServerState {
             let _ = self.advance_depleted_job(now, policy);
         }
         self.state = DeadlineJobState::Runnable;
-        self.miss_recorded = false;
     }
 
     /// Applies the CBS wake-up rule and activates a fresh job when required.
@@ -714,30 +700,12 @@ impl DeadlineServerState {
             }
         }
         self.state = DeadlineJobState::Runnable;
-        self.miss_recorded = false;
     }
 
     /// Ends the current job and throttles it until replenishment.
     fn yield_job(&mut self) {
         self.remaining_runtime_ns = 0;
         self.state = DeadlineJobState::Throttled(DeadlineThrottleReason::Yielded);
-        self.miss_recorded = true;
-    }
-
-    /// Records and reports whether the active job missed its deadline.
-    fn observe_time(&mut self, now_ns: u64) -> bool {
-        if matches!(self.state, DeadlineJobState::Runnable)
-            && !self.miss_recorded
-            && self.absolute_deadline.is_some_and(|deadline| {
-                deadline.is_reached_by(SchedulerTimestamp::from_nanos(now_ns))
-            })
-        {
-            self.miss_recorded = true;
-            self.misses = self.misses.saturating_add(1);
-            true
-        } else {
-            false
-        }
     }
 
     /// Returns the current absolute deadline.
@@ -785,7 +753,6 @@ impl DeadlineServerState {
         self.next_period = Some(now.advance(policy.period_ns()));
         self.remaining_runtime_ns = policy.runtime_ns() as i128;
         self.state = DeadlineJobState::Runnable;
-        self.miss_recorded = false;
     }
 
     fn advance_depleted_job(&mut self, now: SchedulerTimestamp, policy: DeadlinePolicy) -> bool {
@@ -1022,7 +989,7 @@ mod tests {
         assert_eq!(entity.next_scheduler_event_ns(), Some(10));
         assert_eq!(entity.remaining_runtime_ns(), 0);
 
-        entity.activate(10);
+        entity.replenish(10);
 
         assert!(!entity.is_throttled());
         assert_eq!(entity.absolute_deadline_ns(), Some(18));
@@ -1107,7 +1074,5 @@ mod tests {
 
         assert_eq!(entity.absolute_deadline_ns(), Some(4));
         assert_eq!(entity.next_period_ns(), Some(14));
-        assert!(!entity.observe_time(u64::MAX - 1));
-        assert!(entity.observe_time(4));
     }
 }

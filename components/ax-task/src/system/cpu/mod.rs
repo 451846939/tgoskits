@@ -27,12 +27,11 @@ pub(crate) use dispatch::{
 use load::SUMMARY_FAIR_PUSHABLE;
 pub use load::{CpuLoadSummary, DeadlineBandwidthSnapshot, SchedulingClass};
 pub use local::CpuLocal;
-#[cfg(feature = "qperf-metrics")]
-pub(crate) use remote::WakePreemptionDecision;
+use remote::RqCurrentTick;
 pub use remote::{CpuLifecycleState, CpuLocalOwnerBorrow, CpuRemote};
 pub(crate) use remote::{
     CpuRemotePublication, CpuRunQueueState, IdlePullReservation, PreparedMigrationDelivery,
-    SchedulerRequestClaim,
+    SchedulerRequestClaim, WakePreemptionDecision,
 };
 pub use snapshot::CpuSnapshot;
 pub(crate) use transaction::{OwnerRqEntry, OwnerRqTxn};

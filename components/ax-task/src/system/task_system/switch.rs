@@ -8,22 +8,6 @@ pub(super) struct OwnerScheduleOut {
 }
 
 impl TaskSystem {
-    pub(super) fn capture_owner_fair_migration_in_rq(
-        &self,
-        run_queue: &CpuRunQueueState,
-        sched: &mut ThreadSchedState,
-    ) {
-        let timing_granularity_ns = self.config.timing_granularity_ns();
-        if let Some(fair) = sched.policy.active().base_entity().fair() {
-            let virtual_time = run_queue.virtual_time_for_mode(fair.mode());
-            sched
-                .policy
-                .active_mut()
-                .base_entity_mut()
-                .capture_fair_migration(virtual_time, timing_granularity_ns);
-        }
-    }
-
     /// Completes every owner-side selection through the same balance and
     /// one-shot programming sequence.
     ///
@@ -126,6 +110,10 @@ impl TaskSystem {
                 });
             (target, migration)
         });
+        if prepared_migration.is_some() {
+            transaction
+                .capture_current_fair_migration(core.id(), self.config.timing_granularity_ns());
+        }
         if transaction.idle() == Some(core.id()) {
             let dispatch = transaction.take_current().unwrap_or_else(|| {
                 task_runtime::fatal_invariant(0x5343_1105, core.id().as_u64() as usize)
@@ -171,7 +159,6 @@ impl TaskSystem {
             } else {
                 transaction.deactivate_unlinked_current(core.id());
             }
-            self.capture_owner_fair_migration_in_rq(transaction, sched);
             sched
                 .transition(&core, ThreadState::Ready)
                 .unwrap_or_else(|_| {
@@ -276,13 +263,7 @@ impl TaskSystem {
             core.set_wake_cpu_hint(owner);
             false
         } else {
-            self.link_owner_ready_thread_locked(
-                cpu.as_ref().get_ref(),
-                transaction,
-                &core,
-                sched,
-                reason,
-            )
+            self.link_owner_ready_thread_locked(owner, transaction, &core, sched, reason)
         };
         if preempts_current {
             cpu.request_reschedule();

@@ -3,9 +3,6 @@
 /// Largest value in Linux's signed `ktime_t` domain.
 pub const KTIME_MAX_NANOS: u64 = i64::MAX as u64;
 
-/// Whole-second saturation target used by Linux `ktime_add_safe()`.
-pub const KTIME_SAFE_MAX_NANOS: u64 = KTIME_MAX_NANOS / 1_000_000_000 * 1_000_000_000;
-
 /// One finite sample of the runtime monotonic clock.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 #[repr(transparent)]
@@ -36,7 +33,9 @@ impl MonotonicInstant {
         let timeout_ns = timeout.as_nanos();
         let sum = self.0 as u128 + timeout_ns;
         if sum >= KTIME_MAX_NANOS as u128 {
-            MonotonicDeadline(KTIME_SAFE_MAX_NANOS)
+            // Linux `ktime_add_safe()` calls `ktime_set(KTIME_SEC_MAX, 0)`;
+            // `ktime_set()` then clamps that boundary to `KTIME_MAX`.
+            MonotonicDeadline(KTIME_MAX_NANOS)
         } else {
             MonotonicDeadline(sum as u64)
         }
@@ -155,7 +154,7 @@ mod monotonic_time_tests {
 
         assert_eq!(
             now.deadline_after(core::time::Duration::from_nanos(2)),
-            MonotonicDeadline::from_nanos(KTIME_SAFE_MAX_NANOS).unwrap()
+            MonotonicDeadline::from_nanos(KTIME_MAX_NANOS).unwrap()
         );
     }
 }

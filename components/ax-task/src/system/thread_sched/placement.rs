@@ -49,10 +49,15 @@ pub(in crate::system) struct SchedulerPlacement {
 }
 
 impl SchedulerPlacement {
-    pub(super) const fn new() -> Self {
+    /// Initializes Linux's `task_cpu()` before the task is published.
+    ///
+    /// This mirrors `sched_cgroup_fork()`/`__set_task_cpu()`: a new task is
+    /// not runnable yet, but PI and policy transactions already have one rq
+    /// whose lock serializes its scheduler state.
+    pub(super) const fn new(task_cpu: CpuId) -> Self {
         Self {
             state: AtomicU64::new(encode(PlacementSnapshot {
-                task_cpu: None,
+                task_cpu: Some(task_cpu),
                 on_rq: TaskOnRunQueue::None,
                 on_cpu: None,
             })),
@@ -144,7 +149,7 @@ impl SchedulerPlacement {
     /// `rq->nr_running`.
     pub(in crate::system) fn install_idle(&self, cpu: CpuId) {
         self.transition(0x504c_000d, cpu.as_u32() as usize, |state| {
-            (state.task_cpu.is_none()
+            (state.task_cpu == Some(cpu)
                 && state.on_rq == TaskOnRunQueue::None
                 && state.on_cpu.is_none())
             .then_some(PlacementSnapshot {
@@ -447,7 +452,7 @@ mod tests {
     const CPU1: CpuId = CpuId::new(1);
 
     fn running_placement() -> SchedulerPlacement {
-        let placement = SchedulerPlacement::new();
+        let placement = SchedulerPlacement::new(CPU0);
         placement.activate(CPU0);
         placement.set_next_task(CPU0);
         placement
@@ -493,7 +498,7 @@ mod tests {
 
     #[test]
     fn committed_carrier_is_not_retargeted_by_a_later_request() {
-        let placement = SchedulerPlacement::new();
+        let placement = SchedulerPlacement::new(CPU0);
         placement.begin_remote_wakeup(CPU1);
         placement.request_migration(Some(CPU0));
 

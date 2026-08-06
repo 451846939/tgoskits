@@ -32,7 +32,7 @@ impl CpuSnapshot {
         self.current
     }
 
-    /// Returns the number of runnable threads.
+    /// Returns Linux `rq->nr_running`, including a runnable current thread.
     pub const fn runnable(self) -> usize {
         self.runnable
     }

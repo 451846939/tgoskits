@@ -21,8 +21,6 @@ pub enum InboxKind {
 pub enum InboxOperation {
     /// Transfer physical runqueue ownership between CPUs.
     Migration,
-    /// Reconcile a thread's latest scheduling-policy generation.
-    PolicyUpdate,
     /// Reconcile a thread's latest affinity with physical placement.
     AffinityUpdate,
     /// Refresh one Deadline donor after its remote CBS baton returns.
@@ -86,7 +84,7 @@ impl InboxMessage {
         )
     }
 
-    /// Creates a migration/policy-update transfer with retained payload data.
+    /// Creates a migration transfer with retained payload data.
     pub const fn migration_with_payload(
         thread_id: ThreadId,
         source_cpu: CpuId,
@@ -103,26 +101,6 @@ impl InboxMessage {
             target_cpu: target_cpu.as_u32(),
             generation,
             placement_demand,
-            balance_class: None,
-            payload,
-        }
-    }
-
-    /// Creates an owner-local policy reconciliation request.
-    pub const fn policy_update_with_payload(
-        thread_id: ThreadId,
-        owner: CpuId,
-        generation: u64,
-        payload: usize,
-    ) -> Self {
-        Self {
-            kind: InboxKind::OwnerControl,
-            operation: InboxOperation::PolicyUpdate,
-            thread_id,
-            source_cpu: owner.as_u32(),
-            target_cpu: owner.as_u32(),
-            generation,
-            placement_demand: 0,
             balance_class: None,
             payload,
         }
@@ -291,11 +269,6 @@ impl InboxMessage {
         } else {
             Some(CpuId::new(self.target_cpu))
         }
-    }
-
-    /// Returns the transfer or reclaim generation.
-    pub const fn generation(self) -> u64 {
-        self.generation
     }
 
     /// Returns the scheduling demand reserved by a migration carrier.

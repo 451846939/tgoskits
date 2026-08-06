@@ -981,18 +981,16 @@ mod tests {
         system.enqueue(cpu.as_mut(), waiting.id()).unwrap();
 
         system
-            .set_thread_policy(
-                waiting.id(),
-                SchedulePolicy::fair(crate::Nice::ZERO, crate::FairMode::Idle),
-            )
+            .set_affinity(waiting.id(), crate::CpuSet::all(1))
             .unwrap();
         let _runtime_handles = InstalledTaskHandles::new(system.as_ref(), cpu.as_mut());
         assert!(cpu.has_remote_work());
         assert!(cpu.needs_reschedule());
 
         // Forced schedule paths used to consume the sticky bit without first
-        // draining owner work. Claiming scheduler entry must re-observe the
-        // published inbox and preserve a doorbell for the next bounded drain.
+        // draining owner control. Claiming scheduler entry must re-observe the
+        // published affinity request and preserve a doorbell for the next
+        // bounded drain.
         let _ = cpu.remote().take_preempt_requested();
         assert!(cpu.needs_reschedule());
 
@@ -1561,10 +1559,14 @@ mod tests {
             )
             .unwrap();
         system.bring_cpu_online(cpu.as_mut()).unwrap();
-        assert_eq!(
-            system.block_current(cpu.as_mut()).unwrap().next(),
-            idle.id()
-        );
+        let ParkPrepare::Prepared(mut ticket) = system.prepare_park(cpu.as_mut()).unwrap() else {
+            panic!("the bootstrap thread must enter the park transaction")
+        };
+        let ParkCommit::Blocked(decision) = system.commit_park(cpu.as_mut(), &mut ticket).unwrap()
+        else {
+            panic!("the isolated fixture cannot race with a notification")
+        };
+        assert_eq!(decision.next(), idle.id());
         system.complete_context_switch(cpu.as_mut()).unwrap();
         let _runtime_handles = InstalledTaskHandles::new(system.as_ref(), cpu.as_mut());
         test_runtime::configure_idle_wait(true);

@@ -226,6 +226,11 @@ impl PiMutexCore {
         self.owner.store(OWNER_HAS_WAITERS, Ordering::Release);
     }
 
+    /// Ends an ownerless handoff after its last uncommitted waiter is removed.
+    pub(crate) fn publish_unlocked(&self) {
+        self.owner.store(0, Ordering::Release);
+    }
+
     pub(crate) fn clear_waiters_bit(&self, owner: ThreadId) -> Result<(), TaskError> {
         let owner = owner_word(owner)?;
         self.owner.store(owner, Ordering::Release);

@@ -175,8 +175,8 @@ fn hard_irq_contract_is_zero_alloc_zero_free_and_zero_poll() {
             .snapshot(cpu.as_ref())
             .expect("direct wake must be visible on the target runqueue")
             .runnable(),
-        1,
-        "hard-IRQ wake must activate the target runqueue before returning"
+        2,
+        "rq->nr_running must include current plus the directly woken task"
     );
 
     let executor = LocalExecutor::new(executor_thread.wake_handle())

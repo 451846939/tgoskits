@@ -376,14 +376,14 @@ mod tests {
     fn offline_stops_the_device_and_allows_a_fresh_online_cycle() {
         let mut event = LocalClockEvent::offline();
         assert_eq!(
-            event.online(Some(deadline(100))),
+            event.online(deadline(100)),
             ClockEventAction::Program(deadline(100))
         );
         assert_eq!(event.take_offline(), ClockEventAction::Stop);
         assert_eq!(event.phase(), ClockEventPhase::Offline);
         assert_eq!(event.armed_deadline(), None);
         assert_eq!(
-            event.online(Some(deadline(200))),
+            event.online(deadline(200)),
             ClockEventAction::Program(deadline(200))
         );
     }
@@ -392,12 +392,12 @@ mod tests {
     fn stale_irq_after_reonline_cannot_fire_the_new_cpu_epoch_early() {
         let mut event = LocalClockEvent::offline();
         assert_eq!(
-            event.online(Some(deadline(100))),
+            event.online(deadline(100)),
             ClockEventAction::Program(deadline(100))
         );
         assert_eq!(event.take_offline(), ClockEventAction::Stop);
         assert_eq!(
-            event.online(Some(deadline(200))),
+            event.online(deadline(200)),
             ClockEventAction::Program(deadline(200))
         );
 
@@ -409,7 +409,7 @@ mod tests {
             claim => panic!("armed edge was not claimed: {claim:?}"),
         };
         assert_eq!(
-            event.finish_firing(firing),
+            event.finish_firing(firing, instant(150), false),
             ClockEventAction::Program(deadline(200))
         );
         assert_eq!(event.phase(), ClockEventPhase::Armed);
@@ -419,32 +419,27 @@ mod tests {
     #[test]
     fn old_firing_token_cannot_commit_across_an_offline_cycle() {
         let mut event = LocalClockEvent::offline();
-        event.online(Some(deadline(100)));
+        event.online(deadline(100));
         let old_epoch = event.cpu_epoch();
         let firing = fire_due(&mut event, 100);
 
         assert_eq!(event.take_offline(), ClockEventAction::Stop);
-        event.online(Some(deadline(200)));
+        event.online(deadline(200));
         assert!(event.cpu_epoch() > old_epoch);
 
-        assert_eq!(event.finish_firing(firing), ClockEventAction::None);
+        assert_eq!(
+            event.finish_firing(firing, instant(200), false),
+            ClockEventAction::None
+        );
         assert_eq!(event.phase(), ClockEventPhase::Armed);
         assert_eq!(event.armed_deadline(), Some(deadline(200)));
-    }
-
-    #[test]
-    fn online_without_a_finite_periodic_deadline_stays_idle() {
-        let mut event = LocalClockEvent::offline();
-        assert_eq!(event.online(None), ClockEventAction::None);
-        assert_eq!(event.phase(), ClockEventPhase::Idle);
-        assert_eq!(event.armed_deadline(), None);
     }
 
     #[test]
     fn idle_entry_removes_the_scheduler_tick_from_physical_selection() {
         let mut event = LocalClockEvent::offline();
         assert_eq!(
-            event.online(Some(deadline(100))),
+            event.online(deadline(100)),
             ClockEventAction::Program(deadline(100))
         );
         assert_eq!(
@@ -462,7 +457,7 @@ mod tests {
     #[test]
     fn idle_exit_restarts_the_tick_on_its_original_phase() {
         let mut event = LocalClockEvent::offline();
-        event.online(Some(deadline(100)));
+        event.online(deadline(100));
         assert_eq!(event.stop_scheduler_tick_for_idle(), ClockEventAction::Stop);
 
         assert_eq!(
@@ -475,7 +470,7 @@ mod tests {
     #[test]
     fn repeated_idle_iteration_keeps_the_scheduler_tick_stopped() {
         let mut event = LocalClockEvent::offline();
-        event.online(Some(deadline(100)));
+        event.online(deadline(100));
         assert_eq!(event.stop_scheduler_tick_for_idle(), ClockEventAction::Stop);
         assert_eq!(event.stop_scheduler_tick_for_idle(), ClockEventAction::None);
         assert_eq!(event.phase(), ClockEventPhase::Idle);
@@ -490,7 +485,7 @@ mod tests {
             ClockEventAction::None
         );
         assert_eq!(
-            event.online(Some(deadline(100))),
+            event.online(deadline(100)),
             ClockEventAction::Program(deadline(90))
         );
         assert_eq!(event.take_offline(), ClockEventAction::Stop);
@@ -499,7 +494,7 @@ mod tests {
             ClockEventAction::None
         );
         assert_eq!(
-            event.online(Some(deadline(200))),
+            event.online(deadline(200)),
             ClockEventAction::Program(deadline(200))
         );
         assert_eq!(event.scheduler_generation(), 7);
@@ -507,24 +502,22 @@ mod tests {
     }
 
     #[test]
-    fn periodic_overflow_becomes_idle_instead_of_programming_infinity() {
+    #[should_panic(expected = "finite monotonic clock domain")]
+    fn periodic_overflow_is_a_fatal_clock_domain_violation() {
         let mut event = LocalClockEvent::offline();
         assert_eq!(
-            event.online(Some(deadline(ax_task::runtime::KTIME_MAX_NANOS - 5))),
+            event.online(deadline(ax_task::runtime::KTIME_MAX_NANOS - 5)),
             ClockEventAction::Program(deadline(ax_task::runtime::KTIME_MAX_NANOS - 5))
         );
-        let firing = fire_due(&mut event, ax_task::runtime::KTIME_MAX_NANOS - 1);
+        let _firing = fire_due(&mut event, ax_task::runtime::KTIME_MAX_NANOS - 1);
         assert!(event.advance_periodic(instant(ax_task::runtime::KTIME_MAX_NANOS - 1), 10));
-        assert_eq!(event.finish_firing(firing), ClockEventAction::None);
-        assert_eq!(event.phase(), ClockEventPhase::Idle);
-        assert_eq!(event.armed_deadline(), None);
     }
 
     #[test]
     fn every_changed_selected_deadline_reprograms_the_physical_owner() {
         let mut event = LocalClockEvent::offline();
         assert_eq!(
-            event.online(Some(deadline(500))),
+            event.online(deadline(500)),
             ClockEventAction::Program(deadline(500))
         );
         assert_eq!(
@@ -546,7 +539,11 @@ mod tests {
     #[test]
     fn removing_the_only_deadline_stops_the_physical_owner() {
         let mut event = LocalClockEvent::offline();
-        assert_eq!(event.online(None), ClockEventAction::None);
+        assert_eq!(
+            event.online(deadline(1_000)),
+            ClockEventAction::Program(deadline(1_000))
+        );
+        assert_eq!(event.stop_scheduler_tick_for_idle(), ClockEventAction::Stop);
         assert_eq!(
             event.publish_scheduler(1, Some(scheduler_deadline(300))),
             ClockEventAction::Program(deadline(300))
@@ -575,7 +572,7 @@ mod tests {
     fn firing_merges_updates_and_programs_exactly_once_at_finish() {
         let mut event = LocalClockEvent::offline();
         assert_eq!(
-            event.online(Some(deadline(500))),
+            event.online(deadline(500)),
             ClockEventAction::Program(deadline(500))
         );
         let firing = fire_due(&mut event, 500);
@@ -589,7 +586,7 @@ mod tests {
             ClockEventAction::None
         );
         assert_eq!(
-            event.finish_firing(firing),
+            event.finish_firing(firing, instant(500), false),
             ClockEventAction::Program(deadline(250))
         );
         assert_eq!(event.phase(), ClockEventPhase::Armed);
@@ -598,12 +595,12 @@ mod tests {
     #[test]
     fn periodic_advance_is_merged_with_scheduler_deadline() {
         let mut event = LocalClockEvent::offline();
-        event.online(Some(deadline(100)));
+        event.online(deadline(100));
         let firing = fire_due(&mut event, 100);
         assert!(event.advance_periodic(instant(100), 25));
         event.publish_scheduler(1, Some(scheduler_deadline(140)));
         assert_eq!(
-            event.finish_firing(firing),
+            event.finish_firing(firing, instant(100), false),
             ClockEventAction::Program(deadline(125))
         );
     }
@@ -612,7 +609,7 @@ mod tests {
     fn simultaneous_periodic_and_scheduler_expiry_programs_one_replacement() {
         let mut event = LocalClockEvent::offline();
         assert_eq!(
-            event.online(Some(deadline(100))),
+            event.online(deadline(100)),
             ClockEventAction::Program(deadline(100))
         );
         assert_eq!(
@@ -625,7 +622,7 @@ mod tests {
         assert_eq!(event.publish_scheduler(2, None), ClockEventAction::None);
 
         assert_eq!(
-            event.finish_firing(firing),
+            event.finish_firing(firing, instant(100), false),
             ClockEventAction::Program(deadline(125))
         );
         assert_eq!(event.armed_deadline(), Some(deadline(125)));
@@ -635,7 +632,7 @@ mod tests {
     fn early_irq_uses_one_firing_transaction_and_reprograms_once() {
         let mut event = LocalClockEvent::offline();
         assert_eq!(
-            event.online(Some(deadline(500))),
+            event.online(deadline(500)),
             ClockEventAction::Program(deadline(500))
         );
         assert_eq!(
@@ -648,7 +645,7 @@ mod tests {
             claim => panic!("armed edge was not claimed: {claim:?}"),
         };
         assert_eq!(
-            event.finish_firing(firing),
+            event.finish_firing(firing, instant(50), false),
             ClockEventAction::Program(deadline(100))
         );
         assert_eq!(event.phase(), ClockEventPhase::Armed);
@@ -658,7 +655,8 @@ mod tests {
     #[test]
     fn spurious_irq_while_idle_is_a_bounded_noop() {
         let mut event = LocalClockEvent::offline();
-        assert_eq!(event.online(None), ClockEventAction::None);
+        event.online(deadline(500));
+        assert_eq!(event.stop_scheduler_tick_for_idle(), ClockEventAction::Stop);
 
         assert_eq!(event.claim_irq(instant(100)), ClockEventIrqClaim::Ignored);
         assert_eq!(event.phase(), ClockEventPhase::Idle);
@@ -668,7 +666,7 @@ mod tests {
     #[test]
     fn overdue_scheduler_deadline_remains_immediate_until_firing_reconciles_it() {
         let mut event = LocalClockEvent::offline();
-        event.online(Some(deadline(500)));
+        event.online(deadline(500));
         assert_eq!(
             event.publish_scheduler(1, Some(scheduler_deadline(90))),
             ClockEventAction::Program(deadline(90))
@@ -678,7 +676,7 @@ mod tests {
         let firing = fire_due(&mut event, 100);
         assert_eq!(event.publish_scheduler(2, None), ClockEventAction::None);
         assert_eq!(
-            event.finish_firing(firing),
+            event.finish_firing(firing, instant(100), false),
             ClockEventAction::Program(deadline(500))
         );
         assert!(!event.has_immediate_work(instant(100)));

@@ -180,7 +180,6 @@ pub struct ChargeOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DeadlineRuntimeSnapshot {
     pub(super) remaining_runtime_ns: u64,
-    pub(super) misses: u64,
     pub(super) overruns: u64,
     pub(super) pi_boosted: bool,
     pub(super) donor: Option<ThreadId>,
@@ -215,11 +214,6 @@ impl DeadlineRuntimeSnapshot {
     /// Returns the remaining CBS runtime.
     pub const fn remaining_runtime_ns(self) -> u64 {
         self.remaining_runtime_ns
-    }
-
-    /// Returns observed absolute-deadline misses.
-    pub const fn misses(self) -> u64 {
-        self.misses
     }
 
     /// Returns observed CBS overruns.

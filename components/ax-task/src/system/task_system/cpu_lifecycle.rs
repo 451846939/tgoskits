@@ -128,7 +128,6 @@ impl TaskSystem {
         ensure_runtime_success(task_runtime::prepare_cpu_online(RuntimeCpuId::new(
             id.as_u32(),
         )))?;
-        let _clock = self.sample_owner_rq_clock(cpu.as_ref().get_ref());
         let monotonic_now = task_runtime::monotonic_now();
         cpu.as_mut()
             .reset_fair_balance(monotonic_now, self.config.balance_interval_ns());
@@ -197,7 +196,7 @@ impl TaskSystem {
 
         self.migrate_dormant_deadline_bandwidth_for_cpu_offline(&state, &root_domain, id)?;
 
-        let result = if !remote.try_deactivate() {
+        if !remote.try_deactivate() {
             Err(TaskError::CpuNotQuiescent(id.as_u32()))
         } else if !Self::prepare_thread_targets_for_cpu_offline(&state, &root_domain, id)
             || !remote.try_begin_draining()
@@ -230,8 +229,7 @@ impl TaskSystem {
                 self.cpu_remotes[rt_period_replacement.as_usize()].kick_scheduler_work();
             }
             Ok(())
-        };
-        result
+        }
     }
 
     /// Mirrors Linux `dl_task_offline_migration()` for blocked DL tasks.
@@ -312,6 +310,12 @@ impl TaskSystem {
         root_domain: &RootDomainState,
         cpu: CpuId,
     ) -> bool {
+        let is_idle = |id| {
+            state
+                .cpus
+                .iter()
+                .any(|registration| registration.remote.idle_thread() == Some(id))
+        };
         let fallback_for = |affinity: &CpuSet| {
             state
                 .cpus
@@ -328,12 +332,7 @@ impl TaskSystem {
         };
 
         for record in state.slots.iter().filter_map(|slot| slot.record.as_ref()) {
-            let id = record.core.id();
-            let is_idle = state
-                .cpus
-                .iter()
-                .any(|registration| registration.remote.idle_thread() == Some(id));
-            if is_idle {
+            if is_idle(record.core.id()) {
                 continue;
             }
 
@@ -365,6 +364,9 @@ impl TaskSystem {
         }
 
         for record in state.slots.iter().filter_map(|slot| slot.record.as_ref()) {
+            if is_idle(record.core.id()) {
+                continue;
+            }
             if record.core.wake_cpu_hint() != Some(cpu) {
                 continue;
             }
@@ -471,10 +473,14 @@ mod tests {
         system.enqueue(cpu1.as_mut(), sleeper.id()).unwrap();
         assert_eq!(system.schedule(cpu1.as_mut()).unwrap().next(), sleeper.id());
         system.complete_context_switch(cpu1.as_mut()).unwrap();
-        assert_ne!(
-            system.block_current(cpu1.as_mut()).unwrap().next(),
-            sleeper.id()
-        );
+        let ParkPrepare::Prepared(mut ticket) = system.prepare_park(cpu1.as_mut()).unwrap() else {
+            panic!("the isolated sleeper must enter the park transaction")
+        };
+        let ParkCommit::Blocked(decision) = system.commit_park(cpu1.as_mut(), &mut ticket).unwrap()
+        else {
+            panic!("the isolated sleeper cannot race with a notification")
+        };
+        assert_ne!(decision.next(), sleeper.id());
         system.complete_context_switch(cpu1.as_mut()).unwrap();
         assert_eq!(sleeper.state(), ThreadState::Blocked);
         (system, cpu0, cpu1, sleeper)
@@ -544,6 +550,75 @@ mod tests {
             950_000_000,
             "an offline dl_rq resets to its configured maximum before reuse"
         );
+    }
+
+    #[test]
+    fn deadline_extra_bandwidth_rounds_each_root_domain_reservation() {
+        let system = TaskSystem::new(TaskSystemConfig::new(2)).unwrap();
+        let mut cpu0 = system.create_cpu_local(CpuId::new(0)).unwrap();
+        let mut cpu1 = system.create_cpu_local(CpuId::new(1)).unwrap();
+        for cpu in [&mut cpu0, &mut cpu1] {
+            system
+                .register_idle_thread(
+                    cpu.as_mut(),
+                    ThreadSpec::new(SchedulePolicy::fair(Nice::ZERO, FairMode::Idle)),
+                )
+                .unwrap();
+            system.bring_cpu_online(cpu.as_mut()).unwrap();
+        }
+        let one_nanosecond = SchedulePolicy::deadline(
+            DeadlinePolicy::new(1, 1_000_000_000, 1_000_000_000, DeadlineFlags::NONE).unwrap(),
+        );
+        let first = system
+            .create_thread(ThreadSpec::new(one_nanosecond))
+            .unwrap();
+        let _second = system
+            .create_thread(ThreadSpec::new(one_nanosecond))
+            .unwrap();
+
+        assert_eq!(cpu0.remote().deadline_extra_bw_scaled(), 950_000_000);
+        assert_eq!(cpu1.remote().deadline_extra_bw_scaled(), 950_000_000);
+        system.take_cpu_offline(cpu1.as_mut()).unwrap();
+        assert_eq!(cpu0.remote().deadline_extra_bw_scaled(), 949_999_998);
+        system.bring_cpu_online(cpu1.as_mut()).unwrap();
+        assert_eq!(cpu0.remote().deadline_extra_bw_scaled(), 950_000_000);
+        assert_eq!(cpu1.remote().deadline_extra_bw_scaled(), 950_000_000);
+
+        system
+            .set_thread_policy(
+                first.id(),
+                SchedulePolicy::deadline(
+                    DeadlinePolicy::new(2, 1_000_000_000, 1_000_000_000, DeadlineFlags::NONE)
+                        .unwrap(),
+                ),
+            )
+            .unwrap();
+        assert_eq!(cpu0.remote().deadline_extra_bw_scaled(), 949_999_999);
+        assert_eq!(cpu1.remote().deadline_extra_bw_scaled(), 949_999_999);
+    }
+
+    #[test]
+    fn detached_deadline_policy_release_updates_root_domain_synchronously() {
+        let system = TaskSystem::new(TaskSystemConfig::new(1)).unwrap();
+        let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
+        system
+            .register_idle_thread(
+                cpu.as_mut(),
+                ThreadSpec::new(SchedulePolicy::fair(Nice::ZERO, FairMode::Idle)),
+            )
+            .unwrap();
+        system.bring_cpu_online(cpu.as_mut()).unwrap();
+        let deadline = system
+            .create_thread(ThreadSpec::new(SchedulePolicy::deadline(
+                DeadlinePolicy::new(1, 2, 2, DeadlineFlags::NONE).unwrap(),
+            )))
+            .unwrap();
+        assert_eq!(cpu.remote().deadline_extra_bw_scaled(), 450_000_000);
+
+        system
+            .set_thread_policy(deadline.id(), SchedulePolicy::default())
+            .unwrap();
+        assert_eq!(cpu.remote().deadline_extra_bw_scaled(), 950_000_000);
     }
 
     #[test]

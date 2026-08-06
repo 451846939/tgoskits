@@ -6,8 +6,8 @@ use core::{
 };
 
 use ax_task::{
-    ChargeOutcome, CpuId, CpuLocal, CpuRemote, PiMutexAcquire, PiMutexCore, PiMutexLockResult,
-    PiWaitToken, TaskError, TaskSystem, ThreadId, impl_trait,
+    ChargeOutcome, CpuId, CpuLocal, CpuRemote, ParkCommit, ParkPrepare, PiMutexAcquire,
+    PiMutexCore, PiMutexLockResult, PiWaitToken, TaskError, TaskSystem, ThreadId, impl_trait,
     runtime::{TaskRuntime, *},
 };
 
@@ -71,20 +71,13 @@ pub trait TaskSystemClockTestExt {
         now_ns: u64,
     ) -> Result<ax_task::ScheduleDecision, TaskError>;
 
-    fn replenish_deadline_at(
-        &self,
-        cpu: Pin<&mut CpuLocal>,
-        thread: ThreadId,
-        now_ns: u64,
-    ) -> Result<(), TaskError>;
-
     fn rt_run_queue_may_run_at(
         &self,
         cpu: Pin<&mut CpuLocal>,
         now_ns: u64,
     ) -> Result<bool, TaskError>;
 
-    fn drain_policy_updates_at(
+    fn drain_owner_control_at(
         &self,
         cpu: Pin<&mut CpuLocal>,
         now_ns: u64,
@@ -162,11 +155,19 @@ impl TaskSystemClockTestExt for TaskSystem {
 
     fn block_current_at(
         &self,
-        cpu: Pin<&mut CpuLocal>,
+        mut cpu: Pin<&mut CpuLocal>,
         now_ns: u64,
     ) -> Result<ax_task::ScheduleDecision, TaskError> {
         set_scheduler_ns_for_cpu(cpu.owner().as_u32(), now_ns);
-        self.block_current(cpu)
+        let ParkPrepare::Prepared(mut ticket) = self.prepare_park(cpu.as_mut())? else {
+            panic!("isolated block fixture unexpectedly consumed a preceding notification")
+        };
+        match self.commit_park(cpu, &mut ticket)? {
+            ParkCommit::Blocked(decision) => Ok(decision),
+            ParkCommit::Notified => {
+                panic!("isolated block fixture unexpectedly raced with a notification")
+            }
+        }
     }
 
     fn exit_current_at(
@@ -178,16 +179,6 @@ impl TaskSystemClockTestExt for TaskSystem {
         self.exit_current(cpu)
     }
 
-    fn replenish_deadline_at(
-        &self,
-        cpu: Pin<&mut CpuLocal>,
-        thread: ThreadId,
-        now_ns: u64,
-    ) -> Result<(), TaskError> {
-        set_scheduler_ns_for_cpu(cpu.owner().as_u32(), now_ns);
-        self.replenish_deadline(cpu, thread)
-    }
-
     fn rt_run_queue_may_run_at(
         &self,
         cpu: Pin<&mut CpuLocal>,
@@ -197,13 +188,13 @@ impl TaskSystemClockTestExt for TaskSystem {
         self.rt_run_queue_may_run(cpu)
     }
 
-    fn drain_policy_updates_at(
+    fn drain_owner_control_at(
         &self,
         cpu: Pin<&mut CpuLocal>,
         now_ns: u64,
     ) -> Result<ax_task::OwnerControlDrain, TaskError> {
         set_scheduler_ns_for_cpu(cpu.owner().as_u32(), now_ns);
-        self.drain_policy_updates(cpu)
+        self.drain_owner_control(cpu)
     }
 }
 
@@ -718,8 +709,8 @@ impl_trait! {
         }
         fn flush_tlb_local(_start: usize, _size: usize) {}
         fn trace_sched_switch(_record: SchedSwitchRecord) {}
-        fn fatal_invariant(_code: u32, _argument: usize) -> ! {
-            panic!("scheduler invariant reported by integration test")
+        fn fatal_invariant(code: u32, argument: usize) -> ! {
+            panic!("scheduler invariant {code:#010x} reported with argument {argument:#x}")
         }
     }
 }

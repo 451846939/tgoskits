@@ -78,7 +78,11 @@ const fn request_generation(word: u64) -> u64 {
 
 impl CpuRemote {
     pub(crate) fn is_scheduler_ready(&self) -> bool {
-        self.current_thread().is_some() && self.idle_thread().is_some()
+        // CPU online publication is ordered after bootstrap/current and idle
+        // installation. Do not mirror `rq->curr` in an atomic readiness bit:
+        // lifecycle plus the immutable idle identity are the stable facts
+        // remote placement needs here.
+        self.is_online() && self.idle_thread().is_some()
     }
 
     /// Publishes a sticky owner-CPU reschedule request.

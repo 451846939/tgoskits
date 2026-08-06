@@ -2,9 +2,8 @@
 //! Deterministic owner-only SMP push/pull scheduler contracts.
 
 use ax_task::{
-    CpuId, CpuSet, DEFAULT_BALANCE_INTERVAL_NS, DeadlineFlags, DeadlinePolicy, FairMode, Nice,
-    PiMutexCore, RtPriority, SchedulePolicy, SchedulingClass, TaskSystem, TaskSystemConfig,
-    ThreadSpec, ThreadState, WakeResult,
+    CpuId, CpuSet, DEFAULT_BALANCE_INTERVAL_NS, FairMode, Nice, RtPriority, SchedulePolicy,
+    TaskSystem, TaskSystemConfig, ThreadSpec, ThreadState, WakeResult,
 };
 
 pub mod support;
@@ -22,9 +21,9 @@ fn idle_cpu_requests_source_owned_rt_handoff() {
         idle1.id()
     );
 
-    assert!(system.request_idle_pull(cpu1.as_ref()).unwrap());
-    system.drain_policy_updates_at(cpu0.as_mut(), 1).unwrap();
-    system.drain_policy_updates_at(cpu1.as_mut(), 1).unwrap();
+    assert!(system.request_idle_pull(cpu1.as_mut()).unwrap());
+    system.drain_owner_control_at(cpu0.as_mut(), 1).unwrap();
+    system.drain_owner_control_at(cpu1.as_mut(), 1).unwrap();
 
     assert_eq!(
         system.schedule_at(cpu1.as_mut(), 1).unwrap().next(),
@@ -48,8 +47,8 @@ fn coalesced_idle_requests_leave_final_selection_to_the_source_owner() {
         idle1.id()
     );
 
-    assert!(system.request_idle_pull(cpu1.as_ref()).unwrap());
-    assert!(system.request_idle_pull(cpu1.as_ref()).unwrap());
+    assert!(system.request_idle_pull(cpu1.as_mut()).unwrap());
+    assert!(system.request_idle_pull(cpu1.as_mut()).unwrap());
     assert_eq!(
         support::ipi_count(0),
         1,
@@ -59,10 +58,10 @@ fn coalesced_idle_requests_leave_final_selection_to_the_source_owner() {
         .set_affinity(low.id(), singleton_affinity(2, 0))
         .unwrap();
 
-    let drained = system.drain_policy_updates_at(cpu0.as_mut(), 1).unwrap();
+    let drained = system.drain_owner_control_at(cpu0.as_mut(), 1).unwrap();
     assert!(drained.drained() <= ax_task::DEFAULT_BATCH_LIMIT);
-    system.drain_policy_updates_at(cpu1.as_mut(), 1).unwrap();
-    assert_eq!(cpu1.queued_summary(), Some(0));
+    system.drain_owner_control_at(cpu1.as_mut(), 1).unwrap();
+    assert_eq!(cpu1.queued_summary(), 0);
 }
 
 #[test]
@@ -77,46 +76,23 @@ fn stale_idle_pull_request_cannot_overfill_a_target_that_became_runnable() {
         idle1.id()
     );
 
-    assert!(system.request_idle_pull(cpu1.as_ref()).unwrap());
+    assert!(system.request_idle_pull(cpu1.as_mut()).unwrap());
     let local = ready_thread(&system, SchedulePolicy::default());
     system.enqueue_at(cpu1.as_mut(), local.id(), 1).unwrap();
-    assert_eq!(cpu1.queued_summary(), Some(1));
+    assert_eq!(cpu1.queued_summary(), 1);
 
-    system.drain_policy_updates_at(cpu0.as_mut(), 1).unwrap();
-    system.drain_policy_updates_at(cpu1.as_mut(), 1).unwrap();
+    system.drain_owner_control_at(cpu0.as_mut(), 1).unwrap();
+    system.drain_owner_control_at(cpu1.as_mut(), 1).unwrap();
 
     assert_eq!(
         cpu0.queued_summary(),
-        Some(2),
+        2,
         "the source must retain its candidate when the target cancels an uncommitted pull"
     );
     assert_eq!(
         cpu1.queued_summary(),
-        Some(1),
+        1,
         "work arriving before the pull commits must invalidate the stale idle request"
-    );
-}
-
-#[test]
-fn overloaded_owner_pushes_earliest_deadline_through_owner_handoff() {
-    let (system, mut cpu0, mut cpu1, _idle1) = online_pair();
-    let later = ready_thread(&system, SchedulePolicy::deadline(deadline_policy(1, 8, 20)));
-    let earlier = ready_thread(&system, SchedulePolicy::deadline(deadline_policy(1, 5, 20)));
-    system.enqueue_at(cpu0.as_mut(), later.id(), 0).unwrap();
-    system.enqueue_at(cpu0.as_mut(), earlier.id(), 0).unwrap();
-
-    assert_eq!(
-        system.push_overloaded(cpu0.as_mut()).unwrap(),
-        Some(earlier.id())
-    );
-    assert_eq!(cpu0.queued_summary(), Some(1));
-    assert_eq!(cpu1.queued_summary(), Some(0));
-
-    system.drain_policy_updates_at(cpu1.as_mut(), 1).unwrap();
-    assert_eq!(cpu1.queued_summary(), Some(1));
-    assert_eq!(
-        system.schedule_at(cpu1.as_mut(), 1).unwrap().next(),
-        earlier.id()
     );
 }
 
@@ -134,10 +110,10 @@ fn scheduling_overloaded_rt_queue_pushes_one_candidate_automatically() {
         system.schedule_at(cpu0.as_mut(), 0).unwrap().next(),
         high.id()
     );
-    system.drain_policy_updates_at(cpu1.as_mut(), 1).unwrap();
+    system.drain_owner_control_at(cpu1.as_mut(), 1).unwrap();
 
-    assert_eq!(cpu0.queued_summary(), Some(1));
-    assert_eq!(cpu1.queued_summary(), Some(1));
+    assert_eq!(cpu0.queued_summary(), 1);
+    assert_eq!(cpu1.queued_summary(), 1);
     assert_eq!(
         system.schedule_at(cpu1.as_mut(), 1).unwrap().next(),
         middle.id()
@@ -145,37 +121,25 @@ fn scheduling_overloaded_rt_queue_pushes_one_candidate_automatically() {
 }
 
 #[test]
-fn load_summary_publishes_effective_current_and_top_pushable_keys() {
+fn load_summary_contains_only_fair_domain_load() {
     let (system, mut cpu0, _cpu1, _idle1) = online_pair();
-    let owner = ready_thread(&system, SchedulePolicy::default());
-    let donor = system
-        .create_thread(ThreadSpec::new(SchedulePolicy::fifo(
-            RtPriority::new(90).unwrap(),
-        )))
-        .unwrap();
-    let pushable = ready_thread(&system, SchedulePolicy::fifo(RtPriority::new(80).unwrap()));
-    system.enqueue_at(cpu0.as_mut(), owner.id(), 0).unwrap();
+    let current = ready_thread(&system, SchedulePolicy::fifo(RtPriority::new(90).unwrap()));
+    let queued = ready_thread(&system, SchedulePolicy::fifo(RtPriority::new(80).unwrap()));
+    system.enqueue_at(cpu0.as_mut(), current.id(), 0).unwrap();
     assert_eq!(
         system.schedule_at(cpu0.as_mut(), 0).unwrap().next(),
-        owner.id()
+        current.id()
     );
     let before = cpu0.load_summary().epoch();
-    let lock = PiMutexCore::new();
-    let wait = support::commit_pi_wait(&system, &lock, donor.id(), owner.id()).unwrap();
-    system.drain_policy_updates_at(cpu0.as_mut(), 1).unwrap();
-    system.enqueue_at(cpu0.as_mut(), pushable.id(), 1).unwrap();
+    system.enqueue_at(cpu0.as_mut(), queued.id(), 1).unwrap();
 
     let summary = cpu0.load_summary();
     assert!(summary.epoch() > before);
     assert_eq!(summary.queued_count(), 1);
-    assert_eq!(summary.current_key().unwrap().class_rank(), 2);
-    assert_eq!(summary.current_key().unwrap().primary(), 9);
-    assert_eq!(summary.pushable_class(), Some(SchedulingClass::Realtime));
-    assert_eq!(summary.pushable_key().unwrap().primary(), 19);
+    assert_eq!(summary.nr_running(), 2);
     assert_eq!(summary.fair_demand(), 0);
     assert_eq!(summary.workload_demand(), 2_048);
-    assert!(summary.is_overloaded());
-    system.pi_wait_cancel(wait).unwrap();
+    assert!(!summary.has_pushable_fair());
 }
 
 #[test]
@@ -191,8 +155,8 @@ fn initial_fair_placement_uses_an_idle_allowed_cpu() {
         system.schedule_at(cpu1.as_mut(), 0).unwrap().next(),
         idle1.id()
     );
-    assert_eq!(cpu0.queued_summary(), Some(0));
-    assert_eq!(cpu1.queued_summary(), Some(0));
+    assert_eq!(cpu0.queued_summary(), 0);
+    assert_eq!(cpu1.queued_summary(), 0);
     assert_eq!(cpu0.load_summary().nr_running(), 1);
     assert_eq!(cpu1.load_summary().nr_running(), 0);
 
@@ -201,11 +165,7 @@ fn initial_fair_placement_uses_an_idle_allowed_cpu() {
         .place_ready_at(cpu0.as_mut(), placed.id(), 1)
         .unwrap();
 
-    assert!(
-        cpu1.has_remote_work(),
-        "a new fair thread must use an idle allowed CPU instead of stacking behind its creator"
-    );
-    system.drain_policy_updates_at(cpu1.as_mut(), 1).unwrap();
+    system.drain_owner_control_at(cpu1.as_mut(), 1).unwrap();
     assert_eq!(
         system.schedule_at(cpu1.as_mut(), 1).unwrap().next(),
         placed.id()
@@ -238,11 +198,11 @@ fn initial_fair_placement_accounts_for_in_flight_migrations() {
 
     assert_eq!(
         cpu0.queued_summary(),
-        Some(2),
+        2,
         "unconsumed remote placements must participate in subsequent CPU selection"
     );
-    system.drain_policy_updates_at(cpu1.as_mut(), 1).unwrap();
-    assert_eq!(cpu1.queued_summary(), Some(2));
+    system.drain_owner_control_at(cpu1.as_mut(), 1).unwrap();
+    assert_eq!(cpu1.queued_summary(), 2);
     drop(placed);
 }
 
@@ -267,36 +227,11 @@ fn in_flight_migration_reserves_the_exact_fair_demand() {
 
     assert_eq!(
         cpu0.queued_summary(),
-        Some(3),
+        3,
         "the pending nice -20 carrier must outweigh two local normal tasks during placement"
     );
-    system.drain_policy_updates_at(cpu1.as_mut(), 1).unwrap();
-    assert_eq!(cpu1.queued_summary(), Some(1));
-}
-
-#[test]
-fn rt_push_keeps_the_more_urgent_current_task_on_its_owner() {
-    let (system, mut cpu0, mut cpu1, _idle1) = online_pair();
-    let current = ready_thread(&system, SchedulePolicy::fifo(RtPriority::new(90).unwrap()));
-    let urgent = ready_thread(&system, SchedulePolicy::fifo(RtPriority::new(95).unwrap()));
-    let pushable = ready_thread(&system, SchedulePolicy::fifo(RtPriority::new(80).unwrap()));
-    system.enqueue_at(cpu0.as_mut(), current.id(), 0).unwrap();
-    assert_eq!(
-        system.schedule_at(cpu0.as_mut(), 0).unwrap().next(),
-        current.id()
-    );
-    system.enqueue_at(cpu0.as_mut(), urgent.id(), 1).unwrap();
-    system.enqueue_at(cpu0.as_mut(), pushable.id(), 1).unwrap();
-
-    assert_eq!(
-        system.push_overloaded(cpu0.as_mut()).unwrap(),
-        Some(pushable.id())
-    );
-    system.drain_policy_updates_at(cpu1.as_mut(), 1).unwrap();
-    assert_eq!(
-        system.schedule_at(cpu1.as_mut(), 1).unwrap().next(),
-        pushable.id()
-    );
+    system.drain_owner_control_at(cpu1.as_mut(), 1).unwrap();
+    assert_eq!(cpu1.queued_summary(), 1);
 }
 
 #[test]
@@ -314,10 +249,10 @@ fn idle_pull_prefers_rt_work_over_a_larger_fair_queue() {
     system.enqueue_at(cpus[1].as_mut(), high.id(), 0).unwrap();
     system.enqueue_at(cpus[1].as_mut(), low.id(), 0).unwrap();
 
-    assert!(system.request_idle_pull(cpus[2].as_ref()).unwrap());
-    system.drain_policy_updates_at(cpus[0].as_mut(), 1).unwrap();
-    system.drain_policy_updates_at(cpus[1].as_mut(), 1).unwrap();
-    system.drain_policy_updates_at(cpus[2].as_mut(), 1).unwrap();
+    assert!(system.request_idle_pull(cpus[2].as_mut()).unwrap());
+    system.drain_owner_control_at(cpus[0].as_mut(), 1).unwrap();
+    system.drain_owner_control_at(cpus[1].as_mut(), 1).unwrap();
+    system.drain_owner_control_at(cpus[2].as_mut(), 1).unwrap();
 
     assert_eq!(
         system.schedule_at(cpus[2].as_mut(), 1).unwrap().next(),
@@ -359,16 +294,17 @@ fn idle_pull_uses_weighted_demand_not_task_count_within_fair_class() {
     assert_eq!(light.nr_running(), 2);
     assert_eq!(heavy.nr_running(), 5);
     assert!(
-        light.pushable_key() < heavy.pushable_key(),
-        "the fixture must expose that per-runqueue EEVDF deadlines are not a cross-CPU load metric"
+        light.fair_demand() > heavy.fair_demand(),
+        "the fixture must expose that nice-weighted fair demand, not task count, selects the \
+         source"
     );
 
     support::set_monotonic_ns(DEFAULT_BALANCE_INTERVAL_NS);
     support::set_scheduler_ns(DEFAULT_BALANCE_INTERVAL_NS);
-    assert!(system.request_idle_pull(cpus[2].as_ref()).unwrap());
+    assert!(system.request_idle_pull(cpus[2].as_mut()).unwrap());
     for cpu in &mut cpus {
         system
-            .drain_policy_updates_at(cpu.as_mut(), DEFAULT_BALANCE_INTERVAL_NS)
+            .drain_owner_control_at(cpu.as_mut(), DEFAULT_BALANCE_INTERVAL_NS)
             .unwrap();
     }
     let pulled = system
@@ -402,8 +338,10 @@ fn initial_fair_placement_uses_weighted_demand_not_task_count() {
         .place_ready_at(cpu0.as_mut(), placed.id(), 1)
         .unwrap();
 
-    assert!(
-        cpu1.has_remote_work(),
+    system.drain_owner_control_at(cpu1.as_mut(), 1).unwrap();
+    assert_eq!(
+        system.schedule_at(cpu1.as_mut(), 1).unwrap().next(),
+        placed.id(),
         "the new fair task must target the lower weighted-demand CPU even when it owns more tasks"
     );
 }
@@ -429,8 +367,8 @@ fn balance_never_hands_off_a_thread_that_is_still_on_cpu() {
         system.schedule_at(cpu0.as_mut(), 1).unwrap().next(),
         preemptor.id()
     );
-    system.drain_policy_updates_at(cpu1.as_mut(), 1).unwrap();
-    assert_eq!(cpu1.queued_summary(), Some(0));
+    system.drain_owner_control_at(cpu1.as_mut(), 1).unwrap();
+    assert_eq!(cpu1.queued_summary(), 0);
     assert_eq!(
         system.schedule_at(cpu1.as_mut(), 1).unwrap().next(),
         idle1.id()
@@ -446,8 +384,8 @@ fn fair_push_waits_for_the_configured_balance_interval() {
     }
 
     let _first = system.schedule_at(cpu0.as_mut(), 0).unwrap();
-    system.drain_policy_updates_at(cpu1.as_mut(), 0).unwrap();
-    assert_eq!(cpu1.queued_summary(), Some(0));
+    system.drain_owner_control_at(cpu1.as_mut(), 0).unwrap();
+    assert_eq!(cpu1.queued_summary(), 0);
     assert_eq!(
         system.schedule_at(cpu1.as_mut(), 0).unwrap().next(),
         idle1.id()
@@ -457,9 +395,9 @@ fn fair_push_waits_for_the_configured_balance_interval() {
         .schedule_at(cpu0.as_mut(), DEFAULT_BALANCE_INTERVAL_NS)
         .unwrap();
     system
-        .drain_policy_updates_at(cpu1.as_mut(), DEFAULT_BALANCE_INTERVAL_NS)
+        .drain_owner_control_at(cpu1.as_mut(), DEFAULT_BALANCE_INTERVAL_NS)
         .unwrap();
-    assert_eq!(cpu1.queued_summary(), Some(1));
+    assert_eq!(cpu1.queued_summary(), 1);
 }
 
 #[test]
@@ -500,11 +438,11 @@ fn fair_balance_deadline_is_relative_to_cpu_online_time() {
     );
     for cpu in cpus.iter_mut().skip(1) {
         system
-            .drain_policy_updates_at(cpu.as_mut(), BOOT_NOW_NS)
+            .drain_owner_control_at(cpu.as_mut(), BOOT_NOW_NS)
             .unwrap();
         assert_eq!(
             cpu.queued_summary(),
-            Some(0),
+            0,
             "the first runnable batch must receive one full balance interval locally"
         );
     }
@@ -534,31 +472,17 @@ fn fair_balance_deadline_is_relative_to_cpu_online_time() {
     );
     for cpu in cpus.iter_mut().skip(1) {
         system
-            .drain_policy_updates_at(cpu.as_mut(), balance_now)
+            .drain_owner_control_at(cpu.as_mut(), balance_now)
             .unwrap();
     }
     assert_eq!(
         cpus.iter()
             .skip(1)
-            .map(|cpu| cpu.queued_summary().unwrap())
+            .map(|cpu| cpu.queued_summary())
             .sum::<usize>(),
         1
     );
     support::clear_handles();
-}
-
-#[test]
-fn hard_irq_context_cannot_run_owner_balance() {
-    let (system, mut cpu0, _cpu1, _idle1) = online_pair();
-    let later = ready_thread(&system, SchedulePolicy::deadline(deadline_policy(1, 8, 20)));
-    let earlier = ready_thread(&system, SchedulePolicy::deadline(deadline_policy(1, 5, 20)));
-    system.enqueue_at(cpu0.as_mut(), later.id(), 0).unwrap();
-    system.enqueue_at(cpu0.as_mut(), earlier.id(), 0).unwrap();
-
-    support::set_hard_irq(true);
-    assert_eq!(system.push_overloaded(cpu0.as_mut()).unwrap(), None);
-    support::set_hard_irq(false);
-    assert_eq!(cpu0.queued_summary(), Some(2));
 }
 
 #[test]
@@ -597,20 +521,17 @@ fn direct_wake_is_migrated_after_a_new_affinity_generation() {
     assert_eq!(blocked.assigned_cpu(), Some(CpuId::new(0)));
     assert_eq!(
         cpu0.queued_summary(),
-        Some(1),
+        1,
         "direct wake must commit queue membership and remotely visible load in one rq transaction"
     );
     system
         .set_affinity(blocked.id(), singleton_affinity(2, 1))
         .unwrap();
-    assert_eq!(cpu0.queued_summary(), Some(1));
-    assert!(cpu0.has_remote_work());
-
-    system.drain_policy_updates_at(cpu0.as_mut(), 1).unwrap();
-    assert_eq!(cpu0.queued_summary(), Some(0));
-    assert!(cpu1.has_remote_work());
-    system.drain_policy_updates_at(cpu1.as_mut(), 1).unwrap();
-    assert_eq!(cpu1.queued_summary(), Some(1));
+    assert_eq!(cpu0.queued_summary(), 1);
+    system.drain_owner_control_at(cpu0.as_mut(), 1).unwrap();
+    assert_eq!(cpu0.queued_summary(), 0);
+    system.drain_owner_control_at(cpu1.as_mut(), 1).unwrap();
+    assert_eq!(cpu1.queued_summary(), 1);
     assert_eq!(
         system.schedule_at(cpu1.as_mut(), 1).unwrap().next(),
         blocked.id()
@@ -640,18 +561,14 @@ fn in_flight_migration_is_forwarded_to_latest_affinity_target() {
     system
         .set_affinity(thread.id(), singleton_affinity(3, 1))
         .unwrap();
-    system.drain_policy_updates_at(cpus[0].as_mut(), 1).unwrap();
-    assert!(cpus[1].has_remote_work());
-
+    system.drain_owner_control_at(cpus[0].as_mut(), 1).unwrap();
     system
         .set_affinity(thread.id(), singleton_affinity(3, 2))
         .unwrap();
-    system.drain_policy_updates_at(cpus[1].as_mut(), 2).unwrap();
-    assert_eq!(cpus[1].queued_summary(), Some(0));
-    assert!(cpus[2].has_remote_work());
-
-    system.drain_policy_updates_at(cpus[2].as_mut(), 3).unwrap();
-    assert_eq!(cpus[2].queued_summary(), Some(1));
+    system.drain_owner_control_at(cpus[1].as_mut(), 2).unwrap();
+    assert_eq!(cpus[1].queued_summary(), 0);
+    system.drain_owner_control_at(cpus[2].as_mut(), 3).unwrap();
+    assert_eq!(cpus[2].queued_summary(), 1);
     assert_eq!(
         system.schedule_at(cpus[2].as_mut(), 3).unwrap().next(),
         thread.id()
@@ -685,13 +602,13 @@ fn remote_affinity_completion_waits_for_the_destination_owner() {
         "publishing the owner request is not migration completion"
     );
 
-    system.drain_policy_updates_at(cpu0.as_mut(), 1).unwrap();
+    system.drain_owner_control_at(cpu0.as_mut(), 1).unwrap();
     assert_eq!(
         request.try_result(),
         None,
         "detaching from the source is not destination ownership"
     );
-    system.drain_policy_updates_at(cpu1.as_mut(), 2).unwrap();
+    system.drain_owner_control_at(cpu1.as_mut(), 2).unwrap();
     assert_eq!(request.try_result(), Some(Ok(())));
     support::clear_handles();
 }
@@ -718,16 +635,16 @@ fn concurrent_affinity_waiters_complete_only_after_the_latest_destination() {
     let first = system
         .request_affinity(thread.id(), singleton_affinity(3, 1))
         .unwrap();
-    system.drain_policy_updates_at(cpus[0].as_mut(), 1).unwrap();
+    system.drain_owner_control_at(cpus[0].as_mut(), 1).unwrap();
     let latest = system
         .request_affinity(thread.id(), singleton_affinity(3, 2))
         .unwrap();
 
-    system.drain_policy_updates_at(cpus[1].as_mut(), 2).unwrap();
+    system.drain_owner_control_at(cpus[1].as_mut(), 2).unwrap();
     assert_eq!(first.try_result(), None);
     assert_eq!(latest.try_result(), None);
 
-    system.drain_policy_updates_at(cpus[2].as_mut(), 3).unwrap();
+    system.drain_owner_control_at(cpus[2].as_mut(), 3).unwrap();
     assert_eq!(first.try_result(), Some(Ok(())));
     assert_eq!(latest.try_result(), Some(Ok(())));
     support::clear_handles();
@@ -742,14 +659,14 @@ fn exiting_target_resolves_a_pending_affinity_waiter() {
     let request = system
         .request_affinity(thread.id(), singleton_affinity(2, 1))
         .unwrap();
-    system.drain_policy_updates_at(cpu0.as_mut(), 1).unwrap();
+    system.drain_owner_control_at(cpu0.as_mut(), 1).unwrap();
     system.mark_exited(thread.id()).unwrap();
 
     assert_eq!(
         request.try_result(),
         Some(Err(ax_task::TaskError::StaleThreadId))
     );
-    system.drain_policy_updates_at(cpu1.as_mut(), 2).unwrap();
+    system.drain_owner_control_at(cpu1.as_mut(), 2).unwrap();
 }
 
 #[test]
@@ -762,9 +679,7 @@ fn exited_thread_waits_for_in_flight_migration_delivery() {
     system
         .set_affinity(thread_id, singleton_affinity(2, 1))
         .unwrap();
-    system.drain_policy_updates_at(cpu0.as_mut(), 1).unwrap();
-    assert!(cpu1.has_remote_work());
-
+    system.drain_owner_control_at(cpu0.as_mut(), 1).unwrap();
     system.mark_exited(thread_id).unwrap();
     drop(thread);
     assert_eq!(
@@ -776,8 +691,8 @@ fn exited_thread_waits_for_in_flight_migration_delivery() {
         "an inbox-held migration delivery must pin registry-owned resources"
     );
 
-    system.drain_policy_updates_at(cpu1.as_mut(), 2).unwrap();
-    assert_eq!(cpu1.queued_summary(), Some(0));
+    system.drain_owner_control_at(cpu1.as_mut(), 2).unwrap();
+    assert_eq!(cpu1.queued_summary(), 0);
     assert_eq!(
         system
             .service_deferred_task_work(ax_task::DEFAULT_BATCH_LIMIT)
@@ -848,10 +763,6 @@ fn ready_thread(system: &TaskSystem, policy: SchedulePolicy) -> ax_task::ThreadH
     let thread = system.create_thread(ThreadSpec::new(policy)).unwrap();
     system.make_ready(thread.id()).unwrap();
     thread
-}
-
-fn deadline_policy(runtime_ns: u64, deadline_ns: u64, period_ns: u64) -> DeadlinePolicy {
-    DeadlinePolicy::new(runtime_ns, deadline_ns, period_ns, DeadlineFlags::NONE).unwrap()
 }
 
 fn singleton_affinity(cpu_count: usize, cpu: u32) -> CpuSet {

@@ -47,7 +47,10 @@ use registry::{
 use root_domain::{DeadlineBandwidthRebuild, RootDomain, RootDomainPushClass, RootDomainState};
 use thread_callbacks::ThreadCallbackState;
 
-use super::thread_sched::{PiScheduleUpdate, ThreadSchedCell, ThreadSchedState};
+use super::thread_sched::{
+    PiScheduleUpdate, ThreadDeadlineInit, ThreadPlacementInit, ThreadPolicyInit, ThreadRuntimeInit,
+    ThreadSchedCell, ThreadSchedInit, ThreadSchedState,
+};
 #[cfg(test)]
 use crate::runtime::ExecutionContextHandle;
 #[cfg(feature = "qperf-metrics")]
@@ -103,6 +106,7 @@ fn apply_pi_schedule_update(
         donor,
         deadline_donor,
         deadline_donor_core,
+        deadline_donor_server,
         generation: _,
     } = update;
     let old_donor = sched.pi.donor;
@@ -115,15 +119,7 @@ fn apply_pi_schedule_update(
     }
 
     let source_changed = old_donor != donor || old_deadline_donor != deadline_donor;
-    let donor_server = match deadline_donor_core.as_ref() {
-        Some(core) => Some(
-            core.upgrade()
-                .ok_or(TaskError::InvalidPiState)?
-                .sched()
-                .deadline_server(),
-        ),
-        None => None,
-    };
+    let donor_server = deadline_donor_server;
     match (donor, policy) {
         (None, base_policy) if base_policy == base => {
             active.use_base_entity(base_policy);

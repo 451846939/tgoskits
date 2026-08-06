@@ -216,13 +216,16 @@ fn dedicated_idle_does_not_expire_a_fair_service_request() {
         .charge_current_at(cpu.as_mut(), fair_slice_ns, fair_slice_ns, 0)
         .unwrap();
 
-    assert_eq!(cpu.current(), Some(idle.id()));
+    assert_eq!(
+        system.snapshot(cpu.as_ref()).unwrap().current(),
+        Some(idle.id())
+    );
     assert!(
         !charge.slice_expired(),
         "the dedicated idle class does not own a fair service request"
     );
     assert!(
-        !cpu.needs_reschedule(),
+        !system.snapshot(cpu.as_ref()).unwrap().need_resched(),
         "idle accounting must not continuously republish need_resched"
     );
 
@@ -260,7 +263,7 @@ fn sched_idle_work_preempts_the_dedicated_idle_class() {
     system.enqueue_at(cpu.as_mut(), sched_idle.id(), 1).unwrap();
 
     assert!(
-        cpu.needs_reschedule(),
+        system.snapshot(cpu.as_ref()).unwrap().need_resched(),
         "every runnable scheduling class must preempt the dedicated idle class"
     );
 

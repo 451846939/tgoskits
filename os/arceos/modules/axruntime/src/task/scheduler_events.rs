@@ -156,25 +156,23 @@ pub(super) fn record_scheduler_ipi_send() {
 #[cfg(feature = "irq")]
 pub(crate) fn on_clock_event(
     now: ax_task::runtime::MonotonicInstant,
-    scheduler_tick: bool,
 ) -> ax_task::TaskClockEventOutcome {
     TASK_TIMER_IRQ_COUNT.fetch_add(1, Ordering::Relaxed);
-    account_clock_event(now, scheduler_tick)
+    account_clock_event(now)
 }
 
 #[cfg(feature = "irq")]
-fn account_clock_event(
-    now: ax_task::runtime::MonotonicInstant,
-    scheduler_tick: bool,
-) -> ax_task::TaskClockEventOutcome {
-    match ax_task::on_clock_event_with_scheduler_tick(
-        now,
-        TASK_CLOCK_EVENT_IRQ_BUDGET,
-        scheduler_tick,
-    ) {
+fn account_clock_event(now: ax_task::runtime::MonotonicInstant) -> ax_task::TaskClockEventOutcome {
+    match ax_task::on_clock_event(now, TASK_CLOCK_EVENT_IRQ_BUDGET) {
         Ok(outcome) => outcome,
         Err(error) => panic!("task clockevent accounting failed: {error}"),
     }
+}
+
+#[cfg(feature = "irq")]
+pub(crate) fn publish_scheduler_tick(stamp: ax_task::SchedulerTickStamp) {
+    ax_task::publish_scheduler_tick(stamp)
+        .unwrap_or_else(|error| panic!("scheduler tick publication failed: {error}"));
 }
 
 /// Consumes scheduler delivery ownership from the shared physical IPI vector.

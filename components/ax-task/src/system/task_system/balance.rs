@@ -106,6 +106,7 @@ impl TaskSystem {
     /// scheduling state changes. Timer and owner-work callers that need only a
     /// timestamp therefore cannot mutate `rq->clock` outside the rq commit
     /// protocol.
+    #[cfg(test)]
     pub(crate) fn sample_owner_rq_clock(&self, cpu: &CpuLocal) -> RunQueueClockSnapshot {
         let transaction = OwnerRqTxn::begin(self, cpu.remote());
         let clock = transaction.clock();
@@ -118,6 +119,8 @@ impl TaskSystem {
         remote: &CpuRemote,
         run_queue: &CpuRunQueueState,
     ) {
+        #[cfg(test)]
+        LOAD_SUMMARY_PUBLICATIONS.set(LOAD_SUMMARY_PUBLICATIONS.get().saturating_add(1));
         remote.publish_run_queue_load_summary(run_queue);
         self.root_domain
             .publish_run_queue(remote.owner(), run_queue, remote.accepts_placement());
@@ -415,7 +418,6 @@ impl TaskSystem {
             &mut transaction,
         );
         sched.policy.install_active(detached.into_active());
-        self.capture_owner_fair_migration_in_rq(&transaction, &mut sched);
         sched.placement.begin_migration(source, target);
         core.set_wake_cpu_hint(target);
         transaction.commit();

@@ -131,7 +131,7 @@ pub(crate) fn enable_irqs_after_scheduler_online(_online: crate::task::Published
 struct ClockEventFiringTransaction {
     token: crate::clock_event::ClockEventFiringToken,
     #[cfg(feature = "multitask")]
-    scheduler_tick: bool,
+    periodic_tick: bool,
 }
 
 #[cfg(feature = "irq")]
@@ -149,13 +149,15 @@ impl ClockEventFiringTransaction {
             }
             crate::clock_event::ClockEventIrqClaim::Firing(token) => token,
         };
-        let _scheduler_tick = with_local_clock_event_mut(|clockevent| {
+        let periodic_tick = with_local_clock_event_mut(|clockevent| {
             clockevent.advance_periodic(now, periodic_interval_nanos())
         });
+        #[cfg(not(feature = "multitask"))]
+        let _ = periodic_tick;
         Ok(Self {
             token,
             #[cfg(feature = "multitask")]
-            scheduler_tick: _scheduler_tick,
+            periodic_tick,
         })
     }
 
@@ -179,8 +181,8 @@ impl ClockEventFiringTransaction {
     }
 
     #[cfg(feature = "multitask")]
-    const fn scheduler_tick(&self) -> bool {
-        self.scheduler_tick
+    const fn periodic_tick(&self) -> bool {
+        self.periodic_tick
     }
 }
 
@@ -303,7 +305,11 @@ pub(crate) fn timer_irq_handler(ctx: ax_hal::irq::IrqContext) -> ax_hal::irq::Ir
             .expect("current CPU scheduler clock must be online before timer IRQs");
         let now = monotonic_now();
         #[cfg(feature = "multitask")]
-        let outcome = crate::task::on_clock_event(now, firing.scheduler_tick());
+        let outcome = crate::task::on_clock_event(now);
+        #[cfg(feature = "multitask")]
+        if firing.periodic_tick() {
+            crate::task::publish_scheduler_tick(outcome.scheduler_tick_stamp());
+        }
         firing.finish(
             now,
             #[cfg(feature = "multitask")]
@@ -360,7 +366,7 @@ mod tests {
                     !irq_enabled.get(),
                     "clockevent state mutation requires local IRQ exclusion"
                 );
-                (7, clockevent.online(Some(deadline)))
+                (7, clockevent.online(deadline))
             },
             |action| {
                 assert!(
@@ -425,34 +431,38 @@ mod tests {
     fn periodic_deadline_catches_up_without_accumulating_drift() {
         assert_eq!(
             super::next_periodic_deadline(deadline(100), instant(100), 25),
-            Some(deadline(125))
+            deadline(125)
         );
         assert_eq!(
             super::next_periodic_deadline(deadline(100), instant(149), 25),
-            Some(deadline(150))
+            deadline(150)
         );
         assert_eq!(
             super::next_periodic_deadline(deadline(100), instant(150), 25),
-            Some(deadline(175))
+            deadline(175)
         );
     }
 
     #[test]
-    fn initial_periodic_deadline_becomes_idle_at_the_monotonic_limit() {
+    fn initial_periodic_deadline_saturates_at_the_finite_monotonic_limit() {
         let now = instant(ax_task::runtime::KTIME_MAX_NANOS - 1);
-        assert_eq!(super::initial_periodic_deadline(now, 2), None);
-        assert_eq!(super::initial_periodic_deadline(now, 1), None);
+        assert_eq!(
+            super::initial_periodic_deadline(now, 2),
+            deadline(ax_task::runtime::KTIME_MAX_NANOS)
+        );
+        assert_eq!(
+            super::initial_periodic_deadline(now, 1),
+            deadline(ax_task::runtime::KTIME_MAX_NANOS)
+        );
     }
 
     #[test]
-    fn periodic_deadline_saturates_at_the_monotonic_limit() {
-        assert_eq!(
-            super::next_periodic_deadline(
-                deadline(ax_task::runtime::KTIME_SAFE_MAX_NANOS),
-                instant(ax_task::runtime::KTIME_MAX_NANOS - 1),
-                1_000_000_000,
-            ),
-            None
+    #[should_panic(expected = "finite monotonic clock domain")]
+    fn periodic_deadline_overflow_is_a_fatal_clock_domain_violation() {
+        let _ = super::next_periodic_deadline(
+            deadline(ax_task::runtime::KTIME_MAX_NANOS - 2),
+            instant(ax_task::runtime::KTIME_MAX_NANOS - 1),
+            1_000_000_000,
         );
     }
 }

@@ -3,7 +3,6 @@ use super::*;
 #[derive(Debug)]
 pub(super) struct OwnerState {
     claimed: AtomicBool,
-    current_thread: AtomicU64,
     idle_thread: AtomicU64,
     busy_runtime_ns: AtomicU64,
 }
@@ -12,7 +11,6 @@ impl OwnerState {
     pub(super) const fn new() -> Self {
         Self {
             claimed: AtomicBool::new(false),
-            current_thread: AtomicU64::new(0),
             idle_thread: AtomicU64::new(0),
             busy_runtime_ns: AtomicU64::new(0),
         }
@@ -60,20 +58,14 @@ impl CpuRemote {
         })
     }
 
-    /// Returns the generation-bearing current-thread snapshot.
+    /// Returns `rq->curr` under the authoritative runqueue lock.
     pub fn current_thread(&self) -> Option<ThreadId> {
-        decode_thread_id(self.owner_state.current_thread.load(Ordering::Acquire))
+        self.lock_run_queue().current_thread()
     }
 
     /// Returns the configured idle-thread snapshot.
     pub fn idle_thread(&self) -> Option<ThreadId> {
         decode_thread_id(self.owner_state.idle_thread.load(Ordering::Acquire))
-    }
-
-    pub(crate) fn publish_current_thread(&self, current: Option<ThreadId>) {
-        self.owner_state
-            .current_thread
-            .store(current.map_or(0, ThreadId::as_u64), Ordering::Release);
     }
 
     pub(in crate::system::cpu) fn publish_idle_thread(&self, idle: ThreadId) {

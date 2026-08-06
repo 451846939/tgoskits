@@ -70,7 +70,13 @@ impl TaskSystem {
         } else {
             self.pi_thread_core(root)?
         };
-        Ok(PiDonation::new(policy, root, core, &root_core))
+        Ok(PiDonation::new(
+            policy,
+            root,
+            core.effective_scheduling_urgency(),
+            core,
+            &root_core,
+        ))
     }
 
     pub(super) fn resolved_pi_schedule_update(
@@ -84,12 +90,12 @@ impl TaskSystem {
         let mut effective_urgency = base_entity.scheduling_urgency(base);
         let mut pi_donor = None;
         let mut deadline_donor = None;
-        if let Some((top, donor)) = donor.as_ref()
-            && top.urgency < effective_urgency
+        if let Some((_top, donor)) = donor.as_ref()
+            && donor.boost_urgency < effective_urgency
             && let Some(inherited) = pi_inherited_policy(base, donor.policy)
         {
             policy = inherited;
-            effective_urgency = top.urgency;
+            effective_urgency = donor.boost_urgency;
             pi_donor = Some(donor.root);
             deadline_donor =
                 matches!(donor.policy, SchedulePolicy::Deadline(_)).then_some(donor.root);
@@ -102,11 +108,20 @@ impl TaskSystem {
                 .expect("resolved Deadline donor must retain its task reference");
             donor.root_core.clone()
         });
+        let deadline_donor_server = deadline_donor_core
+            .as_ref()
+            .map(|core| {
+                core.upgrade()
+                    .ok_or(TaskError::InvalidPiState)
+                    .map(|core| core.sched().deadline_server())
+            })
+            .transpose()?;
         Ok(PiScheduleUpdate {
             policy,
             donor: pi_donor,
             deadline_donor,
             deadline_donor_core,
+            deadline_donor_server,
             generation,
         })
     }
@@ -123,13 +138,13 @@ impl TaskSystem {
         sched: &mut ThreadSchedState,
         update: PiScheduleUpdate,
         transaction: &mut OwnerRqTxn<'_>,
-    ) -> Result<PiRqFollowup, TaskError> {
+    ) -> PiRqFollowup {
         let owner = sched
             .placement
             .assigned_cpu()
-            .ok_or(TaskError::InvalidPiState)?;
+            .expect("PI target must retain task_cpu()");
         if transaction.owner() != owner {
-            return Err(TaskError::InvalidPiState);
+            task_runtime::fatal_invariant(0x5049_1206, core.id().as_u64() as usize);
         }
         let running = sched.placement.execution_cpu() == Some(owner);
         let queued = sched.placement.queued_cpu() == Some(owner) && !running;
@@ -156,11 +171,16 @@ impl TaskSystem {
             }
             let active = transaction.detach_current_schedule(core.id());
             let active =
-                apply_pi_schedule_update(sched, active, update, owner_now_ns, fair_placement)?;
+                apply_pi_schedule_update(sched, active, update, owner_now_ns, fair_placement)
+                    .unwrap_or_else(|_| {
+                        task_runtime::fatal_invariant(0x5049_1207, core.id().as_u64() as usize)
+                    });
             let policy = active.policy();
             let entity = active.entity().clone();
             let rt_quota_exempt = sched.is_pi_boosted_rt_owner_for(policy);
-            let metadata = sched.rq_task_metadata()?;
+            let metadata = sched.rq_task_metadata().unwrap_or_else(|_| {
+                task_runtime::fatal_invariant(0x5049_1208, core.id().as_u64() as usize)
+            });
             transaction.install_current_schedule(
                 core.id(),
                 active,
@@ -174,7 +194,7 @@ impl TaskSystem {
                 .expect("running PI target must remain current")
                 .refresh_scheduler_metadata(metadata, rt_quota_exempt);
             core.publish_effective_schedule(policy, &entity);
-            return Ok(PiRqFollowup::RemoteReschedule);
+            return PiRqFollowup::RemoteReschedule;
         }
         if queued {
             let current_fair = transaction
@@ -182,11 +202,16 @@ impl TaskSystem {
                 .and_then(|entity| entity.fair());
             let active = transaction.reclassify_task(core.id()).into_active();
             let active =
-                apply_pi_schedule_update(sched, active, update, owner_now_ns, fair_placement)?;
+                apply_pi_schedule_update(sched, active, update, owner_now_ns, fair_placement)
+                    .unwrap_or_else(|_| {
+                        task_runtime::fatal_invariant(0x5049_1209, core.id().as_u64() as usize)
+                    });
             let policy = active.policy();
             let entity = active.entity().clone();
             let rt_quota_exempt = sched.is_pi_boosted_rt_owner_for(policy);
-            let metadata = sched.rq_task_metadata()?;
+            let metadata = sched.rq_task_metadata().unwrap_or_else(|_| {
+                task_runtime::fatal_invariant(0x5049_120a, core.id().as_u64() as usize)
+            });
             transaction.enqueue_task(
                 QueuedThread::new(
                     core.id(),
@@ -200,13 +225,16 @@ impl TaskSystem {
                 current_fair,
             );
             core.publish_effective_schedule(policy, &entity);
-            return Ok(PiRqFollowup::RemoteReschedule);
+            return PiRqFollowup::RemoteReschedule;
         }
         let active = sched.policy.take_active();
-        let active = apply_pi_schedule_update(sched, active, update, owner_now_ns, fair_placement)?;
-        core.publish_effective_schedule(active.policy(), &active.entity());
+        let active = apply_pi_schedule_update(sched, active, update, owner_now_ns, fair_placement)
+            .unwrap_or_else(|_| {
+                task_runtime::fatal_invariant(0x5049_120b, core.id().as_u64() as usize)
+            });
+        core.publish_effective_schedule(active.policy(), active.entity());
         sched.policy.install_active(active);
-        Ok(PiRqFollowup::SchedulerWork)
+        PiRqFollowup::SchedulerWork
     }
 
     /// Recomputes `pi_top_task` and the effective class while holding the task
@@ -219,6 +247,7 @@ impl TaskSystem {
         &self,
         core: &Arc<ThreadCore>,
         sched: &mut ThreadSchedState,
+        donor: Option<(PiWaitKey, PiDonation)>,
     ) -> Result<bool, TaskError> {
         let owner = sched
             .placement
@@ -239,25 +268,33 @@ impl TaskSystem {
             .policy
             .active_option()
             .map(|active| active.base_entity().clone())
-            .or_else(|| transaction.base_scheduling_entity(core.id()))
-            .ok_or(TaskError::InvalidPiState)?;
-        let generation = sched
-            .policy
-            .dispatch_generation
-            .checked_add(1)
-            .ok_or(TaskError::InvalidConfiguration)?;
-        let update = self.resolved_pi_schedule_update(
+            .or_else(|| transaction.base_scheduling_entity(core.id()));
+        let Some(base_entity) = base_entity else {
+            transaction.commit();
+            return Err(TaskError::InvalidPiState);
+        };
+        let Some(generation) = sched.policy.dispatch_generation.checked_add(1) else {
+            transaction.commit();
+            return Err(TaskError::InvalidConfiguration);
+        };
+        let update = match self.resolved_pi_schedule_update(
             sched.policy.base,
             base_entity,
-            sched.pi.donors.first_entry(),
+            donor,
             generation,
-        )?;
+        ) {
+            Ok(update) => update,
+            Err(error) => {
+                transaction.commit();
+                return Err(error);
+            }
+        };
         let changed = core.effective_policy_snapshot() != update.policy
             || sched.pi.donor != update.donor
             || sched.pi.deadline_donor != update.deadline_donor;
         let followup = if changed {
             sched.policy.dispatch_generation = generation;
-            Some(self.apply_pi_schedule_update_in_rq(core, sched, update, &mut transaction)?)
+            Some(self.apply_pi_schedule_update_in_rq(core, sched, update, &mut transaction))
         } else {
             None
         };
@@ -316,11 +353,19 @@ impl TaskSystem {
             .dispatch_generation
             .checked_add(1)
             .ok_or(TaskError::InvalidConfiguration)?;
-        if let Some((old_top, _)) = old_top {
+        let old_key = old_top.as_ref().map(|(key, _)| *key);
+        let remaining_top = owner_sched.pi.donors.first_entry_excluding(old_key);
+        let prospective_top = match (remaining_top, new_top.as_ref()) {
+            (Some(current), Some(candidate)) if candidate.0 < current.0 => Some(candidate.clone()),
+            (Some(current), _) => Some(current),
+            (None, Some(candidate)) => Some(candidate.clone()),
+            (None, None) => None,
+        };
+        if let Some((old_top, _)) = old_top.as_ref() {
             let removed = owner_sched
                 .pi
                 .donors
-                .remove(old_top)
+                .remove(*old_top)
                 .ok_or(TaskError::InvalidPiState)?;
             // SAFETY: the mutex wait lock and owner PI lock detached the only
             // owner-tree linkage which can use this preallocated node.
@@ -332,19 +377,52 @@ impl TaskSystem {
                     .return_owner_donor(removed)
             };
         }
-        if let Some((new_top, donation)) = new_top {
+        if let Some((new_top, donation)) = new_top.as_ref() {
             let new_core = new_core.as_ref().expect("new PI top must retain its task");
             let inserted = unsafe {
                 // SAFETY: one blocked waiter is the top waiter of at most one
                 // mutex and therefore can own one owner-tree linkage.
                 new_core.pi_wait_nodes().take_owner_donor()
             };
-            owner_sched.pi.donors.insert(new_top, donation, inserted);
+            owner_sched
+                .pi
+                .donors
+                .insert(*new_top, donation.clone(), inserted);
         }
-        self.recompute_pi_owner_locked(&owner_core, &mut owner_sched)
-            .unwrap_or_else(|_| {
-                task_runtime::fatal_invariant(0x5049_1202, owner.as_u64() as usize)
-            });
+        if let Err(error) =
+            self.recompute_pi_owner_locked(&owner_core, &mut owner_sched, prospective_top)
+        {
+            if let Some((new_top, _)) = new_top.as_ref() {
+                let removed = owner_sched
+                    .pi
+                    .donors
+                    .remove(*new_top)
+                    .expect("failed PI owner update must retain the proposed donor");
+                // SAFETY: the failed transaction removed the only owner-tree
+                // linkage before returning it to the waiter's storage.
+                unsafe {
+                    new_core
+                        .as_ref()
+                        .expect("new PI top must retain its task")
+                        .pi_wait_nodes()
+                        .return_owner_donor(removed)
+                };
+            }
+            if let Some((old_top, donation)) = old_top.as_ref() {
+                let old_core = old_core.as_ref().expect("old PI top must retain its task");
+                let restored = unsafe {
+                    // SAFETY: the failed transaction returned this task's
+                    // owner linkage above and no other owner can consume it
+                    // while the physical mutex wait lock is held.
+                    old_core.pi_wait_nodes().take_owner_donor()
+                };
+                owner_sched
+                    .pi
+                    .donors
+                    .insert(*old_top, donation.clone(), restored);
+            }
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -575,11 +653,9 @@ impl TaskSystem {
                     .insert(registration.key, old_donation, node);
                 return Err(error);
             }
-            let current = waiter_sched
-                .pi
-                .blocked_on
-                .as_mut()
-                .ok_or(TaskError::InvalidPiState)?;
+            let current = waiter_sched.pi.blocked_on.as_mut().unwrap_or_else(|| {
+                task_runtime::fatal_invariant(0x5049_1210, waiter_core.id().as_u64() as usize)
+            });
             if *current != registration {
                 task_runtime::fatal_invariant(0x5049_1205, waiter_core.id().as_u64() as usize);
             }
@@ -602,8 +678,34 @@ impl TaskSystem {
         origin_lock: Option<PiMutexRaw>,
         top_task: ThreadId,
     ) -> Result<(), TaskError> {
+        self.recompute_pi_chain_bounded(start, origin_lock, top_task, self.config.pi_chain_limit())
+    }
+
+    /// Propagates a committed PI removal or priority change through the
+    /// existing dependency graph.
+    ///
+    /// Linux uses the minimum chain-walk mode for these adjustments: the
+    /// configured admission bound applies to adding a new dependency, not to
+    /// restoring an already accepted graph after unlock, cancellation, or a
+    /// policy change. The fixed thread capacity is the structural upper bound
+    /// of an acyclic in-kernel wait graph.
+    fn recompute_pi_cleanup_chain(
+        &self,
+        start: ThreadId,
+        top_task: ThreadId,
+    ) -> Result<(), TaskError> {
+        self.recompute_pi_chain_bounded(start, None, top_task, self.config.thread_capacity())
+    }
+
+    fn recompute_pi_chain_bounded(
+        &self,
+        start: ThreadId,
+        origin_lock: Option<PiMutexRaw>,
+        top_task: ThreadId,
+        limit: usize,
+    ) -> Result<(), TaskError> {
         let mut current = start;
-        for depth in 1..=self.config.pi_chain_limit() {
+        for depth in 1..=limit {
             let current_core = self.pi_thread_core(current)?;
             let Some(_activity) = current_core.try_scheduler_activity() else {
                 return Err(TaskError::InvalidPiWaitState(
@@ -626,16 +728,12 @@ impl TaskSystem {
             if owner == top_task {
                 return Err(TaskError::PiCycle);
             }
-            if depth == self.config.pi_chain_limit() {
-                return Err(TaskError::PiChainLimit {
-                    limit: self.config.pi_chain_limit(),
-                });
+            if depth == limit {
+                return Err(TaskError::PiChainLimit { limit });
             }
             current = owner;
         }
-        Err(TaskError::PiChainLimit {
-            limit: self.config.pi_chain_limit(),
-        })
+        Err(TaskError::PiChainLimit { limit })
     }
 
     pub(super) fn propagate_pi_waiter_key_after_policy_change(
@@ -653,7 +751,7 @@ impl TaskSystem {
         if owner == thread {
             return Err(TaskError::PiCycle);
         }
-        self.recompute_pi_chain(owner, None, thread)
+        self.recompute_pi_cleanup_chain(owner, thread)
     }
 
     fn remove_registered_waiter(
@@ -696,8 +794,13 @@ impl TaskSystem {
         let owner = snapshot.owner();
         self.remove_lock_waiter(&mut lock_state, owner, waiter_core, generation)?;
         if lock_state.waiters.is_empty() {
-            let owner = owner.ok_or(TaskError::InvalidPiState)?;
-            core.clear_waiters_bit(owner)?;
+            if let Some(owner) = owner {
+                core.clear_waiters_bit(owner).unwrap_or_else(|_| {
+                    task_runtime::fatal_invariant(0x5049_1215, waiter_core.id().as_u64() as usize)
+                });
+            } else {
+                core.publish_unlocked();
+            }
         }
         Ok(owner)
     }
@@ -734,7 +837,6 @@ impl TaskSystem {
         let urgency = waiter_core.effective_pi_wait_urgency();
         let donation = self.pi_donation(&waiter_core)?;
         let key = PiWaitKey::new(urgency, sequence, waiter);
-        let generation = waiter_core.pi_wait_state().begin()?;
         let mut lock_state = lock.lock_state();
         loop {
             let snapshot = mutex_core.owner_snapshot();
@@ -767,7 +869,13 @@ impl TaskSystem {
                     PiWaitStateError::OwnerlessSelectionMissing,
                 ));
             }
-            let initial_owner = owner.map(|owner| self.pi_thread_core(owner)).transpose()?;
+            let initial_owner = owner
+                .map(|owner| {
+                    self.pi_thread_core(owner).map_err(|_| {
+                        TaskError::InvalidPiWaitState(PiWaitStateError::ExitedParticipant)
+                    })
+                })
+                .transpose()?;
             let _owner_activity = if let Some(owner) = initial_owner.as_ref() {
                 Some(
                     owner
@@ -782,6 +890,22 @@ impl TaskSystem {
             if !mutex_core.try_mark_waiters(snapshot) {
                 continue;
             }
+            let generation = match waiter_core.pi_wait_state().begin() {
+                Ok(generation) => generation,
+                Err(error) => {
+                    if !snapshot.has_waiters() {
+                        mutex_core
+                            .clear_waiters_bit(owner.expect("an owned mutex must retain its owner"))
+                            .unwrap_or_else(|_| {
+                                task_runtime::fatal_invariant(
+                                    0x5049_120c,
+                                    waiter_core.id().as_u64() as usize,
+                                )
+                            });
+                    }
+                    return Err(error);
+                }
+            };
             if let Err(error) = self.insert_lock_waiter(
                 &mut lock_state,
                 owner,
@@ -794,7 +918,14 @@ impl TaskSystem {
                 donation,
             ) {
                 if lock_state.waiters.is_empty() {
-                    mutex_core.clear_waiters_bit(owner.ok_or(TaskError::InvalidPiState)?)?;
+                    mutex_core
+                        .clear_waiters_bit(owner.expect("an empty waiter tree must retain owner"))
+                        .unwrap_or_else(|_| {
+                            task_runtime::fatal_invariant(
+                                0x5049_120d,
+                                waiter_core.id().as_u64() as usize,
+                            )
+                        });
                 }
                 return Err(error);
             }
@@ -802,10 +933,22 @@ impl TaskSystem {
             if let Some(owner) = owner
                 && let Err(error) = self.recompute_pi_chain(owner, Some(lock_raw), waiter)
             {
-                let rollback_owner =
-                    self.remove_registered_waiter(&waiter_core, lock_raw, generation, false)?;
+                let rollback_owner = self
+                    .remove_registered_waiter(&waiter_core, lock_raw, generation, false)
+                    .unwrap_or_else(|_| {
+                        task_runtime::fatal_invariant(
+                            0x5049_120e,
+                            waiter_core.id().as_u64() as usize,
+                        )
+                    });
                 if let Some(rollback_owner) = rollback_owner {
-                    self.recompute_pi_chain(rollback_owner, None, waiter)?;
+                    self.recompute_pi_cleanup_chain(rollback_owner, waiter)
+                        .unwrap_or_else(|_| {
+                            task_runtime::fatal_invariant(
+                                0x5049_120f,
+                                waiter_core.id().as_u64() as usize,
+                            )
+                        });
                 }
                 return Err(error);
             }
@@ -827,7 +970,7 @@ impl TaskSystem {
         let owner =
             self.remove_registered_waiter(&token.core, token.lock, token.generation, true)?;
         if let Some(owner) = owner {
-            self.recompute_pi_chain(owner, None, token.thread_id())?;
+            self.recompute_pi_cleanup_chain(owner, token.thread_id())?;
         }
         Ok(())
     }
@@ -878,7 +1021,10 @@ impl TaskSystem {
             drop(lock_state);
             selected
         };
-        self.recompute_pi_chain(old_owner, None, selected.id())?;
+        self.recompute_pi_cleanup_chain(old_owner, selected.id())
+            .unwrap_or_else(|_| {
+                task_runtime::fatal_invariant(0x5049_1211, old_owner.as_u64() as usize)
+            });
         let selected_id = selected.id();
         match self.wake_thread_direct(selected, None) {
             WakeResult::Notified | WakeResult::AlreadyPending => Ok(()),
@@ -927,12 +1073,25 @@ impl TaskSystem {
             self.remove_lock_waiter(&mut lock_state, None, &token.core, token.generation)?;
         debug_assert_eq!(registration.generation, token.generation);
         if let Some(top) = lock_state.waiters.first_entry() {
-            self.replace_owner_lock_top(claimant, None, Some(top))?;
+            self.replace_owner_lock_top(claimant, None, Some(top))
+                .unwrap_or_else(|_| {
+                    task_runtime::fatal_invariant(0x5049_1212, claimant.as_u64() as usize)
+                });
         }
         mutex_core.publish_owner(claimant, !lock_state.waiters.is_empty());
-        token.core.pi_wait_state().grant(token.generation)?;
+        token
+            .core
+            .pi_wait_state()
+            .grant(token.generation)
+            .unwrap_or_else(|_| {
+                task_runtime::fatal_invariant(0x5049_1213, claimant.as_u64() as usize)
+            });
         drop(lock_state);
-        self.recompute_pi_chain(claimant, None, claimant)
+        self.recompute_pi_cleanup_chain(claimant, claimant)
+            .unwrap_or_else(|_| {
+                task_runtime::fatal_invariant(0x5049_1214, claimant.as_u64() as usize)
+            });
+        Ok(())
     }
 }
 

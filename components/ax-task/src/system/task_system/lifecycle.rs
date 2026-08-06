@@ -28,27 +28,57 @@ impl TaskSystem {
             if sched.pi.blocked_on.is_some() || !sched.pi.donors.is_empty() {
                 return Err(TaskError::InvalidPiState);
             }
-            if sched.deadline.bandwidth.reservation_owner().is_some() {
-                sched.deadline.cleanup_pending = true;
-                drop(sched);
-                drop(state);
-                // Owner-control publication enters the scheduler activity
-                // gate. Reopen it before publishing the rq-local Deadline
-                // cleanup; otherwise the exit permit rejects its own work and
-                // leaves the reservation permanently attached.
-                drop(scheduler_exit);
-                self.state.lock().request_owner_reschedule(thread);
-                return Err(TaskError::ThreadBusy);
+            let lifecycle = sched.lifecycle.state();
+            if !crate::thread::transition_is_valid(lifecycle, ThreadState::Exited) {
+                return Err(TaskError::InvalidTransition {
+                    from: lifecycle,
+                    to: ThreadState::Exited,
+                });
+            }
+            record.callbacks.validate_prepare_exit()?;
+            if let Some(owner) = sched.deadline.bandwidth.reservation_owner() {
+                let remote = self
+                    .cpu_remotes
+                    .get(owner.as_usize())
+                    .ok_or(TaskError::InvalidCpu(owner.as_u32()))?;
+                if !remote.is_online() {
+                    task_runtime::fatal_invariant(0x444c_1203, core.id().as_u64() as usize);
+                }
+                let mut transaction = OwnerRqTxn::begin(self, remote);
+                Self::detach_owner_deadline_bandwidth_in_rq(
+                    &record.core,
+                    &mut sched,
+                    remote,
+                    &mut transaction,
+                );
+                transaction.commit();
+                // A stale physical clockevent is harmless, but the owning CPU
+                // must promptly publish the new earliest scheduler deadline
+                // instead of waiting for that stale edge to fire.
+                remote.request_scheduler_work();
             }
             sched.placement.cancel_remote_handoff_for_exit();
-            sched.transition(&record.core, ThreadState::Exited)?;
+            sched
+                .transition(&record.core, ThreadState::Exited)
+                .unwrap_or_else(|_| {
+                    task_runtime::fatal_invariant(0x4558_000a, core.id().as_u64() as usize)
+                });
             scheduler_exit.seal();
-            record.callbacks.prepare_exit(record.extension.is_some())?;
+            record
+                .callbacks
+                .prepare_exit(record.extension.is_some())
+                .unwrap_or_else(|_| {
+                    task_runtime::fatal_invariant(0x4558_000b, core.id().as_u64() as usize)
+                });
             let exited_core = Arc::clone(&record.core);
             drop(sched);
             state.queue_exited_thread(thread);
             let mut root_domain = self.root_domain.lock();
-            let released = state.release_deadline_reservation_on_exit(thread)?;
+            let released = state
+                .release_deadline_reservation_on_exit(thread)
+                .unwrap_or_else(|_| {
+                    task_runtime::fatal_invariant(0x4558_000c, core.id().as_u64() as usize)
+                });
             root_domain.release_deadline(released);
             exited_core
         };

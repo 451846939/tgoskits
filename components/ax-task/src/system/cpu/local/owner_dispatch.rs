@@ -12,13 +12,6 @@ impl CpuLocal {
         self.remote.lock_run_queue().current_core()
     }
 
-    pub(crate) fn current_switch_endpoint(&self) -> Option<SwitchEndpoint> {
-        self.remote
-            .lock_run_queue()
-            .current()
-            .map(CurrentDispatch::switch_endpoint)
-    }
-
     /// Clones a strong handle for the currently executing thread.
     ///
     /// This owner-side lookup never consults the generation registry. The

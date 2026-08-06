@@ -8,6 +8,26 @@ impl TaskSystem {
     /// Deadline threads are admitted immediately and therefore must cover the
     /// complete online root domain.
     pub fn create_thread(&self, spec: ThreadSpec) -> Result<ThreadHandle, TaskError> {
+        // SAFETY: the runtime publishes the calling CPU identity before task
+        // creation is enabled. Like Linux fork, this establishes task_cpu()
+        // before the new task can participate in PI or become runnable.
+        let initial_cpu = CpuId::new(unsafe { task_runtime::current_cpu_id() }.as_u32());
+        self.create_thread_on_cpu(spec, initial_cpu)
+    }
+
+    /// Builds an unpublished task with an explicit initial `task_cpu`.
+    ///
+    /// Ordinary fork uses the calling CPU. Per-CPU bootstrap and idle tasks
+    /// instead mirror Linux `init_idle()` and bind the target rq before the
+    /// task can be observed by PI, policy, or hotplug code.
+    fn create_thread_on_cpu(
+        &self,
+        spec: ThreadSpec,
+        initial_cpu: CpuId,
+    ) -> Result<ThreadHandle, TaskError> {
+        if initial_cpu.as_usize() >= self.config.cpu_count() {
+            return Err(TaskError::InvalidCpu(initial_cpu.as_u32()));
+        }
         let policy = spec.policy();
         let affinity = spec
             .affinity()
@@ -58,15 +78,21 @@ impl TaskSystem {
             .and_then(ThreadExtension::scheduler_tick_work);
         let sched = Arc::new(ThreadSchedCell::new(
             id,
-            ThreadSchedState::new(
-                policy,
-                entity,
-                deadline_server,
-                affinity.clone(),
-                reservation,
-                resources.context(),
-                resources.address_space(),
-            ),
+            ThreadSchedState::new(ThreadSchedInit {
+                policy: ThreadPolicyInit { policy, entity },
+                placement: ThreadPlacementInit {
+                    initial_cpu,
+                    affinity: affinity.clone(),
+                },
+                deadline: ThreadDeadlineInit {
+                    server: deadline_server,
+                    reservation_scaled: reservation,
+                },
+                runtime: ThreadRuntimeInit {
+                    context: resources.context(),
+                    address_space: resources.address_space(),
+                },
+            }),
         ));
         let core = Arc::new(ThreadCore::new(
             id,
@@ -182,7 +208,7 @@ impl TaskSystem {
             }
         }
 
-        let thread = self.create_thread(unpublished.into_spec())?;
+        let thread = self.create_thread_on_cpu(unpublished.into_spec(), cpu.owner())?;
         let setup = (|| {
             let core = {
                 let state = self.state.lock();
@@ -199,7 +225,7 @@ impl TaskSystem {
                 *sched.policy.active_mut().entity_mut() = entity;
             }
             self.link_owner_ready_thread_locked(
-                cpu.as_ref().get_ref(),
+                cpu.owner(),
                 &mut transaction,
                 &core,
                 &mut sched,
@@ -249,7 +275,7 @@ impl TaskSystem {
             }
         }
 
-        let thread = self.create_thread(unpublished.into_spec())?;
+        let thread = self.create_thread_on_cpu(unpublished.into_spec(), cpu.owner())?;
         let setup = self.make_ready(thread.id()).and_then(|()| {
             let state = self.state.lock();
             let core = Arc::clone(&state.thread_record(thread.id())?.core);
@@ -288,7 +314,7 @@ impl TaskSystem {
                 }
             )
             || !sched.affinity.affinity.contains(owner)
-            || sched.placement.assigned_cpu().is_some()
+            || sched.placement.assigned_cpu() != Some(owner)
             || sched.placement.on_cpu().is_some()
             || sched.placement.requested_migration().is_some()
         {

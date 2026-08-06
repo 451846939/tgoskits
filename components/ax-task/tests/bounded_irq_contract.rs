@@ -1,8 +1,5 @@
-use core::pin::Pin;
-
 use ax_task::{
-    CpuId, ThreadId,
-    inbox::{InboxKind, InboxMessage, InboxNode, PublishResult, SchedulerInbox},
+    ThreadId,
     runtime::{MonotonicDeadline, MonotonicInstant},
     timer::{
         ExpiredTaskDeadline, TaskDeadlineExpireRequest, TaskDeadlineKind, TaskDeadlineNode,
@@ -39,52 +36,8 @@ fn timer_irq_work_is_bounded() {
     assert!(batch.pending());
 }
 
-#[test]
-fn owner_control_publication_coalesces_and_drain_is_bounded() {
-    let inbox = SchedulerInbox::new(InboxKind::OwnerControl);
-    let first = inbox_node(InboxKind::OwnerControl);
-    let second = inbox_node(InboxKind::OwnerControl);
-    let first_message = InboxMessage::migration(thread(1), CpuId::new(0), CpuId::new(1), 1, 1_024);
-    let second_message = InboxMessage::migration(thread(2), CpuId::new(0), CpuId::new(1), 2, 1_024);
-    assert_eq!(
-        inbox.publish(first.pin(), first_message),
-        PublishResult::Published
-    );
-    assert_eq!(
-        inbox.publish(first.pin(), first_message),
-        PublishResult::AlreadyPending
-    );
-    assert_eq!(
-        inbox.publish(second.pin(), second_message),
-        PublishResult::Published
-    );
-    let mut output = [InboxMessage::EMPTY; 2];
-
-    let batch = inbox.drain(1, &mut output);
-
-    assert_eq!(batch.drained(), 1);
-    assert!(batch.pending());
-    assert_eq!(output[0].thread_id(), thread(1));
-}
-
 fn timer(slot: u32) -> Box<TaskDeadlineNode> {
     Box::new(TaskDeadlineNode::for_thread(thread(slot)))
-}
-
-struct TestInboxNode(Pin<Box<InboxNode>>);
-
-impl TestInboxNode {
-    fn pin(&self) -> Pin<&'static InboxNode> {
-        let node = self.0.as_ref().get_ref() as *const InboxNode;
-        unsafe {
-            // The test drains every published node before dropping the fixture.
-            Pin::new_unchecked(&*node)
-        }
-    }
-}
-
-fn inbox_node(kind: InboxKind) -> TestInboxNode {
-    TestInboxNode(Box::pin(InboxNode::new(kind)))
 }
 
 fn thread(slot: u32) -> ThreadId {

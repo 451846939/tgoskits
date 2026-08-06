@@ -1,8 +1,5 @@
 use super::*;
-use crate::{
-    SchedulerClockEvent,
-    system::task_system::{SwitchEndpoint, TaskSystem},
-};
+use crate::{SchedulerClockEvent, system::task_system::TaskSystem};
 mod dispatch_state;
 mod drain_state;
 mod owner_deadline;

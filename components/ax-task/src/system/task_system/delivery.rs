@@ -1,26 +1,30 @@
-use super::*;
+use super::{dispatch::PolicyGenerationCommit, *};
+
+pub(super) struct OwnerPolicyApply {
+    pub(super) commit: PolicyGenerationCommit,
+    pub(super) owner_now_ns: u64,
+    pub(super) preempts_current: bool,
+    pub(super) effective_policy: SchedulePolicy,
+    pub(super) effective_entity: SchedulingEntity,
+}
 
 impl TaskSystem {
-    fn apply_owner_policy_update(
+    pub(super) fn apply_owner_policy_update_locked(
         &self,
-        cpu: Pin<&mut CpuLocal>,
+        remote: &CpuRemote,
         core: &Arc<ThreadCore>,
+        sched: &mut ThreadSchedState,
         generation: u64,
-    ) -> Result<bool, TaskError> {
-        let owner = cpu.owner();
-        let mut sched = core.sched().lock();
+    ) -> Result<OwnerPolicyApply, TaskError> {
+        let owner = remote.owner();
         let donor = sched.pi.donors.first_entry();
-        Self::validate_owner_policy_generation(&sched, generation)?;
-        if sched.policy.pending_update().is_none() {
-            return Ok(false);
-        }
+        Self::validate_owner_policy_generation(sched, generation)?;
         let queued = sched.placement.queued_cpu() == Some(owner)
             && sched.placement.execution_cpu().is_none();
         let running = sched.placement.execution_cpu() == Some(owner)
             && sched.placement.on_cpu() == Some(owner);
 
-        let remote = Arc::clone(cpu.remote());
-        let mut transaction = OwnerRqTxn::begin(self, &remote);
+        let mut transaction = OwnerRqTxn::begin(self, remote);
         let owner_now_ns = transaction.clock().wall().as_nanos();
         if transaction.current().is_some() {
             let _settled = transaction.settle_current(0);
@@ -58,15 +62,10 @@ impl TaskSystem {
         } else {
             sched.policy.take_active()
         };
-        Self::detach_owner_deadline_bandwidth_in_rq(
-            core,
-            &mut sched,
-            cpu.remote(),
-            &mut transaction,
-        );
+        Self::detach_owner_deadline_bandwidth_in_rq(core, sched, remote, &mut transaction);
         let commit = self
             .apply_policy_generation_locked(
-                &mut sched,
+                sched,
                 &mut active,
                 generation,
                 Some(owner_now_ns),
@@ -90,14 +89,14 @@ impl TaskSystem {
             .unwrap_or_else(|_| {
                 task_runtime::fatal_invariant(0x5251_1206, core.id().as_u64() as usize)
             });
-        active =
-            apply_pi_schedule_update(&mut sched, active, pi_update, owner_now_ns, fair_placement)
-                .unwrap_or_else(|_| {
-                    task_runtime::fatal_invariant(0x5251_1207, core.id().as_u64() as usize)
-                });
-        core.publish_effective_schedule(active.policy(), &active.entity());
+        active = apply_pi_schedule_update(sched, active, pi_update, owner_now_ns, fair_placement)
+            .unwrap_or_else(|_| {
+                task_runtime::fatal_invariant(0x5251_1207, core.id().as_u64() as usize)
+            });
+        let effective_policy = active.policy();
+        let effective_entity = active.entity().clone();
         let preempts_current = if running {
-            Self::activate_deadline_bandwidth_locked(core, &mut sched, &mut transaction, owner);
+            Self::activate_deadline_bandwidth_locked(core, sched, &mut transaction, owner);
             let rt_quota_exempt = sched.is_pi_boosted_rt_owner_for(active.policy());
             let migration_capable = sched.affinity.affinity.is_migration_capable();
             let metadata = sched.rq_task_metadata().unwrap_or_else(|_| {
@@ -119,10 +118,10 @@ impl TaskSystem {
         } else if queued {
             sched.policy.install_active(active);
             self.link_owner_ready_thread_locked(
-                cpu.as_ref().get_ref(),
+                owner,
                 &mut transaction,
                 core,
-                &mut sched,
+                sched,
                 EnqueueReason::PolicyChanged,
             )
         } else {
@@ -130,12 +129,13 @@ impl TaskSystem {
             false
         };
         transaction.commit();
-        drop(sched);
-        Self::finish_policy_generation(core, commit, Some(owner_now_ns));
-        if preempts_current {
-            cpu.request_reschedule();
-        }
-        Ok(true)
+        Ok(OwnerPolicyApply {
+            commit,
+            owner_now_ns,
+            preempts_current,
+            effective_policy,
+            effective_entity,
+        })
     }
 
     /// Enqueues a ready thread on an affinity-compatible owner CPU.
@@ -349,7 +349,6 @@ impl TaskSystem {
                 &mut transaction,
             );
             sched.policy.install_active(detached.into_active());
-            self.capture_owner_fair_migration_in_rq(&transaction, &mut sched);
             sched.placement.begin_migration(owner, target);
             core.set_wake_cpu_hint(target);
             transaction.commit();
@@ -394,14 +393,14 @@ impl TaskSystem {
     }
 
     /// Applies a bounded batch of owner-CPU effective-policy updates.
-    pub fn drain_policy_updates(
+    pub fn drain_owner_control(
         &self,
         cpu: Pin<&mut CpuLocal>,
     ) -> Result<OwnerControlDrain, TaskError> {
-        self.drain_policy_updates_owner(cpu)
+        self.drain_owner_control_inner(cpu)
     }
 
-    fn drain_policy_updates_owner(
+    fn drain_owner_control_inner(
         &self,
         mut cpu: Pin<&mut CpuLocal>,
     ) -> Result<OwnerControlDrain, TaskError> {
@@ -568,20 +567,6 @@ impl TaskSystem {
                 self.reconcile_owner_affinity_update(cpu.as_mut(), &core)?;
                 continue;
             }
-            if operation == InboxOperation::PolicyUpdate {
-                if source != owner || target != owner {
-                    return Err(TaskError::CpuOwnerMismatch {
-                        expected: source.as_u32(),
-                        actual: owner.as_u32(),
-                    });
-                }
-                let policy_applied =
-                    self.apply_owner_policy_update(cpu.as_mut(), &core, message.generation())?;
-                if policy_applied {
-                    self.recompute_pi_after_policy_update(core.id())?;
-                }
-                continue;
-            }
             if operation == InboxOperation::Migration {
                 if target != owner {
                     return Err(TaskError::CpuOwnerMismatch {
@@ -638,7 +623,7 @@ impl TaskSystem {
         }
         let policy_pending = cpu.remote().owner_control_inbox().has_pending();
         if policy_pending {
-            self.drain_policy_updates_owner(cpu.as_mut())?;
+            self.drain_owner_control_inner(cpu.as_mut())?;
         }
         if cpu.has_remote_work() {
             cpu.defer_scheduler_work();

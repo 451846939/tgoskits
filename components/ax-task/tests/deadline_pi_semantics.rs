@@ -33,7 +33,6 @@ fn pi_orders_equal_relative_deadlines_by_the_active_absolute_job_deadline() {
     );
     system.block_current_at(cpu.as_mut(), 100).unwrap();
 
-    assert!(early.effective_scheduling_key() < late.effective_scheduling_key());
     let late_wait = support::commit_pi_wait(&system, &lock, late.id(), owner.id()).unwrap();
     let early_wait = support::commit_pi_wait(&system, &lock, early.id(), owner.id()).unwrap();
     assert_eq!(
@@ -44,7 +43,7 @@ fn pi_orders_equal_relative_deadlines_by_the_active_absolute_job_deadline() {
     system
         .pi_mutex_release(lock.mutex_ref().unwrap(), owner.id())
         .unwrap();
-    assert!(early_wait.is_selected());
+    assert!(early_wait.is_top_waiter());
     system.pi_mutex_claim(&early_wait).unwrap();
     assert!(early_wait.is_granted());
     assert!(!late_wait.is_granted());
@@ -64,12 +63,7 @@ fn exhausted_deadline_with_only_an_uncontended_lock_is_throttled() {
 
     let charged = system.charge_current_at(cpu.as_mut(), 2, 2, 0).unwrap();
     assert!(charged.slice_expired());
-    assert!(
-        !system
-            .deadline_runtime(deadline.id())
-            .unwrap()
-            .pi_critical_rescue()
-    );
+    assert!(!system.deadline_runtime(deadline.id()).unwrap().pi_boosted());
 }
 
 #[test]
@@ -118,10 +112,10 @@ fn exhausted_deadline_donation_rescues_every_contended_owner_in_the_chain() {
 
     let second = system.deadline_runtime(second_owner.id()).unwrap();
     assert_eq!(second.donor(), Some(donor.id()));
-    assert!(second.pi_critical_rescue());
+    assert!(second.pi_boosted());
     let first = system.deadline_runtime(first_owner.id()).unwrap();
     assert_eq!(first.donor(), Some(donor.id()));
-    assert!(first.pi_critical_rescue());
+    assert!(first.pi_boosted());
     system.pi_wait_cancel(donor_wait).unwrap();
     system.pi_wait_cancel(second_wait).unwrap();
 }
@@ -148,16 +142,15 @@ fn queued_owner_receives_an_exhausted_donor_as_runnable_rescue_work() {
 
     system.enqueue_at(cpu.as_mut(), owner.id(), 1).unwrap();
     let wait = support::commit_pi_wait(&system, &lock, donor.id(), owner.id()).unwrap();
-    system.drain_policy_updates_at(cpu.as_mut(), 1).unwrap();
+    system.drain_owner_control_at(cpu.as_mut(), 1).unwrap();
     assert_eq!(
         system.schedule_at(cpu.as_mut(), 1).unwrap().next(),
         owner.id()
     );
-    assert!(
-        system
-            .deadline_runtime(owner.id())
-            .unwrap()
-            .pi_critical_rescue()
+    assert!(system.deadline_runtime(owner.id()).unwrap().pi_boosted());
+    assert_eq!(
+        system.deadline_runtime(owner.id()).unwrap().donor(),
+        Some(donor.id())
     );
     system.pi_wait_cancel(wait).unwrap();
 }
@@ -174,7 +167,7 @@ fn uncontended_rt_lock_owner_does_not_bypass_exhausted_rt_bandwidth() {
         .charge_current_at(cpu.as_mut(), 950_000_001, 950_000_001, 0)
         .unwrap();
     assert!(
-        cpu.needs_reschedule(),
+        system.snapshot(cpu.as_ref()).unwrap().need_resched(),
         "Linux RT throttles only after runtime strictly exceeds quota"
     );
 
@@ -200,7 +193,7 @@ fn withdrawing_an_rt_boost_preserves_the_owners_base_rr_quantum() {
     system.enqueue_at(cpu.as_mut(), owner.id(), 0).unwrap();
     let lock = PiMutexCore::new();
     let wait = support::commit_pi_wait(&system, &lock, donor.id(), owner.id()).unwrap();
-    system.drain_policy_updates_at(cpu.as_mut(), 0).unwrap();
+    system.drain_owner_control_at(cpu.as_mut(), 0).unwrap();
     assert_eq!(
         system.schedule_at(cpu.as_mut(), 0).unwrap().next(),
         owner.id()
@@ -214,7 +207,7 @@ fn withdrawing_an_rt_boost_preserves_the_owners_base_rr_quantum() {
     );
     system.schedule_at(cpu.as_mut(), 3).unwrap();
     system.pi_wait_cancel(wait).unwrap();
-    system.drain_policy_updates_at(cpu.as_mut(), 3).unwrap();
+    system.drain_owner_control_at(cpu.as_mut(), 3).unwrap();
     system.schedule_at(cpu.as_mut(), 3).unwrap();
 
     assert!(

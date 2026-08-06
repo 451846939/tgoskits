@@ -7,7 +7,7 @@ pub mod support;
 use support::TaskSystemClockTestExt;
 
 #[test]
-fn queued_policy_update_is_applied_by_the_runqueue_owner() {
+fn queued_policy_update_commits_in_one_owner_rq_transaction() {
     let (system, mut cpu) = online_system(1);
     let fair = ready_thread(&system, SchedulePolicy::default());
     let promoted = ready_thread(&system, SchedulePolicy::default());
@@ -17,16 +17,15 @@ fn queued_policy_update_is_applied_by_the_runqueue_owner() {
     let fifo = SchedulePolicy::fifo(RtPriority::new(80).unwrap());
     system.set_thread_policy(promoted.id(), fifo).unwrap();
     assert_eq!(promoted.policy(), fifo);
-    assert_eq!(promoted.effective_policy(), SchedulePolicy::default());
-
+    assert_eq!(promoted.effective_policy(), fifo);
     assert_eq!(
         system
-            .drain_policy_updates_at(cpu.as_mut(), 1)
+            .drain_owner_control_at(cpu.as_mut(), 1)
             .unwrap()
             .drained(),
-        1
+        0,
+        "policy changes must not leave a second-stage owner delivery"
     );
-    assert_eq!(promoted.effective_policy(), fifo);
     assert_eq!(
         system.schedule_at(cpu.as_mut(), 1).unwrap().next(),
         promoted.id()
@@ -46,7 +45,13 @@ fn running_policy_update_survives_old_dispatch_commit() {
 
     let fifo = SchedulePolicy::fifo(RtPriority::new(80).unwrap());
     system.set_thread_policy(running.id(), fifo).unwrap();
-    system.drain_policy_updates_at(cpu.as_mut(), 7).unwrap();
+    assert_eq!(
+        system
+            .drain_owner_control_at(cpu.as_mut(), 7)
+            .unwrap()
+            .drained(),
+        0
+    );
     assert_eq!(running.effective_policy(), fifo);
 
     let lower = ready_thread(&system, SchedulePolicy::fifo(RtPriority::new(70).unwrap()));
@@ -58,7 +63,7 @@ fn running_policy_update_survives_old_dispatch_commit() {
 }
 
 #[test]
-fn remote_running_policy_update_is_delivered_to_its_owner_cpu() {
+fn remote_running_policy_update_commits_before_returning() {
     support::clear_handles();
     let system = TaskSystem::new(TaskSystemConfig::new(2)).unwrap();
     let mut cpu0 = system.create_cpu_local(CpuId::new(0)).unwrap();
@@ -81,16 +86,16 @@ fn remote_running_policy_update_is_delivered_to_its_owner_cpu() {
 
     let fifo = SchedulePolicy::fifo(RtPriority::new(60).unwrap());
     system.set_thread_policy(running.id(), fifo).unwrap();
-    assert!(cpu1.has_remote_work());
-    assert_eq!(support::ipi_count(1), 1);
+    assert_eq!(running.policy(), fifo);
+    assert_eq!(running.effective_policy(), fifo);
     assert_eq!(
         system
-            .drain_policy_updates_at(cpu1.as_mut(), 1)
+            .drain_owner_control_at(cpu1.as_mut(), 1)
             .unwrap()
             .drained(),
-        1
+        0,
+        "a remote rq transaction may request rescheduling but must not defer policy ownership"
     );
-    assert_eq!(running.effective_policy(), fifo);
     support::clear_handles();
 }
 
@@ -103,7 +108,6 @@ fn owner_applies_deadline_to_fair_and_fair_to_deadline_transitions() {
     let deadline =
         SchedulePolicy::deadline(DeadlinePolicy::new(2, 5, 10, DeadlineFlags::NONE).unwrap());
     system.set_thread_policy(thread.id(), deadline).unwrap();
-    system.drain_policy_updates_at(cpu.as_mut(), 3).unwrap();
     assert_eq!(
         system.schedule_at(cpu.as_mut(), 3).unwrap().next(),
         thread.id()
@@ -119,7 +123,6 @@ fn owner_applies_deadline_to_fair_and_fair_to_deadline_transitions() {
 
     let fair = SchedulePolicy::fair(Nice::new(5).unwrap(), FairMode::Normal);
     system.set_thread_policy(thread.id(), fair).unwrap();
-    system.drain_policy_updates_at(cpu.as_mut(), 4).unwrap();
     assert_eq!(thread.effective_policy(), fair);
     assert_eq!(
         system.deadline_runtime(thread.id()),
@@ -128,7 +131,7 @@ fn owner_applies_deadline_to_fair_and_fair_to_deadline_transitions() {
 }
 
 #[test]
-fn coalesced_stale_message_applies_only_the_latest_policy_generation() {
+fn back_to_back_policy_updates_publish_each_committed_generation() {
     let (system, mut cpu) = online_system(1);
     let thread = ready_thread(&system, SchedulePolicy::default());
     system.enqueue_at(cpu.as_mut(), thread.id(), 0).unwrap();
@@ -136,22 +139,22 @@ fn coalesced_stale_message_applies_only_the_latest_policy_generation() {
     let stale = SchedulePolicy::fifo(RtPriority::new(90).unwrap());
     let latest = SchedulePolicy::fair(Nice::new(10).unwrap(), FairMode::Batch);
     system.set_thread_policy(thread.id(), stale).unwrap();
+    assert_eq!(thread.effective_policy(), stale);
     system.set_thread_policy(thread.id(), latest).unwrap();
     assert_eq!(thread.policy(), latest);
-    assert_eq!(thread.effective_policy(), SchedulePolicy::default());
+    assert_eq!(thread.effective_policy(), latest);
 
     assert_eq!(
         system
-            .drain_policy_updates_at(cpu.as_mut(), 1)
+            .drain_owner_control_at(cpu.as_mut(), 1)
             .unwrap()
             .drained(),
-        1
+        0
     );
-    assert_eq!(thread.effective_policy(), latest);
 }
 
 #[test]
-fn exited_thread_waits_for_in_flight_policy_delivery() {
+fn committed_policy_update_does_not_pin_exited_thread_resources() {
     let (system, mut cpu) = online_system(1);
     let thread = ready_thread(&system, SchedulePolicy::default());
     let thread_id = thread.id();
@@ -172,16 +175,8 @@ fn exited_thread_waits_for_in_flight_policy_delivery() {
             .service_deferred_task_work(ax_task::DEFAULT_BATCH_LIMIT)
             .unwrap()
             .processed(),
-        0,
-        "an inbox-held policy delivery must pin registry-owned resources"
-    );
-    system.drain_policy_updates_at(cpu.as_mut(), 1).unwrap();
-    assert_eq!(
-        system
-            .service_deferred_task_work(ax_task::DEFAULT_BATCH_LIMIT)
-            .unwrap()
-            .processed(),
-        1
+        1,
+        "a committed rq transaction must not leave an inbox-owned thread reference"
     );
     assert_eq!(
         system.thread_state(thread_id),
@@ -211,7 +206,7 @@ fn exited_thread_rejects_policy_and_affinity_mutation() {
 }
 
 #[test]
-fn pending_deadline_to_fair_update_keeps_active_admission_reserved() {
+fn deadline_to_fair_releases_admission_before_returning() {
     let (system, mut cpu) = online_system(1);
     let active = ready_thread(&system, deadline(90, 100));
     system.enqueue_at(cpu.as_mut(), active.id(), 0).unwrap();
@@ -219,19 +214,20 @@ fn pending_deadline_to_fair_update_keeps_active_admission_reserved() {
     system
         .set_thread_policy(active.id(), SchedulePolicy::default())
         .unwrap();
-    assert!(matches!(
-        system.create_thread(ThreadSpec::new(deadline(10, 100))),
-        Err(TaskError::DeadlineAdmission)
-    ));
-
-    system.drain_policy_updates_at(cpu.as_mut(), 1).unwrap();
     system
         .create_thread(ThreadSpec::new(deadline(10, 100)))
         .unwrap();
+    assert_eq!(
+        system
+            .drain_owner_control_at(cpu.as_mut(), 1)
+            .unwrap()
+            .drained(),
+        0
+    );
 }
 
 #[test]
-fn pending_deadline_reduction_releases_admission_only_after_owner_apply() {
+fn deadline_reduction_releases_admission_before_returning() {
     let (system, mut cpu) = online_system(1);
     let active = ready_thread(&system, deadline(90, 100));
     system.enqueue_at(cpu.as_mut(), active.id(), 0).unwrap();
@@ -239,19 +235,20 @@ fn pending_deadline_reduction_releases_admission_only_after_owner_apply() {
     system
         .set_thread_policy(active.id(), deadline(50, 100))
         .unwrap();
-    assert!(matches!(
-        system.create_thread(ThreadSpec::new(deadline(45, 100))),
-        Err(TaskError::DeadlineAdmission)
-    ));
-
-    system.drain_policy_updates_at(cpu.as_mut(), 1).unwrap();
     system
         .create_thread(ThreadSpec::new(deadline(45, 100)))
         .unwrap();
+    assert_eq!(
+        system
+            .drain_owner_control_at(cpu.as_mut(), 1)
+            .unwrap()
+            .drained(),
+        0
+    );
 }
 
 #[test]
-fn pending_fair_to_deadline_update_reserves_before_owner_apply() {
+fn fair_to_deadline_reserves_admission_before_returning() {
     let (system, mut cpu) = online_system(1);
     let active = ready_thread(&system, SchedulePolicy::default());
     system.enqueue_at(cpu.as_mut(), active.id(), 0).unwrap();
@@ -264,16 +261,13 @@ fn pending_fair_to_deadline_update_reserves_before_owner_apply() {
         Err(TaskError::DeadlineAdmission)
     ));
 
-    // The policy inbox carries an intrusive Arc publication that is normally
-    // consumed by the owner CPU at its next scheduler safe point. Complete
-    // that ownership transfer before the isolated fixture is torn down so the
-    // test does not strand the publication outside TaskSystem's registry.
     assert_eq!(
         system
-            .drain_policy_updates_at(cpu.as_mut(), 1)
+            .drain_owner_control_at(cpu.as_mut(), 1)
             .unwrap()
             .drained(),
-        1
+        0,
+        "deadline admission and policy publication are one owner-rq transaction"
     );
 }
 

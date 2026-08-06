@@ -73,11 +73,51 @@ trait TaskSystemClockTestExt {
         now_ns: u64,
     ) -> Result<ParkCommit, TaskError>;
 
-    fn drain_policy_updates_at(
+    fn drain_owner_control_at(
         &self,
         cpu: Pin<&mut CpuLocal>,
         now_ns: u64,
     ) -> Result<OwnerControlDrain, TaskError>;
+}
+
+#[test]
+fn cpu_online_transition_samples_the_owner_rq_clock_once() {
+    let system = TaskSystem::new(TaskSystemConfig::new(1)).unwrap();
+    let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
+
+    crate::test_runtime::reset_scheduler_reads();
+    system.bring_cpu_online(cpu.as_mut()).unwrap();
+
+    assert_eq!(
+        crate::test_runtime::scheduler_reads(),
+        1,
+        "one rq state transition must use one clock sample"
+    );
+}
+
+#[test]
+fn block_transition_samples_the_owner_rq_clock_once() {
+    let system = TaskSystem::new(TaskSystemConfig::new(1)).unwrap();
+    let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
+    system
+        .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
+        .unwrap();
+    system
+        .register_idle_thread(
+            cpu.as_mut(),
+            ThreadSpec::new(SchedulePolicy::fair(Nice::ZERO, FairMode::Idle)),
+        )
+        .unwrap();
+    system.bring_cpu_online(cpu.as_mut()).unwrap();
+
+    crate::test_runtime::reset_scheduler_reads();
+    let _decision = system.block_current_at(cpu.as_mut(), 1).unwrap();
+
+    assert_eq!(
+        crate::test_runtime::scheduler_reads(),
+        1,
+        "park preparation and rq commit are one scheduling transition"
+    );
 }
 
 impl TaskSystemClockTestExt for TaskSystem {
@@ -156,11 +196,19 @@ impl TaskSystemClockTestExt for TaskSystem {
 
     fn block_current_at(
         &self,
-        cpu: Pin<&mut CpuLocal>,
+        mut cpu: Pin<&mut CpuLocal>,
         now_ns: u64,
     ) -> Result<ScheduleDecision, TaskError> {
         crate::test_runtime::set_scheduler_ns_for_cpu(cpu.owner().as_u32(), now_ns);
-        self.block_current(cpu)
+        let ParkPrepare::Prepared(mut ticket) = self.prepare_park(cpu.as_mut())? else {
+            panic!("isolated block fixture unexpectedly consumed a preceding notification")
+        };
+        match self.commit_park(cpu, &mut ticket)? {
+            ParkCommit::Blocked(decision) => Ok(decision),
+            ParkCommit::Notified => {
+                panic!("isolated block fixture unexpectedly raced with a notification")
+            }
+        }
     }
 
     fn exit_current_at(
@@ -182,13 +230,13 @@ impl TaskSystemClockTestExt for TaskSystem {
         self.commit_park(cpu, token)
     }
 
-    fn drain_policy_updates_at(
+    fn drain_owner_control_at(
         &self,
         cpu: Pin<&mut CpuLocal>,
         now_ns: u64,
     ) -> Result<OwnerControlDrain, TaskError> {
         crate::test_runtime::set_scheduler_ns_for_cpu(cpu.owner().as_u32(), now_ns);
-        self.drain_policy_updates(cpu)
+        self.drain_owner_control(cpu)
     }
 }
 
@@ -331,13 +379,10 @@ fn remote_deadline_wake_uses_the_target_runqueue_clock() {
         system.wake_thread_direct(Arc::clone(&deadline.core), Some(CpuId::new(1))),
         crate::WakeResult::Notified
     );
-    let absolute_deadline = deadline
-        .core
-        .sched()
-        .lock()
-        .policy
-        .active()
-        .entity()
+    let absolute_deadline = cpu1
+        .lock_run_queue()
+        .scheduling_entity(deadline.id())
+        .expect("the woken Deadline entity must be owned by the target rq")
         .deadline()
         .and_then(DeadlineEntity::absolute_deadline_ns);
     assert_eq!(absolute_deadline, Some(15));
@@ -406,7 +451,7 @@ fn cpu_owners_schedule_while_cold_domains_are_locked() {
             ready.wait();
             start.wait();
             let result = system
-                .drain_policy_updates_at(cpu.as_mut(), 1)
+                .drain_owner_control_at(cpu.as_mut(), 1)
                 .and_then(|_| system.schedule_at(cpu.as_mut(), 1).map(|_| ()));
             completed.send((cpu_index, result)).unwrap();
         }));
@@ -501,7 +546,7 @@ fn same_cpu_hard_irq_publication_uses_irq_return_instead_of_a_self_ipi() {
     crate::test_runtime::set_hard_irq(false);
 
     let scheduler_ipi_send_count = crate::test_runtime::scheduler_ipi_send_count();
-    let drained = system.drain_policy_updates_at(cpu.as_mut(), 1).unwrap();
+    let drained = system.drain_owner_control_at(cpu.as_mut(), 1).unwrap();
     assert_eq!(drained.drained(), 1);
     assert_eq!(
         scheduler_ipi_send_count, 0,
@@ -659,13 +704,10 @@ fn fair_service_thread_woken_from_irq_preempts_without_waiting_for_timer() {
         system.thread_state(service.id()).unwrap(),
         ThreadState::Ready
     );
-    let queued = service
-        .core
-        .sched()
-        .lock()
-        .policy
-        .active()
-        .entity()
+    let queued = cpu
+        .lock_run_queue()
+        .scheduling_entity(service.id())
+        .expect("the IRQ-woken service must be linked in its owner rq")
         .fair()
         .unwrap();
     assert_eq!(queued.vruntime(), 19_000_000);
@@ -784,7 +826,11 @@ fn same_cpu_task_wake_activates_the_owner_runqueue_directly() {
         ThreadState::Ready
     );
     let token = task_runtime::irq_guard_enter();
-    assert_eq!(system.snapshot(cpu.as_ref()).unwrap().runnable(), 1);
+    assert_eq!(
+        system.snapshot(cpu.as_ref()).unwrap().runnable(),
+        2,
+        "Linux rq->nr_running includes both the non-idle current and queued wakee"
+    );
     // SAFETY: this consumes the task-context owner token on the same host
     // thread after the snapshot borrow has ended.
     unsafe { task_runtime::irq_guard_exit(token) };
@@ -1290,6 +1336,12 @@ fn lowering_rt_priority_notifies_overloaded_root_domain_owner() {
         system
             .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
             .unwrap();
+        system
+            .register_idle_thread(
+                cpu.as_mut(),
+                ThreadSpec::new(SchedulePolicy::fair(Nice::ZERO, FairMode::Idle)),
+            )
+            .unwrap();
         system.bring_cpu_online(cpu.as_mut()).unwrap();
     }
 
@@ -1363,6 +1415,12 @@ fn priority_drop_serializes_root_domain_push_delivery() {
     for cpu in &mut cpus {
         system
             .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
+            .unwrap();
+        system
+            .register_idle_thread(
+                cpu.as_mut(),
+                ThreadSpec::new(SchedulePolicy::fair(Nice::ZERO, FairMode::Idle)),
+            )
             .unwrap();
         system.bring_cpu_online(cpu.as_mut()).unwrap();
     }
@@ -1520,7 +1578,7 @@ fn queued_affinity_update_refreshes_pushability_summary() {
     let mut cpu0_only = CpuSet::empty(2);
     assert!(cpu0_only.insert(CpuId::new(0)));
     let narrow = system.request_affinity(queued.id(), cpu0_only).unwrap();
-    system.drain_policy_updates_at(cpu0.as_mut(), 3).unwrap();
+    system.drain_owner_control_at(cpu0.as_mut(), 3).unwrap();
     assert_eq!(narrow.try_result(), Some(Ok(())));
     assert!(
         !system
@@ -1531,7 +1589,7 @@ fn queued_affinity_update_refreshes_pushability_summary() {
     let widen = system
         .request_affinity(queued.id(), CpuSet::all(2))
         .unwrap();
-    system.drain_policy_updates_at(cpu0.as_mut(), 4).unwrap();
+    system.drain_owner_control_at(cpu0.as_mut(), 4).unwrap();
     assert_eq!(widen.try_result(), Some(Ok(())));
     assert!(
         system
@@ -1615,7 +1673,7 @@ fn same_cpu_task_wake_before_park_preserves_the_notification_until_prepare() {
 }
 
 #[test]
-fn policy_update_doorbell_runs_outside_cold_irq_lock_domains() {
+fn policy_reschedule_doorbell_runs_outside_cold_irq_lock_domains() {
     let system = Box::pin(TaskSystem::new(TaskSystemConfig::new(1)).unwrap());
     let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
     system
@@ -1642,8 +1700,8 @@ fn policy_update_doorbell_runs_outside_cold_irq_lock_domains() {
     assert_eq!(
         crate::test_runtime::scheduler_ipi_irq_guards(),
         owner_scope_guards + 1,
-        "the inbox publish guard may cover the doorbell, but registry/root-domain guards must be \
-         gone"
+        "the reschedule publication guard may cover the doorbell, but registry/root-domain guards \
+         must be gone"
     );
 }
 
@@ -1874,7 +1932,7 @@ fn migration_carrier_closes_hotplug_before_detached_placement_commits() {
     system
         .place_ready_at(cpu0.as_mut(), thread.id(), 0)
         .unwrap();
-    system.drain_policy_updates_at(cpu1.as_mut(), 0).unwrap();
+    system.drain_owner_control_at(cpu1.as_mut(), 0).unwrap();
 
     let sched = thread.core.sched().lock();
     assert_eq!(sched.placement.queued_cpu(), Some(CpuId::new(1)));
@@ -2135,6 +2193,12 @@ fn affinity_constrained_fair_balance_keeps_backing_off() {
         system
             .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
             .unwrap();
+        system
+            .register_idle_thread(
+                cpu.as_mut(),
+                ThreadSpec::new(SchedulePolicy::fair(Nice::ZERO, FairMode::Idle)),
+            )
+            .unwrap();
         system.bring_cpu_online_at(cpu.as_mut(), 0).unwrap();
     }
 
@@ -2184,6 +2248,12 @@ fn successful_fair_balance_resets_the_minimum_interval() {
         system
             .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
             .unwrap();
+        system
+            .register_idle_thread(
+                cpu.as_mut(),
+                ThreadSpec::new(SchedulePolicy::fair(Nice::ZERO, FairMode::Idle)),
+            )
+            .unwrap();
         system.bring_cpu_online_at(cpu.as_mut(), 0).unwrap();
     }
 
@@ -2231,6 +2301,12 @@ fn fair_balance_selects_one_candidate_across_multiple_destinations() {
         system
             .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
             .unwrap();
+        system
+            .register_idle_thread(
+                cpu.as_mut(),
+                ThreadSpec::new(SchedulePolicy::fair(Nice::ZERO, FairMode::Idle)),
+            )
+            .unwrap();
         system.bring_cpu_online_at(cpu.as_mut(), 0).unwrap();
     }
     let movable = system
@@ -2273,6 +2349,12 @@ fn fair_balance_scans_past_an_affinity_constrained_candidate() {
     for cpu in [&mut cpu0, &mut cpu1] {
         system
             .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
+            .unwrap();
+        system
+            .register_idle_thread(
+                cpu.as_mut(),
+                ThreadSpec::new(SchedulePolicy::fair(Nice::ZERO, FairMode::Idle)),
+            )
             .unwrap();
         system.bring_cpu_online_at(cpu.as_mut(), 0).unwrap();
     }
@@ -3318,7 +3400,7 @@ fn prepared_exit_rejects_new_remote_affinity_delivery() {
 }
 
 #[test]
-fn prepared_exit_rejects_new_remote_deadline_policy_delivery() {
+fn prepared_exit_rejects_a_synchronous_deadline_policy_transaction() {
     let system = TaskSystem::new(TaskSystemConfig::new(2)).unwrap();
     let mut cpu0 = system.create_cpu_local(CpuId::new(0)).unwrap();
     let mut cpu1 = system.create_cpu_local(CpuId::new(1)).unwrap();
@@ -3344,7 +3426,10 @@ fn prepared_exit_rejects_new_remote_deadline_policy_delivery() {
         .unwrap();
     let deadline =
         SchedulePolicy::deadline(DeadlinePolicy::new(1, 2, 10, DeadlineFlags::NONE).unwrap());
-    system.set_thread_policy(exiting_id, deadline).unwrap();
+    assert_eq!(
+        system.set_thread_policy(exiting_id, deadline),
+        Err(TaskError::NotReady)
+    );
     assert!(
         !cpu0.has_remote_work(),
         "a prepared exit must reject new policy delivery reservations"
@@ -3433,7 +3518,7 @@ fn failed_owner_batch_releases_all_detached_payloads() {
         )
         .unwrap();
     assert_eq!(
-        system.drain_policy_updates_at(cpu1.as_mut(), 1),
+        system.drain_owner_control_at(cpu1.as_mut(), 1),
         Err(TaskError::InvalidConfiguration)
     );
     assert_eq!(thread.core.scheduler_inbox_delivery_count(), 0);
@@ -3605,7 +3690,7 @@ fn running_rt_task_has_one_active_schedule_owner() {
 }
 
 #[test]
-fn policy_safe_point_drains_only_owner_control() {
+fn policy_update_commits_without_owner_control_delivery() {
     let system = TaskSystem::new(TaskSystemConfig::new(1)).unwrap();
     let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
     let running = system
@@ -3626,18 +3711,22 @@ fn policy_safe_point_drains_only_owner_control() {
             SchedulePolicy::fifo(RtPriority::new(1).unwrap()),
         )
         .unwrap();
-    assert!(cpu.remote().owner_control_inbox().has_pending());
+    assert_eq!(
+        system.thread_policy(running.id()).unwrap(),
+        SchedulePolicy::fifo(RtPriority::new(1).unwrap())
+    );
+    assert!(!cpu.remote().owner_control_inbox().has_pending());
 
     system.schedule_if_requested_at(cpu.as_mut(), 1).unwrap();
 
     assert_eq!(
         cpu.remote().owner_control_inbox().drain_attempts(),
-        control_drains + 1,
-        "the owner must still consume the policy delivery"
+        control_drains,
+        "a synchronous policy transaction must not enter the owner-control inbox"
     );
     assert!(
         !cpu.remote().owner_control_inbox().has_pending(),
-        "the policy delivery must not remain stranded after its owner safe point"
+        "a policy transaction must not create owner-control work"
     );
 }
 
@@ -3665,16 +3754,13 @@ fn owner_policy_apply_notifies_extension_at_the_owner_timestamp() {
         thread.id()
     );
 
+    crate::test_runtime::set_scheduler_ns_for_cpu(0, 1_050_000);
     system
         .set_thread_policy(
             thread.id(),
             SchedulePolicy::fair(Nice::new(5).unwrap(), FairMode::Normal),
         )
         .unwrap();
-    system
-        .drain_policy_updates_at(cpu.as_mut(), 1_050_000)
-        .unwrap();
-
     assert_eq!(POLICY_APPLIED_CALLBACKS.load(Ordering::Acquire), 1);
     assert_eq!(POLICY_APPLIED_AT_NS.load(Ordering::Acquire), 1_050_000);
 }
@@ -3773,18 +3859,12 @@ fn fair_policy_update_reweights_lag_without_resetting_service_history() {
         .set_thread_policy(first.id(), SchedulePolicy::fair(nice, FairMode::Normal))
         .unwrap();
     system
-        .drain_policy_updates_at(cpu.as_mut(), 1_050_000)
+        .drain_owner_control_at(cpu.as_mut(), 1_050_000)
         .unwrap();
-    let reweighted = system
-        .state
-        .lock()
-        .thread_record(first.id())
-        .unwrap()
-        .sched
-        .lock()
-        .policy
-        .active()
-        .entity()
+    let reweighted = cpu
+        .lock_run_queue()
+        .current_scheduling_entity()
+        .expect("the running task must retain its rq-owned Fair entity")
         .fair()
         .unwrap();
     let lag =
@@ -3804,18 +3884,12 @@ fn fair_policy_update_reweights_lag_without_resetting_service_history() {
         .set_thread_policy(first.id(), SchedulePolicy::fair(nice, FairMode::Batch))
         .unwrap();
     system
-        .drain_policy_updates_at(cpu.as_mut(), 1_050_000)
+        .drain_owner_control_at(cpu.as_mut(), 1_050_000)
         .unwrap();
-    let batch = system
-        .state
-        .lock()
-        .thread_record(first.id())
-        .unwrap()
-        .sched
-        .lock()
-        .policy
-        .active()
-        .entity()
+    let batch = cpu
+        .lock_run_queue()
+        .current_scheduling_entity()
+        .expect("the running task must retain its rq-owned Batch entity")
         .fair()
         .unwrap();
     assert_eq!(batch.vruntime(), reweighted.vruntime());
@@ -3829,18 +3903,12 @@ fn fair_policy_update_reweights_lag_without_resetting_service_history() {
         )
         .unwrap();
     system
-        .drain_policy_updates_at(cpu.as_mut(), 1_050_000)
+        .drain_owner_control_at(cpu.as_mut(), 1_050_000)
         .unwrap();
-    let idle = system
-        .state
-        .lock()
-        .thread_record(first.id())
-        .unwrap()
-        .sched
-        .lock()
-        .policy
-        .active()
-        .entity()
+    let idle = cpu
+        .lock_run_queue()
+        .current_scheduling_entity()
+        .expect("the running task must retain its rq-owned SCHED_IDLE entity")
         .fair()
         .unwrap();
     assert_eq!(idle.nice(), Nice::LOWEST);
@@ -3927,19 +3995,13 @@ fn running_idle_to_normal_transition_uses_both_class_virtual_times() {
         .set_thread_policy(idle.id(), SchedulePolicy::default())
         .unwrap();
     system
-        .drain_policy_updates_at(cpu.as_mut(), 1_001_000)
+        .drain_owner_control_at(cpu.as_mut(), 1_001_000)
         .unwrap();
 
-    let transitioned = system
-        .state
-        .lock()
-        .thread_record(idle.id())
-        .unwrap()
-        .sched
-        .lock()
-        .policy
-        .active()
-        .entity()
+    let transitioned = cpu
+        .lock_run_queue()
+        .current_scheduling_entity()
+        .expect("the running policy target must remain rq->curr")
         .fair()
         .unwrap();
     assert_eq!(
@@ -3965,13 +4027,15 @@ fn running_normal_to_idle_transition_settles_then_rebases_lag() {
         )
         .unwrap();
     system
-        .drain_policy_updates_at(cpu.as_mut(), 1_000_000)
+        .drain_owner_control_at(cpu.as_mut(), 1_000_000)
         .unwrap();
 
-    let state = system.state.lock();
-    let record = state.thread_record(normal.id()).unwrap();
-    let sched = record.sched.lock();
-    let transitioned = sched.policy.active().entity().fair().unwrap();
+    let transitioned = cpu
+        .lock_run_queue()
+        .current_scheduling_entity()
+        .expect("the running policy target must remain rq->curr")
+        .fair()
+        .unwrap();
     assert_eq!(transitioned.mode(), FairMode::Idle);
     assert_eq!(
         transitioned.vruntime(),
@@ -4008,7 +4072,7 @@ fn bounded_inbox_remainder_stays_sticky_across_scheduler_entry() {
         );
     }
 
-    let first = system.drain_policy_updates_at(cpu.as_mut(), 1).unwrap();
+    let first = system.drain_owner_control_at(cpu.as_mut(), 1).unwrap();
     assert_eq!(first.drained(), cpu.batch_limit());
     assert!(first.pending());
     assert!(
@@ -4019,7 +4083,7 @@ fn bounded_inbox_remainder_stays_sticky_across_scheduler_entry() {
     );
     assert!(cpu.needs_reschedule());
 
-    let second = system.drain_policy_updates_at(cpu.as_mut(), 2).unwrap();
+    let second = system.drain_owner_control_at(cpu.as_mut(), 2).unwrap();
     assert_eq!(second.drained(), 1);
     assert!(!second.pending());
     assert!(matches!(
@@ -4055,45 +4119,6 @@ fn future_deadline_members_do_not_create_scheduler_work() {
 }
 
 #[test]
-fn elapsed_deadline_event_is_reconciled_without_a_physical_timer_node() {
-    let system = TaskSystem::new(TaskSystemConfig::new(1)).unwrap();
-    let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
-    system
-        .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
-        .unwrap();
-    system.bring_cpu_online(cpu.as_mut()).unwrap();
-
-    let policy =
-        SchedulePolicy::deadline(DeadlinePolicy::new(1, 10, 100, DeadlineFlags::NONE).unwrap());
-    let thread = system.create_thread(ThreadSpec::new(policy)).unwrap();
-    system.make_ready(thread.id()).unwrap();
-    system.enqueue_at(cpu.as_mut(), thread.id(), 0).unwrap();
-    let core = {
-        let state = system.state.lock();
-        Arc::clone(&state.thread_record(thread.id()).unwrap().core)
-    };
-
-    crate::test_runtime::set_monotonic_ns(10);
-    {
-        let mut sched = core.sched().lock();
-        system.refresh_owner_deadline_timers_locked(&core, &mut sched, cpu.as_mut());
-        assert!(
-            sched.deadline.cbs_timer.is_none(),
-            "Linux start_dl_timer() does not arm an already elapsed scheduler deadline"
-        );
-        assert_eq!(
-            cpu.lock_run_queue()
-                .scheduling_entity(core.id())
-                .and_then(|entity| entity.deadline().cloned())
-                .unwrap()
-                .misses(),
-            1,
-            "the owner must reconcile the elapsed CBS state in the same scheduler transaction"
-        );
-    }
-}
-
-#[test]
 fn forced_yield_clears_slice_expiration_accounted_by_that_schedule() {
     let system = TaskSystem::new(TaskSystemConfig::new(1)).unwrap();
     let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
@@ -4108,9 +4133,11 @@ fn forced_yield_clears_slice_expiration_accounted_by_that_schedule() {
 
     system.yield_current_at(cpu.as_mut(), 8).unwrap();
 
+    let request_state = cpu.remote().scheduler_request_state_for_test();
     assert!(
-        !cpu.needs_reschedule(),
-        "the scheduling transaction already handled the RR expiration it accounted"
+        !cpu.remote().take_preempt_requested(),
+        "the scheduling transaction already handled the RR expiration it accounted: \
+         {request_state:?}"
     );
 }
 
@@ -4123,23 +4150,17 @@ fn single_runnable_fair_yield_preserves_the_active_request() {
         .unwrap();
     system.bring_cpu_online(cpu.as_mut()).unwrap();
 
-    let before = current
-        .core
-        .sched()
-        .lock()
-        .policy
-        .active()
-        .entity()
+    let before = cpu
+        .lock_run_queue()
+        .current_scheduling_entity()
+        .expect("bootstrap current must be owned by rq->curr")
         .fair()
         .unwrap();
     let decision = system.yield_current_at(cpu.as_mut(), 0).unwrap();
-    let after = current
-        .core
-        .sched()
-        .lock()
-        .policy
-        .active()
-        .entity()
+    let after = cpu
+        .lock_run_queue()
+        .current_scheduling_entity()
+        .expect("no-switch yield must retain rq->curr")
         .fair()
         .unwrap();
 
@@ -4155,46 +4176,6 @@ fn single_runnable_fair_yield_preserves_the_active_request() {
             .unwrap()
             .slice_expired(),
         "a no-switch yield must preserve the active runtime dispatch"
-    );
-}
-
-#[test]
-fn forced_yield_does_not_consume_deferred_owner_work() {
-    let system = TaskSystem::new(TaskSystemConfig::new(1)).unwrap();
-    let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
-    system
-        .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
-        .unwrap();
-    system.bring_cpu_online(cpu.as_mut()).unwrap();
-    let contender = system
-        .create_thread(ThreadSpec::new(SchedulePolicy::default()))
-        .unwrap();
-    system.make_ready(contender.id()).unwrap();
-    system.enqueue_at(cpu.as_mut(), contender.id(), 0).unwrap();
-
-    let deferred = Box::pin(crate::inbox::InboxNode::new(InboxKind::OwnerControl));
-    publish_test_scheduler_work(cpu.remote(), test_inbox_node(&deferred), 7);
-    assert!(cpu.remote().owner_control_inbox().has_pending());
-
-    system.yield_current_at(cpu.as_mut(), 1).unwrap();
-
-    assert!(
-        cpu.remote().owner_control_inbox().has_pending(),
-        "sched_yield must not consume unrelated remote/deferred work"
-    );
-    let before_tail = system.drain_policy_updates_at(cpu.as_mut(), 1).unwrap();
-    assert_eq!(
-        (before_tail.drained(), before_tail.pending()),
-        (0, true),
-        "owner work must remain deferred until the outgoing stack loses its on-CPU lifetime pin",
-    );
-    system.complete_context_switch(cpu.as_mut()).unwrap();
-    assert_eq!(
-        system
-            .drain_policy_updates_at(cpu.as_mut(), 1)
-            .unwrap()
-            .drained(),
-        1
     );
 }
 
@@ -4256,7 +4237,7 @@ fn running_migration_is_published_only_after_switch_tail() {
     let mut target_only = CpuSet::empty(2);
     target_only.insert(CpuId::new(1));
     system.set_affinity(thread.id(), target_only).unwrap();
-    system.drain_policy_updates_at(cpu0.as_mut(), 1).unwrap();
+    system.drain_owner_control_at(cpu0.as_mut(), 1).unwrap();
     let decision = system
         .schedule_if_requested_at(cpu0.as_mut(), 1)
         .unwrap()
@@ -4267,7 +4248,7 @@ fn running_migration_is_published_only_after_switch_tail() {
 
     system.complete_context_switch(cpu0.as_mut()).unwrap();
     assert!(cpu1.has_remote_work());
-    let transfer = system.drain_policy_updates_at(cpu1.as_mut(), 2).unwrap();
+    let transfer = system.drain_owner_control_at(cpu1.as_mut(), 2).unwrap();
     assert_eq!(transfer.drained(), 1);
     assert!(!transfer.pending());
 }
@@ -4295,41 +4276,40 @@ fn queued_affinity_migration_captures_lag_before_detaching_from_source() {
         .unwrap();
     for thread in [&migrating, &peer] {
         system.make_ready(thread.id()).unwrap();
+        system.enqueue(cpu0.as_mut(), thread.id()).unwrap();
     }
 
     cpu0.lock_run_queue().set_virtual_time_for_test(1_000);
     for (thread, vruntime, deadline) in [(&migrating, 900, 950), (&peer, 1_100, 1_200)] {
-        let policy = SchedulePolicy::default();
         let entity = SchedulingEntity::Fair(FairEntity::test_state(
             Nice::ZERO,
             FairMode::Normal,
             vruntime,
             deadline,
         ));
-        cpu0.lock_run_queue()
-            .enqueue_task(
-                QueuedThread::new(
-                    thread.id(),
-                    ActiveSchedulingState::new(policy, entity.clone()),
-                    Arc::clone(&thread.core),
-                    false,
-                    true,
-                    RqTaskMetadata::test(2),
-                ),
-                EnqueueReason::Preempted,
-                None,
-            )
-            .unwrap();
-        let mut sched = thread.core.sched().lock();
-        *sched.policy.active_mut().entity_mut() = entity;
-        sched.placement.activate(CpuId::new(0));
-        thread.core.set_wake_cpu_hint(CpuId::new(0));
+        let remote = Arc::clone(cpu0.remote());
+        let mut transaction = OwnerRqTxn::begin(&system, &remote);
+        let mut active = transaction.reclassify_task(thread.id()).into_active();
+        *active.entity_mut() = entity;
+        transaction.enqueue_task(
+            QueuedThread::new(
+                thread.id(),
+                active,
+                Arc::clone(&thread.core),
+                false,
+                true,
+                RqTaskMetadata::test(2),
+            ),
+            EnqueueReason::Preempted,
+            None,
+        );
+        transaction.commit();
     }
 
     let mut cpu1_only = CpuSet::empty(2);
     assert!(cpu1_only.insert(CpuId::new(1)));
     system.set_affinity(migrating.id(), cpu1_only).unwrap();
-    system.drain_policy_updates_at(cpu0.as_mut(), 1).unwrap();
+    system.drain_owner_control_at(cpu0.as_mut(), 1).unwrap();
 
     assert_eq!(
         migrating
@@ -4499,14 +4479,14 @@ fn schedule_out_rechecks_affinity_under_the_thread_lock() {
 }
 
 #[test]
-fn owner_pick_reconciles_affinity_changed_after_inbox_drain() {
+fn owner_schedule_applies_affinity_before_picking_the_next_task() {
     let system = TaskSystem::new(TaskSystemConfig::new(2)).unwrap();
     let mut cpu0 = system.create_cpu_local(CpuId::new(0)).unwrap();
     let mut cpu1 = system.create_cpu_local(CpuId::new(1)).unwrap();
     let running = system
         .install_bootstrap_thread(cpu0.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
         .unwrap();
-    let idle0 = system
+    let _idle0 = system
         .register_idle_thread(
             cpu0.as_mut(),
             ThreadSpec::new(SchedulePolicy::fair(Nice::ZERO, FairMode::Idle)),
@@ -4527,23 +4507,12 @@ fn owner_pick_reconciles_affinity_changed_after_inbox_drain() {
     system.make_ready(candidate.id()).unwrap();
     system.enqueue_at(cpu0.as_mut(), candidate.id(), 0).unwrap();
 
-    // Model a remote writer publishing immediately after the owner drained its
-    // inbox but before pick-next locked this queued candidate. Linux closes
-    // this window by rechecking the task mask while holding task/rq ownership.
     let mut cpu1_only = CpuSet::empty(2);
     assert!(cpu1_only.insert(CpuId::new(1)));
     system.set_affinity(candidate.id(), cpu1_only).unwrap();
 
-    crate::test_runtime::set_scheduler_ns(1);
-    let remote = Arc::clone(cpu0.remote());
-    let next = {
-        let mut transaction = OwnerRqTxn::begin(&system, &remote);
-        let next =
-            system.pick_owner_next_in_rq(cpu0.as_mut(), &mut transaction, Some(running.id()));
-        transaction.commit();
-        next.core
-    };
-    assert_eq!(next.id(), idle0.id());
+    let next = system.schedule_at(cpu0.as_mut(), 1).unwrap();
+    assert_eq!(next.next(), running.id());
     assert_eq!(
         candidate
             .core
@@ -4716,6 +4685,49 @@ fn rt_deadline_put_prev_keeps_one_runqueue_owner() {
 }
 
 #[test]
+fn deadline_runqueue_ledger_tracks_policy_replacement() {
+    let system = TaskSystem::new(TaskSystemConfig::new(1)).unwrap();
+    let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
+    system
+        .register_idle_thread(
+            cpu.as_mut(),
+            ThreadSpec::new(SchedulePolicy::fair(Nice::ZERO, FairMode::Idle)),
+        )
+        .unwrap();
+    system.bring_cpu_online(cpu.as_mut()).unwrap();
+
+    let deadline = system
+        .create_thread(ThreadSpec::new(SchedulePolicy::deadline(
+            DeadlinePolicy::new(4, 8, 8, DeadlineFlags::NONE).unwrap(),
+        )))
+        .unwrap();
+    system.make_ready(deadline.id()).unwrap();
+    system.enqueue_at(cpu.as_mut(), deadline.id(), 0).unwrap();
+    let bandwidth = cpu.lock_run_queue().deadline_bandwidth();
+    assert_eq!(bandwidth.this_bw_scaled(), 500_000_000);
+    assert_eq!(bandwidth.running_bw_scaled(), 500_000_000);
+
+    system
+        .set_thread_policy(deadline.id(), SchedulePolicy::default())
+        .unwrap();
+    system.drain_owner_control_at(cpu.as_mut(), 1).unwrap();
+    let bandwidth = cpu.lock_run_queue().deadline_bandwidth();
+    assert_eq!(bandwidth.this_bw_scaled(), 0);
+    assert_eq!(bandwidth.running_bw_scaled(), 0);
+
+    system
+        .set_thread_policy(
+            deadline.id(),
+            SchedulePolicy::deadline(DeadlinePolicy::new(2, 10, 20, DeadlineFlags::NONE).unwrap()),
+        )
+        .unwrap();
+    system.drain_owner_control_at(cpu.as_mut(), 2).unwrap();
+    let bandwidth = cpu.lock_run_queue().deadline_bandwidth();
+    assert_eq!(bandwidth.this_bw_scaled(), 100_000_000);
+    assert_eq!(bandwidth.running_bw_scaled(), 100_000_000);
+}
+
+#[test]
 fn blocked_affinity_update_completes_after_switch_tail() {
     let system = TaskSystem::new(TaskSystemConfig::new(2)).unwrap();
     let mut cpu0 = system.create_cpu_local(CpuId::new(0)).unwrap();
@@ -4751,12 +4763,12 @@ fn blocked_affinity_update_completes_after_switch_tail() {
     let change = system.request_affinity(blocked.id(), cpu1_only).unwrap();
     assert_eq!(change.try_result(), None);
 
-    let deferred = system.drain_policy_updates_at(cpu0.as_mut(), 2).unwrap();
+    let deferred = system.drain_owner_control_at(cpu0.as_mut(), 2).unwrap();
     assert_eq!(deferred.drained(), 0);
     assert!(deferred.pending());
 
     system.complete_context_switch(cpu0.as_mut()).unwrap();
-    system.drain_policy_updates_at(cpu0.as_mut(), 2).unwrap();
+    system.drain_owner_control_at(cpu0.as_mut(), 2).unwrap();
 
     assert_eq!(change.try_result(), Some(Ok(())));
     assert_eq!(blocked.core.wake_cpu_hint(), Some(CpuId::new(1)));
@@ -4781,7 +4793,7 @@ fn initial_placement_hands_affinity_pinned_thread_to_its_owner_cpu() {
         .place_ready_at(cpu0.as_mut(), thread.id(), 0)
         .unwrap();
     assert!(cpu1.has_remote_work());
-    system.drain_policy_updates_at(cpu1.as_mut(), 0).unwrap();
+    system.drain_owner_control_at(cpu1.as_mut(), 0).unwrap();
     assert_eq!(
         system.schedule_at(cpu1.as_mut(), 0).unwrap().next(),
         thread.id()
@@ -4925,13 +4937,13 @@ fn active_sleep_timer_pins_affinity_placement_to_its_owner_cpu() {
     let mut includes_owner = CpuSet::empty(2);
     includes_owner.insert(CpuId::new(1));
     system.set_affinity(thread.id(), includes_owner).unwrap();
-    assert_eq!(thread.assigned_cpu(), None);
+    assert_eq!(thread.assigned_cpu(), Some(CpuId::new(0)));
     assert_eq!(thread.core.wake_cpu_hint(), Some(CpuId::new(1)));
     assert!(thread.core.complete_sleep_timer(7));
 }
 
 #[test]
-fn queued_pi_owner_is_requeued_only_by_its_owner_cpu() {
+fn queued_pi_owner_is_reclassified_inside_one_owner_rq_transaction() {
     let system = TaskSystem::new(TaskSystemConfig::new(1)).unwrap();
     let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
     system.bring_cpu_online(cpu.as_mut()).unwrap();
@@ -4962,8 +4974,8 @@ fn queued_pi_owner_is_requeued_only_by_its_owner_cpu() {
         SchedulePolicy::Fifo { priority } if priority.get() == 99
     ));
     assert_eq!(system.snapshot(cpu.as_ref()).unwrap().runnable(), 2);
-    let drain = system.drain_policy_updates_at(cpu.as_mut(), 1).unwrap();
-    assert_eq!(drain.drained(), 1);
+    let drain = system.drain_owner_control_at(cpu.as_mut(), 1).unwrap();
+    assert_eq!(drain.drained(), 0);
     assert_eq!(
         system.schedule_at(cpu.as_mut(), 1).unwrap().next(),
         owner.id()
@@ -5037,7 +5049,7 @@ fn effective_rt_entity_never_replaces_the_base_rr_accounting() {
     system.enqueue_at(cpu.as_mut(), owner.id(), 0).unwrap();
     let lock = PiMutexCore::new();
     let wait = commit_pi_wait(&system, &lock, donor.id(), owner.id()).unwrap();
-    system.drain_policy_updates_at(cpu.as_mut(), 0).unwrap();
+    system.drain_owner_control_at(cpu.as_mut(), 0).unwrap();
 
     let rq = cpu.lock_run_queue();
     let (effective_policy, effective_entity) = rq.scheduling_state(owner.id()).unwrap();
@@ -5064,7 +5076,7 @@ fn effective_rt_entity_never_replaces_the_base_rr_accounting() {
             .slice_expired()
     );
     system.pi_wait_cancel(wait).unwrap();
-    system.drain_policy_updates_at(cpu.as_mut(), 4).unwrap();
+    system.drain_owner_control_at(cpu.as_mut(), 4).unwrap();
     system.schedule_at(cpu.as_mut(), 4).unwrap();
     assert!(
         system
@@ -5507,7 +5519,7 @@ fn deadline_pi_charges_the_owner_local_cbs_without_debiting_the_donor() {
         donor.id()
     );
     let wait = commit_pi_wait(&system, &lock, donor.id(), owner.id()).unwrap();
-    system.drain_policy_updates_at(cpu.as_mut(), 0).unwrap();
+    system.drain_owner_control_at(cpu.as_mut(), 0).unwrap();
     assert_eq!(
         system.block_current_at(cpu.as_mut(), 0).unwrap().next(),
         owner.id()
@@ -5576,7 +5588,7 @@ fn remote_pi_owner_charges_its_local_cbs_with_donor_parameters() {
         donor.id()
     );
     system.complete_context_switch(cpu0.as_mut()).unwrap();
-    system.drain_policy_updates_at(cpu1.as_mut(), 0).unwrap();
+    system.drain_owner_control_at(cpu1.as_mut(), 0).unwrap();
 
     let owner_runtime = system.deadline_runtime(owner.id()).unwrap();
     assert_eq!(owner_runtime.donor(), Some(donor.id()));
@@ -5659,7 +5671,7 @@ fn coalesced_deadline_refresh_recomputes_the_owner_cbs_state() {
         "the dedicated intrusive node must coalesce the newer refresh"
     );
 
-    system.drain_policy_updates_at(cpu.as_mut(), 10).unwrap();
+    system.drain_owner_control_at(cpu.as_mut(), 10).unwrap();
 
     assert!(
         core.sched().lock().deadline.cbs_timer.is_some(),

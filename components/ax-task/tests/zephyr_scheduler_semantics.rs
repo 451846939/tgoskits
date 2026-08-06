@@ -27,7 +27,7 @@ fn higher_priority_fifo_wake_requests_preemption() {
     let higher = ready_thread(&system, fifo(20));
     system.enqueue_at(cpu.as_mut(), higher.id(), 1).unwrap();
 
-    assert!(cpu.needs_reschedule());
+    assert!(system.snapshot(cpu.as_ref()).unwrap().need_resched());
     assert_eq!(
         system
             .schedule_if_requested_at(cpu.as_mut(), 1)
@@ -52,7 +52,7 @@ fn same_priority_fifo_wake_does_not_request_preemption() {
     let peer = ready_thread(&system, fifo(10));
     system.enqueue_at(cpu.as_mut(), peer.id(), 1).unwrap();
 
-    assert!(!cpu.needs_reschedule());
+    assert!(!system.snapshot(cpu.as_ref()).unwrap().need_resched());
     assert!(
         system
             .schedule_if_requested_at(cpu.as_mut(), 1)
@@ -60,7 +60,10 @@ fn same_priority_fifo_wake_does_not_request_preemption() {
             .decision()
             .is_none()
     );
-    assert_eq!(cpu.current(), Some(running.id()));
+    assert_eq!(
+        system.snapshot(cpu.as_ref()).unwrap().current(),
+        Some(running.id())
+    );
 }
 
 #[test]
@@ -76,7 +79,7 @@ fn batch_wake_does_not_request_ordinary_fair_preemption() {
     let batch = ready_thread(&system, SchedulePolicy::fair(Nice::ZERO, FairMode::Batch));
     system.enqueue_at(cpu.as_mut(), batch.id(), 1).unwrap();
 
-    assert!(!cpu.needs_reschedule());
+    assert!(!system.snapshot(cpu.as_ref()).unwrap().need_resched());
     assert!(
         system
             .schedule_if_requested_at(cpu.as_mut(), 1)
@@ -84,7 +87,10 @@ fn batch_wake_does_not_request_ordinary_fair_preemption() {
             .decision()
             .is_none()
     );
-    assert_eq!(cpu.current(), Some(running.id()));
+    assert_eq!(
+        system.snapshot(cpu.as_ref()).unwrap().current(),
+        Some(running.id())
+    );
 }
 
 #[test]
@@ -101,7 +107,7 @@ fn batch_wake_preempts_sched_idle_current() {
     system.enqueue_at(cpu.as_mut(), batch.id(), 1).unwrap();
 
     assert!(
-        cpu.needs_reschedule(),
+        system.snapshot(cpu.as_ref()).unwrap().need_resched(),
         "Batch is ordinary fair work and must preempt SCHED_IDLE"
     );
     assert_eq!(
@@ -329,8 +335,8 @@ fn repeated_smp_wake_distributes_rt_threads_without_duplicate_entries() {
     system.complete_context_switch(cpu1.as_mut()).unwrap();
     assert_eq!(first.state(), ThreadState::Ready);
     assert_eq!(second.state(), ThreadState::Ready);
-    assert_eq!(cpu0.queued_summary(), Some(1));
-    assert_eq!(cpu1.queued_summary(), Some(1));
+    assert_eq!(cpu0.queued_summary(), 1);
+    assert_eq!(cpu1.queued_summary(), 1);
     support::clear_handles();
 }
 

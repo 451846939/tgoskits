@@ -178,12 +178,21 @@ impl SchedulerClass {
         if self == Self::Stop {
             return None;
         }
+        // Linux `dequeue_entity()` calls `update_entity_lag()` while the
+        // entity is still on cfs_rq, before `__dequeue_entity()` changes the
+        // weighted average. Capture the same source-rq value before removing
+        // our intrusive node; post-dequeue virtual time is not the task's
+        // migration lag.
+        let source_virtual_time = run_queue
+            .queued_thread_including_current(id)
+            .and_then(|thread| thread.base_entity.fair())
+            .map(|fair| run_queue.virtual_time_for_mode(fair.mode()));
         let mut thread = self.dequeue_task(run_queue, membership, id)?;
-        if let Some(fair) = thread.active.entity().fair() {
-            thread.active.entity_mut().capture_fair_migration(
-                run_queue.virtual_time_for_mode(fair.mode()),
-                timing_granularity_ns,
-            );
+        if let Some(source_virtual_time) = source_virtual_time {
+            thread
+                .active
+                .base_entity_mut()
+                .capture_fair_migration(source_virtual_time, timing_granularity_ns);
         }
         Some(thread)
     }
@@ -276,7 +285,11 @@ impl SchedulerClass {
     pub(crate) const fn task_tick(self, charge: DispatchCharge) -> ClassTick {
         ClassTick {
             request_reschedule: match self {
-                Self::Deadline => charge.deadline_overrun,
+                // Linux `update_curr_dl_se()` always dequeues and reschedules
+                // an exhausted CBS entity. `SCHED_FLAG_DL_OVERRUN` controls
+                // only user-visible overrun notification, never whether the
+                // throttled task may keep running.
+                Self::Deadline => charge.slice_expired,
                 Self::Realtime | Self::Fair | Self::IdleFair => charge.slice_expired,
                 Self::Stop => false,
             },

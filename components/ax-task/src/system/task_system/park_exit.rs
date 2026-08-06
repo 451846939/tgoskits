@@ -334,51 +334,6 @@ impl TaskSystem {
         Ok(())
     }
 
-    /// Parks the current thread and selects its replacement.
-    pub fn block_current(
-        &self,
-        mut cpu: Pin<&mut CpuLocal>,
-    ) -> Result<ScheduleDecision, TaskError> {
-        self.ensure_owner_cpu_context(&cpu)?;
-        let clock = self.sample_owner_rq_clock(cpu.as_ref().get_ref());
-        let now_ns = clock.wall().as_nanos();
-        match self.prepare_park(cpu.as_mut())? {
-            ParkPrepare::Prepared(mut ticket) => {
-                match self.commit_park_owner(cpu.as_mut(), &mut ticket, OwnerRqEntry::IrqSave)? {
-                    ParkCommit::Blocked(decision) => Ok(decision),
-                    ParkCommit::Notified => {
-                        let core = cpu.current_core().ok_or(TaskError::NoRunnableThread)?;
-                        let endpoint = cpu
-                            .current_switch_endpoint()
-                            .ok_or(TaskError::NoRunnableThread)?;
-                        Ok(Self::owner_switch_plan(
-                            Some(&core),
-                            Some(endpoint),
-                            &core,
-                            endpoint,
-                            SwitchReason::Blocked,
-                            now_ns,
-                        ))
-                    }
-                }
-            }
-            ParkPrepare::Notified => {
-                let core = cpu.current_core().ok_or(TaskError::NoRunnableThread)?;
-                let endpoint = cpu
-                    .current_switch_endpoint()
-                    .ok_or(TaskError::NoRunnableThread)?;
-                Ok(Self::owner_switch_plan(
-                    Some(&core),
-                    Some(endpoint),
-                    &core,
-                    endpoint,
-                    SwitchReason::Blocked,
-                    now_ns,
-                ))
-            }
-        }
-    }
-
     /// Validates all fallible current-thread exit prerequisites without
     /// publishing the thread as exited.
     pub(crate) fn prepare_current_exit(
@@ -631,13 +586,17 @@ impl TaskSystem {
             let sched = previous_core.sched().lock();
             let remote = Arc::clone(cpu.remote());
             let transaction = OwnerRqTxn::begin(self, &remote);
-            self.validate_switch_handoff_state(
+            let validation = self.validate_switch_handoff_state(
                 owner,
                 transaction.deadline_bandwidth(),
                 initial_handoff,
                 placement,
                 &sched,
-            )?;
+            );
+            if let Err(error) = validation {
+                transaction.commit();
+                return Err(error);
+            }
             transaction.commit();
         }
 
@@ -667,13 +626,20 @@ impl TaskSystem {
             let mut sched = handoff.previous().sched().lock();
             let remote = Arc::clone(cpu.remote());
             let mut transaction = OwnerRqTxn::begin(self, &remote);
-            let (migration_target, previous_exited) = self.validate_switch_handoff_state(
+            let validation = self.validate_switch_handoff_state(
                 owner,
                 transaction.deadline_bandwidth(),
                 handoff,
                 placement,
                 &sched,
-            )?;
+            );
+            let (migration_target, previous_exited) = match validation {
+                Ok(validated) => validated,
+                Err(error) => {
+                    transaction.commit();
+                    return Err(error);
+                }
+            };
             if migration_target.is_some() && sched.deadline.bandwidth.reservation_owner().is_some()
             {
                 Self::detach_owner_deadline_bandwidth_in_rq(

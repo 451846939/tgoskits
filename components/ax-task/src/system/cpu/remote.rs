@@ -15,9 +15,8 @@ pub(crate) use idle_pull::IdlePullReservation;
 pub use lifecycle::CpuLifecycleState;
 pub(crate) use lifecycle::{CpuRemotePublication, OwnedCpuRemotePublication};
 pub use owner::CpuLocalOwnerBorrow;
-pub(crate) use run_queue::CpuRunQueueState;
-#[cfg(feature = "qperf-metrics")]
-pub(crate) use run_queue::WakePreemptionDecision;
+pub(in crate::system::cpu) use run_queue::RqCurrentTick;
+pub(crate) use run_queue::{CpuRunQueueState, WakePreemptionDecision};
 pub(crate) use scheduler::SchedulerRequestClaim;
 
 /// Stable cross-CPU publication endpoint for one scheduler owner.

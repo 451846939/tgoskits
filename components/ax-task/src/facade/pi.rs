@@ -48,7 +48,7 @@ pub(super) fn prepare_pi_park_attempt(
     if cpu.current() != Some(token.thread_id()) {
         return Err(TaskError::InvalidPiState);
     }
-    system.drain_policy_updates(cpu.as_mut())?;
+    system.drain_owner_control(cpu.as_mut())?;
     if token.can_claim() || token.is_granted() {
         return Ok(PiParkAttempt::Complete);
     }

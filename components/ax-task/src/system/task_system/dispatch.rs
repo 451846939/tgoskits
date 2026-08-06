@@ -2,9 +2,12 @@
 
 use super::*;
 
+#[derive(Clone, Copy)]
 pub(super) struct PolicyGenerationCommit {
-    base_policy: SchedulePolicy,
-    running_policy_changed: bool,
+    pub(super) base_policy: SchedulePolicy,
+    pub(super) running_policy_changed: bool,
+    pub(super) held_deadline_reservation: u64,
+    pub(super) committed_deadline_reservation: u64,
 }
 
 #[cfg(test)]
@@ -131,11 +134,15 @@ impl TaskSystem {
         if core.publish_wake() {
             return WakeResult::AlreadyPending;
         }
-        if sched.lifecycle.state() == ThreadState::Running {
-            // Match Linux's current-task fast path: publishing the wake is the
-            // complete transaction while the thread is still running. Keep
-            // the bit for the next prepare_park() instead of selecting a CPU
-            // and reserving a runqueue publication that cannot enqueue work.
+        if matches!(
+            sched.lifecycle.state(),
+            ThreadState::Ready | ThreadState::Running | ThreadState::Waking
+        ) {
+            // Match Linux's runnable/current fast path: the task is already
+            // eligible or completing an earlier wake, so no activation and
+            // no rq ownership transfer is legal. Keep the notification for
+            // the next prepare_park() instead of dereferencing task-owned
+            // policy state which a Ready task has transferred to its rq.
             return WakeResult::Notified;
         }
         let preferred = preferred
@@ -412,13 +419,8 @@ impl TaskSystem {
             transaction.commit();
             return Ok(preempts_current);
         }
-        let preempts_current = self.link_owner_ready_thread_locked(
-            cpu.as_ref().get_ref(),
-            &mut transaction,
-            core,
-            sched,
-            reason,
-        );
+        let preempts_current =
+            self.link_owner_ready_thread_locked(owner, &mut transaction, core, sched, reason);
         let timer_preempts = self
             .refresh_owner_deadline_timers_in_rq(core, sched, cpu, now_ns, &mut transaction)
             .unwrap_or(false);
@@ -428,7 +430,7 @@ impl TaskSystem {
 
     fn link_owner_throttled_deadline_locked(
         &self,
-        run_queue: &mut CpuRunQueueState,
+        run_queue: &mut OwnerRqTxn<'_>,
         core: &Arc<ThreadCore>,
         sched: &mut ThreadSchedState,
         owner: CpuId,
@@ -443,18 +445,14 @@ impl TaskSystem {
             task_runtime::fatal_invariant(0x574b_1111, core.id().as_u64() as usize)
         });
         let active = sched.policy.take_active();
-        run_queue
-            .enqueue_throttled_deadline(QueuedThread::new(
-                core.id(),
-                active,
-                Arc::clone(core),
-                false,
-                sched.affinity.affinity.is_migration_capable(),
-                metadata,
-            ))
-            .unwrap_or_else(|_| {
-                task_runtime::fatal_invariant(0x574b_1112, core.id().as_u64() as usize)
-            });
+        run_queue.enqueue_throttled_deadline(QueuedThread::new(
+            core.id(),
+            active,
+            Arc::clone(core),
+            false,
+            sched.affinity.affinity.is_migration_capable(),
+            metadata,
+        ));
         sched.placement.activate(owner);
         core.publish_effective_schedule(policy, &entity);
         core.set_wake_cpu_hint(owner);
@@ -462,13 +460,12 @@ impl TaskSystem {
 
     pub(super) fn link_owner_ready_thread_locked(
         &self,
-        cpu: &CpuLocal,
-        run_queue: &mut CpuRunQueueState,
+        owner: CpuId,
+        run_queue: &mut OwnerRqTxn<'_>,
         core: &Arc<ThreadCore>,
         sched: &mut ThreadSchedState,
         reason: EnqueueReason,
     ) -> bool {
-        let owner = cpu.owner();
         let policy = sched.policy.active().policy();
         let current_fair = run_queue
             .current_scheduling_entity()
@@ -478,22 +475,18 @@ impl TaskSystem {
             task_runtime::fatal_invariant(0x574b_1102, core.id().as_u64() as usize)
         });
         let active = sched.policy.take_active();
-        let queued_entity = run_queue
-            .enqueue_task(
-                QueuedThread::new(
-                    core.id(),
-                    active,
-                    Arc::clone(core),
-                    sched.is_pi_boosted_rt_owner_for(policy),
-                    sched.affinity.affinity.is_migration_capable(),
-                    metadata,
-                ),
-                reason,
-                current_fair,
-            )
-            .unwrap_or_else(|_| {
-                task_runtime::fatal_invariant(0x574b_1103, core.id().as_u64() as usize)
-            });
+        let queued_entity = run_queue.enqueue_task(
+            QueuedThread::new(
+                core.id(),
+                active,
+                Arc::clone(core),
+                sched.is_pi_boosted_rt_owner_for(policy),
+                sched.affinity.affinity.is_migration_capable(),
+                metadata,
+            ),
+            reason,
+            current_fair,
+        );
         Self::activate_deadline_bandwidth_locked(core, sched, run_queue, owner);
         run_queue.update_fair_virtual_time(current_fair);
         let fair_virtual_time = queued_entity
@@ -552,7 +545,7 @@ impl TaskSystem {
     pub(super) fn activate_deadline_bandwidth_locked(
         core: &Arc<ThreadCore>,
         sched: &mut ThreadSchedState,
-        run_queue: &mut CpuRunQueueState,
+        run_queue: &mut OwnerRqTxn<'_>,
         owner: CpuId,
     ) {
         if !matches!(sched.policy.base, SchedulePolicy::Deadline(_)) {
@@ -578,7 +571,7 @@ impl TaskSystem {
     pub(super) fn attach_deadline_bandwidth_locked(
         core: &Arc<ThreadCore>,
         sched: &mut ThreadSchedState,
-        run_queue: &mut CpuRunQueueState,
+        run_queue: &mut OwnerRqTxn<'_>,
         owner: CpuId,
         active: bool,
     ) {
@@ -594,7 +587,7 @@ impl TaskSystem {
         core: &Arc<ThreadCore>,
         sched: &mut ThreadSchedState,
         remote: &CpuRemote,
-        run_queue: &mut CpuRunQueueState,
+        run_queue: &mut OwnerRqTxn<'_>,
     ) {
         let owner = remote.owner();
         let Some(assigned_cpu) = sched.deadline.bandwidth.reservation_owner() else {
@@ -624,7 +617,7 @@ impl TaskSystem {
         sched: &mut ThreadSchedState,
         mut cpu: Pin<&mut CpuLocal>,
         now_ns: u64,
-        run_queue: &mut CpuRunQueueState,
+        run_queue: &mut OwnerRqTxn<'_>,
     ) {
         let owner = cpu.owner();
         let base_entity = if let Some(active) = sched.policy.active_option() {
@@ -744,9 +737,7 @@ impl TaskSystem {
     ) -> Option<Arc<ThreadCore>> {
         let current = transaction.current_thread();
         let current_core = transaction.current_core();
-        let Some(dispatch) = transaction.current_mut() else {
-            return None;
-        };
+        let dispatch = transaction.current_mut()?;
         if current != Some(dispatch.thread())
             || current_core
                 .as_ref()
@@ -761,37 +752,6 @@ impl TaskSystem {
         let _charged_runtime_ns = dispatch.take_charged_runtime_ns();
         let overrun_core = dispatch.deadline_overrun_core();
         dispatch.take_deadline_overrun().then_some(overrun_core)
-    }
-
-    pub(super) fn apply_policy_generation(
-        &self,
-        core: &Arc<ThreadCore>,
-        generation: u64,
-        owner_now_ns: Option<u64>,
-        fair_placement: Option<FairPolicyPlacement>,
-        activate_deadline: bool,
-    ) -> Result<bool, TaskError> {
-        let mut sched = core.sched().lock();
-        let mut active = sched.policy.take_active();
-        let applied = self.apply_policy_generation_locked(
-            &mut sched,
-            &mut active,
-            generation,
-            owner_now_ns,
-            fair_placement,
-            activate_deadline,
-        )?;
-        if !sched.pi.donors.is_empty() || sched.pi.donor.is_some() {
-            return Err(TaskError::InvalidPiState);
-        }
-        core.publish_effective_schedule(active.policy(), &active.entity());
-        sched.policy.install_active(active);
-        let Some(commit) = applied else {
-            return Ok(false);
-        };
-        drop(sched);
-        Self::finish_policy_generation(core, commit, owner_now_ns);
-        Ok(true)
     }
 
     pub(super) fn apply_policy_generation_locked(
@@ -844,6 +804,7 @@ impl TaskSystem {
         if sched.pi.donor.is_none() {
             active.use_base_entity(base_policy);
         }
+        let held_deadline_reservation = sched.held_deadline_reservation();
         let committed = sched.policy.commit_pending_update();
         debug_assert_eq!(committed, pending);
         sched
@@ -855,10 +816,27 @@ impl TaskSystem {
         Ok(Some(PolicyGenerationCommit {
             base_policy,
             running_policy_changed,
+            held_deadline_reservation,
+            committed_deadline_reservation: committed.reservation_scaled,
         }))
     }
 
-    pub(super) fn finish_policy_generation(
+    pub(super) fn finish_policy_admission_locked(
+        root_domain: &mut root_domain::RootDomainGuard<'_>,
+        core: &Arc<ThreadCore>,
+        commit: PolicyGenerationCommit,
+    ) {
+        root_domain
+            .replace_deadline_utilization(
+                commit.held_deadline_reservation,
+                commit.committed_deadline_reservation,
+            )
+            .unwrap_or_else(|_| {
+                task_runtime::fatal_invariant(0x444c_1202, core.id().as_u64() as usize)
+            });
+    }
+
+    pub(super) fn notify_policy_generation(
         core: &Arc<ThreadCore>,
         commit: PolicyGenerationCommit,
         owner_now_ns: Option<u64>,
@@ -883,16 +861,18 @@ impl TaskSystem {
         sched: &ThreadSchedState,
         generation: u64,
     ) -> Result<(), TaskError> {
-        if generation > sched.policy.update_generation() {
+        let pending = sched
+            .policy
+            .pending_update()
+            .ok_or(TaskError::InvalidConfiguration)?;
+        if generation != pending.generation || generation != sched.policy.update_generation() {
             return Err(TaskError::InvalidConfiguration);
         }
-        if sched.policy.pending_update().is_some() {
-            sched
-                .policy
-                .dispatch_generation
-                .checked_add(1)
-                .ok_or(TaskError::InvalidConfiguration)?;
-        }
+        sched
+            .policy
+            .dispatch_generation
+            .checked_add(1)
+            .ok_or(TaskError::InvalidConfiguration)?;
         Ok(())
     }
 

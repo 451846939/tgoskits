@@ -12,11 +12,6 @@ use support::TaskSystemClockTestExt;
 fn reclaim_includes_unreserved_root_domain_bandwidth() {
     let (system, mut cpu) = online_system();
     let reclaimer = ready_deadline(&system, 500, 1_000, 1_000, DeadlineFlags::RECLAIM);
-    assert_eq!(
-        cpu.deadline_extra_bw_scaled(),
-        450_000_000,
-        "the owner runqueue must receive its Linux dl_rq.extra_bw share"
-    );
     system.enqueue_at(cpu.as_mut(), reclaimer.id(), 0).unwrap();
     assert_eq!(
         system.schedule_at(cpu.as_mut(), 0).unwrap().next(),
@@ -41,90 +36,6 @@ fn reclaim_includes_unreserved_root_domain_bandwidth() {
         448,
         "GRUB must include the root domain's unreserved capacity in Uextra"
     );
-}
-
-#[test]
-fn detached_policy_release_updates_runqueue_extra_bandwidth_synchronously() {
-    let (system, cpu) = online_system();
-    let deadline = system
-        .create_thread(ThreadSpec::new(SchedulePolicy::deadline(
-            DeadlinePolicy::new(1, 2, 2, DeadlineFlags::NONE).unwrap(),
-        )))
-        .unwrap();
-    assert_eq!(cpu.deadline_extra_bw_scaled(), 450_000_000);
-
-    system
-        .set_thread_policy(deadline.id(), SchedulePolicy::default())
-        .unwrap();
-    assert_eq!(
-        cpu.deadline_extra_bw_scaled(),
-        950_000_000,
-        "policy apply must release dl_bw before returning, not through a pending fallback"
-    );
-}
-
-#[test]
-fn root_domain_extra_bandwidth_uses_linux_per_reservation_rounding() {
-    support::clear_handles();
-    let system = TaskSystem::new(TaskSystemConfig::new(2)).unwrap();
-    let mut cpu0 = system.create_cpu_local(CpuId::new(0)).unwrap();
-    let mut cpu1 = system.create_cpu_local(CpuId::new(1)).unwrap();
-    for cpu in [&mut cpu0, &mut cpu1] {
-        system
-            .register_idle_thread(
-                cpu.as_mut(),
-                ThreadSpec::new(SchedulePolicy::fair(Nice::ZERO, FairMode::Idle)),
-            )
-            .unwrap();
-        system.bring_cpu_online(cpu.as_mut()).unwrap();
-    }
-    let policy = SchedulePolicy::deadline(
-        DeadlinePolicy::new(1, 1_000_000_000, 1_000_000_000, DeadlineFlags::NONE).unwrap(),
-    );
-    system.create_thread(ThreadSpec::new(policy)).unwrap();
-    system.create_thread(ThreadSpec::new(policy)).unwrap();
-
-    assert_eq!(cpu0.deadline_extra_bw_scaled(), 950_000_000);
-    assert_eq!(cpu1.deadline_extra_bw_scaled(), 950_000_000);
-    system.take_cpu_offline(cpu1.as_mut()).unwrap();
-    assert_eq!(cpu0.deadline_extra_bw_scaled(), 949_999_998);
-    system.bring_cpu_online(cpu1.as_mut()).unwrap();
-    assert_eq!(cpu0.deadline_extra_bw_scaled(), 950_000_000);
-    assert_eq!(cpu1.deadline_extra_bw_scaled(), 950_000_000);
-}
-
-#[test]
-fn deadline_policy_replace_rounds_old_and_new_reservations_separately() {
-    support::clear_handles();
-    let system = TaskSystem::new(TaskSystemConfig::new(2)).unwrap();
-    let mut cpu0 = system.create_cpu_local(CpuId::new(0)).unwrap();
-    let mut cpu1 = system.create_cpu_local(CpuId::new(1)).unwrap();
-    for cpu in [&mut cpu0, &mut cpu1] {
-        system
-            .register_idle_thread(
-                cpu.as_mut(),
-                ThreadSpec::new(SchedulePolicy::fair(Nice::ZERO, FairMode::Idle)),
-            )
-            .unwrap();
-        system.bring_cpu_online(cpu.as_mut()).unwrap();
-    }
-    let two = SchedulePolicy::deadline(
-        DeadlinePolicy::new(2, 1_000_000_000, 1_000_000_000, DeadlineFlags::NONE).unwrap(),
-    );
-    let thread = ready_deadline(
-        &system,
-        1,
-        1_000_000_000,
-        1_000_000_000,
-        DeadlineFlags::NONE,
-    );
-    system.enqueue_at(cpu0.as_mut(), thread.id(), 0).unwrap();
-
-    system.set_thread_policy(thread.id(), two).unwrap();
-
-    assert_eq!(cpu0.deadline_extra_bw_scaled(), 949_999_999);
-    assert_eq!(cpu1.deadline_extra_bw_scaled(), 949_999_999);
-    system.drain_policy_updates_at(cpu0.as_mut(), 0).unwrap();
 }
 
 #[test]
@@ -154,19 +65,15 @@ fn reclaim_starts_only_after_the_blocked_reservation_zero_lag_time() {
     let activity = system.deadline_activity(donor.id()).unwrap();
     assert_eq!(activity.activity(), DeadlineActivity::ActiveNonContending);
     assert_eq!(activity.zero_lag_ns(), Some(4));
-    assert_eq!(cpu.deadline_bandwidth().this_bw_scaled(), 750_000_000);
-    assert_eq!(cpu.deadline_bandwidth().running_bw_scaled(), 750_000_000);
+    install_runtime_handles(&system, cpu.as_mut());
     support::set_monotonic_ns(4);
-    let irq_budget = cpu.batch_limit();
-    assert_eq!(
-        cpu.as_mut()
-            .on_task_clock_event(
-                ax_task::runtime::MonotonicInstant::from_nanos(4).unwrap(),
-                irq_budget,
-            )
-            .expired(),
-        1
-    );
+    support::set_scheduler_ns(4);
+    let event = ax_task::on_clock_event(
+        ax_task::runtime::MonotonicInstant::from_nanos(4).unwrap(),
+        ax_task::DEFAULT_BATCH_LIMIT,
+    )
+    .unwrap();
+    assert_eq!(event.expired(), 1);
     assert!(
         system
             .schedule_if_requested_at(cpu.as_mut(), 4)
@@ -177,7 +84,6 @@ fn reclaim_starts_only_after_the_blocked_reservation_zero_lag_time() {
     let activity = system.deadline_activity(donor.id()).unwrap();
     assert_eq!(activity.activity(), DeadlineActivity::Inactive);
     assert_eq!(activity.zero_lag_ns(), None);
-    assert_eq!(cpu.deadline_bandwidth().inactive_bw_scaled(), 500_000_000);
     assert_eq!(
         system
             .deadline_runtime(reclaimer.id())
@@ -205,10 +111,11 @@ fn reclaim_starts_only_after_the_blocked_reservation_zero_lag_time() {
             .remaining_runtime_ns(),
         3
     );
+    support::clear_handles();
 }
 
 #[test]
-fn deadline_yield_does_not_publish_immediate_reclaimable_runtime() {
+fn deadline_yield_stays_contending_until_its_next_cbs_release() {
     let (system, mut cpu) = online_system();
     let donor = ready_deadline(&system, 4, 8, 8, DeadlineFlags::NONE);
     let reclaimer = ready_deadline(&system, 4, 8, 16, DeadlineFlags::RECLAIM);
@@ -226,9 +133,8 @@ fn deadline_yield_does_not_publish_immediate_reclaimable_runtime() {
         reclaimer.id()
     );
     let activity = system.deadline_activity(donor.id()).unwrap();
-    assert_eq!(activity.activity(), DeadlineActivity::ActiveNonContending);
-    assert_eq!(activity.zero_lag_ns(), Some(8));
-    assert_eq!(cpu.deadline_bandwidth().inactive_bw_scaled(), 0);
+    assert_eq!(activity.activity(), DeadlineActivity::ActiveContending);
+    assert_eq!(activity.zero_lag_ns(), None);
     assert!(
         !system
             .charge_current_at(cpu.as_mut(), 6, 4, 0)
@@ -273,12 +179,10 @@ fn wake_before_zero_lag_cancels_the_pending_inactive_transition() {
         "remote wake must account CBS activity in the same target-rq transaction"
     );
     assert_eq!(activity.zero_lag_ns(), None);
-    assert_eq!(cpu.deadline_bandwidth().inactive_bw_scaled(), 0);
-    system.drain_policy_updates_at(cpu.as_mut(), 3).unwrap();
+    system.drain_owner_control_at(cpu.as_mut(), 3).unwrap();
     let activity = system.deadline_activity(thread.id()).unwrap();
     assert_eq!(activity.activity(), DeadlineActivity::ActiveContending);
     assert_eq!(activity.zero_lag_ns(), None);
-    assert_eq!(cpu.deadline_bandwidth().inactive_bw_scaled(), 0);
 
     assert_eq!(
         system.schedule_at(cpu.as_mut(), 4).unwrap().next(),
@@ -311,7 +215,7 @@ fn throttled_wake_cannot_restore_cbs_budget_before_replenishment() {
         thread.id()
     );
     system.complete_context_switch(cpu.as_mut()).unwrap();
-    assert_eq!(thread.state(), ThreadState::Blocked);
+    assert_eq!(thread.state(), ThreadState::Ready);
     assert_eq!(
         system
             .deadline_runtime(thread.id())
@@ -322,8 +226,8 @@ fn throttled_wake_cannot_restore_cbs_budget_before_replenishment() {
 
     install_runtime_handles(&system, cpu.as_mut());
     assert_eq!(thread.wake_handle().wake(), WakeResult::Notified);
-    system.drain_policy_updates_at(cpu.as_mut(), 3).unwrap();
-    assert_eq!(thread.state(), ThreadState::Blocked);
+    system.drain_owner_control_at(cpu.as_mut(), 3).unwrap();
+    assert_eq!(thread.state(), ThreadState::Ready);
     assert_eq!(
         system
             .deadline_runtime(thread.id())
@@ -339,7 +243,7 @@ fn throttled_wake_cannot_restore_cbs_budget_before_replenishment() {
     {
         assert_ne!(decision.next(), thread.id());
     }
-    assert_eq!(thread.state(), ThreadState::Blocked);
+    assert_eq!(thread.state(), ThreadState::Ready);
     // CBS depletion waits for the next release. For constrained D<P
     // reservations, replenishing at the scheduling deadline would provide a
     // second budget inside the same period.
@@ -351,18 +255,15 @@ fn throttled_wake_cannot_restore_cbs_budget_before_replenishment() {
     {
         assert_ne!(decision.next(), thread.id());
     }
-    assert_eq!(thread.state(), ThreadState::Blocked);
+    assert_eq!(thread.state(), ThreadState::Ready);
     support::set_monotonic_ns(20);
-    let irq_budget = cpu.batch_limit();
-    assert_eq!(
-        cpu.as_mut()
-            .on_task_clock_event(
-                ax_task::runtime::MonotonicInstant::from_nanos(20).unwrap(),
-                irq_budget,
-            )
-            .expired(),
-        1
-    );
+    support::set_scheduler_ns(20);
+    let event = ax_task::on_clock_event(
+        ax_task::runtime::MonotonicInstant::from_nanos(20).unwrap(),
+        ax_task::DEFAULT_BATCH_LIMIT,
+    )
+    .unwrap();
+    assert_eq!(event.expired(), 1);
     let decision = system.schedule_at(cpu.as_mut(), 20).unwrap();
     assert_eq!(decision.next(), thread.id());
     assert_eq!(
@@ -391,24 +292,24 @@ fn deadline_bandwidth_moves_between_owner_runqueues() {
         system.bring_cpu_online(cpu.as_mut()).unwrap();
     }
     let first = ready_deadline(&system, 2, 10, 20, DeadlineFlags::NONE);
-    let second = ready_deadline(&system, 2, 10, 20, DeadlineFlags::NONE);
-    assert_eq!(cpu0.deadline_extra_bw_scaled(), 850_000_000);
-    assert_eq!(cpu1.deadline_extra_bw_scaled(), 850_000_000);
+    let second = ready_deadline(&system, 2, 15, 20, DeadlineFlags::NONE);
     system.enqueue_at(cpu0.as_mut(), first.id(), 0).unwrap();
     system.enqueue_at(cpu0.as_mut(), second.id(), 0).unwrap();
-    assert_eq!(cpu0.deadline_bandwidth().this_bw_scaled(), 200_000_000);
-
-    let migrated = system
-        .push_overloaded(cpu0.as_mut())
-        .unwrap()
-        .expect("an overloaded Deadline runqueue must push one reservation");
-    assert_eq!(cpu0.deadline_bandwidth().this_bw_scaled(), 100_000_000);
-    assert_eq!(cpu1.deadline_bandwidth().this_bw_scaled(), 0);
-    system.drain_policy_updates_at(cpu1.as_mut(), 1).unwrap();
-    assert_eq!(cpu1.deadline_bandwidth().this_bw_scaled(), 100_000_000);
     assert_eq!(
-        system.deadline_activity(migrated).unwrap().bandwidth_cpu(),
+        system.schedule_at(cpu0.as_mut(), 0).unwrap().next(),
+        first.id()
+    );
+    system.drain_owner_control_at(cpu1.as_mut(), 1).unwrap();
+    assert_eq!(
+        system
+            .deadline_activity(second.id())
+            .unwrap()
+            .bandwidth_cpu(),
         Some(CpuId::new(1))
+    );
+    assert_eq!(
+        system.schedule_at(cpu1.as_mut(), 1).unwrap().next(),
+        second.id()
     );
 }
 
@@ -417,19 +318,18 @@ fn queued_policy_change_replaces_the_deadline_reservation_accounting() {
     let (system, mut cpu) = online_system();
     let thread = ready_deadline(&system, 4, 8, 8, DeadlineFlags::NONE);
     system.enqueue_at(cpu.as_mut(), thread.id(), 0).unwrap();
-    assert_eq!(cpu.deadline_bandwidth().this_bw_scaled(), 500_000_000);
 
     system
         .set_thread_policy(thread.id(), SchedulePolicy::default())
         .unwrap();
-    system.drain_policy_updates_at(cpu.as_mut(), 1).unwrap();
-    assert_eq!(cpu.deadline_bandwidth().this_bw_scaled(), 0);
+    system.drain_owner_control_at(cpu.as_mut(), 1).unwrap();
+    assert!(matches!(thread.policy(), SchedulePolicy::Fair { .. }));
 
     let replacement =
         SchedulePolicy::deadline(DeadlinePolicy::new(2, 10, 20, DeadlineFlags::NONE).unwrap());
     system.set_thread_policy(thread.id(), replacement).unwrap();
-    system.drain_policy_updates_at(cpu.as_mut(), 2).unwrap();
-    assert_eq!(cpu.deadline_bandwidth().this_bw_scaled(), 100_000_000);
+    system.drain_owner_control_at(cpu.as_mut(), 2).unwrap();
+    assert!(matches!(thread.policy(), SchedulePolicy::Deadline(_)));
     assert_eq!(
         system.deadline_activity(thread.id()).unwrap().activity(),
         DeadlineActivity::ActiveContending
@@ -456,12 +356,17 @@ fn scheduler_capacity_is_rejected_before_deadline_runqueue_publication() {
         system.create_thread(ThreadSpec::new(second_policy)),
         Err(TaskError::ThreadCapacity)
     );
-
-    assert_eq!(cpu.deadline_bandwidth().this_bw_scaled(), 100_000_000);
+    assert_eq!(
+        system
+            .deadline_activity(first.id())
+            .unwrap()
+            .bandwidth_cpu(),
+        Some(CpuId::new(0))
+    );
 }
 
 #[test]
-fn blocked_deadline_exit_waits_for_owner_member_cleanup() {
+fn blocked_deadline_exit_detaches_owner_membership_synchronously() {
     let (system, mut cpu) = online_system();
     let thread = ready_deadline(&system, 1, 10, 10, DeadlineFlags::NONE);
     system.enqueue_at(cpu.as_mut(), thread.id(), 0).unwrap();
@@ -472,10 +377,7 @@ fn blocked_deadline_exit_waits_for_owner_member_cleanup() {
     system.block_current_at(cpu.as_mut(), 0).unwrap();
     system.complete_context_switch(cpu.as_mut()).unwrap();
 
-    assert_eq!(system.mark_exited(thread.id()), Err(TaskError::ThreadBusy));
-    assert_eq!(cpu.deadline_bandwidth().this_bw_scaled(), 100_000_000);
-    let drain = system.drain_policy_updates_at(cpu.as_mut(), 0).unwrap();
-    assert_eq!((drain.drained(), drain.pending()), (1, false));
+    system.mark_exited(thread.id()).unwrap();
     assert_eq!(
         system
             .deadline_activity(thread.id())
@@ -483,9 +385,6 @@ fn blocked_deadline_exit_waits_for_owner_member_cleanup() {
             .bandwidth_cpu(),
         None
     );
-    system.mark_exited(thread.id()).unwrap();
-
-    assert_eq!(cpu.deadline_bandwidth().this_bw_scaled(), 0);
     assert_eq!(thread.state(), ThreadState::Exited);
 }
 

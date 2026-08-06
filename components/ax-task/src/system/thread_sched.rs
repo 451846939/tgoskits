@@ -93,15 +93,21 @@ impl ThreadSchedCell {
             SchedulingEntity::new_with_deadline_server(policy, 1, 0, deadline_server.clone());
         Self::new(
             id,
-            ThreadSchedState::new(
-                policy,
-                entity,
-                deadline_server,
-                CpuSet::all(1),
-                0,
-                ExecutionContextHandle::NONE,
-                AddressSpaceHandle::NONE,
-            ),
+            ThreadSchedState::new(ThreadSchedInit {
+                policy: ThreadPolicyInit { policy, entity },
+                placement: ThreadPlacementInit {
+                    initial_cpu: CpuId::new(0),
+                    affinity: CpuSet::all(1),
+                },
+                deadline: ThreadDeadlineInit {
+                    server: deadline_server,
+                    reservation_scaled: 0,
+                },
+                runtime: ThreadRuntimeInit {
+                    context: ExecutionContextHandle::NONE,
+                    address_space: AddressSpaceHandle::NONE,
+                },
+            }),
         )
     }
 }
@@ -117,27 +123,51 @@ pub(super) struct ThreadSchedState {
     pub(super) runtime: runtime_state::ThreadRuntimeState,
 }
 
+pub(super) struct ThreadPolicyInit {
+    pub(super) policy: SchedulePolicy,
+    pub(super) entity: SchedulingEntity,
+}
+
+pub(super) struct ThreadPlacementInit {
+    pub(super) initial_cpu: CpuId,
+    pub(super) affinity: CpuSet,
+}
+
+pub(super) struct ThreadDeadlineInit {
+    pub(super) server: DeadlineServer,
+    pub(super) reservation_scaled: u64,
+}
+
+pub(super) struct ThreadRuntimeInit {
+    pub(super) context: ExecutionContextHandle,
+    pub(super) address_space: AddressSpaceHandle,
+}
+
+pub(super) struct ThreadSchedInit {
+    pub(super) policy: ThreadPolicyInit,
+    pub(super) placement: ThreadPlacementInit,
+    pub(super) deadline: ThreadDeadlineInit,
+    pub(super) runtime: ThreadRuntimeInit,
+}
+
 impl ThreadSchedState {
-    pub(super) fn new(
-        policy: SchedulePolicy,
-        entity: SchedulingEntity,
-        deadline_server: DeadlineServer,
-        affinity: CpuSet,
-        deadline_reservation: u64,
-        context: ExecutionContextHandle,
-        address_space: AddressSpaceHandle,
-    ) -> Self {
+    pub(super) fn new(init: ThreadSchedInit) -> Self {
         Self {
             lifecycle: alloc::sync::Arc::new(ThreadLifecycle::new()),
-            policy: policy_state::ThreadPolicyState::new(policy, entity),
-            placement: alloc::sync::Arc::new(placement::SchedulerPlacement::new()),
-            affinity: placement::ThreadAffinityState::new(affinity),
+            policy: policy_state::ThreadPolicyState::new(init.policy.policy, init.policy.entity),
+            placement: alloc::sync::Arc::new(placement::SchedulerPlacement::new(
+                init.placement.initial_cpu,
+            )),
+            affinity: placement::ThreadAffinityState::new(init.placement.affinity),
             deadline: deadline_state::ThreadDeadlineState::new(
-                deadline_server,
-                deadline_reservation,
+                init.deadline.server,
+                init.deadline.reservation_scaled,
             ),
             pi: pi_state::ThreadPiState::new(),
-            runtime: runtime_state::ThreadRuntimeState::new(context, address_space),
+            runtime: runtime_state::ThreadRuntimeState::new(
+                init.runtime.context,
+                init.runtime.address_space,
+            ),
         }
     }
 

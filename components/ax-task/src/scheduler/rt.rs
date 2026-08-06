@@ -57,9 +57,7 @@ impl RtRunQueueBandwidth {
 
     /// Accounts current RT execution and reports a raw throttle transition.
     ///
-    /// Linux throttles only when `rt_time > rt_runtime`. A PI-boosted owner
-    /// does not clear the raw state; it bypasses the effective throttle until
-    /// it can release the contended lock.
+    /// Linux throttles only when `rt_time > rt_runtime`.
     pub(crate) fn account(&mut self, runtime_ns: u64) -> bool {
         if !self.enabled {
             return false;
@@ -73,6 +71,15 @@ impl RtRunQueueBandwidth {
 
     pub(crate) fn throttle_if_exceeded(&mut self) -> bool {
         if !self.enabled || self.time_ns <= self.runtime_ns {
+            return false;
+        }
+        if self.runtime_ns == 0 {
+            // Linux `sched_rt_runtime_exceeded()` does not throttle a root
+            // bandwidth domain with no assigned runtime. Such execution is
+            // possible only through PI boosting, and a zero-period
+            // replenishment could never make a throttled rq runnable again.
+            debug_assert!(!self.throttled);
+            self.time_ns = 0;
             return false;
         }
         let changed = !self.throttled;
@@ -290,6 +297,16 @@ mod tests {
         assert!(rq.account(1));
         assert!(rq.throttle_if_exceeded());
         assert!(rq.is_throttled());
+    }
+
+    #[test]
+    fn zero_root_runtime_discards_boosted_charge_without_throttling() {
+        let mut rq = RtRunQueueBandwidth::new(100, 0);
+
+        assert!(rq.account(1));
+        assert!(!rq.throttle_if_exceeded());
+        assert_eq!(rq.time_ns(), 0);
+        assert!(!rq.is_throttled());
     }
 
     #[test]
