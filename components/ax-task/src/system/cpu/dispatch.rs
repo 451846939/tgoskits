@@ -55,11 +55,19 @@ pub(crate) struct CurrentDispatchState {
 }
 
 /// Copy-only current scheduling state observed under the runqueue lock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DispatchRole {
+    Task,
+    DedicatedIdle,
+}
+
+/// Copy-only current scheduling state observed under the runqueue lock.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CurrentSchedule {
     thread: ThreadId,
     policy: SchedulePolicy,
     entity: SchedulingEntity,
+    role: DispatchRole,
 }
 
 impl CurrentSchedule {
@@ -73,6 +81,7 @@ impl CurrentSchedule {
             thread,
             policy,
             entity,
+            role: DispatchRole::Task,
         }
     }
 
@@ -89,6 +98,9 @@ impl CurrentSchedule {
     }
 
     pub(crate) const fn absolute_deadline_ns(self) -> Option<u64> {
+        if matches!(self.role, DispatchRole::DedicatedIdle) {
+            return None;
+        }
         match self.entity.deadline() {
             Some(deadline) => deadline.absolute_deadline_ns(),
             None => None,
@@ -96,7 +108,11 @@ impl CurrentSchedule {
     }
 
     pub(crate) const fn fair_entity(self) -> Option<crate::FairEntity> {
-        self.entity.fair()
+        if matches!(self.role, DispatchRole::DedicatedIdle) {
+            None
+        } else {
+            self.entity.fair()
+        }
     }
 
     pub(crate) const fn scheduling_key(self) -> SchedulingKey {
@@ -113,11 +129,19 @@ impl CurrentSchedule {
     }
 
     pub(crate) const fn placement_demand(self) -> u64 {
-        self.policy.placement_demand()
+        if matches!(self.role, DispatchRole::DedicatedIdle) {
+            0
+        } else {
+            self.policy.placement_demand()
+        }
     }
 
     pub(crate) const fn fair_demand(self) -> u64 {
-        self.policy.fair_demand()
+        if matches!(self.role, DispatchRole::DedicatedIdle) {
+            0
+        } else {
+            self.policy.fair_demand()
+        }
     }
 
     pub(crate) fn should_preempt(
@@ -126,6 +150,12 @@ impl CurrentSchedule {
         woken_entity: SchedulingEntity,
         fair_virtual_time: u64,
     ) -> bool {
+        // Linux's per-CPU idle task belongs to idle_sched_class, not to the
+        // fair SCHED_IDLE policy. Every runnable class therefore preempts it,
+        // including ordinary FairMode::Idle work.
+        if matches!(self.role, DispatchRole::DedicatedIdle) {
+            return true;
+        }
         match woken_policy {
             SchedulePolicy::KernelStop => !matches!(self.policy, SchedulePolicy::KernelStop),
             SchedulePolicy::Deadline(_) => match self.policy {
@@ -256,6 +286,15 @@ impl CurrentDispatch {
         }
     }
 
+    /// Advances the owner clock for the per-CPU idle dispatch.
+    ///
+    /// The dedicated idle task is not a Fair entity in Linux's scheduler
+    /// model. It must not consume a Fair request or task runtime merely because
+    /// the runtime represents its context with a regular thread object.
+    pub(super) fn account_dedicated_idle_until(&mut self, now_ns: u64) {
+        self.accounted_until_ns = now_ns;
+    }
+
     pub(crate) fn finish_runtime_accounting(&self, now_ns: u64) {
         self.runtime_core().finish_runtime_accounting(now_ns);
     }
@@ -317,11 +356,12 @@ impl CurrentDispatch {
         )
     }
 
-    pub(crate) const fn schedule_snapshot(&self) -> CurrentSchedule {
+    pub(crate) const fn schedule_snapshot(&self, role: DispatchRole) -> CurrentSchedule {
         CurrentSchedule {
             thread: self.thread,
             policy: self.policy,
             entity: self.entity,
+            role,
         }
     }
 

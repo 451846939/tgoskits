@@ -2,7 +2,9 @@ use alloc::{boxed::Box, vec::Vec};
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use super::*;
-use crate::{FairEntity, PiMutexAcquire, PiMutexCore, PiMutexLockResult};
+use crate::{
+    FairEntity, PiMutexAcquire, PiMutexCore, PiMutexLockResult, system::cpu::DispatchRole,
+};
 
 trait TaskSystemClockTestExt {
     fn enqueue_at(
@@ -685,11 +687,13 @@ fn eligible_fair_current_keeps_latest_eevdf_slice_protection_on_wake() {
     assert!(current.is_eligible(1_000));
     assert!(woken.deadline_precedes(current));
     assert!(
-        !dispatch.schedule_snapshot().should_preempt(
-            SchedulePolicy::default(),
-            SchedulingEntity::Fair(woken),
-            1_000,
-        ),
+        !dispatch
+            .schedule_snapshot(DispatchRole::Task)
+            .should_preempt(
+                SchedulePolicy::default(),
+                SchedulingEntity::Fair(woken),
+                1_000,
+            ),
         "latest EEVDF keeps an eligible current request protected until its request boundary"
     );
 }

@@ -298,6 +298,33 @@ TGOSKits 不复制 Linux 的 IRQ thread 基础设施，但采用相同的所有�
 路径。数据 I/O 只能由 hard IRQ publication 推进到唯一 queue owner，再由最后 owner
 完成 source rearm。
 
+### 专用 idle 调度类与 block worker 唤醒
+
+RISC-V 四核完整组在非零 boot hart 上曾表现为 `fs-basic` 长时间无进展。GDB 同时观察到
+两个逻辑 CPU 的 runqueue 为空、current 等于各自专用 idle，但 `need_resched` 持续重新
+发布；block hctx worker 当时并未持有设备或 completion 锁。根因不在 NVMe 的 IRQ
+重试，而是调度器把 runtime 的专用 idle context 当成普通 `FairMode::Idle` 实体计费：
+fair request 到期后重新发布 reschedule，形成 idle 到自身的连续切换。
+
+Linux v7.1 明确把两类 idle 分开：per-CPU idle task 属于 `idle_sched_class`，不会入队、
+迁移或消耗 fair request；用户 `SCHED_IDLE` 仍属于 fair class。TGOSKits 因此在 current
+dispatch 快照中保存显式 `Task / DedicatedIdle` 角色，而不是从 `FairMode::Idle` 猜测：
+
+- `DedicatedIdle` 只推进 owner 的已记账时间戳，不计 task runtime、fair vruntime、RT
+  quota 或 slice deadline，也不发布 slice-expired reschedule；
+- runqueue 的 fair current、placement demand 和 fair demand 都排除专用 idle；
+- 任何实际 runnable class，包括普通 `FairMode::Idle`，都立即抢占专用 idle；
+- 普通 `FairMode::Idle` 仍完整保留 Linux `SCHED_IDLE` 的 fair 记账和最低权重行为。
+
+确定性回归分别覆盖“专用 idle 跨越一个完整 fair request 仍不产生 slice expiry”和
+“普通 SCHED_IDLE work 必须唤醒专用 idle CPU”。这个修正位于通用 owner-runqueue
+边界，四架构和所有 worker 唤醒共同受益；block 层没有新增 polling、retry 或超时兜底。
+
+修复后的官方 RISC-V `rust/all` 连续取得正式通过标志：boot HART 0 时 `fs-basic`
+为 1,639 ms、QEMU case 5.08 s；随后 boot HART 1 时 `fs-basic` 为 1,720 ms、QEMU case
+5.45 s（含构建的墙钟 6.60 s）。此前相同的非零 boot-hart 场景在 `fs-basic` 停留超过
+一分钟；这里记录的是该活锁回归的消除，不据此宣称端到端性能已经达到 Linux RT。
+
 ### Hardware queue
 
 `HardwareQueue` is move-only and is owned by one maintenance task. Its data path

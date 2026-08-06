@@ -100,6 +100,85 @@ fn cpu_busy_runtime_counts_non_idle_dispatches_only() {
 }
 
 #[test]
+fn dedicated_idle_does_not_expire_a_fair_service_request() {
+    support::clear_handles();
+    support::set_online_cpu_count(1);
+    support::set_hard_irq(false);
+
+    let config = TaskSystemConfig::new(1);
+    let fair_slice_ns = config.fair_slice_ns();
+    let system = TaskSystem::new(config).unwrap();
+    let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
+    let idle = system
+        .register_idle_thread(
+            cpu.as_mut(),
+            ThreadSpec::new(SchedulePolicy::fair(Nice::ZERO, FairMode::Idle)),
+        )
+        .unwrap();
+    system.bring_cpu_online(cpu.as_mut()).unwrap();
+    assert_eq!(
+        system.schedule_at(cpu.as_mut(), 0).unwrap().next(),
+        idle.id()
+    );
+
+    let charge = system
+        .charge_current_at(cpu.as_mut(), fair_slice_ns, fair_slice_ns, 0)
+        .unwrap();
+
+    assert_eq!(cpu.current(), Some(idle.id()));
+    assert!(
+        !charge.slice_expired(),
+        "the dedicated idle class does not own a fair service request"
+    );
+    assert!(
+        !cpu.needs_reschedule(),
+        "idle accounting must not continuously republish need_resched"
+    );
+
+    drop(idle);
+    support::clear_handles();
+}
+
+#[test]
+fn sched_idle_work_preempts_the_dedicated_idle_class() {
+    support::clear_handles();
+    support::set_online_cpu_count(1);
+    support::set_hard_irq(false);
+
+    let system = TaskSystem::new(TaskSystemConfig::new(1)).unwrap();
+    let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
+    let dedicated_idle = system
+        .register_idle_thread(
+            cpu.as_mut(),
+            ThreadSpec::new(SchedulePolicy::fair(Nice::ZERO, FairMode::Idle)),
+        )
+        .unwrap();
+    system.bring_cpu_online(cpu.as_mut()).unwrap();
+    assert_eq!(
+        system.schedule_at(cpu.as_mut(), 0).unwrap().next(),
+        dedicated_idle.id()
+    );
+
+    let sched_idle = system
+        .create_thread(ThreadSpec::new(SchedulePolicy::fair(
+            Nice::ZERO,
+            FairMode::Idle,
+        )))
+        .unwrap();
+    system.make_ready(sched_idle.id()).unwrap();
+    system.enqueue_at(cpu.as_mut(), sched_idle.id(), 1).unwrap();
+
+    assert!(
+        cpu.needs_reschedule(),
+        "every runnable scheduling class must preempt the dedicated idle class"
+    );
+
+    drop(sched_idle);
+    drop(dedicated_idle);
+    support::clear_handles();
+}
+
+#[test]
 fn current_address_space_replacement_updates_only_the_running_owner_record() {
     support::clear_handles();
     let resources = unsafe {

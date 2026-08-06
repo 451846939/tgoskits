@@ -152,7 +152,12 @@ impl CpuLocal {
         // scheduling snapshot is committed under the runqueue lock before a
         // concurrent wake may compare preemption priority.
         let this = unsafe { self.get_unchecked_mut() };
-        let snapshot = dispatch.schedule_snapshot();
+        let role = if this.dispatch.idle == Some(dispatch.thread) {
+            DispatchRole::DedicatedIdle
+        } else {
+            DispatchRole::Task
+        };
+        let snapshot = dispatch.schedule_snapshot(role);
         let mut run_queue = this.remote.lock_run_queue();
         this.dispatch.current_dispatch = Some(dispatch);
         run_queue.set_current(Some(snapshot));
@@ -206,30 +211,30 @@ impl CpuLocal {
         runtime_ns: u64,
         reclaimed_ns: u64,
     ) -> Result<DispatchCharge, TaskError> {
-        let bandwidth = run_queue.deadline_bandwidth();
-        let inactive_bw_scaled = bandwidth.inactive_bw_scaled();
-        let max_bw_scaled = bandwidth.max_bw_scaled();
-        let extra_bw_scaled = remote.deadline_extra_bw_scaled();
-        let current_is_non_idle =
-            dispatch_state.current.is_some() && dispatch_state.current != dispatch_state.idle;
-        let grub_reclaimed_ns = dispatch_state
-            .current_dispatch
-            .as_ref()
-            .map_or(0, |dispatch| {
-                dispatch.grub_reclaimed_ns(
-                    runtime_ns,
-                    inactive_bw_scaled,
-                    extra_bw_scaled,
-                    max_bw_scaled,
-                )
-            });
+        let dedicated_idle =
+            dispatch_state.current.is_some() && dispatch_state.current == dispatch_state.idle;
         let dispatch = dispatch_state
             .current_dispatch
             .as_mut()
             .ok_or(TaskError::NoRunnableThread)?;
-        if current_is_non_idle {
-            remote.charge_busy_runtime(runtime_ns);
+        if dedicated_idle {
+            dispatch.account_dedicated_idle_until(now_ns);
+            run_queue.set_current(Some(
+                dispatch.schedule_snapshot(DispatchRole::DedicatedIdle),
+            ));
+            return Ok(DispatchCharge::default());
         }
+        let bandwidth = run_queue.deadline_bandwidth();
+        let inactive_bw_scaled = bandwidth.inactive_bw_scaled();
+        let max_bw_scaled = bandwidth.max_bw_scaled();
+        let extra_bw_scaled = remote.deadline_extra_bw_scaled();
+        let grub_reclaimed_ns = dispatch.grub_reclaimed_ns(
+            runtime_ns,
+            inactive_bw_scaled,
+            extra_bw_scaled,
+            max_bw_scaled,
+        );
+        remote.charge_busy_runtime(runtime_ns);
         let charge = dispatch.charge(
             runtime_ns,
             now_ns,
@@ -239,7 +244,7 @@ impl CpuLocal {
         let current_fair = dispatch.entity.fair();
         let rt_quota_exempt = dispatch.rt_quota_exempt;
         run_queue.update_fair_virtual_time(current_fair);
-        run_queue.set_current(Some(dispatch.schedule_snapshot()));
+        run_queue.set_current(Some(dispatch.schedule_snapshot(DispatchRole::Task)));
         let rt_quota_exhausted = if matches!(
             current_policy,
             SchedulePolicy::Fifo { .. } | SchedulePolicy::RoundRobin { .. }

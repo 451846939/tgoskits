@@ -18,7 +18,8 @@ use core::{
 
 pub(crate) use clock::{RunQueueClock, RunQueueClockSnapshot};
 pub(crate) use dispatch::{
-    CurrentDispatch, CurrentDispatchState, CurrentSchedule, DispatchCharge, SwitchHandoff,
+    CurrentDispatch, CurrentDispatchState, CurrentSchedule, DispatchCharge, DispatchRole,
+    SwitchHandoff,
 };
 pub use load::{CpuLoadSummary, DeadlineBandwidthSnapshot, SchedulingClass};
 use load::{
