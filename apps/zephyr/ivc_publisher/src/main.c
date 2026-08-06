@@ -31,6 +31,7 @@
 #define AXIVC_PERF_MAGIC 0x49565046U
 #define AXIVC_PERF_VERSION 1U
 #define AXIVC_PERF_ITERATIONS 100U
+#define AXIVC_MEMCPY_BENCH_ITERATIONS 10U
 #define AXIVC_PERF_TEST_COUNT 4U
 #define AXIVC_PERF_STATE_IDLE 0U
 #define AXIVC_PERF_STATE_READY 1U
@@ -107,6 +108,10 @@ static const uint32_t perf_sizes[AXIVC_PERF_TEST_COUNT] = {
 	1024U * 1024U,
 	10U * 1024U * 1024U,
 };
+
+static uint8_t bench_src[AXIVC_PERF_PAYLOAD_MAX] __aligned(64);
+static uint8_t bench_dst[AXIVC_PERF_PAYLOAD_MAX] __aligned(64);
+static volatile uint64_t bench_guard;
 
 static uint64_t hvc_call(uint64_t code, uint64_t arg0, uint64_t arg1,
 			 uint64_t arg2, uint64_t arg3, uint64_t arg4,
@@ -206,15 +211,18 @@ static void region_init(struct axivc_region *region)
 			 __ATOMIC_RELAXED);
 	__atomic_store_n(&region->header.ring_size, sizeof(struct axivc_ring),
 			 __ATOMIC_RELAXED);
-	__atomic_store_n(&region->perf.magic, AXIVC_PERF_MAGIC,
-			 __ATOMIC_RELAXED);
-	__atomic_store_n(&region->perf.version, AXIVC_PERF_VERSION,
-			 __ATOMIC_RELAXED);
 	perf_store_state(&region->perf, AXIVC_PERF_STATE_IDLE);
 	__atomic_store_n(&region->header.version, AXIVC_REGION_VERSION,
 			 __ATOMIC_RELEASE);
 	__atomic_store_n(&region->header.magic, AXIVC_REGION_MAGIC,
 			 __ATOMIC_RELEASE);
+}
+
+static void perf_start(struct axivc_perf_control *perf)
+{
+	__atomic_store_n(&perf->version, AXIVC_PERF_VERSION, __ATOMIC_RELAXED);
+	perf_store_state(perf, AXIVC_PERF_STATE_IDLE);
+	__atomic_store_n(&perf->magic, AXIVC_PERF_MAGIC, __ATOMIC_RELEASE);
 }
 
 static void notify_linux(void)
@@ -227,6 +235,116 @@ static void wait_for_state(struct axivc_perf_control *perf, uint32_t state)
 {
 	while (perf_load_state(perf) != state) {
 		k_busy_wait(50);
+	}
+}
+
+static uint64_t now_ns(void)
+{
+	return k_cycle_get_64() * 1000000000ULL / sys_clock_hw_cycles_per_sec();
+}
+
+static uint64_t bench_memcpy_ns(uint8_t *dst, const uint8_t *src, size_t bytes)
+{
+	uint64_t start_ns;
+	uint64_t end_ns;
+
+	start_ns = now_ns();
+	for (uint32_t iter = 0; iter < AXIVC_MEMCPY_BENCH_ITERATIONS; iter++) {
+		memcpy(dst, src, bytes);
+		bench_guard ^= dst[(iter * 4099U) % bytes];
+	}
+	end_ns = now_ns();
+	return end_ns - start_ns;
+}
+
+#if defined(__GNUC__)
+__attribute__((noinline, optimize("no-tree-loop-distribute-patterns")))
+#else
+__attribute__((noinline))
+#endif
+static void copy64_loop(void *dst, const void *src, size_t bytes)
+{
+	uint64_t *d64 = dst;
+	const uint64_t *s64 = src;
+	size_t words = bytes / sizeof(uint64_t);
+
+	for (size_t i = 0; i < words; i++) {
+		d64[i] = s64[i];
+	}
+	for (size_t i = words * sizeof(uint64_t); i < bytes; i++) {
+		((uint8_t *)dst)[i] = ((const uint8_t *)src)[i];
+	}
+	__asm__ volatile("" ::: "memory");
+}
+
+static uint64_t bench_copy64_ns(uint8_t *dst, const uint8_t *src, size_t bytes)
+{
+	uint64_t start_ns;
+	uint64_t end_ns;
+
+	start_ns = now_ns();
+	for (uint32_t iter = 0; iter < AXIVC_MEMCPY_BENCH_ITERATIONS; iter++) {
+		copy64_loop(dst, src, bytes);
+		bench_guard ^= dst[(iter * 4099U) % bytes];
+	}
+	end_ns = now_ns();
+	return end_ns - start_ns;
+}
+
+static uint64_t gbps_x1000(size_t bytes, uint64_t iterations, uint64_t ns)
+{
+	if (ns == 0) {
+		return 0;
+	}
+	return (uint64_t)bytes * iterations * 8ULL * 1000ULL / ns;
+}
+
+static void print_gbps_x1000(uint64_t value)
+{
+	printk("%llu.%03llu", (unsigned long long)(value / 1000ULL),
+	       (unsigned long long)(value % 1000ULL));
+}
+
+static void run_zephyr_memcpy_bench(uint8_t *read_mem, uint8_t *write_mem)
+{
+	printk("zephyr memcpy bench iterations=%u unit=Gbps\n",
+	       AXIVC_MEMCPY_BENCH_ITERATIONS);
+
+	for (uint32_t test = 0; test < AXIVC_PERF_TEST_COUNT; test++) {
+		size_t bytes = perf_sizes[test];
+		uint64_t ram_to_ram_ns;
+		uint64_t shm_to_ram_ns;
+		uint64_t ram_to_shm_ns;
+		uint64_t shm_to_shm_ns;
+		uint64_t copy64_shm_to_shm_ns;
+
+		memset(bench_src, 0x5a, bytes);
+		memset(bench_dst, 0, bytes);
+		memcpy(read_mem, bench_src, bytes);
+		memset(write_mem, 0, bytes);
+
+		ram_to_ram_ns = bench_memcpy_ns(bench_dst, bench_src, bytes);
+		shm_to_ram_ns = bench_memcpy_ns(bench_dst, read_mem, bytes);
+		ram_to_shm_ns = bench_memcpy_ns(write_mem, bench_src, bytes);
+		shm_to_shm_ns = bench_memcpy_ns(write_mem, read_mem, bytes);
+		copy64_shm_to_shm_ns = bench_copy64_ns(write_mem, read_mem, bytes);
+
+		printk("zephyr memcpy bench size=%zu ram_to_ram=", bytes);
+		print_gbps_x1000(gbps_x1000(bytes, AXIVC_MEMCPY_BENCH_ITERATIONS,
+					    ram_to_ram_ns));
+		printk(" shm_to_ram=");
+		print_gbps_x1000(gbps_x1000(bytes, AXIVC_MEMCPY_BENCH_ITERATIONS,
+					    shm_to_ram_ns));
+		printk(" ram_to_shm=");
+		print_gbps_x1000(gbps_x1000(bytes, AXIVC_MEMCPY_BENCH_ITERATIONS,
+					    ram_to_shm_ns));
+		printk(" shm_to_shm=");
+		print_gbps_x1000(gbps_x1000(bytes, AXIVC_MEMCPY_BENCH_ITERATIONS,
+					    shm_to_shm_ns));
+		printk(" copy64_shm_to_shm=");
+		print_gbps_x1000(gbps_x1000(bytes, AXIVC_MEMCPY_BENCH_ITERATIONS,
+					    copy64_shm_to_shm_ns));
+		printk(" guard=%llu\n", (unsigned long long)bench_guard);
 	}
 }
 
@@ -265,7 +383,6 @@ int main(void)
 	}
 	region_init(region);
 
-	perf = &region->perf;
 	read_mem = (uint8_t *)region + AXIVC_PERF_READ_MEM_OFFSET;
 	write_mem = (uint8_t *)region + AXIVC_PERF_WRITE_MEM_OFFSET;
 
@@ -275,6 +392,11 @@ int main(void)
 		return 1;
 	}
 
+	run_zephyr_memcpy_bench(read_mem, write_mem);
+
+	perf = &region->perf;
+	perf_start(perf);
+
 	printk("zephyr ivc perf shared base=0x%llx size=%llu read_mem=0x%x write_mem=0x%x cache=%s\n",
 	       (unsigned long long)shm_base, (unsigned long long)shm_size,
 	       AXIVC_PERF_READ_MEM_OFFSET, AXIVC_PERF_WRITE_MEM_OFFSET,
@@ -282,6 +404,9 @@ int main(void)
 
 	for (uint32_t test = 0; test < AXIVC_PERF_TEST_COUNT; test++) {
 		uint64_t copy_total_ns = 0;
+		uint64_t wait_ready_total_ns = 0;
+		uint64_t descriptor_total_ns = 0;
+		uint64_t done_notify_total_ns = 0;
 		size_t bytes = perf_sizes[test];
 
 		if (bytes > AXIVC_PERF_PAYLOAD_MAX) {
@@ -297,12 +422,19 @@ int main(void)
 			uint32_t req_test;
 			uint32_t req_iter;
 
+			start_ns = now_ns();
 			wait_for_state(perf, AXIVC_PERF_STATE_READY);
+			end_ns = now_ns();
+			wait_ready_total_ns += end_ns - start_ns;
+
+			start_ns = now_ns();
 			req_test = __atomic_load_n(&perf->test_index,
 						   __ATOMIC_ACQUIRE);
 			req_iter = __atomic_load_n(&perf->iteration,
 						   __ATOMIC_ACQUIRE);
 			req_bytes = __atomic_load_n(&perf->bytes, __ATOMIC_ACQUIRE);
+			end_ns = now_ns();
+			descriptor_total_ns += end_ns - start_ns;
 			if (req_test != test || req_iter != iter || req_bytes != bytes) {
 				printk("zephyr ivc perf failed descriptor test=%u iter=%u bytes=%llu\n",
 				       req_test, req_iter,
@@ -310,16 +442,17 @@ int main(void)
 				return 1;
 			}
 
-			start_ns = k_cycle_get_64() * 1000000000ULL /
-				   sys_clock_hw_cycles_per_sec();
-			memcpy(write_mem, read_mem, bytes);
-			end_ns = k_cycle_get_64() * 1000000000ULL /
-				 sys_clock_hw_cycles_per_sec();
+			start_ns = now_ns();
+			copy64_loop(write_mem, read_mem, bytes);
+			end_ns = now_ns();
 			copy_total_ns += end_ns - start_ns;
 			__atomic_store_n(&perf->zephyr_copy_ns, end_ns - start_ns,
 					 __ATOMIC_RELAXED);
+			start_ns = now_ns();
 			perf_store_state(perf, AXIVC_PERF_STATE_DONE);
 			notify_linux();
+			end_ns = now_ns();
+			done_notify_total_ns += end_ns - start_ns;
 		}
 
 		printk("zephyr ivc copy size=%zu iterations=%u avg=%llu B/s\n",
@@ -327,6 +460,22 @@ int main(void)
 		       (unsigned long long)((uint64_t)bytes *
 					    AXIVC_PERF_ITERATIONS *
 					    1000000000ULL / copy_total_ns));
+		printk("zephyr ivc breakdown size=%zu wait_ready_us=%llu descriptor_us=%llu copy_gbps=%llu.%03llu done_notify_us=%llu\n",
+		       bytes,
+		       (unsigned long long)(wait_ready_total_ns /
+					    AXIVC_PERF_ITERATIONS / 1000ULL),
+		       (unsigned long long)(descriptor_total_ns /
+					    AXIVC_PERF_ITERATIONS / 1000ULL),
+		       (unsigned long long)((uint64_t)bytes *
+					    AXIVC_PERF_ITERATIONS * 8ULL /
+					    copy_total_ns),
+		       (unsigned long long)((((uint64_t)bytes *
+					     AXIVC_PERF_ITERATIONS * 8ULL *
+					     1000ULL) /
+					    copy_total_ns) %
+					   1000ULL),
+		       (unsigned long long)(done_notify_total_ns /
+					    AXIVC_PERF_ITERATIONS / 1000ULL));
 	}
 
 	wait_for_state(perf, AXIVC_PERF_STATE_IDLE);

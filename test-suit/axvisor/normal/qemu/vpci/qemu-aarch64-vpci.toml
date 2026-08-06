@@ -1,0 +1,49 @@
+args = [
+    "-nographic",
+    "-cpu",
+    "cortex-a72",
+    "-machine",
+    "virt,virtualization=on,gic-version=3",
+    "-smp",
+    "4",
+    "-device",
+    "virtio-blk-device,drive=disk0",
+    "-drive",
+    "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-aarch64-alpine.img",
+    "-append",
+    "root=/dev/vda rw init=/bin/sh",
+    "-m",
+    "8g",
+]
+fail_regex = [
+    "(?i)\\bpanic(?:ked)?\\b",
+    "(?i)kernel panic",
+    "(?i)unhandled page fault",
+    "(?i)page fault",
+    "(?m)^vpci smoke failed\\s*$",
+]
+success_regex = [
+    "(?m)^vpci smoke pass!\\s*$",
+]
+shell_prefix = "~ #"
+shell_init_cmd = '''
+echo "linux vpci smoke start"
+mkdir -p /sys
+mount -t sysfs sysfs /sys 2>/dev/null || true
+dev=/sys/bus/pci/devices/0000:00:05.0
+if [ -r "$dev/vendor" ] && [ -r "$dev/device" ] &&
+   [ "$(cat "$dev/vendor")" = "0xaaaa" ] &&
+   [ "$(cat "$dev/device")" = "0x0001" ]; then
+    echo 'vpci smoke pass!'
+else
+    echo "known pci devices:"
+    ls /sys/bus/pci/devices 2>/dev/null || true
+    for dev in /sys/bus/pci/devices/*; do
+        [ -r "$dev/vendor" ] || continue
+        echo "$dev vendor=$(cat "$dev/vendor") device=$(cat "$dev/device")"
+    done
+    echo 'vpci smoke failed'
+fi
+'''
+to_bin = true
+uefi = false

@@ -175,11 +175,27 @@ static void print_perf_summary(const uint64_t read_ns[AXIVC_PERF_TEST_COUNT],
 {
     printf("ivc perf summary iterations=%u unit=Gbps\n", AXIVC_PERF_ITERATIONS);
     for (uint32_t test = 0; test < AXIVC_PERF_TEST_COUNT; test++) {
-        printf("ivc perf summary size=%s read=%.3f write=%.3f zephyr_copy=%.3f\n",
+        printf("ivc perf summary size=%s read=%.3f write=%.3f\n",
                perf_size_labels[test],
                throughput_gbps(perf_sizes[test], AXIVC_PERF_ITERATIONS, read_ns[test]),
-               throughput_gbps(perf_sizes[test], AXIVC_PERF_ITERATIONS, write_ns[test]),
-               throughput_gbps(perf_sizes[test], AXIVC_PERF_ITERATIONS, zephyr_copy_ns[test]));
+               throughput_gbps(perf_sizes[test], AXIVC_PERF_ITERATIONS, write_ns[test]));
+    }
+}
+
+static void print_perf_breakdown(
+    const uint64_t fill_ns[AXIVC_PERF_TEST_COUNT],
+    const uint64_t local_copy_ns[AXIVC_PERF_TEST_COUNT],
+    const uint64_t write_ns[AXIVC_PERF_TEST_COUNT],
+    const uint64_t publish_ns[AXIVC_PERF_TEST_COUNT],
+    const uint64_t wait_done_ns[AXIVC_PERF_TEST_COUNT],
+    const uint64_t read_ns[AXIVC_PERF_TEST_COUNT],
+    const uint64_t verify_ns[AXIVC_PERF_TEST_COUNT],
+    const uint64_t idle_ns[AXIVC_PERF_TEST_COUNT])
+{
+    for (uint32_t test = 0; test < AXIVC_PERF_TEST_COUNT; test++) {
+        uint64_t e2e_ns = write_ns[test] + publish_ns[test] + wait_done_ns[test] +
+                          read_ns[test] + verify_ns[test] + idle_ns[test];
+        double iter = (double)AXIVC_PERF_ITERATIONS;
     }
 }
 
@@ -217,6 +233,12 @@ static int run_perf_subscriber(uint64_t target_publisher_id, uint64_t channel_ke
     uint64_t read_ns[AXIVC_PERF_TEST_COUNT] = {0};
     uint64_t write_ns[AXIVC_PERF_TEST_COUNT] = {0};
     uint64_t zephyr_copy_ns[AXIVC_PERF_TEST_COUNT] = {0};
+    uint64_t fill_ns[AXIVC_PERF_TEST_COUNT] = {0};
+    uint64_t local_copy_ns[AXIVC_PERF_TEST_COUNT] = {0};
+    uint64_t publish_ns[AXIVC_PERF_TEST_COUNT] = {0};
+    uint64_t wait_done_ns[AXIVC_PERF_TEST_COUNT] = {0};
+    uint64_t verify_ns[AXIVC_PERF_TEST_COUNT] = {0};
+    uint64_t idle_ns[AXIVC_PERF_TEST_COUNT] = {0};
     uint64_t shm_base = 0;
     uint64_t shm_size = 0;
 
@@ -310,18 +332,32 @@ static int run_perf_subscriber(uint64_t target_publisher_id, uint64_t channel_ke
             uint64_t start;
             uint64_t end;
 
+            start = now_ns();
             fill_random(source, bytes, 0x49564300U ^ (test << 16) ^ iter);
+            end = now_ns();
+            fill_ns[test] += end - start;
+
+            start = now_ns();
+            memcpy(sink, source, bytes);
+            end = now_ns();
+            local_copy_ns[test] += end - start;
 
             start = now_ns();
             memcpy(read_mem, source, bytes);
             end = now_ns();
             write_ns[test] += end - start;
 
+            start = now_ns();
             publish_perf_request(perf, test, iter, bytes);
+            end = now_ns();
+            publish_ns[test] += end - start;
 
+            start = now_ns();
             while (load_state(perf) != AXIVC_PERF_STATE_DONE) {
                 usleep(50);
             }
+            end = now_ns();
+            wait_done_ns[test] += end - start;
             zephyr_copy_ns[test] += consume_zephyr_copy_ns(perf);
 
             start = now_ns();
@@ -329,6 +365,7 @@ static int run_perf_subscriber(uint64_t target_publisher_id, uint64_t channel_ke
             end = now_ns();
             read_ns[test] += end - start;
 
+            start = now_ns();
             if (memcmp(source, sink, bytes) != 0) {
                 fprintf(stderr,
                         "IVC perf data mismatch test=%u iter=%u bytes=%zu\n",
@@ -336,8 +373,13 @@ static int run_perf_subscriber(uint64_t target_publisher_id, uint64_t channel_ke
                 ret = 8;
                 break;
             }
+            end = now_ns();
+            verify_ns[test] += end - start;
 
+            start = now_ns();
             store_state(perf, AXIVC_PERF_STATE_IDLE);
+            end = now_ns();
+            idle_ns[test] += end - start;
         }
 
         if (ret == 0) {
@@ -359,6 +401,8 @@ static int run_perf_subscriber(uint64_t target_publisher_id, uint64_t channel_ke
             }
         }
         print_perf_summary(read_ns, write_ns, zephyr_copy_ns);
+        print_perf_breakdown(fill_ns, local_copy_ns, write_ns, publish_ns,
+                             wait_done_ns, read_ns, verify_ns, idle_ns);
         printf("ivc perf test pass\n");
     } else {
         printf("ivc perf test failed\n");

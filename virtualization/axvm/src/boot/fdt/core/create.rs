@@ -48,6 +48,7 @@ pub fn create_guest_fdt(
         )
     })?;
     guest_tree.add_ivc_channel_nodes(&crate_config.devices.emu_devices)?;
+    guest_tree.add_vpci_host_nodes(&crate_config.devices.emu_devices)?;
     Ok(guest_tree.finish())
 }
 
@@ -213,6 +214,7 @@ pub fn patch_guest_fdt_for_runtime(
     let memory_specs = guest_memory_specs(memory_regions, crate_config);
     tree.rebuild_memory_nodes(&memory_specs)?;
     tree.add_ivc_channel_nodes(&crate_config.devices.emu_devices)?;
+    tree.add_vpci_host_nodes(&crate_config.devices.emu_devices)?;
     if create_chosen
         || initrd_start_size.is_some()
         || tree.inner().get_by_path_id("/chosen").is_some()
@@ -259,6 +261,68 @@ impl FdtTree {
             self.add_ivc_channel_node(device)?;
         }
         Ok(())
+    }
+
+    fn add_vpci_host_nodes(&mut self, devices: &[EmulatedDeviceConfig]) -> AxVmResult {
+        for device in devices
+            .iter()
+            .filter(|device| device.emu_type == EmulatedDeviceType::VirtualPciHost)
+        {
+            self.add_vpci_host_node(device)?;
+        }
+        Ok(())
+    }
+
+    fn add_vpci_host_node(&mut self, device: &EmulatedDeviceConfig) -> AxVmResult {
+        let node_path = format!("/pcie@{:x}", device.base_gpa);
+        let node_id = self.ensure_path(&node_path)?;
+        let bus = device.cfg_list.first().copied().unwrap_or(0) as u32;
+        let mem_base = device
+            .cfg_list
+            .get(5)
+            .copied()
+            .map(|base| base as u64)
+            .unwrap_or_else(|| {
+                align_up_u64(device.base_gpa as u64 + device.length as u64, 0x10_0000)
+            });
+        let mem_size = device
+            .cfg_list
+            .get(6)
+            .copied()
+            .map(|size| size as u64)
+            .unwrap_or(0x10_0000);
+
+        info!("Adding guest virtual PCI host FDT node {node_path}");
+        self.set_property(node_id, prop_string("compatible", "pci-host-ecam-generic"))?;
+        self.set_property(node_id, prop_string("device_type", "pci"))?;
+        self.set_property(node_id, prop_string("status", "okay"))?;
+        self.set_property(node_id, prop_u32_list("#address-cells", &[3]))?;
+        self.set_property(node_id, prop_u32_list("#size-cells", &[2]))?;
+        self.set_property(node_id, prop_u32_list("#interrupt-cells", &[1]))?;
+        self.set_property(node_id, prop_u32_list("bus-range", &[bus, bus]))?;
+        self.set_property(node_id, prop_empty("dma-coherent"))?;
+        self.set_property(node_id, self.vpci_ranges_property(mem_base, mem_size))?;
+
+        self.inner_mut()
+            .view_typed_mut(node_id)
+            .ok_or_else(|| ax_err_type!(InvalidData, "new virtual PCI host node is missing"))?
+            .set_regs(&[RegInfo::new(
+                device.base_gpa as u64,
+                Some(device.length as u64),
+            )]);
+        Ok(())
+    }
+
+    fn vpci_ranges_property(&self, mem_base: u64, mem_size: u64) -> fdt_edit::Property {
+        const PCI_RANGE_MEM32: u32 = 0x0200_0000;
+
+        let mut cells = Vec::new();
+        cells.push(PCI_RANGE_MEM32);
+        cells.push((mem_base >> 32) as u32);
+        cells.push(mem_base as u32);
+        push_u64_cells(&mut cells, mem_base, self.root_cells("#address-cells", 2));
+        push_u64_cells(&mut cells, mem_size, 2);
+        prop_u32_list("ranges", &cells)
     }
 
     fn add_ivc_channel_node(&mut self, device: &EmulatedDeviceConfig) -> AxVmResult {
@@ -328,6 +392,25 @@ impl FdtTree {
             )]);
 
         Ok(phandle)
+    }
+}
+
+fn align_up_u64(value: u64, align: u64) -> u64 {
+    debug_assert!(align.is_power_of_two());
+    (value + align - 1) & !(align - 1)
+}
+
+fn push_u64_cells(cells: &mut Vec<u32>, value: u64, cell_count: u32) {
+    match cell_count {
+        0 => {}
+        1 => cells.push(value as u32),
+        _ => {
+            cells.push((value >> 32) as u32);
+            cells.push(value as u32);
+            for _ in 2..cell_count {
+                cells.push(0);
+            }
+        }
     }
 }
 
@@ -589,5 +672,56 @@ mod tests {
                 .is_some()
         );
         assert!(node.get_property("memory-region").is_some());
+    }
+
+    #[test]
+    fn runtime_patch_adds_virtual_pci_host_node() {
+        let mut fdt = Fdt::new();
+        let root = fdt.root_id();
+        fdt.node_mut(root)
+            .unwrap()
+            .set_property(prop_u32("#address-cells", 2));
+        fdt.node_mut(root)
+            .unwrap()
+            .set_property(prop_u32("#size-cells", 2));
+        let dtb = fdt.encode().as_ref().to_vec();
+        let cfg = AxVMCrateConfig {
+            devices: axvmconfig::VMDevicesConfig {
+                emu_devices: alloc::vec![axvmconfig::EmulatedDeviceConfig {
+                    name: "vpci-host".into(),
+                    base_gpa: 0x5000_0000,
+                    length: 0x10_0000,
+                    irq_id: 0,
+                    emu_type: axvmconfig::EmulatedDeviceType::VirtualPciHost,
+                    cfg_list: alloc::vec![0, 5, 0, 0xaaaa, 0x0001],
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let patched = super::patch_guest_fdt_for_runtime(&dtb, &[], &cfg, None, false).unwrap();
+        let reparsed = Fdt::from_bytes(&patched).unwrap();
+        let node_id = reparsed.get_by_path_id("/pcie@50000000").unwrap();
+        let node = reparsed.node(node_id).unwrap();
+        let typed_node = reparsed.view_typed(node_id).unwrap();
+
+        assert_eq!(
+            node.get_property("compatible").unwrap().as_str(),
+            Some("pci-host-ecam-generic")
+        );
+        assert_eq!(
+            node.get_property("device_type").unwrap().as_str(),
+            Some("pci")
+        );
+        assert_eq!(
+            node.get_property("#address-cells").unwrap().get_u32(),
+            Some(3)
+        );
+        assert_eq!(node.get_property("#size-cells").unwrap().get_u32(), Some(2));
+        assert!(node.get_property("bus-range").is_some());
+        assert!(node.get_property("ranges").is_some());
+        assert_eq!(typed_node.regs()[0].address, 0x5000_0000);
+        assert_eq!(typed_node.regs()[0].size, Some(0x10_0000));
     }
 }

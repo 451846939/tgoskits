@@ -699,6 +699,9 @@ pub enum EmulatedDeviceType {
     /// device tree or ACPI table.
     IVCChannel          = 0xA,
 
+    /// A minimal virtual PCI host bridge with ECAM configuration space.
+    VirtualPciHost      = 0x80,
+
     // Arch-specific interrupt controller devices.
     // 0x20 - 0x22: GPPT (GIC Partial Passthrough) devices.
     /// ARM GIC Partial Passthrough Redistributor device.
@@ -899,6 +902,7 @@ impl Display for EmulatedDeviceType {
             // EmulatedDeviceType::SGIR => write!(f, "interrupt icc sgir"),
             // EmulatedDeviceType::GICR => write!(f, "interrupt controller gicr"),
             EmulatedDeviceType::IVCChannel => write!(f, "ivc channel"),
+            EmulatedDeviceType::VirtualPciHost => write!(f, "virtual pci host"),
             EmulatedDeviceType::Dummy => write!(f, "meta device"),
             EmulatedDeviceType::VirtioBlk => write!(f, "virtio block"),
             EmulatedDeviceType::VirtioNet => write!(f, "virtio net"),
@@ -909,12 +913,13 @@ impl Display for EmulatedDeviceType {
 
 impl EmulatedDeviceType {
     /// All known emulated device types.
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 18] = [
         EmulatedDeviceType::Dummy,
         EmulatedDeviceType::InterruptController,
         EmulatedDeviceType::Console,
         EmulatedDeviceType::FwCfg,
         EmulatedDeviceType::IVCChannel,
+        EmulatedDeviceType::VirtualPciHost,
         EmulatedDeviceType::GPPTRedistributor,
         EmulatedDeviceType::GPPTDistributor,
         EmulatedDeviceType::GPPTITS,
@@ -959,6 +964,7 @@ impl EmulatedDeviceType {
             0x2 => Some(EmulatedDeviceType::Console),
             0x3 => Some(EmulatedDeviceType::FwCfg),
             0xA => Some(EmulatedDeviceType::IVCChannel),
+            0x80 => Some(EmulatedDeviceType::VirtualPciHost),
             0x20 => Some(EmulatedDeviceType::GPPTRedistributor),
             0x21 => Some(EmulatedDeviceType::GPPTDistributor),
             0x22 => Some(EmulatedDeviceType::GPPTITS),

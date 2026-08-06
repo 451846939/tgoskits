@@ -38,6 +38,7 @@ mod loongarch_pch_pic;
 mod range_alloc;
 mod registration;
 mod service;
+mod vpci;
 #[cfg(target_arch = "x86_64")]
 mod x86;
 
@@ -65,6 +66,7 @@ pub use loongarch_pch_pic::{
 pub use range_alloc::{GuestRangeAllocator, GuestRangeAllocatorKey, IvcNotifyIrqKey};
 pub use registration::{DeviceBundle, DeviceLifecycle, DeviceRegistration, PollableDeviceOps};
 pub use service::{DeviceServices, ServiceCardinality, ServiceKey};
+pub use vpci::{VirtualPciEndpointConfig, VirtualPciHost, VirtualPciHostFactory};
 #[cfg(target_arch = "x86_64")]
 // Reusable x86 device models and narrow typed services. These are target-gated
 // device packages, not part of the architecture-neutral framework core.

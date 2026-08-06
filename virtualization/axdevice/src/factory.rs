@@ -21,7 +21,7 @@ use axvm_types::{EmulatedDeviceConfig, EmulatedDeviceType};
 
 use crate::{
     DeviceBundle, DeviceManagerError, DeviceManagerResult, GuestRangeAllocatorKey, IvcNotifyIrqKey,
-    range_alloc::IvcGuestRangeAllocator,
+    VirtualPciHostFactory, range_alloc::IvcGuestRangeAllocator,
 };
 
 /// Resolves a VM-local interrupt line for a device under construction.
@@ -179,5 +179,6 @@ impl DeviceFactory for MetaDeviceFactory {
 /// Registers device factories that do not depend on an architecture backend.
 pub fn register_builtin_factories(registry: &mut DeviceFactoryRegistry) -> DeviceManagerResult {
     registry.register(Arc::new(MetaDeviceFactory))?;
-    registry.register(Arc::new(IvcChannelFactory))
+    registry.register(Arc::new(IvcChannelFactory))?;
+    registry.register(Arc::new(VirtualPciHostFactory))
 }
