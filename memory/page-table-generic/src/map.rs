@@ -295,7 +295,7 @@ where
     fn is_frame_empty(&self) -> bool {
         let entries = self.as_slice();
         for pte in entries {
-            if pte.to_config(false).valid {
+            if pte.valid() {
                 return false;
             }
         }

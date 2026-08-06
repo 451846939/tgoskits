@@ -6,6 +6,47 @@ use page_table_generic::*;
 mod mocks;
 use mocks::*;
 
+#[derive(Clone, Copy, Debug)]
+struct AddressOnlyDirectoryPte(PteImpl);
+
+impl PageTableEntry for AddressOnlyDirectoryPte {
+    fn from_config(config: PteConfig) -> Self {
+        const LEAF_VALID_BIT: u64 = 1 << 63;
+
+        let mut pte = PteImpl::from_config(config);
+        if config.is_dir && !config.huge {
+            pte.0 &= !LEAF_VALID_BIT;
+        }
+        Self(pte)
+    }
+
+    fn to_config(&self, is_dir: bool) -> PteConfig {
+        let mut config = self.0.to_config(is_dir);
+        if is_dir && !config.huge && config.paddr.as_usize() != 0 {
+            config.valid = true;
+            config.is_dir = true;
+        }
+        config
+    }
+
+    fn valid(&self) -> bool {
+        self.0.valid() || self.0.to_config(false).paddr.as_usize() != 0
+    }
+}
+
+#[derive(Clone, Copy)]
+struct AddressOnlyDirectoryMeta;
+
+impl TableMeta for AddressOnlyDirectoryMeta {
+    type P = AddressOnlyDirectoryPte;
+
+    const PAGE_SIZE: usize = 0x1000;
+    const LEVEL_BITS: &[usize] = &[9, 9, 9, 9];
+    const MAX_BLOCK_LEVEL: usize = 3;
+
+    fn flush(_vaddr: Option<VirtAddr>) {}
+}
+
 /// 测试大页偏移计算
 ///
 /// Bug描述：translate方法在计算大页偏移时总是使用MAX_BLOCK_LEVEL，
@@ -218,6 +259,36 @@ fn test_unmap_mixed_entries() {
     );
 
     println!("✅ 混合条目取消映射测试通过！");
+}
+
+#[test]
+fn unmap_preserves_address_only_sibling_directory() {
+    let mut page_table = PageTable::<AddressOnlyDirectoryMeta, Fram4k>::new(Fram4k).unwrap();
+    let first_vaddr = VirtAddr::from_usize(0x1000);
+    let sibling_vaddr = VirtAddr::from_usize(0x20_0000);
+    let sibling_paddr = PhysAddr::from_usize(0x30_0000);
+
+    for (vaddr, paddr) in [
+        (first_vaddr, PhysAddr::from_usize(0x10_0000)),
+        (sibling_vaddr, sibling_paddr),
+    ] {
+        page_table
+            .map_page(
+                vaddr,
+                paddr,
+                PageSize::Size4K,
+                MappingFlags::READ | MappingFlags::WRITE,
+            )
+            .unwrap();
+    }
+
+    page_table.unmap_page(first_vaddr).unwrap();
+
+    assert!(matches!(
+        page_table.query(first_vaddr),
+        Err(PagingError::NotMapped)
+    ));
+    assert_eq!(page_table.query(sibling_vaddr).unwrap().0, sibling_paddr);
 }
 
 /// 测试MemConfig的正确实现

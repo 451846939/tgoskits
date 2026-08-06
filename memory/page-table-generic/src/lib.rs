@@ -98,6 +98,9 @@ pub trait PageTableEntry: Debug + Sync + Send + Clone + Copy + Sized + 'static {
     /// 包含当前页表项所有状态的 PteConfig
     fn to_config(&self, is_dir: bool) -> PteConfig;
 
+    /// Returns whether this entry is valid without requiring its page-table level.
+    ///
+    /// Implementations must recognize both leaf mappings and child-table entries.
     fn valid(&self) -> bool;
 }
 
