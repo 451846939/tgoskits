@@ -1,5 +1,5 @@
 use std::{
-    fs,
+    env, fs,
     io::{Read, Write},
     net::TcpListener,
     path::{Path, PathBuf},
@@ -24,6 +24,9 @@ const DEFAULT_UEFI_TARGET: &str = "x86_64-unknown-uefi";
 const HTTP_SMOKE_TIMEOUT: Duration = Duration::from_secs(120);
 const QEMU_HOST_GATEWAY: &str = "10.0.2.2";
 const LEGACY_X86_64_UEFI_FIRMWARE_ENV: &str = "AXVISOR_X86_64_UEFI_FIRMWARE";
+const OSTOOL_X86_64_OVMF_CACHE_PATH: &[&str] = &["ostool", "ovmf", "x64", "code.fd"];
+const SERIAL_READY_MARKER: &str = "AXLOADER READY";
+const SERIAL_BOOT_RETRY_MARKER: &str = "boot_retry_wait:";
 
 #[derive(Clone, Copy)]
 struct LoaderSmokeTarget {
@@ -166,6 +169,10 @@ fn run_http_smoke_test(workspace_root: &Path, target: &str) -> anyhow::Result<()
     run_loader_build(workspace_root, target, true)?;
 
     let firmware = find_uefi_firmware(smoke_target)?;
+    println!(
+        "axloader http smoke: using UEFI firmware {}",
+        firmware.display()
+    );
     let temp = tempfile::tempdir().context("failed to create axloader HTTP smoke temp dir")?;
     let efi_boot_dir = temp.path().join("esp/EFI/BOOT");
     fs::create_dir_all(&efi_boot_dir)
@@ -200,19 +207,18 @@ fn run_http_smoke_test(workspace_root: &Path, target: &str) -> anyhow::Result<()
 
     let started = Instant::now();
     let mut transcript = String::new();
-    let mut boot_sent = false;
+    let mut boot_offer_sender = BootOfferSender::new();
     let mut loaded = false;
     while started.elapsed() < HTTP_SMOKE_TIMEOUT {
         match output_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(chunk) => {
                 print!("{chunk}");
                 transcript.push_str(&chunk);
-                if !boot_sent && transcript.contains("AXLOADER READY") {
+                if boot_offer_sender.should_send_boot(&transcript) {
                     stdin
                         .write_all(boot_line.as_bytes())
                         .context("failed to send AXLOADER BOOT over QEMU serial")?;
                     stdin.flush().ok();
-                    boot_sent = true;
                 }
                 if transcript.contains("elf_loaded:") {
                     loaded = true;
@@ -298,8 +304,7 @@ fn find_uefi_firmware(target: LoaderSmokeTarget) -> anyhow::Result<PathBuf> {
         }
     }
 
-    for candidate in target.firmware_candidates {
-        let path = PathBuf::from(candidate);
+    for path in firmware_candidate_paths(target) {
         if path.is_file() {
             return Ok(path);
         }
@@ -310,6 +315,21 @@ fn find_uefi_firmware(target: LoaderSmokeTarget) -> anyhow::Result<PathBuf> {
         target.cargo_target,
         target.firmware_env
     )
+}
+
+fn firmware_candidate_paths(target: LoaderSmokeTarget) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if target.cargo_target == DEFAULT_UEFI_TARGET {
+        candidates.push(ostool_x86_64_ovmf_code_path());
+    }
+    candidates.extend(target.firmware_candidates.iter().map(PathBuf::from));
+    candidates
+}
+
+fn ostool_x86_64_ovmf_code_path() -> PathBuf {
+    let mut path = env::temp_dir();
+    path.extend(OSTOOL_X86_64_OVMF_CACHE_PATH);
+    path
 }
 
 fn spawn_axloader_qemu(
@@ -339,6 +359,8 @@ fn x86_64_qemu_args(firmware: &Path, esp_dir: &Path) -> Vec<String> {
         "1".into(),
         "-machine".into(),
         "q35".into(),
+        "-accel".into(),
+        "kvm".into(),
         "-display".into(),
         "none".into(),
         "-monitor".into(),
@@ -358,6 +380,68 @@ fn x86_64_qemu_args(firmware: &Path, esp_dir: &Path) -> Vec<String> {
         format!("format=raw,if=ide,file=fat:rw:{}", esp_dir.display()),
     ]
     .into()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BootTranscriptMarker {
+    Ready,
+    Retry,
+}
+
+impl BootTranscriptMarker {
+    fn len(self) -> usize {
+        match self {
+            Self::Ready => SERIAL_READY_MARKER.len(),
+            Self::Retry => SERIAL_BOOT_RETRY_MARKER.len(),
+        }
+    }
+}
+
+struct BootOfferSender {
+    event_search_start: usize,
+    ready_armed: bool,
+}
+
+impl BootOfferSender {
+    fn new() -> Self {
+        Self {
+            event_search_start: 0,
+            ready_armed: true,
+        }
+    }
+
+    fn should_send_boot(&mut self, transcript: &str) -> bool {
+        let mut should_send = false;
+        while let Some((relative_offset, marker)) =
+            next_boot_transcript_marker(&transcript[self.event_search_start..])
+        {
+            self.event_search_start += relative_offset + marker.len();
+            match marker {
+                BootTranscriptMarker::Retry => self.ready_armed = true,
+                BootTranscriptMarker::Ready if self.ready_armed => {
+                    self.ready_armed = false;
+                    should_send = true;
+                }
+                BootTranscriptMarker::Ready => {}
+            }
+        }
+
+        should_send
+    }
+}
+
+fn next_boot_transcript_marker(transcript: &str) -> Option<(usize, BootTranscriptMarker)> {
+    [
+        transcript
+            .find(SERIAL_READY_MARKER)
+            .map(|offset| (offset, BootTranscriptMarker::Ready)),
+        transcript
+            .find(SERIAL_BOOT_RETRY_MARKER)
+            .map(|offset| (offset, BootTranscriptMarker::Retry)),
+    ]
+    .into_iter()
+    .flatten()
+    .min_by_key(|(offset, _)| *offset)
 }
 
 fn spawn_output_reader(mut output: impl Read + Send + 'static, tx: mpsc::Sender<String>) {
@@ -577,5 +661,55 @@ mod tests {
         assert!(boot_line.contains("\"kernel_size\":4096"));
         assert!(boot_line.contains("\"arch\":\"x86_64\""));
         assert!(boot_line.ends_with('\n'));
+    }
+
+    #[test]
+    fn x86_64_firmware_candidates_prefer_ostool_ovmf_cache() {
+        let target = smoke_target("x86_64-unknown-uefi").unwrap();
+        let candidates = firmware_candidate_paths(target);
+
+        assert_eq!(candidates[0], ostool_x86_64_ovmf_code_path());
+        assert!(
+            candidates
+                .iter()
+                .any(|path| { path == Path::new("/usr/share/OVMF/OVMF_CODE_4M.fd") })
+        );
+    }
+
+    #[test]
+    fn x86_64_smoke_qemu_uses_required_kvm_acceleration() {
+        let args = x86_64_qemu_args(Path::new("/ovmf.fd"), Path::new("/esp"));
+
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-accel".to_string(), "kvm".to_string()]),
+            "axloader HTTP smoke runs on KVM-labelled CI and must not silently fall back to TCG"
+        );
+    }
+
+    #[test]
+    fn boot_offer_sender_ignores_duplicate_ready_output() {
+        let mut sender = BootOfferSender::new();
+
+        assert!(sender.should_send_boot("HTTP bootloader\nAXLOADER READY {"));
+        assert!(
+            !sender.should_send_boot("HTTP bootloader\nAXLOADER READY {}\nAXLOADER READY {}\n")
+        );
+    }
+
+    #[test]
+    fn boot_offer_sender_rearms_after_loader_retry() {
+        let mut sender = BootOfferSender::new();
+
+        assert!(sender.should_send_boot("AXLOADER READY {}\n"));
+        assert!(!sender.should_send_boot("AXLOADER READY {}\n"));
+        assert!(
+            sender.should_send_boot(
+                "AXLOADER READY {}\nboot_retry_wait: 3000 ms\nAXLOADER READY {}\n"
+            )
+        );
+        assert!(!sender.should_send_boot(
+            "AXLOADER READY {}\nboot_retry_wait: 3000 ms\nAXLOADER READY {}\nAXLOADER READY {}\n"
+        ));
     }
 }

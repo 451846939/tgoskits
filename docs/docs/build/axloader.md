@@ -30,11 +30,11 @@ cargo xtask axloader <subcommand>
 ```mermaid
 flowchart TB
     BUILD["1. cargo build --release<br/>产出 target/<uefi>/release/axloader.efi"]
-    FW["2. find_uefi_firmware<br/>OVMF (env / 标准路径)"]
+    FW["2. find_uefi_firmware<br/>OVMF (env / ostool cache / 标准路径)"]
     ESP["3. 组装 ESP<br/>esp/EFI/BOOT/BOOTX64.EFI"]
     KERNEL["4. minimal_x86_64_kernel_elf<br/>手工拼装的 2 字节 jmp . 内核"]
     HTTP["5. SmokeHttpServer::start<br/>监听 0.0.0.0:0 提供 /kernel.elf"]
-    QEMU["6. spawn_axloader_qemu<br/>q35 + pflash(OVMF) + user net(e1000)"]
+    QEMU["6. spawn_axloader_qemu<br/>q35 + KVM + pflash(OVMF) + user net(e1000)"]
     SERIAL["7. 监听 QEMU stdio<br/>等待 'AXLOADER READY'"]
     BOOT["8. 写入 AXLOADER BOOT JSON 行<br/>含 kernel_url=http://10.0.2.2:<port>/kernel.elf"]
     FETCH["9. QEMU user-net 访问 host<br/>10.0.2.2 (QEMU_HOST_GATEWAY)"]
@@ -46,10 +46,11 @@ flowchart TB
 
 关键点：
 
-- **UEFI 固件定位**：`find_uefi_firmware` 依次查询环境变量（`AXLOADER_X86_64_UEFI_FIRMWARE`，兼容旧名 `AXVISOR_X86_64_UEFI_FIRMWARE`），再扫描 `X86_64_UEFI_FIRMWARE_CANDIDATES` 中常见的 OVMF 路径（`/usr/share/OVMF/OVMF_CODE_4M.fd` 等）。都找不到时报错并提示安装 `ovmf`。
+- **UEFI 固件定位**：`find_uefi_firmware` 依次查询环境变量（`AXLOADER_X86_64_UEFI_FIRMWARE`，兼容旧名 `AXVISOR_X86_64_UEFI_FIRMWARE`）、ostool 自动下载的 OVMF cache（`/tmp/ostool/ovmf/x64/code.fd`），再扫描 `X86_64_UEFI_FIRMWARE_CANDIDATES` 中常见的系统 OVMF 路径（`/usr/share/OVMF/OVMF_CODE_4M.fd` 等）。CI 不再手动下载或安装 OVMF，避免把环境准备变成 smoke test 的主要失败来源。
+- **QEMU/KVM 启动环境**：HTTP smoke 的 CI job 运行在带 `kvm` 标签且 `require_kvm=true` 的 runner 上，QEMU 参数显式传入 `-accel kvm`。这样固件启动时间不会退回到 TCG 慢路径；如果 KVM 不可用，也会直接暴露 runner 配置问题，而不是消耗完整个 smoke 超时。
 - **QEMU user-net 网关**：QEMU 的 user-mode 网络把 host 映射为 `10.0.2.2`（常量 `QEMU_HOST_GATEWAY`），因此 guest 内的 axloader 通过这个 IP 访问 host 上临时启动的 HTTP 服务，无需配置 bridge/tap。
 - **最小内核**：`minimal_x86_64_kernel_elf` 手工拼装一个极简 ELF64——程序头指向 `0x20_0000`，入口指令为 `eb fe`（`jmp .`）。它不需要做任何实际工作，smoke test 只关心 axloader 是否成功下载、解析 ELF 并报告 `elf_loaded:`。
-- **协议 JSON**：通过 QEMU 的 stdio 串口向 axloader 发送一行 `AXLOADER BOOT {...}`，字段包括 `protocol_version`、`boot_id`、`kernel_url`、`kernel_size`、`image_format=elf64`、`arch`、`entry_symbol`。axloader 看到 `AXLOADER READY` 提示后才开始读取这行命令。
+- **协议 JSON**：通过 QEMU 的 stdio 串口向 axloader 发送一行 `AXLOADER BOOT {...}`，字段包括 `protocol_version`、`boot_id`、`kernel_url`、`kernel_size`、`image_format=elf64`、`arch`、`entry_symbol`。axloader 每轮等待控制命令时都会打印 `AXLOADER READY`；host harness 按 READY/retry 状态发送 offer，使测试协议和 loader 的重试状态机保持一致。
 - **成功判据**：必须在 `HTTP_SMOKE_TIMEOUT`（120s）内同时观察到 ① transcript 出现 `elf_loaded:`；② HTTP server 的 `was_requested()` 为真（即 axloader 真的发起了对 `/kernel.elf` 的请求）。只满足其中一条仍判定失败，防止假阳性。
 
 ## SmokeHttpServer
@@ -68,6 +69,7 @@ flowchart TB
 ```bash
 qemu-system-x86_64 \
   -m 256M -smp 1 -machine q35 \
+  -accel kvm \
   -display none -monitor none -serial stdio \
   -netdev user,id=net0 -device e1000,netdev=net0 \
   -drive if=pflash,format=raw,readonly=on,file=<OVMF> \
@@ -109,4 +111,4 @@ cargo xtask axloader test qemu
 cargo xtask axloader test qemu --target x86_64-unknown-uefi
 ```
 
-CI 中通常直接 `cargo xtask axloader test qemu`。若本地缺少 OVMF 固件，可设置 `AXLOADER_X86_64_UEFI_FIRMWARE=/path/to/OVMF_CODE.fd` 指向已有固件。
+CI 中通常直接 `cargo xtask axloader test qemu`。若本地缺少 ostool OVMF cache 或系统 OVMF 固件，可设置 `AXLOADER_X86_64_UEFI_FIRMWARE=/path/to/OVMF_CODE.fd` 指向已有固件。
