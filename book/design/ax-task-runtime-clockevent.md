@@ -48,14 +48,16 @@ Linux v7.1 的 `struct rq` 自己保存 `clock`/`clock_task`，`update_rq_clock(
 
 - `CpuRunQueueState::RunQueueClock` 是 scheduler 时间的唯一状态源，只能在目标 runqueue 的
   IRQ-safe raw lock 内更新；
-- `TaskRuntime::scheduler_clock_source(cpu)` 只提供指定 CPU 的原始 counter 样本，不直接成为
-  Deadline、RT 或 Fair 的时间真值；远程 wake 锁定目标 rq 后，也必须读取目标 CPU 的 source；
+- `TaskRuntime::rq_clock_sample(cpu)` 只提供指定 CPU 的已校正 scheduler clock 和累计 hardirq
+  时间，不直接成为 Deadline、RT 或 Fair 的时间真值；远程 wake 锁定目标 rq 后，也必须读取
+  目标 CPU 的 sample；
 - 第一个样本建立基线，随后按 Linux 的 signed-delta 回绕顺序累计；负向 source 抖动不允许
   把 rq clock 倒退；
 - 一个 owner rq 事务最多更新一次。dispatch settle、timer 重编程和 switch plan 等事务尾只能
   读取 `RunQueueClockSnapshot`，不得再次读取 source；
-- 当前 runtime 没有可独立证明的 IRQ/steal-time source，因此不伪造第二个 `clock_task`。
-  将来只有在这些来源成为独立权威后，才可按 Linux 的 subtraction 模型增加 task clock。
+- ax-runtime 的 common IRQ entry/exit 独占每 CPU、嵌套安全的累计 hardirq 时间；rq 保存
+  `clock/clock_task/prev_irq_time`，只在同一个 rq transaction 中扣除新增 hardirq 时间。
+  当前没有可独立证明的 steal-time source，因此只扣 hardirq，不伪造 steal-time。
 
 物理 timer 仍使用 `MonotonicInstant/MonotonicDeadline`。周期 Fair balance 对应 Linux 的
 `jiffies`/`sd->last_balance`，因此也属于 monotonic cadence：clockevent 到期只把它提升为
@@ -66,7 +68,9 @@ periodic balance 的物理事件到期，必须显式推进 monotonic fake；`*_
 
 ## ax-task 的所有权
 
-每个 `CpuLocal` 独占一个固定容量 `TaskDeadlineQueue`。条目必须是 generation-bearing 的值记录，只允许：
+每个 CPU 的 `CpuRemote` 持有一个 IRQ-safe、固定容量的 `TaskDeadlineQueue` base。它是该 CPU
+task deadline 的唯一 owner：本地 timer IRQ/soft worker 负责消费，远程 `task_rq` 迁移只在
+持有对应 rq/thread 事务时取消或转移旧 base 条目。条目必须是 generation-bearing 的值记录，只允许：
 
 - sleep、park、wait timeout；
 - RR、Fair、Deadline/CBS/GRUB 的调度期限；
@@ -92,17 +96,17 @@ periodic balance 的物理事件到期，必须显式推进 monotonic fake；`*_
 
 notify 与 timeout 只能有一个 winner。
 
-### TaskDeadlineUpdate
+### SchedulerDeadlineUpdate
 
 本 CPU 最早任务期限改变后，ax-task 发布：
 
 - 单调递增且非零的 generation；
 - `Option<MonotonicDeadline>`；
-- 是否有必须在 safe point 处理的 deferred work。
 
-deadline 与 deferred-work 语义未改变时，owner 保留原 generation，不制造一次新的物理
-发布；任一语义字段改变时才递增 generation。runtime 只能丢弃旧 generation，不得以相同
-deadline 值推断 publication 已被处理。
+deadline 语义未改变时，owner 保留原 generation，不制造一次新的物理发布；期限改变时才
+递增 generation。deferred task-work 使用独立的 scheduler request reason，不再复制到
+clockevent publication。runtime 只能丢弃旧 generation，不得以相同 deadline 值推断
+publication 已被处理。
 
 ## ax-runtime 的所有权
 
@@ -125,10 +129,11 @@ Armed(deadline) -> Firing ------+
 - `Firing`：旧 arm 已失效，handler 正在合并更新。
 
 online 与 offline 都推进 epoch。进入 `Firing` 会产生不可复制的
-`ClockEventFiringToken`；finish 与 panic recovery 必须消费该 token。若 CPU 已经过一次
+`ClockEventFiringToken`；finish 必须消费该 token。若 CPU 已经过一次
 offline/re-online，旧 token 只能失效，不能提交到新周期。
 
-`LocalClockEvent` 是以下状态的唯一存储：task generation、task deadline、periodic deadline、deferred-work flag 和当前物理 arm。禁止旁路 scalar cache。
+`LocalClockEvent` 是以下状态的唯一存储：scheduler generation、scheduler deadline、
+periodic deadline 和当前物理 arm。禁止旁路 scalar cache。
 
 ### 重新编程规则
 
@@ -141,19 +146,25 @@ offline/re-online，旧 token 只能失效，不能提交到新周期。
 
 `Firing` 期间只更新逻辑 source state。handler 结束时从最新 task deadline 和 periodic deadline 计算一次 authoritative minimum，并且只提交一次硬件动作。
 
+Deadline CBS/zero-lag hard timer 的对象生命周期由 owner rq 的 Deadline member set 保持，
+等价于 Linux 把 hrtimer 嵌入 `sched_dl_entity`。hard IRQ 只用 generation-bearing event 在该 rq
+取得 `ThreadCore` lifetime anchor，释放 rq 后再按 `p->pi_lock -> rq` 顺序执行 CBS 事务；禁止
+通过 task-only 全局 registry 升级 `ThreadId`，也禁止把裸 timer-node 指针重新放回 heap。
+
 物理 IRQ 先执行 claim。这里必须区分“逻辑上没有可消费的 arm”和“物理 source 已经
 静默”：
 
 - `Offline/Idle/Firing` 收到的 stale/spurious edge 不进入 ax-task，但返回前必须 stop/mask
   物理 clockevent；否则 level/pending source 可以在 EOI 后立刻重入，形成 IRQ storm；
-- edge 早于当前 `armed_deadline` 时只重编程当前 arm，不调用 ax-task；这同时处理
-  offline 前残留、re-online 后才交付的 pending edge；
-- 只有当前 arm 已到期时才取得 firing token 并进入有界调度处理。
+- `Armed` 收到物理 edge 时一律执行 `Armed -> Firing(token)` 并失效旧 arm，和 Linux
+  `hrtimer_interrupt()` 相同；若 edge 早于逻辑期限，有界到期扫描自然不产生 due work，
+  finish 再按最新 source state 统一重编程一次。不得在 claim 前自行判断 early edge 并走
+  第二套 rearm 路径。
 
 stop/mask 不是中断控制器 ACK/EOI。x86 LAPIC timer mask、AArch64 generic timer disable、
 RISC-V compare 更新和 LoongArch timer disable/clear 由 clockevent backend 实现；控制器的
 claim/ACK/EOI 仍由 trap/IRQ 入口成对完成。若 `Firing` 状态遇到被屏蔽的嵌套旧边，外层
-firing transaction 会在 finish/recover 时根据最新 source state 重新 program。
+firing transaction 会在 finish 时根据最新 source state 重新 program。
 
 ### 上下线
 
@@ -185,8 +196,8 @@ ax-task 并平移逻辑期限；否则 scheduler 与用户 absolute sleep 会永
 
 平台控制器和 timer device 在 runtime handler 前 claim/ACK 或失效 delivered event。runtime 顺序固定为：
 
-1. claim 当前 arm；无逻辑 owner 的 stale edge 先 stop/mask，早到边重编程当前 arm，只有
-   已到期边进入 `Firing(token)` 并忘记旧 arm；
+1. claim 当前 arm；无逻辑 owner 的 stale edge 先 stop/mask；任何有效 `Armed` edge 都进入
+   `Firing(token)` 并忘记旧 arm；
 2. 推进 periodic source；
 3. 调用 ax-task 的 bounded `on_clock_event(now, budget)`；
 4. 发布 reschedule 与 deadline/deferred-work sticky state；
@@ -194,7 +205,7 @@ ax-task 并平移逻辑期限；否则 scheduler 与用户 absolute sleep 会永
 6. 统一 program 或 stop 一次；
 7. 返回平台完成 EOI。
 
-步骤 3 到 6 都受 firing token 的 CPU epoch 约束；旧 token 的 finish/recover 不得发布
+步骤 3 到 6 都受 firing token 的 CPU epoch 约束；旧 token 的 finish 不得发布
 逻辑 source 或物理动作。
 
 hard IRQ 必须：
@@ -211,11 +222,13 @@ hard IRQ 必须：
 
 预算耗尽时同时发布 sticky deadline work 和 `need_resched`。safe point 在 drain 前 claim 旧 publication；若仍有 remainder 或并发新 publication，再发布新 sticky work。旧 completion 不得清掉新工作。
 
-### 正确性恢复
+### 无轮询恢复路径
 
-物理 timer 只是加速路径。每个 scheduler safe point 会检查 cached minimum；若期限已经过期，则提升一个 bounded batch 到 expired buffer。这样即使硬件边丢失、过晚或 CPU 因其他 `need_resched` 无法进入 idle，sleeper 仍能推进。
-
-恢复路径同样禁止任意 callback。
+物理 clockevent 是 deadline 推进的正式所有者，不是可丢失后再由 scheduler 偶然扫描补救的
+加速路径。实现不提供 `claim_due`、`recover_overdue`、析构恢复或周期轮询。正确性由
+generation publication、`Firing` 合并、idle 最终复查和远程 doorbell 共同保证；预算耗尽只
+发布有界 soft-timer work，由 owner scheduler safe point 的 softirq 等价路径继续消费；若该
+路径持续有 remainder，则 sticky request 强制再次进入 safe point，不能依赖偶然 tick 推进。
 
 ## idle 与远程投递
 
@@ -317,11 +330,11 @@ panic TX 有固定字节预算，竞争时丢弃。它与 IRQ endpoint 共用同
 - final arm removal；
 - batch exhaustion 和 remainder rearm；
 - remote deadline 与 idle lost-wakeup；
-- 无物理 IRQ 的 overdue safe-point recovery；
+- hard IRQ batch 耗尽后的 owner safe-point 有界 continuation；
 - park notify-vs-timeout 唯一 winner；
 - owner mismatch cancellation retry；
 - IPI consume/publish 生命周期；
-- switch-tail 顺序与失败重试；
+- switch-tail 顺序与 raw switch 前的失败注入回滚；
 - CPU offline/re-online；
 - IRQ endpoint revoke/quiesce/reclaim。
 

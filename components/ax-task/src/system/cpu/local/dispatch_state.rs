@@ -1,26 +1,74 @@
 use super::*;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FairBalanceTimer {
+    Idle,
+    Armed(MonotonicDeadline),
+    Pending,
+}
+
 #[derive(Debug)]
 pub(crate) struct OwnerDispatchState {
-    pub(crate) current: Option<ThreadId>,
-    pub(crate) current_core: Option<Arc<ThreadCore>>,
-    pub(crate) current_dispatch: Option<CurrentDispatch>,
-    pub(crate) idle: Option<ThreadId>,
-    pub(crate) idle_core: Option<Arc<ThreadCore>>,
     pub(crate) fair_balance_interval_ns: u64,
+    pub(crate) fair_balance_timer: FairBalanceTimer,
     pub(crate) switch_handoff: Option<SwitchHandoff>,
+    idle_pull_visited: CpuSet,
 }
 
 impl OwnerDispatchState {
     pub(crate) fn new(config: TaskSystemConfig) -> Self {
         Self {
-            current: None,
-            current_core: None,
-            current_dispatch: None,
-            idle: None,
-            idle_core: None,
             fair_balance_interval_ns: config.balance_interval_ns().max(1),
+            fair_balance_timer: FairBalanceTimer::Idle,
             switch_handoff: None,
+            idle_pull_visited: CpuSet::empty(config.cpu_count()),
         }
+    }
+
+    pub(crate) fn publish_fair_balance_due(&mut self, now: MonotonicInstant) -> bool {
+        match self.fair_balance_timer {
+            FairBalanceTimer::Pending => true,
+            FairBalanceTimer::Armed(deadline) if now.reached(deadline) => {
+                self.fair_balance_timer = FairBalanceTimer::Pending;
+                true
+            }
+            FairBalanceTimer::Idle | FairBalanceTimer::Armed(_) => false,
+        }
+    }
+
+    pub(crate) fn defer_fair_balance(&mut self, now: MonotonicInstant, interval_ns: u64) {
+        self.fair_balance_timer = FairBalanceTimer::Armed(
+            now.deadline_after(core::time::Duration::from_nanos(interval_ns.max(1))),
+        );
+    }
+
+    pub(crate) const fn fair_balance_deadline(&self) -> Option<MonotonicDeadline> {
+        match self.fair_balance_timer {
+            FairBalanceTimer::Armed(deadline) => Some(deadline),
+            FairBalanceTimer::Idle | FairBalanceTimer::Pending => None,
+        }
+    }
+
+    pub(crate) const fn fair_balance_pending(&self) -> bool {
+        matches!(self.fair_balance_timer, FairBalanceTimer::Pending)
+    }
+
+    pub(crate) fn clear_fair_balance(&mut self) {
+        self.fair_balance_timer = FairBalanceTimer::Idle;
+    }
+
+    pub(crate) const fn idle_pull_visited(&self) -> &CpuSet {
+        &self.idle_pull_visited
+    }
+
+    pub(crate) fn mark_idle_pull_source(&mut self, source: CpuId) {
+        assert!(
+            self.idle_pull_visited.insert(source),
+            "one idle-pull scan cannot visit the same source twice"
+        );
+    }
+
+    pub(crate) fn reset_idle_pull_scan(&mut self) {
+        self.idle_pull_visited.clear();
     }
 }

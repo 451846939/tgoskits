@@ -18,6 +18,7 @@ pub(crate) struct RtRunQueueBandwidth {
 }
 
 impl RtRunQueueBandwidth {
+    #[cfg(test)]
     pub(crate) const fn new(period_ns: u64, runtime_ns: u64) -> Self {
         Self {
             enabled: runtime_ns < period_ns,
@@ -27,28 +28,56 @@ impl RtRunQueueBandwidth {
         }
     }
 
+    pub(crate) const fn offline() -> Self {
+        Self {
+            enabled: false,
+            runtime_ns: 0,
+            time_ns: 0,
+            throttled: false,
+        }
+    }
+
+    /// Linux `__enable_runtime()`: install the root quota and discard stale
+    /// accounting before this rq becomes visible in the online span.
+    pub(crate) fn enable(&mut self, period_ns: u64, runtime_ns: u64) {
+        self.enabled = runtime_ns < period_ns;
+        self.runtime_ns = runtime_ns;
+        self.time_ns = 0;
+        self.throttled = false;
+    }
+
+    /// Linux `__disable_runtime()` terminal state. Runtime loans must already
+    /// have been reclaimed under the root bandwidth lock.
+    pub(crate) fn disable(&mut self) {
+        self.enabled = false;
+        self.runtime_ns = 0;
+        self.time_ns = 0;
+        self.throttled = false;
+    }
+
     /// Accounts current RT execution and reports a raw throttle transition.
     ///
     /// Linux throttles only when `rt_time > rt_runtime`. A PI-boosted owner
     /// does not clear the raw state; it bypasses the effective throttle until
     /// it can release the contended lock.
-    pub(crate) fn charge(&mut self, runtime_ns: u64) -> bool {
+    pub(crate) fn account(&mut self, runtime_ns: u64) -> bool {
         if !self.enabled {
             return false;
         }
-        let was_throttled = self.throttled;
         self.time_ns = self
             .time_ns
             .checked_add(runtime_ns)
             .expect("one RT period cannot accumulate u64 runtime");
-        if self.time_ns > self.runtime_ns {
-            self.throttled = true;
-        }
-        !was_throttled && self.throttled
+        self.time_ns > self.runtime_ns
     }
 
-    pub(crate) const fn may_run(self, boosted: bool) -> bool {
-        !self.enabled || boosted || !self.throttled
+    pub(crate) fn throttle_if_exceeded(&mut self) -> bool {
+        if !self.enabled || self.time_ns <= self.runtime_ns {
+            return false;
+        }
+        let changed = !self.throttled;
+        self.throttled = true;
+        changed
     }
 
     pub(crate) const fn is_throttled(self) -> bool {
@@ -79,6 +108,35 @@ impl RtRunQueueBandwidth {
     pub(crate) const fn time_ns(self) -> u64 {
         self.time_ns
     }
+
+    pub(crate) const fn runtime_ns(self) -> u64 {
+        self.runtime_ns
+    }
+
+    pub(crate) const fn enabled(self) -> bool {
+        self.enabled
+    }
+
+    pub(crate) const fn spare_runtime_ns(self) -> u64 {
+        self.runtime_ns.saturating_sub(self.time_ns)
+    }
+
+    pub(crate) fn lend_runtime(&mut self, amount: u64) {
+        assert!(self.enabled && amount <= self.spare_runtime_ns());
+        self.runtime_ns -= amount;
+    }
+
+    pub(crate) fn borrow_runtime(&mut self, amount: u64, period_ns: u64) {
+        assert!(self.enabled && self.runtime_ns.saturating_add(amount) <= period_ns);
+        self.runtime_ns += amount;
+    }
+
+    pub(crate) fn adjust_runtime(&mut self, delta: i128) {
+        let runtime = i128::from(self.runtime_ns)
+            .checked_add(delta)
+            .expect("RT runtime loan adjustment overflowed");
+        self.runtime_ns = u64::try_from(runtime).expect("RT runtime loan adjustment underflowed");
+    }
 }
 
 /// One active root-domain RT period callback.
@@ -105,6 +163,8 @@ struct RootRtBandwidthState {
 pub(crate) struct RootRtBandwidth {
     enabled: bool,
     period_ns: u64,
+    runtime_ns: u64,
+    runtime_lock: IrqTicketLock<()>,
     state: IrqTicketLock<RootRtBandwidthState>,
 }
 
@@ -113,12 +173,26 @@ impl RootRtBandwidth {
         Self {
             enabled: config.rt_runtime_ns() < config.rt_period_ns(),
             period_ns: config.rt_period_ns(),
+            runtime_ns: config.rt_runtime_ns(),
+            runtime_lock: IrqTicketLock::new(()),
             state: IrqTicketLock::new(RootRtBandwidthState {
                 owner: None,
                 deadline: None,
                 generation: 0,
             }),
         }
+    }
+
+    pub(crate) const fn period_ns(&self) -> u64 {
+        self.period_ns
+    }
+
+    pub(crate) const fn runtime_ns(&self) -> u64 {
+        self.runtime_ns
+    }
+
+    pub(crate) fn lock_runtime(&self) -> crate::lock::IrqTicketGuard<'_, ()> {
+        self.runtime_lock.lock()
     }
 
     /// Starts the root period on the CPU that activated RT work.
@@ -210,17 +284,19 @@ mod tests {
     fn strict_runtime_edge_matches_linux_rt() {
         let mut rq = RtRunQueueBandwidth::new(100, 95);
 
-        assert!(!rq.charge(95));
-        assert!(rq.may_run(false));
-        assert!(rq.charge(1));
-        assert!(!rq.may_run(false));
-        assert!(rq.may_run(true));
+        assert!(!rq.account(95));
+        assert!(!rq.throttle_if_exceeded());
+        assert!(!rq.is_throttled());
+        assert!(rq.account(1));
+        assert!(rq.throttle_if_exceeded());
+        assert!(rq.is_throttled());
     }
 
     #[test]
     fn period_unthrottles_only_below_runtime() {
         let mut rq = RtRunQueueBandwidth::new(100, 95);
-        rq.charge(191);
+        assert!(rq.account(191));
+        assert!(rq.throttle_if_exceeded());
 
         assert!(!rq.replenish(1));
         assert!(rq.is_throttled());

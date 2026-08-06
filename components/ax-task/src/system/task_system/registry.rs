@@ -66,24 +66,6 @@ pub(super) enum DeadlineCallbackClaim {
     },
 }
 
-/// Proof that every fallible read required by one PI-chain recomputation
-/// succeeded while the task-system registry lock was held.
-#[derive(Clone, Copy, Debug)]
-pub(super) struct PiRecomputeProof {
-    start: ThreadId,
-    depth: usize,
-}
-
-impl PiRecomputeProof {
-    pub(super) const fn start(self) -> ThreadId {
-        self.start
-    }
-
-    pub(super) const fn depth(self) -> usize {
-        self.depth
-    }
-}
-
 impl TaskSystemState {
     pub(super) fn claim_pending_deadline_overrun(
         &mut self,
@@ -146,10 +128,7 @@ impl TaskSystemState {
         for slot in &self.slots {
             let held = if let Some(record) = &slot.record {
                 let sched = record.sched.lock();
-                sched
-                    .deadline
-                    .active_reservation
-                    .max(sched.deadline.desired_reservation)
+                sched.held_deadline_reservation()
             } else {
                 slot.pending_deadline_reservation
             };
@@ -216,13 +195,6 @@ impl TaskSystemState {
         }
     }
 
-    pub(super) fn online_cpu_count(&self) -> usize {
-        self.cpus
-            .iter()
-            .filter(|cpu| cpu.remote.is_online())
-            .count()
-    }
-
     pub(super) fn release_deadline_reservation_on_exit(
         &mut self,
         thread: ThreadId,
@@ -230,12 +202,9 @@ impl TaskSystemState {
         let held = {
             let record = self.thread_record(thread)?;
             let mut sched = record.sched.lock();
-            let held = sched
-                .deadline
-                .active_reservation
-                .max(sched.deadline.desired_reservation);
-            sched.deadline.active_reservation = 0;
-            sched.deadline.desired_reservation = 0;
+            let held = sched.held_deadline_reservation();
+            sched.deadline.bandwidth.replace_detached_reservation(0);
+            sched.policy.discard_pending_update();
             held
         };
         Ok(held)
@@ -272,10 +241,9 @@ impl TaskSystemState {
                 || sched.placement.execution_cpu().is_some()
                 || sched.placement.on_cpu().is_some()
                 || sched.placement.has_pending_migration()
-                || sched.deadline.bandwidth_cpu.is_some()
+                || sched.deadline.bandwidth.reservation_owner().is_some()
                 || sched.deadline.cleanup_pending
-                || sched.pi.deadline_cbs_borrower.is_some()
-                || record.blocked_on.is_some()
+                || sched.pi.blocked_on.is_some()
                 || record.callbacks.blocks_reap()
                 || record.core.scheduler_inbox_delivery_count() != 0
                 || record.core.sleep_timer_cpu().is_some()
@@ -283,10 +251,7 @@ impl TaskSystemState {
             {
                 return Err(TaskError::ThreadBusy);
             }
-            sched
-                .deadline
-                .active_reservation
-                .max(sched.deadline.desired_reservation)
+            sched.held_deadline_reservation()
         };
         let record = slot.record.take().ok_or(TaskError::StaleThreadId)?;
         if advance_thread_slot_generation(slot) {
@@ -324,9 +289,8 @@ impl TaskSystemState {
             // raw inbox Arc and access to scheduler-owned thread state.
             if sched.placement.on_cpu().is_some()
                 || sched.placement.has_pending_migration()
-                || sched.deadline.bandwidth_cpu.is_some()
+                || sched.deadline.bandwidth.reservation_owner().is_some()
                 || sched.deadline.cleanup_pending
-                || sched.pi.deadline_cbs_borrower.is_some()
                 || sched.deadline.overrun_events != 0
                 || record.callbacks.blocks_reap()
                 || record.core.scheduler_inbox_delivery_count() != 0
@@ -354,10 +318,7 @@ impl TaskSystemState {
         let record = slot.record.take().ok_or(TaskError::StaleThreadId)?;
         let held = {
             let sched = record.sched.lock();
-            sched
-                .deadline
-                .active_reservation
-                .max(sched.deadline.desired_reservation)
+            sched.held_deadline_reservation()
         };
         if advance_thread_slot_generation(slot) {
             self.free_slots.push(thread.slot());
@@ -452,72 +413,10 @@ impl TaskSystemState {
         Ok(sched.deadline.overrun_events != 0)
     }
 
-    pub(super) fn ensure_pi_acyclic(
-        &self,
-        waiter: ThreadId,
-        mut owner: ThreadId,
-        chain_limit: usize,
-    ) -> Result<(), TaskError> {
-        for depth in 1..=chain_limit {
-            if owner == waiter {
-                return Err(TaskError::PiCycle);
-            }
-            let Some(registration) = self.thread_record(owner)?.blocked_on else {
-                return Ok(());
-            };
-            let lock_state = unsafe {
-                // SAFETY: a live blocked_on registration is lifetime-bound by
-                // its wait token and keeps the physical lock identity stable.
-                registration.lock.lock_state()
-            };
-            if !lock_state.waiters.contains(registration.key) {
-                return Err(TaskError::InvalidPiState);
-            }
-            let Some(next_owner) = (unsafe {
-                // SAFETY: the live registration retains the mutex-core lifetime.
-                registration.lock.core()
-            })
-            .owner_snapshot()
-            .owner() else {
-                return Ok(());
-            };
-            if depth == chain_limit {
-                return Err(TaskError::PiChainLimit { limit: chain_limit });
-            }
-            owner = next_owner;
-        }
-        Err(TaskError::PiChainLimit { limit: chain_limit })
-    }
-
-    pub(super) fn select_allowed_cpu(&self, affinity: &CpuSet) -> Option<CpuId> {
-        self.cpus
-            .iter()
-            .enumerate()
-            .filter(|(index, registration)| {
-                registration.remote.accepts_placement()
-                    && affinity.contains(CpuId::new(*index as u32))
-            })
-            .filter_map(|(index, registration)| {
-                let cpu = CpuId::new(index as u32);
-                registration
-                    .remote
-                    .accepts_placement()
-                    .then_some(cpu)
-                    .and_then(|cpu| {
-                        registration
-                            .remote
-                            .try_runnable_summary()
-                            .map(|runnable| (runnable, cpu))
-                    })
-            })
-            .min_by_key(|(load, cpu)| (*load, cpu.as_u32()))
-            .map(|(_, cpu)| cpu)
-    }
-
     pub(super) fn select_initial_fair_cpu(
         &self,
         affinity: &CpuSet,
-        preferred: CpuId,
+        preferred: Option<CpuId>,
     ) -> Option<CpuId> {
         self.cpus
             .iter()
@@ -527,10 +426,11 @@ impl TaskSystemState {
                 if !registration.remote.accepts_placement() || !affinity.contains(cpu) {
                     return None;
                 }
-                registration
-                    .remote
-                    .try_placement_demand()
-                    .map(|load| (load, cpu != preferred, cpu))
+                Some((
+                    registration.remote.placement_demand(),
+                    Some(cpu) != preferred,
+                    cpu,
+                ))
             })
             .min_by_key(|(load, not_preferred, cpu)| (*load, *not_preferred, cpu.as_u32()))
             .map(|(_, _, cpu)| cpu)
@@ -579,8 +479,8 @@ impl TaskSystemState {
                         .placement
                         .execution_cpu()
                         .or(sched.placement.queued_cpu())
-                        .or(sched.deadline.bandwidth_cpu),
-                    sched.policy.generation,
+                        .or(sched.placement.assigned_cpu()),
+                    sched.policy.update_generation(),
                 )
             };
             let Some(cpu) = cpu else {
@@ -614,271 +514,6 @@ impl TaskSystemState {
         }
     }
 
-    pub(super) fn validate_pi_donor(&self, waiter: ThreadId) -> Result<(), TaskError> {
-        let record = self.thread_record(waiter)?;
-        let (policy, donor) = {
-            let sched = record.sched.lock();
-            (sched.policy.effective, sched.pi.donor.unwrap_or(waiter))
-        };
-        if matches!(policy, SchedulePolicy::Deadline(_))
-            && self
-                .thread_record(donor)?
-                .sched
-                .lock()
-                .policy
-                .base_entity
-                .deadline()
-                .is_none()
-        {
-            return Err(TaskError::InvalidPiState);
-        }
-        Ok(())
-    }
-
-    pub(super) fn prepare_pi_recompute_chain(
-        &self,
-        start: ThreadId,
-        chain_limit: usize,
-    ) -> Result<PiRecomputeProof, TaskError> {
-        let mut current = start;
-        for depth in 1..=chain_limit {
-            let record = self.thread_record(current)?;
-            let (blocked_on, dispatch_generation, donating_locks) = {
-                let sched = record.sched.lock();
-                (
-                    record.blocked_on,
-                    sched.policy.dispatch_generation,
-                    sched.pi.donating_locks,
-                )
-            };
-            if dispatch_generation == u64::MAX {
-                return Err(TaskError::InvalidConfiguration);
-            }
-            if record.pi_donors.len() != donating_locks {
-                return Err(TaskError::InvalidPiState);
-            }
-            if let Some(top) = record.pi_donors.first() {
-                self.validate_pi_donor(top.thread)?;
-            }
-            let Some(registration) = blocked_on else {
-                return Ok(PiRecomputeProof { start, depth });
-            };
-            let lock_state = unsafe {
-                // SAFETY: blocked_on retains the lock-identity lifetime.
-                registration.lock.lock_state()
-            };
-            if !lock_state.waiters.contains(registration.key) {
-                return Err(TaskError::InvalidPiState);
-            }
-            let Some(owner) = (unsafe {
-                // SAFETY: the live registration retains the mutex-core lifetime.
-                registration.lock.core()
-            })
-            .owner_snapshot()
-            .owner() else {
-                return Ok(PiRecomputeProof { start, depth });
-            };
-            if depth == chain_limit {
-                return Err(TaskError::PiChainLimit { limit: chain_limit });
-            }
-            current = owner;
-        }
-        Err(TaskError::PiChainLimit { limit: chain_limit })
-    }
-
-    /// Prevalidates the claimant after its selected wait edge is detached.
-    ///
-    /// The caller still holds the physical lock's waiter-tree guard, so the
-    /// committed graph continues to contain `claimant.blocked_on` until local
-    /// ownership is published. Re-entering that lock while walking the old
-    /// edge would self-deadlock. The prepared claim semantically removes this
-    /// one edge, making the claimant the terminal owner of a one-node chain.
-    pub(super) fn prepare_pi_recompute_after_claim(
-        &self,
-        claimant: ThreadId,
-        expected: PiWaitRegistration,
-    ) -> Result<PiRecomputeProof, TaskError> {
-        let record = self.thread_record(claimant)?;
-        let sched = record.sched.lock();
-        if record.blocked_on != Some(expected)
-            || sched.policy.dispatch_generation == u64::MAX
-            || record.pi_donors.len() != sched.pi.donating_locks
-        {
-            return Err(if sched.policy.dispatch_generation == u64::MAX {
-                TaskError::InvalidConfiguration
-            } else {
-                TaskError::InvalidPiState
-            });
-        }
-        drop(sched);
-        if let Some(top) = record.pi_donors.first() {
-            self.validate_pi_donor(top.thread)?;
-        }
-        Ok(PiRecomputeProof {
-            start: claimant,
-            depth: 1,
-        })
-    }
-
-    pub(super) fn apply_pi_recompute_chain(&mut self, proof: PiRecomputeProof, fair_slice_ns: u64) {
-        let mut current = proof.start();
-        for depth in 1..=proof.depth() {
-            let (
-                current_core,
-                base,
-                base_entity,
-                previous_policy,
-                previous_entity,
-                previous_pi_donor,
-                previous_deadline_donor,
-                donating_locks,
-                previous_pi_critical_rescue,
-                previous_dispatch_generation,
-            ) = {
-                let record = self
-                    .thread_record(current)
-                    .expect("prepared PI chain must retain every thread record");
-                let sched = record.sched.lock();
-                let base_entity = sched.policy.base_entity;
-                debug_assert_eq!(
-                    base_entity.deadline().is_some(),
-                    matches!(sched.policy.applied, SchedulePolicy::Deadline(_)),
-                    "the applied policy and its owner CBS entity must change together"
-                );
-                (
-                    Arc::clone(&record.core),
-                    sched.policy.applied,
-                    base_entity,
-                    sched.policy.effective,
-                    sched.policy.effective_entity,
-                    sched.pi.donor,
-                    sched.pi.deadline_donor,
-                    sched.pi.donating_locks,
-                    sched.pi.critical_rescue,
-                    sched.policy.dispatch_generation,
-                )
-            };
-            let mut effective = base;
-            let mut effective_entity = base_entity;
-            let mut effective_urgency = base_entity.scheduling_urgency(base);
-            let mut pi_donor = None;
-            let mut deadline_donor = None;
-            if let Some(top) = self
-                .thread_record(current)
-                .expect("prepared PI owner must remain live")
-                .pi_donors
-                .first()
-            {
-                let waiter = top.thread;
-                let donor_record = self
-                    .thread_record(waiter)
-                    .expect("prepared PI waiter must retain its thread record");
-                let (donor_policy, donor) = {
-                    let sched = donor_record.sched.lock();
-                    (sched.policy.effective, sched.pi.donor.unwrap_or(waiter))
-                };
-                let donor_entity = if matches!(donor_policy, SchedulePolicy::Deadline(_)) {
-                    self.thread_record(donor)
-                        .expect("prepared PI donor must retain its thread record")
-                        .sched
-                        .lock()
-                        .policy
-                        .base_entity
-                        .deadline()
-                        .map(SchedulingEntity::Deadline)
-                        .expect("prepared Deadline PI donor must retain its entity")
-                } else if previous_pi_donor == Some(donor)
-                    && previous_policy == donor_policy
-                    && previous_entity.matches_policy(donor_policy)
-                {
-                    previous_entity
-                } else {
-                    let virtual_time = base_entity.fair().map_or(0, |fair| fair.vruntime());
-                    SchedulingEntity::new(donor_policy, fair_slice_ns, virtual_time)
-                };
-                let donor_urgency = donor_entity.scheduling_urgency(donor_policy);
-                if donor_urgency < effective_urgency {
-                    effective = donor_policy;
-                    effective_entity = donor_entity;
-                    effective_urgency = donor_urgency;
-                    pi_donor = Some(donor);
-                    deadline_donor =
-                        matches!(donor_policy, SchedulePolicy::Deadline(_)).then_some(donor);
-                }
-            }
-            let changed = previous_policy != effective
-                || previous_pi_donor != pi_donor
-                || previous_deadline_donor != deadline_donor;
-            let deadline_donor_core = deadline_donor.map(|donor| {
-                Arc::downgrade(
-                    &self
-                        .thread_record(donor)
-                        .expect("prepared PI donor must retain its thread record")
-                        .core,
-                )
-            });
-            let should_rescue = donating_locks != 0
-                && effective_entity
-                    .deadline()
-                    .is_some_and(|deadline| deadline.remaining_runtime_ns() == 0);
-            let rescue_changed = should_rescue != previous_pi_critical_rescue;
-            let next_dispatch_generation = if changed || rescue_changed {
-                Some(
-                    previous_dispatch_generation
-                        .checked_add(1)
-                        .expect("prepared PI dispatch generation must not overflow"),
-                )
-            } else {
-                None
-            };
-            let (rescue_changed, policy, entity) = {
-                let mut sched = current_core.sched().lock();
-                if changed {
-                    sched.policy.effective = effective;
-                    sched.pi.donor = pi_donor;
-                    sched.pi.deadline_donor = deadline_donor;
-                    sched.pi.deadline_donor_core = deadline_donor_core;
-                    sched.policy.effective_entity = effective_entity;
-                }
-                if rescue_changed {
-                    sched.pi.critical_rescue = should_rescue;
-                    if should_rescue {
-                        sched.policy.effective_entity.enter_pi_critical_rescue();
-                    } else {
-                        sched.policy.effective_entity.leave_pi_critical_rescue();
-                    }
-                    if !sched.is_pi_boosted() {
-                        sched.policy.base_entity = sched.policy.effective_entity;
-                    }
-                }
-                if let Some(generation) = next_dispatch_generation {
-                    sched.policy.dispatch_generation = generation;
-                }
-                (
-                    rescue_changed,
-                    sched.policy.effective,
-                    sched.policy.effective_entity,
-                )
-            };
-            if changed || rescue_changed {
-                current_core.publish_effective_schedule(policy, entity);
-                self.request_owner_reschedule(current);
-            }
-            let owner = self
-                .refresh_blocked_waiter_key(current)
-                .expect("prepared PI waiter key refresh must remain valid");
-            let Some(owner) = owner else {
-                return;
-            };
-            assert!(
-                depth < proof.depth(),
-                "prepared PI chain depth must cover its terminal owner"
-            );
-            current = owner;
-        }
-        unreachable!("prepared PI chain must terminate at its proven depth");
-    }
-
     pub(super) fn cpu_remote(&self, cpu: CpuId) -> Option<&CpuRemote> {
         let registration = self.cpu_registration(cpu).ok()?;
         if !registration.remote.is_online() {
@@ -907,8 +542,6 @@ pub(super) struct ThreadRecord {
     // Explicit teardown consumes this bundle before dropping the extension.
     pub(super) resources: ThreadResources,
     pub(super) extension: Option<ThreadExtension>,
-    pub(super) blocked_on: Option<PiWaitRegistration>,
-    pub(super) pi_donors: PiWaitTree,
     pub(super) callbacks: ThreadCallbackState,
 }
 
@@ -936,17 +569,9 @@ impl DetachedThreadRecord {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct PiWaitRegistration {
-    pub(super) lock: PiMutexRaw,
-    pub(super) key: PiWaitKey,
-    pub(super) generation: u64,
-}
-
 impl ThreadRecord {
     pub(super) fn has_live_pi_edges(&self) -> bool {
-        self.blocked_on.is_some()
-            || !self.pi_donors.is_empty()
-            || self.sched.lock().pi.donating_locks != 0
+        let sched = self.sched.lock();
+        sched.pi.blocked_on.is_some() || !sched.pi.donors.is_empty()
     }
 }

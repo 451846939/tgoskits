@@ -1,10 +1,95 @@
 //! Class-specific mutable state stored with each thread.
 
-use crate::{DeadlineEntity, FairEntity, SchedulePolicy, SchedulingKey, SchedulingUrgency};
+use crate::{DeadlineEntity, DeadlineServer, FairEntity, SchedulePolicy, SchedulingUrgency};
+
+/// Complete class accounting of one task with one physical owner.
+///
+/// Linux embeds the Fair, RT, and Deadline entities in `task_struct`; changing
+/// effective priority never transfers the configured-policy entity to a
+/// second owner. This value provides the same ownership rule without
+/// intrusive self references: it moves as a unit between task control and the
+/// owner rq, retains the base entity across a cross-class PI boost, and owns at
+/// most one inherited-class entity used by that boost.
+#[derive(Debug)]
+pub(crate) struct ActiveSchedulingState {
+    effective_policy: SchedulePolicy,
+    base_entity: SchedulingEntity,
+    inherited_entity: Option<SchedulingEntity>,
+}
+
+impl ActiveSchedulingState {
+    pub(crate) fn new(policy: SchedulePolicy, entity: SchedulingEntity) -> Self {
+        Self {
+            effective_policy: policy,
+            base_entity: entity,
+            inherited_entity: None,
+        }
+    }
+
+    pub(crate) const fn policy(&self) -> SchedulePolicy {
+        self.effective_policy
+    }
+
+    pub(crate) fn entity(&self) -> &SchedulingEntity {
+        self.inherited_entity.as_ref().unwrap_or(&self.base_entity)
+    }
+
+    pub(crate) fn entity_mut(&mut self) -> &mut SchedulingEntity {
+        self.inherited_entity
+            .as_mut()
+            .unwrap_or(&mut self.base_entity)
+    }
+
+    pub(crate) const fn base_entity(&self) -> &SchedulingEntity {
+        &self.base_entity
+    }
+
+    pub(crate) const fn base_entity_mut(&mut self) -> &mut SchedulingEntity {
+        &mut self.base_entity
+    }
+
+    pub(crate) fn replace_base_entity(&mut self, entity: SchedulingEntity) {
+        self.base_entity = entity;
+    }
+
+    pub(crate) const fn uses_inherited_entity(&self) -> bool {
+        self.inherited_entity.is_some()
+    }
+
+    /// Makes the configured-policy entity effective again after PI deboost.
+    pub(crate) fn use_base_entity(&mut self, policy: SchedulePolicy) {
+        self.inherited_entity = None;
+        self.effective_policy = policy;
+    }
+
+    /// Changes only the effective policy/key while retaining base accounting.
+    ///
+    /// This is used for same-class PI. In particular, an RR task keeps its
+    /// remaining quantum while inheriting an RT priority.
+    pub(crate) fn use_base_entity_with_effective_policy(&mut self, policy: SchedulePolicy) {
+        debug_assert!(self.inherited_entity.is_none());
+        self.effective_policy = policy;
+    }
+
+    /// Installs the class-specific entity used by a cross-class PI boost.
+    pub(crate) fn use_inherited_entity(
+        &mut self,
+        policy: SchedulePolicy,
+        entity: SchedulingEntity,
+    ) {
+        self.inherited_entity = Some(entity);
+        self.effective_policy = policy;
+    }
+
+    pub(crate) fn update_inherited_effective_policy(&mut self, policy: SchedulePolicy) {
+        debug_assert!(self.inherited_entity.is_some());
+        self.effective_policy = policy;
+    }
+}
 
 /// Mutable scheduler accounting owned by one thread record.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SchedulingEntity {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SchedulingEntity {
     /// Runtime-owned CPU-stopper work has no budget accounting.
     KernelStop,
     /// EEVDF fair accounting.
@@ -22,7 +107,22 @@ pub enum SchedulingEntity {
 
 impl SchedulingEntity {
     /// Creates class-specific state for a base policy.
+    #[cfg(test)]
     pub fn new(policy: SchedulePolicy, fair_slice_ns: u64, virtual_time: u64) -> Self {
+        Self::new_with_deadline_server(
+            policy,
+            fair_slice_ns,
+            virtual_time,
+            DeadlineServer::unbound(),
+        )
+    }
+
+    pub(crate) fn new_with_deadline_server(
+        policy: SchedulePolicy,
+        fair_slice_ns: u64,
+        virtual_time: u64,
+        deadline_server: DeadlineServer,
+    ) -> Self {
         match policy {
             SchedulePolicy::KernelStop => Self::KernelStop,
             SchedulePolicy::Fair { nice, mode } => {
@@ -32,7 +132,9 @@ impl SchedulingEntity {
             SchedulePolicy::RoundRobin { quantum_ns, .. } => Self::RoundRobin {
                 remaining_quantum_ns: quantum_ns,
             },
-            SchedulePolicy::Deadline(policy) => Self::Deadline(DeadlineEntity::new(policy)),
+            SchedulePolicy::Deadline(policy) => {
+                Self::Deadline(DeadlineEntity::from_task_server(policy, deadline_server))
+            }
         }
     }
 
@@ -86,23 +188,34 @@ impl SchedulingEntity {
     }
 
     /// Returns the EEVDF entity when this is a fair thread.
-    pub const fn fair(self) -> Option<FairEntity> {
+    pub const fn fair(&self) -> Option<FairEntity> {
         match self {
-            Self::Fair(entity) => Some(entity),
+            Self::Fair(entity) => Some(*entity),
             _ => None,
         }
     }
 
     /// Returns the CBS entity when this is a Deadline thread.
-    pub const fn deadline(self) -> Option<DeadlineEntity> {
+    pub const fn deadline(&self) -> Option<&DeadlineEntity> {
         match self {
             Self::Deadline(entity) => Some(entity),
             _ => None,
         }
     }
 
+    /// Returns Deadline flags owned by the executing task. PI donor flags are
+    /// reservation parameters only and must not grant reclaim or redirect
+    /// overrun notification.
+    pub fn deadline_owner_flags(&self) -> crate::DeadlineFlags {
+        match self {
+            Self::Deadline(entity) => entity.owner_flags(),
+            _ => crate::DeadlineFlags::NONE,
+        }
+    }
+
     /// Reports whether this accounting representation matches a policy class.
-    pub const fn matches_policy(self, policy: SchedulePolicy) -> bool {
+    #[cfg(test)]
+    pub const fn matches_policy(&self, policy: SchedulePolicy) -> bool {
         matches!(
             (self, policy),
             (Self::KernelStop, SchedulePolicy::KernelStop)
@@ -114,7 +227,7 @@ impl SchedulingEntity {
     }
 
     /// Reports whether a round-robin dispatch consumed its complete quantum.
-    pub const fn round_robin_quantum_expired(self) -> bool {
+    pub const fn round_robin_quantum_expired(&self) -> bool {
         matches!(
             self,
             Self::RoundRobin {
@@ -137,7 +250,7 @@ impl SchedulingEntity {
     }
 
     /// Returns whether an exhausted Deadline entity is throttled.
-    pub const fn is_deadline_throttled(self) -> bool {
+    pub fn is_deadline_throttled(&self) -> bool {
         matches!(self, Self::Deadline(entity) if entity.is_throttled())
     }
 
@@ -150,33 +263,8 @@ impl SchedulingEntity {
         true
     }
 
-    /// Makes an exhausted Deadline entity runnable for a PI-critical unlock path.
-    pub(crate) fn enter_pi_critical_rescue(&mut self) {
-        if let Self::Deadline(entity) = self {
-            entity.enter_pi_critical_rescue();
-        }
-    }
-
-    /// Restores CBS throttling after the last contended PI edge disappears.
-    pub(crate) fn leave_pi_critical_rescue(&mut self) {
-        if let Self::Deadline(entity) = self {
-            entity.leave_pi_critical_rescue();
-        }
-    }
-
-    /// Builds a scheduler urgency key from mutable class state.
-    ///
-    /// Deadline ordering uses the active absolute scheduling deadline rather
-    /// than the relative policy value shared by every job.
-    pub const fn scheduling_key(self, policy: SchedulePolicy, sequence: u64) -> SchedulingKey {
-        match self {
-            Self::Deadline(deadline) => deadline.scheduling_key(sequence),
-            _ => policy.scheduling_key(sequence),
-        }
-    }
-
     /// Builds PI urgency without a thread or arrival tie-break.
-    pub const fn scheduling_urgency(self, policy: SchedulePolicy) -> SchedulingUrgency {
+    pub fn scheduling_urgency(&self, policy: SchedulePolicy) -> SchedulingUrgency {
         match self {
             Self::Deadline(deadline) => deadline.scheduling_urgency(),
             _ => policy.scheduling_urgency(),
@@ -208,7 +296,7 @@ mod tests {
         earlier.activate_deadline(100);
         later.activate_deadline(200);
 
-        assert!(earlier.scheduling_key(policy, 2) < later.scheduling_key(policy, 1));
+        assert!(earlier.scheduling_urgency(policy) < later.scheduling_urgency(policy));
     }
 
     #[test]
@@ -228,6 +316,8 @@ mod tests {
             Some(u64::MAX - 1)
         );
         assert_eq!(later.deadline().unwrap().absolute_deadline_ns(), Some(4));
-        assert!(earlier.scheduling_key(earlier_policy, 2) < later.scheduling_key(later_policy, 1));
+        assert!(
+            earlier.scheduling_urgency(earlier_policy) < later.scheduling_urgency(later_policy)
+        );
     }
 }

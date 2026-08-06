@@ -26,6 +26,35 @@ pub(super) fn inject_migration_publication_race(system: &TaskSystem, target: Cpu
 }
 
 impl TaskSystem {
+    /// Reads the unique scheduler-class state while holding `p->pi_lock`.
+    ///
+    /// A detached or migrating task owns the state in `ThreadPolicyState`.
+    /// A queued or running task owns it in exactly one rq. This mirrors
+    /// Linux's `task_rq_lock()` rule instead of copying current state back into
+    /// the task merely to answer an affinity request.
+    pub(super) fn affinity_schedule_state_locked(
+        &self,
+        core: &Arc<ThreadCore>,
+        sched: &ThreadSchedState,
+    ) -> Result<(SchedulePolicy, SchedulingEntity), TaskError> {
+        if let Some(active) = sched.policy.active_option() {
+            return Ok((active.policy(), active.entity().clone()));
+        }
+        let owner = sched
+            .placement
+            .control_owner()
+            .ok_or(TaskError::InvalidConfiguration)?;
+        let remote = self
+            .cpu_remote(owner)
+            .ok_or(TaskError::CpuOffline(owner.as_u32()))?;
+        let transaction = OwnerRqTxn::begin(self, remote);
+        let state = transaction
+            .scheduling_state(core.id())
+            .ok_or(TaskError::InvalidConfiguration);
+        transaction.commit();
+        state
+    }
+
     pub(super) fn complete_affinity_if_satisfied_locked(
         core: &Arc<ThreadCore>,
         sched: &ThreadSchedState,
@@ -41,9 +70,8 @@ impl TaskSystem {
         ]
         .into_iter()
         .flatten()
-        .all(|cpu| sched.placement.affinity.contains(cpu));
-        placement_is_allowed
-            && core.publish_affinity_completion(sched.placement.affinity_generation)
+        .all(|cpu| sched.affinity.affinity.contains(cpu));
+        placement_is_allowed && core.publish_affinity_completion(sched.affinity.affinity_generation)
     }
 
     pub(super) fn prepare_owner_migration(
@@ -59,76 +87,10 @@ impl TaskSystem {
         PreparedMigrationDelivery::prepare(target_remote, core, source, target)
     }
 
-    pub(super) fn publish_owner_policy_retry(
-        &self,
-        core: &Arc<ThreadCore>,
-        owner: CpuId,
-        generation: u64,
-    ) -> Result<(), TaskError> {
-        let remote = self
-            .cpu_remote(owner)
-            .ok_or(TaskError::CpuOffline(owner.as_u32()))?;
-        if !core.reserve_scheduler_inbox_delivery() {
-            return Ok(());
-        }
-        let pointer = Arc::as_ptr(core);
-        // SAFETY: this count is transferred to the embedded inbox node and
-        // consumed by exactly one later owner drain.
-        unsafe { Arc::increment_strong_count(pointer) };
-        // SAFETY: the transferred Arc count keeps the embedded node pinned.
-        let node = unsafe { Pin::new_unchecked((*pointer).policy_update_node()) };
-        let message = InboxMessage::policy_update_with_payload(
-            core.id(),
-            owner,
-            generation,
-            pointer.expose_provenance(),
-        );
-        if remote.publish_owner_control(node, message) != PublishResult::Published {
-            // SAFETY: rejected/coalesced publication did not consume this
-            // attempt's retained reference.
-            unsafe { Arc::decrement_strong_count(pointer) };
-            core.cancel_scheduler_inbox_delivery();
-        }
-        Ok(())
-    }
-
-    pub(super) fn publish_owner_deadline_refresh(
-        &self,
-        core: &Arc<ThreadCore>,
-        owner: CpuId,
-        generation: u64,
-    ) -> Result<(), TaskError> {
-        let remote = self
-            .cpu_remote(owner)
-            .ok_or(TaskError::CpuOffline(owner.as_u32()))?;
-        if !core.reserve_scheduler_inbox_delivery() {
-            return Ok(());
-        }
-        let pointer = Arc::as_ptr(core);
-        // SAFETY: this count is transferred to the dedicated refresh node and
-        // consumed by exactly one owner-side inbox drain.
-        unsafe { Arc::increment_strong_count(pointer) };
-        // SAFETY: the transferred Arc count pins the embedded refresh node.
-        let node = unsafe { Pin::new_unchecked((*pointer).deadline_refresh_node()) };
-        let message = InboxMessage::deadline_refresh_with_payload(
-            core.id(),
-            owner,
-            generation,
-            pointer.expose_provenance(),
-        );
-        if remote.publish_owner_control(node, message) != PublishResult::Published {
-            // SAFETY: rejected/coalesced publication retained no extra count.
-            unsafe { Arc::decrement_strong_count(pointer) };
-            core.cancel_scheduler_inbox_delivery();
-        }
-        Ok(())
-    }
-
     pub(super) fn publish_owner_deadline_refresh_reserved(
         &self,
         core: &Arc<ThreadCore>,
         owner: CpuId,
-        generation: u64,
         publication: CpuRemotePublication<'_>,
     ) {
         if !core.reserve_scheduler_inbox_delivery() {
@@ -143,7 +105,7 @@ impl TaskSystem {
         let message = InboxMessage::deadline_refresh_with_payload(
             core.id(),
             owner,
-            generation,
+            0,
             pointer.expose_provenance(),
         );
         if publication.publish_owner_control(node, message) != PublishResult::Published {
@@ -234,8 +196,8 @@ impl TaskSystem {
         if sched.lifecycle.state() == ThreadState::Exited {
             return Err(TaskError::NotReady);
         }
-        let is_deadline = matches!(sched.policy.applied, SchedulePolicy::Deadline(_))
-            || matches!(sched.policy.requested, SchedulePolicy::Deadline(_));
+        let is_deadline = matches!(sched.policy.base, SchedulePolicy::Deadline(_))
+            || matches!(sched.policy.requested_policy(), SchedulePolicy::Deadline(_));
         if is_deadline && !affinity.covers(&root_domain.online) {
             return Err(TaskError::DeadlineAffinity);
         }
@@ -243,29 +205,44 @@ impl TaskSystem {
         if timer_cpu.is_some_and(|cpu| !affinity.contains(cpu)) {
             return Err(TaskError::ActiveTimerAffinity);
         }
+        let (policy, entity) = self.affinity_schedule_state_locked(&core, &sched)?;
+        let preferred = sched
+            .placement
+            .control_owner()
+            .or_else(|| core.wake_cpu_hint());
+        drop(root_domain);
         let target = timer_cpu
-            .or_else(|| state.select_allowed_cpu(&affinity))
+            .or_else(|| match policy {
+                SchedulePolicy::Fair {
+                    mode: FairMode::Normal | FairMode::Batch,
+                    ..
+                } => state.select_initial_fair_cpu(&affinity, preferred),
+                SchedulePolicy::Fifo { .. }
+                | SchedulePolicy::RoundRobin { .. }
+                | SchedulePolicy::Deadline(_) => {
+                    self.select_priority_cpu(policy, entity, &affinity, preferred, None)
+                }
+                SchedulePolicy::KernelStop
+                | SchedulePolicy::Fair {
+                    mode: FairMode::Idle,
+                    ..
+                } => self.select_fallback_active_cpu(&affinity, None),
+            })
             .ok_or(TaskError::InvalidConfiguration)?;
         let generation = sched
-            .placement
+            .affinity
             .affinity_generation
             .checked_add(1)
             .ok_or(TaskError::InvalidConfiguration)?;
-        sched.placement.affinity_generation = generation;
-        sched.placement.affinity = affinity;
+        sched.affinity.affinity_generation = generation;
+        sched.affinity.affinity = Arc::new(affinity);
         // The affinity mask is task metadata, but physical placement belongs
         // to one runqueue owner. A remote writer only publishes a reconciliation
         // request; it never rewrites Queued/Running or the independent
         // switch-tail `on_cpu` publication in place.
-        let owner = sched
-            .placement
-            .execution_cpu()
-            .or(sched.placement.queued_cpu())
-            .or(sched.placement.on_cpu())
-            .or(sched.placement.committed_migration_target())
-            .or(sched.deadline.bandwidth_cpu);
+        let owner = sched.placement.control_owner();
         let target = owner
-            .filter(|owner| sched.placement.affinity.contains(*owner))
+            .filter(|owner| sched.affinity.affinity.contains(*owner))
             .unwrap_or(target);
         core.set_wake_cpu_hint(target);
         let completed = Self::complete_affinity_if_satisfied_locked(&core, &sched);
@@ -273,7 +250,6 @@ impl TaskSystem {
         let publication = owner.map_or(Ok(()), |owner| {
             state.publish_affinity_update(&core, owner, target)
         });
-        drop(root_domain);
         drop(state);
         if completed {
             core.notify_affinity_waiters();
@@ -295,27 +271,23 @@ impl TaskSystem {
     /// to the selected destination CPU.
     pub fn set_current_affinity(
         &self,
-        mut cpu: Pin<&mut CpuLocal>,
+        cpu: Pin<&mut CpuLocal>,
         affinity: CpuSet,
     ) -> Result<bool, TaskError> {
         self.ensure_owner_cpu_context(&cpu)?;
         validate_affinity(&affinity, self.config.cpu_count())?;
         self.ensure_owner_cpu_online(&cpu)?;
         let root_domain = self.root_domain.lock();
-        let current = cpu.current().ok_or(TaskError::NoRunnableThread)?;
-        let core = cpu
-            .current_core()
-            .filter(|core| core.id() == current)
-            .cloned()
-            .ok_or(TaskError::InvalidConfiguration)?;
+        let core = cpu.current_core().ok_or(TaskError::NoRunnableThread)?;
+        let current = core.id();
         let mut sched = core.sched().lock();
         if sched.placement.execution_cpu() != Some(cpu.owner())
             || sched.placement.on_cpu() != Some(cpu.owner())
         {
             return Err(TaskError::InvalidConfiguration);
         }
-        let is_deadline = matches!(sched.policy.applied, SchedulePolicy::Deadline(_))
-            || matches!(sched.policy.requested, SchedulePolicy::Deadline(_));
+        let is_deadline = matches!(sched.policy.base, SchedulePolicy::Deadline(_))
+            || matches!(sched.policy.requested_policy(), SchedulePolicy::Deadline(_));
         if is_deadline && !affinity.covers(&root_domain.online) {
             return Err(TaskError::DeadlineAffinity);
         }
@@ -323,23 +295,57 @@ impl TaskSystem {
         if timer_cpu.is_some_and(|timer_cpu| !affinity.contains(timer_cpu)) {
             return Err(TaskError::ActiveTimerAffinity);
         }
-        let target = timer_cpu
-            .or_else(|| self.select_allowed_active_cpu(&affinity, None))
-            .ok_or(TaskError::InvalidConfiguration)?;
         let owner = cpu.owner();
         let must_migrate = !affinity.contains(owner);
-        let generation = sched
-            .placement
-            .affinity_generation
-            .checked_add(1)
-            .ok_or(TaskError::InvalidConfiguration)?;
-        sched.placement.affinity_generation = generation;
-        sched.placement.affinity = affinity;
+        let remote = Arc::clone(cpu.remote());
+        let transaction = OwnerRqTxn::begin(self, &remote);
+        if transaction.current_thread() != Some(current)
+            || transaction
+                .current_core()
+                .is_none_or(|current_core| !Arc::ptr_eq(&current_core, &core))
+        {
+            transaction.commit();
+            return Err(TaskError::InvalidConfiguration);
+        }
+        let selection = transaction
+            .scheduling_state(current)
+            .ok_or(TaskError::InvalidConfiguration)
+            .and_then(|(policy, entity)| {
+                timer_cpu
+                    .or_else(|| {
+                        self.select_priority_cpu(
+                            policy,
+                            entity,
+                            &affinity,
+                            Some(owner),
+                            must_migrate.then_some(owner),
+                        )
+                    })
+                    .ok_or(TaskError::InvalidConfiguration)
+            })
+            .and_then(|target| {
+                sched
+                    .affinity
+                    .affinity_generation
+                    .checked_add(1)
+                    .map(|generation| (target, generation))
+                    .ok_or(TaskError::InvalidConfiguration)
+            });
+        let (target, generation) = match selection {
+            Ok(selection) => selection,
+            Err(error) => {
+                transaction.commit();
+                return Err(error);
+            }
+        };
+        sched.affinity.affinity_generation = generation;
+        sched.affinity.affinity = Arc::new(affinity);
         sched
             .placement
             .request_migration(must_migrate.then_some(target));
         core.set_wake_cpu_hint(if must_migrate { target } else { owner });
         let completed = Self::complete_affinity_if_satisfied_locked(&core, &sched);
+        transaction.commit();
         drop(sched);
         drop(root_domain);
         if completed {
@@ -348,7 +354,6 @@ impl TaskSystem {
         if must_migrate {
             cpu.request_reschedule();
         }
-        self.publish_owner_cpu_load_summary(cpu.as_mut());
         Ok(must_migrate)
     }
 }

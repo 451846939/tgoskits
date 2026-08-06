@@ -38,9 +38,9 @@ pub fn current_thread(pin: &CpuPin<'_>) -> Result<NonNull<CurrentThreadHeader>, 
 ///
 /// The caller must keep the scheduler-owned current task alive and must not
 /// dereference the result after a context switch.
-pub unsafe fn current_thread_raw() -> *const CurrentThreadHeader {
+pub unsafe fn scheduler_current_thread_unpinned()
+-> Result<NonNull<CurrentThreadHeader>, CpuLocalError> {
     unsafe { cpu_local::scheduler_current_thread() }
-        .map_or(core::ptr::null(), |pointer| pointer.as_ptr().cast_const())
 }
 
 /// Reads the logical CPU ID before constructing a scheduler guard.

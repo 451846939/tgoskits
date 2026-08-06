@@ -1,11 +1,16 @@
+use core::sync::atomic::fence;
+
 use super::*;
 
 const REQUEST_PREEMPT: u64 = 1 << 0;
 const REQUEST_OWNER_WORK: u64 = 1 << 1;
 const REQUEST_SOFT_TIMER: u64 = 1 << 2;
-const REQUEST_REASON_MASK: u64 = REQUEST_PREEMPT | REQUEST_OWNER_WORK | REQUEST_SOFT_TIMER;
+const REQUEST_HARD_TIMER: u64 = 1 << 5;
+const REQUEST_REASON_MASK: u64 =
+    REQUEST_PREEMPT | REQUEST_OWNER_WORK | REQUEST_SOFT_TIMER | REQUEST_HARD_TIMER;
 const REQUEST_ENTRY_MASK: u64 = REQUEST_PREEMPT | REQUEST_OWNER_WORK;
 const REQUEST_IDLE_POLLING: u64 = 1 << 3;
+const REQUEST_PARK_PREEMPT_DEFERRED: u64 = 1 << 4;
 const REQUEST_GENERATION_SHIFT: u32 = 8;
 const REQUEST_FLAGS_MASK: u64 = (1 << REQUEST_GENERATION_SHIFT) - 1;
 const REQUEST_GENERATION_MAX: u64 = u64::MAX >> REQUEST_GENERATION_SHIFT;
@@ -53,20 +58,16 @@ impl SchedulerRequestClaim {
 }
 
 #[derive(Debug)]
-pub(super) struct SchedulerDoorbellState {
-    ready: AtomicBool,
+pub(super) struct SchedulerRequestState {
     request: AtomicU64,
     acknowledged_generation: AtomicU64,
-    park_preempt_deferred: AtomicBool,
 }
 
-impl SchedulerDoorbellState {
+impl SchedulerRequestState {
     pub(super) const fn new() -> Self {
         Self {
-            ready: AtomicBool::new(false),
             request: AtomicU64::new(0),
             acknowledged_generation: AtomicU64::new(0),
-            park_preempt_deferred: AtomicBool::new(false),
         }
     }
 }
@@ -76,12 +77,8 @@ const fn request_generation(word: u64) -> u64 {
 }
 
 impl CpuRemote {
-    pub(crate) fn mark_scheduler_ready(&self) {
-        self.scheduler.ready.store(true, Ordering::Release);
-    }
-
     pub(crate) fn is_scheduler_ready(&self) -> bool {
-        self.scheduler.ready.load(Ordering::Acquire)
+        self.current_thread().is_some() && self.idle_thread().is_some()
     }
 
     /// Publishes a sticky owner-CPU reschedule request.
@@ -121,7 +118,7 @@ impl CpuRemote {
     fn publish_scheduler_request_owned(&self, reason: u64) -> SchedulerRequestPublication {
         debug_assert_ne!(reason & REQUEST_REASON_MASK, 0);
         let previous = self
-            .scheduler
+            .scheduler_request
             .request
             .try_update(Ordering::AcqRel, Ordering::Acquire, |word| {
                 let generation = request_generation(word).checked_add(1)?;
@@ -150,11 +147,11 @@ impl CpuRemote {
     }
 
     pub(crate) fn soft_timer_work_pending(&self) -> bool {
-        self.scheduler.request.load(Ordering::Acquire) & REQUEST_SOFT_TIMER != 0
+        self.scheduler_request.request.load(Ordering::Acquire) & REQUEST_SOFT_TIMER != 0
     }
 
     pub(in crate::system::cpu) fn begin_soft_timer_work(&self) -> bool {
-        self.scheduler
+        self.scheduler_request
             .request
             .fetch_and(!REQUEST_SOFT_TIMER, Ordering::AcqRel)
             & REQUEST_SOFT_TIMER
@@ -168,6 +165,24 @@ impl CpuRemote {
         // interval and may replace the sticky bit with its actual remainder.
         if pending {
             let _ = self.publish_scheduler_request_owned(REQUEST_SOFT_TIMER);
+        }
+    }
+
+    pub(in crate::system::cpu) fn publish_hard_timer_work(&self) {
+        let _ = self.publish_scheduler_request_owned(REQUEST_HARD_TIMER);
+    }
+
+    pub(in crate::system::cpu) fn begin_hard_timer_work(&self) -> bool {
+        self.scheduler_request
+            .request
+            .fetch_and(!REQUEST_HARD_TIMER, Ordering::AcqRel)
+            & REQUEST_HARD_TIMER
+            != 0
+    }
+
+    pub(in crate::system::cpu) fn finish_hard_timer_work(&self, pending: bool) {
+        if pending {
+            let _ = self.publish_scheduler_request_owned(REQUEST_HARD_TIMER);
         }
     }
 
@@ -240,18 +255,18 @@ impl CpuRemote {
 
     /// Tests the sticky reschedule request without consuming it.
     pub fn needs_reschedule(&self) -> bool {
-        let request = self.scheduler.request.load(Ordering::Acquire);
+        let request = self.scheduler_request.request.load(Ordering::Acquire);
         request & REQUEST_REASON_MASK != 0
             || request_generation(request)
                 != self
-                    .scheduler
+                    .scheduler_request
                     .acknowledged_generation
                     .load(Ordering::Acquire)
     }
 
     pub(crate) fn claim_scheduler_request(&self) -> SchedulerRequestClaim {
         let request = self
-            .scheduler
+            .scheduler_request
             .request
             .fetch_and(!REQUEST_ENTRY_MASK, Ordering::AcqRel);
         SchedulerRequestClaim {
@@ -261,10 +276,10 @@ impl CpuRemote {
     }
 
     pub(crate) fn acknowledge_scheduler_request(&self, claim: SchedulerRequestClaim) {
-        self.scheduler
+        self.scheduler_request
             .acknowledged_generation
             .store(claim.generation, Ordering::Release);
-        let request = self.scheduler.request.load(Ordering::Acquire);
+        let request = self.scheduler_request.request.load(Ordering::Acquire);
         if self.has_remote_work() && request & REQUEST_ENTRY_MASK == 0 {
             self.request_scheduler_work();
         }
@@ -279,10 +294,10 @@ impl CpuRemote {
 
     #[cfg(test)]
     pub(crate) fn scheduler_request_state_for_test(&self) -> (u64, u64, u64) {
-        let request = self.scheduler.request.load(Ordering::Acquire);
+        let request = self.scheduler_request.request.load(Ordering::Acquire);
         (
             request_generation(request),
-            self.scheduler
+            self.scheduler_request
                 .acknowledged_generation
                 .load(Ordering::Acquire),
             request & REQUEST_REASON_MASK,
@@ -291,17 +306,19 @@ impl CpuRemote {
 
     pub(crate) fn defer_park_preemption(&self, requested: bool) {
         if requested {
-            self.scheduler
-                .park_preempt_deferred
-                .store(true, Ordering::Release);
+            self.scheduler_request
+                .request
+                .fetch_or(REQUEST_PARK_PREEMPT_DEFERRED, Ordering::Release);
         }
     }
 
     pub(crate) fn finish_park_preemption(&self, resume_running: bool) {
         let deferred = self
-            .scheduler
-            .park_preempt_deferred
-            .swap(false, Ordering::AcqRel);
+            .scheduler_request
+            .request
+            .fetch_and(!REQUEST_PARK_PREEMPT_DEFERRED, Ordering::AcqRel)
+            & REQUEST_PARK_PREEMPT_DEFERRED
+            != 0;
         if resume_running && deferred {
             let _ = self.request_reschedule_owned();
         }
@@ -309,13 +326,13 @@ impl CpuRemote {
 
     pub(crate) fn prepare_idle_wait(&self) -> bool {
         let previous = self
-            .scheduler
+            .scheduler_request
             .request
             .fetch_or(REQUEST_IDLE_POLLING, Ordering::AcqRel);
         let may_wait = previous & REQUEST_REASON_MASK == 0
             && !self.needs_reschedule()
             && !self.has_remote_work()
-            && self.try_runnable_summary() == Some(0);
+            && self.queued_summary() == 0;
         if !may_wait {
             self.finish_idle_wait();
         }
@@ -323,22 +340,24 @@ impl CpuRemote {
     }
 
     pub(crate) fn finish_idle_wait(&self) {
-        self.scheduler
+        self.scheduler_request
             .request
             .fetch_and(!REQUEST_IDLE_POLLING, Ordering::Release);
+        // Linux `current_clr_polling()` pairs this full barrier with
+        // `resched_curr()`: work published before the clear remains visible
+        // to the final IRQ-off recheck, while a producer observing the clear
+        // must ring the physical doorbell.
+        fence(Ordering::SeqCst);
     }
 
     pub(crate) fn is_idle_polling(&self) -> bool {
-        self.scheduler.request.load(Ordering::Acquire) & REQUEST_IDLE_POLLING != 0
+        self.scheduler_request.request.load(Ordering::Acquire) & REQUEST_IDLE_POLLING != 0
     }
 
     pub(super) fn reset_scheduler_for_offline(&self) {
-        self.scheduler.request.store(0, Ordering::Relaxed);
-        self.scheduler
+        self.scheduler_request.request.store(0, Ordering::Relaxed);
+        self.scheduler_request
             .acknowledged_generation
             .store(0, Ordering::Relaxed);
-        self.scheduler
-            .park_preempt_deferred
-            .store(false, Ordering::Relaxed);
     }
 }

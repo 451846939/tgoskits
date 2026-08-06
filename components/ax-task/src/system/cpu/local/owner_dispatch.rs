@@ -1,0 +1,202 @@
+//! Owner-only dispatch, handoff, and balance scratch facade.
+
+use super::*;
+
+impl CpuLocal {
+    /// Returns the currently executing non-idle thread, if any.
+    pub(crate) fn current(&self) -> Option<ThreadId> {
+        self.remote.lock_run_queue().current_thread()
+    }
+
+    pub(crate) fn current_core(&self) -> Option<Arc<ThreadCore>> {
+        self.remote.lock_run_queue().current_core()
+    }
+
+    pub(crate) fn current_switch_endpoint(&self) -> Option<SwitchEndpoint> {
+        self.remote
+            .lock_run_queue()
+            .current()
+            .map(CurrentDispatch::switch_endpoint)
+    }
+
+    /// Clones a strong handle for the currently executing thread.
+    ///
+    /// This owner-side lookup never consults the generation registry. The
+    /// stable core retained by `CpuLocal` pins the registry record and any OS
+    /// extension until the returned handle is dropped.
+    pub(crate) fn current_thread_handle(&self) -> Result<ThreadHandle, TaskError> {
+        self.remote
+            .lock_run_queue()
+            .current_core()
+            .map(ThreadHandle::from_core)
+            .ok_or(TaskError::NoRunnableThread)
+    }
+
+    /// Returns the configured CPU idle thread, if any.
+    pub(crate) fn idle(&self) -> Option<ThreadId> {
+        self.remote.lock_run_queue().idle()
+    }
+
+    /// Returns the number of runnable non-idle threads.
+    pub(crate) fn runnable_count(&self) -> usize {
+        self.remote.lock_run_queue().nr_running()
+    }
+
+    pub(crate) fn is_quiescent_for_offline(&self) -> bool {
+        let run_queue = self.remote.lock_run_queue();
+        let deadlines = self.remote.lock_deadline_base();
+        (run_queue.current_thread().is_none() || run_queue.current_thread() == run_queue.idle())
+            && run_queue.nr_running() == 0
+            && run_queue.deadline_members_are_empty()
+            && deadlines.queue.is_empty()
+            && deadlines.expired_count == 0
+            && self.dispatch.switch_handoff.is_none()
+            && self.remote.is_quiescent_for_offline()
+    }
+
+    /// Publishes a sticky reschedule request from task or IRQ context.
+    pub(crate) fn request_reschedule(&self) {
+        self.remote.request_reschedule();
+    }
+
+    pub(crate) fn request_scheduler_work(&self) {
+        self.remote.request_scheduler_work();
+    }
+
+    pub(crate) fn defer_scheduler_work(&self) {
+        self.remote.defer_scheduler_work();
+    }
+
+    /// Tests the sticky reschedule request without clearing it.
+    pub(crate) fn needs_reschedule(&self) -> bool {
+        self.remote.needs_reschedule()
+    }
+
+    /// Returns the bounded scheduler safe-point work budget.
+    pub(crate) const fn batch_limit(&self) -> usize {
+        self.drain.batch_limit()
+    }
+
+    /// Reads current lifecycle under an already-active scheduler IRQ-off baton.
+    ///
+    /// # Safety
+    ///
+    /// The scheduler frame must keep local IRQs disabled through this read.
+    pub(crate) unsafe fn scheduler_current_lifecycle_state(&self) -> Option<ThreadState> {
+        // SAFETY: forwarded from this method's scheduler-frame contract.
+        unsafe { self.remote.lock_run_queue_irq_disabled() }
+            .current()
+            .map(|dispatch| dispatch.runtime_core().state())
+    }
+
+    pub(crate) fn install_idle(
+        self: Pin<&mut Self>,
+        system: &TaskSystem,
+        idle: ThreadId,
+        core: Arc<ThreadCore>,
+        active: ActiveSchedulingState,
+        metadata: RqTaskMetadata,
+        rt_quota_exempt: bool,
+    ) {
+        debug_assert_eq!(idle, core.id());
+        // SAFETY: changing fields does not move this pinned object.
+        let fields = unsafe { self.get_unchecked_mut() };
+        let mut transaction = OwnerRqTxn::begin(system, &fields.remote);
+        transaction.install_idle(Arc::clone(&core), active, metadata, rt_quota_exempt);
+        core.sched().placement().install_idle(fields.owner);
+        transaction.commit();
+        fields.remote.publish_idle_thread(idle);
+    }
+
+    pub(crate) fn stage_switch_handoff(
+        self: Pin<&mut Self>,
+        previous: Arc<ThreadCore>,
+        migration: Option<PreparedMigrationDelivery>,
+    ) -> Result<(), TaskError> {
+        let handoff = &mut self.dispatch_state_mut().switch_handoff;
+        if handoff.is_some() {
+            return Err(TaskError::InvalidConfiguration);
+        }
+        *handoff = Some(SwitchHandoff::prepared(previous, migration));
+        Ok(())
+    }
+
+    pub(crate) fn finish_switch_runtime_tail(
+        mut self: Pin<&mut Self>,
+        previous: ThreadId,
+        migration_target: Option<CpuId>,
+    ) -> Result<(), TaskError> {
+        let handoff = self
+            .as_mut()
+            .dispatch_state_mut()
+            .switch_handoff
+            .take()
+            .ok_or(TaskError::InvalidConfiguration)?;
+        if handoff.previous().id() != previous
+            || handoff.migration_target() != migration_target
+            || handoff.runtime_tail_is_finished()
+        {
+            return Err(TaskError::InvalidConfiguration);
+        }
+        self.dispatch_state_mut().switch_handoff = Some(handoff.finish_runtime_tail()?);
+        Ok(())
+    }
+
+    pub(crate) fn take_switch_handoff(self: Pin<&mut Self>) -> Option<SwitchHandoff> {
+        self.dispatch_state_mut().switch_handoff.take()
+    }
+
+    pub(crate) fn switch_handoff(&self) -> Option<&SwitchHandoff> {
+        self.dispatch.switch_handoff.as_ref()
+    }
+
+    pub(crate) fn defer_park_preemption(&self, requested: bool) {
+        self.remote.defer_park_preemption(requested);
+    }
+
+    pub(crate) fn finish_park_preemption(&self, resume_running: bool) {
+        self.remote.finish_park_preemption(resume_running);
+    }
+
+    pub(crate) fn dispatch_state_mut(
+        self: Pin<&mut Self>,
+    ) -> &mut dispatch_state::OwnerDispatchState {
+        // SAFETY: the owner borrow is pinned, and OwnerDispatchState contains
+        // no self-referential pointer that can move CpuLocal.
+        &mut unsafe { self.get_unchecked_mut() }.dispatch
+    }
+
+    pub(crate) fn lock_run_queue(&self) -> IrqTicketGuard<'_, CpuRunQueueState> {
+        self.remote.lock_run_queue()
+    }
+
+    pub(crate) fn drain_state_mut(self: Pin<&mut Self>) -> &mut drain_state::OwnerDrainScratch {
+        // SAFETY: scratch buffers are owner-only and do not move CpuLocal.
+        &mut unsafe { self.get_unchecked_mut() }.drain
+    }
+
+    pub(crate) const fn drain_state(&self) -> &drain_state::OwnerDrainScratch {
+        &self.drain
+    }
+
+    #[cfg(test)]
+    pub(crate) fn deadline_members_are_empty_for_test(&self) -> bool {
+        self.remote.lock_run_queue().deadline_members_are_empty()
+    }
+
+    pub(crate) fn balance_request_node(&self) -> Pin<&'static InboxNode> {
+        self.remote.balance_request_node()
+    }
+
+    pub(crate) const fn idle_pull_visited(&self) -> &CpuSet {
+        self.dispatch.idle_pull_visited()
+    }
+
+    pub(crate) fn mark_idle_pull_source(self: Pin<&mut Self>, source: CpuId) {
+        self.dispatch_state_mut().mark_idle_pull_source(source);
+    }
+
+    pub(crate) fn reset_idle_pull_scan(self: Pin<&mut Self>) {
+        self.dispatch_state_mut().reset_idle_pull_scan();
+    }
+}

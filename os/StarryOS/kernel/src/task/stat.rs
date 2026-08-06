@@ -1,6 +1,6 @@
 use alloc::{borrow::ToOwned, fmt, string::String};
 
-use ax_errno::AxResult;
+use ax_errno::{AxError, AxResult};
 use ax_std::os::arceos::task::ThreadState;
 use starry_signal::Signo;
 
@@ -119,7 +119,7 @@ impl TaskStat {
             start_stack: mem.start_stack,
             start_brk: proc_data.get_heap_top() as u64,
             exit_signal: proc_data.exit_signal().unwrap_or(Signo::SIGCHLD) as u8,
-            processor: task.cpu_id() as u32,
+            processor: task.assigned_cpu().ok_or(AxError::BadState)? as u32,
             exit_code: proc.exit_code(),
             ..Default::default()
         })

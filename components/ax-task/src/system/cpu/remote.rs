@@ -1,5 +1,6 @@
 use super::*;
 
+mod deadline;
 mod delivery;
 mod idle_pull;
 mod lifecycle;
@@ -8,6 +9,7 @@ mod owner;
 mod run_queue;
 mod scheduler;
 
+pub(crate) use deadline::{CpuDeadlineState, SchedulerDeadlinePublicationState};
 pub(crate) use delivery::PreparedMigrationDelivery;
 pub(crate) use idle_pull::IdlePullReservation;
 pub use lifecycle::CpuLifecycleState;
@@ -27,11 +29,13 @@ pub(crate) use scheduler::SchedulerRequestClaim;
 pub struct CpuRemote {
     owner: CpuId,
     run_queue: IrqTicketLock<CpuRunQueueState>,
+    rt_runtime: IrqTicketLock<RtRunQueueBandwidth>,
+    deadline: IrqTicketLock<CpuDeadlineState>,
     /// Linux `dl_rq.extra_bw`: root-domain bandwidth published for this rq.
     deadline_extra_bw_scaled: AtomicU64,
     owner_state: owner::OwnerState,
     publication: lifecycle::CpuPublicationState,
-    scheduler: scheduler::SchedulerDoorbellState,
+    scheduler_request: scheduler::SchedulerRequestState,
     load: load_summary::RemoteLoadState,
     idle_pull: idle_pull::IdlePullState,
     delivery: delivery::RemoteDeliveryState,
@@ -44,10 +48,12 @@ impl CpuRemote {
         Arc::new(Self {
             owner,
             run_queue: IrqTicketLock::new(CpuRunQueueState::new(owner, config)),
+            rt_runtime: IrqTicketLock::new(RtRunQueueBandwidth::offline()),
+            deadline: IrqTicketLock::new(CpuDeadlineState::new(config)),
             deadline_extra_bw_scaled: AtomicU64::new(deadline_max_bw_scaled),
             owner_state: owner::OwnerState::new(),
             publication: lifecycle::CpuPublicationState::new(),
-            scheduler: scheduler::SchedulerDoorbellState::new(),
+            scheduler_request: scheduler::SchedulerRequestState::new(),
             load: load_summary::RemoteLoadState::new(),
             idle_pull: idle_pull::IdlePullState::new(),
             delivery: delivery::RemoteDeliveryState::new(),
@@ -61,6 +67,31 @@ impl CpuRemote {
     /// by this lock and must not escape its CPU-local scheduler baton.
     pub(crate) fn lock_run_queue(&self) -> IrqTicketGuard<'_, CpuRunQueueState> {
         self.run_queue.lock()
+    }
+
+    /// Acquires the rq under an already-active scheduler IRQ-off baton.
+    ///
+    /// # Safety
+    ///
+    /// See [`IrqTicketLock::lock_irq_disabled`].
+    pub(crate) unsafe fn lock_run_queue_irq_disabled(
+        &self,
+    ) -> IrqTicketGuard<'_, CpuRunQueueState> {
+        // SAFETY: forwarded unchanged to the caller's scheduler-baton contract.
+        unsafe { self.run_queue.lock_irq_disabled() }
+    }
+
+    /// Locks this CPU's hrtimer-style task-deadline base.
+    ///
+    /// The rq lock precedes this lock when both are required. Timer IRQ code
+    /// takes only this lock; soft-timer callbacks release it before acquiring a
+    /// task control lock or rq lock.
+    pub(crate) fn lock_deadline_base(&self) -> IrqTicketGuard<'_, CpuDeadlineState> {
+        self.deadline.lock()
+    }
+
+    pub(crate) fn lock_rt_runtime(&self) -> IrqTicketGuard<'_, RtRunQueueBandwidth> {
+        self.rt_runtime.lock()
     }
 
     pub(crate) fn publish_deadline_extra_bw(&self, extra_bw_scaled: u64) {

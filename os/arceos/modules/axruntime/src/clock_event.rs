@@ -53,15 +53,13 @@ pub(crate) struct ClockEventFiringToken {
 pub(crate) enum ClockEventIrqClaim {
     /// The edge has no live clockevent owner in this CPU epoch.
     Ignored,
-    /// The edge arrived before the current epoch's armed deadline.
-    Rearm(ClockDeadline),
-    /// The current epoch's deadline is due and owns scheduler service.
+    /// The armed epoch owns one bounded scheduler service transaction.
     Firing(ClockEventFiringToken),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SchedulerTickState {
-    Running { next: Option<ClockDeadline> },
+    Running { next: ClockDeadline },
     Stopped { resume_from: Option<ClockDeadline> },
 }
 
@@ -92,7 +90,7 @@ impl LocalClockEvent {
         }
     }
 
-    pub(crate) fn online(&mut self, periodic: Option<ClockDeadline>) -> ClockEventAction {
+    pub(crate) fn online(&mut self, periodic: ClockDeadline) -> ClockEventAction {
         assert_eq!(
             self.phase,
             ClockEventPhase::Offline,
@@ -114,7 +112,9 @@ impl LocalClockEvent {
         let SchedulerTickState::Running { next } = self.scheduler_tick else {
             return ClockEventAction::None;
         };
-        self.scheduler_tick = SchedulerTickState::Stopped { resume_from: next };
+        self.scheduler_tick = SchedulerTickState::Stopped {
+            resume_from: Some(next),
+        };
         self.reconcile_arm()
     }
 
@@ -178,22 +178,20 @@ impl LocalClockEvent {
 
     /// Claims a physical timer edge for this CPU lifecycle epoch.
     ///
-    /// A pending edge from an older offline cycle can be delivered after the
-    /// timer has been armed for a new epoch. If the new deadline is not due,
-    /// the edge only re-arms that deadline and must not enter ax-task.
-    pub(crate) fn claim_irq(&mut self, now: MonotonicInstant) -> ClockEventIrqClaim {
+    /// Every edge observed while armed starts one hrtimer-style firing
+    /// transaction. Logical expiry is decided by the scheduler using its own
+    /// clock; an early or stale hardware edge therefore completes normally
+    /// and reprograms the still-earliest absolute deadline exactly once.
+    pub(crate) fn claim_irq(&mut self, _now: MonotonicInstant) -> ClockEventIrqClaim {
         match self.phase {
             ClockEventPhase::Offline | ClockEventPhase::Idle | ClockEventPhase::Firing => {
                 return ClockEventIrqClaim::Ignored;
             }
             ClockEventPhase::Armed => {}
         }
-        let armed = self
+        let _armed = self
             .armed_deadline
             .expect("armed clockevent must retain its physical deadline");
-        if !now.reached(armed.as_monotonic()) {
-            return ClockEventIrqClaim::Rearm(armed);
-        }
         self.armed_deadline = None;
         self.phase = ClockEventPhase::Firing;
         ClockEventIrqClaim::Firing(ClockEventFiringToken {
@@ -209,9 +207,7 @@ impl LocalClockEvent {
         let SchedulerTickState::Running { next } = &mut self.scheduler_tick else {
             return false;
         };
-        let Some(current) = *next else {
-            return false;
-        };
+        let current = *next;
         if !now.reached(current.as_monotonic()) {
             return false;
         }
@@ -219,7 +215,12 @@ impl LocalClockEvent {
         true
     }
 
-    pub(crate) fn finish_firing(&mut self, token: ClockEventFiringToken) -> ClockEventAction {
+    pub(crate) fn finish_firing(
+        &mut self,
+        token: ClockEventFiringToken,
+        now: MonotonicInstant,
+        defer_due_work: bool,
+    ) -> ClockEventAction {
         if token.cpu_epoch != self.cpu_epoch {
             return ClockEventAction::None;
         }
@@ -229,6 +230,17 @@ impl LocalClockEvent {
             "clockevent finish requires a firing transaction"
         );
         self.phase = ClockEventPhase::Idle;
+        if defer_due_work
+            && self
+                .selected_deadline()
+                .is_some_and(|deadline| now.reached(deadline.as_monotonic()))
+        {
+            // The scheduler safe point owns progress after an IRQ budget
+            // overrun. Keep the logical deadline published but do not turn an
+            // already-due value into an interrupt storm.
+            self.armed_deadline = None;
+            return ClockEventAction::Stop;
+        }
         self.reconcile_arm()
     }
 
@@ -267,7 +279,7 @@ impl LocalClockEvent {
         #[cfg(feature = "multitask")]
         {
             let scheduler_tick = match self.scheduler_tick {
-                SchedulerTickState::Running { next } => next,
+                SchedulerTickState::Running { next } => Some(next),
                 SchedulerTickState::Stopped { .. } => None,
             };
             match (scheduler_tick, self.scheduler_deadline) {
@@ -280,7 +292,7 @@ impl LocalClockEvent {
         #[cfg(not(feature = "multitask"))]
         {
             match self.scheduler_tick {
-                SchedulerTickState::Running { next } => next,
+                SchedulerTickState::Running { next } => Some(next),
                 SchedulerTickState::Stopped { .. } => None,
             }
         }
@@ -389,13 +401,17 @@ mod tests {
             ClockEventAction::Program(deadline(200))
         );
 
-        // Model an interrupt edge that was pending before the CPU completed
-        // the offline/online cycle. It must not consume the new epoch's arm.
+        // A stale physical edge enters the same firing transaction as any
+        // other hrtimer edge. Since no logical deadline is due, finish
+        // reprograms the new epoch's still-earliest deadline.
+        let firing = match event.claim_irq(instant(150)) {
+            ClockEventIrqClaim::Firing(firing) => firing,
+            claim => panic!("armed edge was not claimed: {claim:?}"),
+        };
         assert_eq!(
-            event.claim_irq(instant(150)),
-            ClockEventIrqClaim::Rearm(deadline(200))
+            event.finish_firing(firing),
+            ClockEventAction::Program(deadline(200))
         );
-
         assert_eq!(event.phase(), ClockEventPhase::Armed);
         assert_eq!(event.armed_deadline(), Some(deadline(200)));
     }
@@ -616,7 +632,7 @@ mod tests {
     }
 
     #[test]
-    fn early_irq_reprograms_without_entering_the_scheduler_transaction() {
+    fn early_irq_uses_one_firing_transaction_and_reprograms_once() {
         let mut event = LocalClockEvent::offline();
         assert_eq!(
             event.online(Some(deadline(500))),
@@ -627,9 +643,13 @@ mod tests {
             ClockEventAction::Program(deadline(100))
         );
 
+        let firing = match event.claim_irq(instant(50)) {
+            ClockEventIrqClaim::Firing(firing) => firing,
+            claim => panic!("armed edge was not claimed: {claim:?}"),
+        };
         assert_eq!(
-            event.claim_irq(instant(50)),
-            ClockEventIrqClaim::Rearm(deadline(100))
+            event.finish_firing(firing),
+            ClockEventAction::Program(deadline(100))
         );
         assert_eq!(event.phase(), ClockEventPhase::Armed);
         assert_eq!(event.armed_deadline(), Some(deadline(100)));

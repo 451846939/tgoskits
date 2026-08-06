@@ -6,6 +6,7 @@ mod load;
 mod local;
 mod remote;
 mod snapshot;
+mod transaction;
 
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 use core::{
@@ -16,19 +17,16 @@ use core::{
     sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering},
 };
 
-pub(crate) use clock::{RunQueueClock, RunQueueClockSnapshot};
+pub(crate) use clock::{RqTaskTime, RunQueueClock, RunQueueClockSnapshot};
+#[cfg(test)]
+pub(crate) use dispatch::CurrentSchedule;
 pub(crate) use dispatch::{
-    CurrentDispatch, CurrentDispatchState, CurrentSchedule, DispatchCharge, DispatchRole,
+    CurrentClassState, CurrentDispatch, CurrentDispatchState, DispatchCharge, DispatchRole,
     SwitchHandoff,
 };
+use load::SUMMARY_FAIR_PUSHABLE;
 pub use load::{CpuLoadSummary, DeadlineBandwidthSnapshot, SchedulingClass};
-use load::{
-    LOAD_SUMMARY_READ_RETRIES, SUMMARY_CLASS_MASK, SUMMARY_CURRENT_CLASS_SHIFT,
-    SUMMARY_CURRENT_PRESENT, SUMMARY_OVERLOADED, SUMMARY_PUSHABLE_CLASS_SHIFT,
-    SUMMARY_PUSHABLE_PRESENT,
-};
 pub use local::CpuLocal;
-use local::earliest;
 #[cfg(feature = "qperf-metrics")]
 pub(crate) use remote::WakePreemptionDecision;
 pub use remote::{CpuLifecycleState, CpuLocalOwnerBorrow, CpuRemote};
@@ -37,11 +35,12 @@ pub(crate) use remote::{
     SchedulerRequestClaim,
 };
 pub use snapshot::CpuSnapshot;
+pub(crate) use transaction::{OwnerRqEntry, OwnerRqTxn};
 
 use crate::{
-    CpuId, DeadlineAdmission, FairMode, RootRtBandwidth, RtRunQueueBandwidth, RunQueue,
-    SchedulePolicy, SchedulingEntity, SchedulingKey, TaskError, TaskSystemConfig, ThreadHandle,
-    ThreadId, ThreadState,
+    ActiveSchedulingState, CpuId, CpuSet, FairMode, QueuedThread, RootRtBandwidth, RqTaskMetadata,
+    RtRunQueueBandwidth, RunQueue, SchedulePolicy, SchedulingEntity, TaskError, TaskSystemConfig,
+    ThreadHandle, ThreadId, ThreadState,
     inbox::{InboxKind, InboxMessage, InboxNode, PublishResult, SchedulerInbox},
     lock::{IrqScope, IrqTicketGuard, IrqTicketLock},
     runtime::{

@@ -48,6 +48,62 @@ fn runqueue_task_clock_excludes_target_cpu_hardirq_time() {
 }
 
 #[test]
+fn set_next_uses_task_clock_after_hardirq_accounting() {
+    support::clear_handles();
+    support::set_online_cpu_count(1);
+    support::set_hard_irq(false);
+    support::set_scheduler_ns_for_cpu(0, 0);
+    support::set_hardirq_ns_for_cpu(0, 0);
+
+    let system = TaskSystem::new(TaskSystemConfig::new(1)).unwrap();
+    let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
+    let bootstrap = system
+        .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
+        .unwrap();
+    let idle = system
+        .register_idle_thread(
+            cpu.as_mut(),
+            ThreadSpec::new(SchedulePolicy::fair(Nice::ZERO, FairMode::Idle)),
+        )
+        .unwrap();
+    system.bring_cpu_online(cpu.as_mut()).unwrap();
+
+    let fifo = system
+        .create_thread(ThreadSpec::new(SchedulePolicy::fifo(
+            RtPriority::new(1).unwrap(),
+        )))
+        .unwrap();
+    system.make_ready(fifo.id()).unwrap();
+
+    // The rq wall clock advances by 100ns, while 25ns are charged to hard IRQ.
+    // Linux set_next_task_* starts runtime accounting from rq_clock_task=75,
+    // not rq_clock=100.
+    support::set_hardirq_ns_for_cpu(0, 25);
+    system.enqueue_at(cpu.as_mut(), fifo.id(), 100).unwrap();
+    let decision = system.schedule_at(cpu.as_mut(), 100).unwrap();
+    assert_eq!(decision.next(), fifo.id());
+
+    // No task time elapsed since set_next. The old split owner path stored the
+    // wall timestamp in CurrentDispatch, so this settlement wrapped backwards
+    // and tripped SchedulerTimestamp::since's half-range invariant.
+    system
+        .charge_current_until_at(cpu.as_mut(), 100, 0)
+        .unwrap();
+    assert_eq!(
+        system
+            .thread_runtime(fifo.id())
+            .unwrap()
+            .charged_runtime_ns(),
+        0
+    );
+
+    drop(fifo);
+    drop(idle);
+    drop(bootstrap);
+    support::clear_handles();
+}
+
+#[test]
 fn runtime_snapshot_includes_the_running_residual_before_switch_commit() {
     support::clear_handles();
     support::set_online_cpu_count(1);

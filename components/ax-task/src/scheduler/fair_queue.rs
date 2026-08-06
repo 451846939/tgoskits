@@ -5,7 +5,10 @@ use core::cmp::Ordering;
 
 #[cfg(test)]
 use super::queue::record_fair_runqueue_visit;
-use super::{queue::QueuedThread, virtual_before, virtual_delta, virtual_min};
+use super::{
+    queue::{QueuedThread, QueuedThreadSnapshot},
+    virtual_before, virtual_delta, virtual_min,
+};
 use crate::{FairEntity, ThreadId};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -113,6 +116,7 @@ pub(super) struct FairRunQueue {
     zero_vruntime: u64,
     sum_weighted_delta: i128,
     total_weight: i128,
+    migratable_count: usize,
     len: usize,
 }
 
@@ -124,6 +128,7 @@ impl FairRunQueue {
             zero_vruntime: 0,
             sum_weighted_delta: 0,
             total_weight: 0,
+            migratable_count: 0,
             len: 0,
         }
     }
@@ -136,6 +141,10 @@ impl FairRunQueue {
 
     pub(super) const fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    pub(super) const fn has_migratable(&self) -> bool {
+        self.migratable_count != 0
     }
 
     pub(super) fn total_weight(&self) -> u64 {
@@ -166,6 +175,12 @@ impl FairRunQueue {
             "fair runqueue cannot contain one thread twice"
         );
         self.add_weighted_entity(fair_entity(&thread));
+        if thread.migration_capable {
+            self.migratable_count = self
+                .migratable_count
+                .checked_add(1)
+                .expect("fair migratable count must fit usize");
+        }
         let core = Arc::clone(&thread.core);
         let mut inserted = unsafe {
             // SAFETY: target-rq placement serializes the single fair linkage
@@ -189,6 +204,12 @@ impl FairRunQueue {
         let removed = removed.expect("fair runqueue identity index must match its tree");
         let removed = Self::return_removed(removed);
         self.remove_weighted_entity(fair_entity(&removed));
+        if removed.migration_capable {
+            self.migratable_count = self
+                .migratable_count
+                .checked_sub(1)
+                .expect("fair migratable count must match queue membership");
+        }
         self.len -= 1;
         Some(removed)
     }
@@ -204,6 +225,12 @@ impl FairRunQueue {
         let removed = removed.expect("eligible fair key must remain present until owner removal");
         let removed = Self::return_removed(removed);
         self.remove_weighted_entity(fair_entity(&removed));
+        if removed.migration_capable {
+            self.migratable_count = self
+                .migratable_count
+                .checked_sub(1)
+                .expect("fair migratable count must match queue membership");
+        }
         self.len -= 1;
         Some(removed)
     }
@@ -215,8 +242,8 @@ impl FairRunQueue {
     pub(super) fn find_first_matching(
         &self,
         predicate: &mut impl FnMut(&QueuedThread) -> bool,
-    ) -> Option<QueuedThread> {
-        find_first_matching(self.root.as_deref(), predicate).cloned()
+    ) -> Option<QueuedThreadSnapshot> {
+        find_first_matching(self.root.as_deref(), predicate).map(QueuedThreadSnapshot::from)
     }
 
     pub(super) fn update_virtual_time(&mut self, current: Option<FairEntity>) -> u64 {
@@ -300,7 +327,8 @@ impl FairRunQueue {
 
 fn fair_entity(thread: &QueuedThread) -> FairEntity {
     thread
-        .entity
+        .active
+        .entity()
         .fair()
         .expect("FairRunQueue accepts only fair scheduling entities")
 }

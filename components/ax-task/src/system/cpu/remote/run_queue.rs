@@ -1,107 +1,13 @@
 use core::ops::{Deref, DerefMut};
 
 use super::*;
-use crate::RtPriority;
+use crate::SchedulerClass;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WakePreemptionDecision {
     KeepCurrent,
     WakeeSelected,
     QueuedCandidateSelected,
-}
-
-/// Linux `dl_rq` bandwidth ledger owned by one runqueue lock.
-#[derive(Debug)]
-struct DeadlineRunQueueBandwidth {
-    this_bw_scaled: u64,
-    running_bw_scaled: u64,
-    max_bw_scaled: u64,
-}
-
-impl DeadlineRunQueueBandwidth {
-    const fn new(max_bw_scaled: u64) -> Self {
-        Self {
-            this_bw_scaled: 0,
-            running_bw_scaled: 0,
-            max_bw_scaled,
-        }
-    }
-
-    fn add(&mut self, utilization_scaled: u64, active: bool) {
-        let this_bw_scaled = self
-            .this_bw_scaled
-            .checked_add(utilization_scaled)
-            .unwrap_or_else(|| {
-                task_runtime::fatal_invariant(0x444c_1001, utilization_scaled as usize)
-            });
-        let running_bw_scaled = if active {
-            self.running_bw_scaled
-                .checked_add(utilization_scaled)
-                .unwrap_or_else(|| {
-                    task_runtime::fatal_invariant(0x444c_1002, utilization_scaled as usize)
-                })
-        } else {
-            self.running_bw_scaled
-        };
-        if running_bw_scaled > this_bw_scaled {
-            task_runtime::fatal_invariant(0x444c_1003, utilization_scaled as usize);
-        }
-        self.this_bw_scaled = this_bw_scaled;
-        self.running_bw_scaled = running_bw_scaled;
-    }
-
-    fn remove(&mut self, utilization_scaled: u64, active: bool) {
-        let this_bw_scaled = self
-            .this_bw_scaled
-            .checked_sub(utilization_scaled)
-            .unwrap_or_else(|| {
-                task_runtime::fatal_invariant(0x444c_1004, utilization_scaled as usize)
-            });
-        let running_bw_scaled = if active {
-            self.running_bw_scaled
-                .checked_sub(utilization_scaled)
-                .unwrap_or_else(|| {
-                    task_runtime::fatal_invariant(0x444c_1005, utilization_scaled as usize)
-                })
-        } else {
-            self.running_bw_scaled
-        };
-        if running_bw_scaled > this_bw_scaled {
-            task_runtime::fatal_invariant(0x444c_1006, utilization_scaled as usize);
-        }
-        self.this_bw_scaled = this_bw_scaled;
-        self.running_bw_scaled = running_bw_scaled;
-    }
-
-    fn activate(&mut self, utilization_scaled: u64) {
-        let running_bw_scaled = self
-            .running_bw_scaled
-            .checked_add(utilization_scaled)
-            .unwrap_or_else(|| {
-                task_runtime::fatal_invariant(0x444c_1007, utilization_scaled as usize)
-            });
-        if running_bw_scaled > self.this_bw_scaled {
-            task_runtime::fatal_invariant(0x444c_1008, utilization_scaled as usize);
-        }
-        self.running_bw_scaled = running_bw_scaled;
-    }
-
-    fn deactivate(&mut self, utilization_scaled: u64) {
-        self.running_bw_scaled = self
-            .running_bw_scaled
-            .checked_sub(utilization_scaled)
-            .unwrap_or_else(|| {
-                task_runtime::fatal_invariant(0x444c_1009, utilization_scaled as usize)
-            });
-    }
-
-    const fn snapshot(&self) -> DeadlineBandwidthSnapshot {
-        DeadlineBandwidthSnapshot {
-            this_bw_scaled: self.this_bw_scaled,
-            running_bw_scaled: self.running_bw_scaled,
-            max_bw_scaled: self.max_bw_scaled,
-        }
-    }
 }
 
 impl WakePreemptionDecision {
@@ -120,13 +26,19 @@ pub(crate) struct CpuRunQueueState {
     owner: CpuId,
     clock: RunQueueClock,
     queue: RunQueue,
-    current: Option<CurrentSchedule>,
-    rt_bandwidth: RtRunQueueBandwidth,
-    /// Deadline bandwidth and membership belong to the same transaction as
-    /// physical runqueue membership. Remote wakeups therefore cannot expose a
-    /// runnable Deadline entity before its CBS reservation is accounted.
-    deadline_members: Vec<Arc<ThreadCore>>,
-    deadline_bandwidth: DeadlineRunQueueBandwidth,
+    idle: Option<IdleRqTask>,
+}
+
+/// Per-CPU idle task state owned by rq but never linked as a class entity.
+///
+/// This mirrors Linux's idle scheduling class: idle remains logically on its
+/// rq while staying outside class queues, `nr_running`, and load accounting.
+#[derive(Debug)]
+struct IdleRqTask {
+    core: Arc<ThreadCore>,
+    active: Option<ActiveSchedulingState>,
+    metadata: RqTaskMetadata,
+    rt_quota_exempt: bool,
 }
 
 impl CpuRunQueueState {
@@ -134,13 +46,11 @@ impl CpuRunQueueState {
         Self {
             owner,
             clock: RunQueueClock::new(),
-            queue: RunQueue::new(),
-            current: None,
-            rt_bandwidth: RtRunQueueBandwidth::new(config.rt_period_ns(), config.rt_runtime_ns()),
-            deadline_members: Vec::with_capacity(config.thread_capacity()),
-            deadline_bandwidth: DeadlineRunQueueBandwidth::new(
+            queue: RunQueue::configured(
                 u64::from(config.deadline_cap_percent()) * 10_000_000,
+                config.thread_capacity(),
             ),
+            idle: None,
         }
     }
 
@@ -150,128 +60,371 @@ impl CpuRunQueueState {
         self.clock.update(sample)
     }
 
-    /// Reads the last owner-accepted runqueue clock without sampling hardware.
-    pub(crate) fn clock_snapshot(&self) -> Option<RunQueueClockSnapshot> {
-        self.clock.snapshot()
+    pub(crate) const fn current(&self) -> Option<&CurrentDispatch> {
+        self.queue.current()
     }
 
-    pub(crate) const fn current(&self) -> Option<CurrentSchedule> {
-        self.current
+    pub(crate) fn current_mut(&mut self) -> Option<&mut CurrentDispatch> {
+        self.queue.current_mut()
     }
 
-    pub(crate) fn set_current(&mut self, current: Option<CurrentSchedule>) {
-        if let Some(current) = current {
-            self.queue
-                .update_linked_current(
-                    current.thread(),
-                    current.schedule_policy(),
-                    current.scheduling_entity(),
-                )
-                .expect("running RT/DL linkage must match the dispatch snapshot");
+    pub(crate) fn current_scheduling_entity(&self) -> Option<SchedulingEntity> {
+        let current = self.queue.current()?;
+        self.queue
+            .linked_current_entity(current.thread())
+            .or_else(|| current.owned_scheduling_entity())
+    }
+
+    pub(crate) fn current_scheduling_entity_mut(&mut self) -> Option<&mut SchedulingEntity> {
+        let thread = self.current_thread()?;
+        if self.queue.is_linked_current(thread) {
+            return self.queue.linked_current_entity_mut(thread);
         }
-        self.current = current;
+        Some(self.queue.current_mut()?.active_mut().entity_mut())
     }
 
-    pub(crate) fn charge_rt_runtime(&mut self, runtime_ns: u64) -> bool {
-        self.rt_bandwidth.charge(runtime_ns)
+    pub(crate) fn install_current(&mut self, current: CurrentDispatch) {
+        if self.queue.current().is_some() {
+            task_runtime::fatal_invariant(0x5251_0001, self.owner.as_u32() as usize);
+        }
+        self.queue.install_current(current);
     }
 
-    pub(crate) fn rt_may_run(&self, boosted: bool) -> bool {
-        self.rt_bandwidth.may_run(boosted)
+    pub(crate) fn take_current(&mut self) -> Option<CurrentDispatch> {
+        self.queue.take_current()
     }
 
-    pub(crate) fn rt_runtime_until_throttle(&self) -> Option<u64> {
-        self.rt_bandwidth.runtime_until_throttle()
+    pub(crate) fn linked_current_entity_mut(
+        &mut self,
+        thread: ThreadId,
+    ) -> Option<&mut SchedulingEntity> {
+        self.queue.linked_current_entity_mut(thread)
     }
 
-    pub(crate) fn rt_is_effectively_throttled(&self) -> bool {
-        self.rt_bandwidth.is_throttled() && !self.queue.has_exempt_rt()
+    pub(crate) fn scheduling_entity(&self, thread: ThreadId) -> Option<SchedulingEntity> {
+        self.queue.scheduling_entity(thread).or_else(|| {
+            self.queue
+                .current()
+                .filter(|current| current.thread() == thread)
+                .and_then(CurrentDispatch::owned_scheduling_entity)
+        })
     }
 
-    pub(crate) fn replenish_rt_runtime(&mut self, overruns: u64) -> bool {
-        self.rt_bandwidth.replenish(overruns)
+    pub(crate) fn base_scheduling_entity(&self, thread: ThreadId) -> Option<SchedulingEntity> {
+        self.queue.base_scheduling_entity(thread).or_else(|| {
+            self.queue
+                .current()
+                .filter(|current| current.thread() == thread)
+                .and_then(CurrentDispatch::owned_base_scheduling_entity)
+        })
     }
 
-    pub(crate) fn has_rt_activity(&self) -> bool {
-        self.rt_bandwidth.time_ns() != 0 || self.has_runnable_rt()
+    pub(crate) fn update_base_deadline_entity(
+        &mut self,
+        thread: ThreadId,
+        entity: SchedulingEntity,
+    ) -> bool {
+        self.queue.update_base_deadline_entity(thread, entity)
+    }
+
+    /// Returns the scheduler-class state owned by this rq.
+    ///
+    /// Fair and stopper current tasks keep the entity in `CurrentDispatch`;
+    /// RT and Deadline current tasks remain linked in their class structures.
+    /// This is the single owner-side query for both representations.
+    pub(crate) fn scheduling_state(
+        &self,
+        thread: ThreadId,
+    ) -> Option<(SchedulePolicy, SchedulingEntity)> {
+        if let Some(current) = self
+            .queue
+            .current()
+            .filter(|current| current.thread() == thread)
+        {
+            return self
+                .current_scheduling_entity()
+                .map(|entity| (current.schedule_policy(), entity));
+        }
+        self.queue.scheduling_state(thread)
+    }
+
+    pub(crate) fn current_runtime_timer_delta_ns(&self) -> Option<u64> {
+        let current = self.queue.current()?;
+        let entity = self
+            .queue
+            .linked_current_entity(current.thread())
+            .or_else(|| current.owned_scheduling_entity())
+            .expect("current dispatch must have one rq-owned scheduling entity");
+        CurrentDispatch::runtime_timer_delta_for(entity)
+    }
+
+    pub(crate) fn current_thread(&self) -> Option<ThreadId> {
+        self.queue.current().map(CurrentDispatch::thread)
+    }
+
+    pub(crate) fn current_core(&self) -> Option<Arc<ThreadCore>> {
+        self.queue
+            .current()
+            .map(|dispatch| Arc::clone(dispatch.runtime_core_arc()))
+    }
+
+    pub(crate) fn update_current_runtime_binding(
+        &mut self,
+        thread: ThreadId,
+        binding: crate::runtime::ThreadRuntimeBinding,
+    ) -> Result<(), TaskError> {
+        let current = self
+            .queue
+            .current_mut()
+            .ok_or(TaskError::NoRunnableThread)?;
+        if current.thread() != thread {
+            return Err(TaskError::InvalidConfiguration);
+        }
+        current.update_runtime_binding(binding);
+        Ok(())
+    }
+
+    pub(crate) fn detach_current_schedule(
+        &mut self,
+        thread: ThreadId,
+    ) -> Result<ActiveSchedulingState, TaskError> {
+        if self.current_thread() != Some(thread) {
+            return Err(TaskError::InvalidConfiguration);
+        }
+        if self.queue.is_linked_current(thread) {
+            return self
+                .queue
+                .reclassify_task(thread)
+                .map(QueuedThread::into_active)
+                .ok_or(TaskError::NotReady);
+        }
+        self.queue
+            .current_mut()
+            .and_then(CurrentDispatch::take_owned_for_reclassify)
+            .ok_or(TaskError::InvalidConfiguration)
+    }
+
+    pub(crate) fn install_current_schedule(
+        &mut self,
+        thread: ThreadId,
+        active: ActiveSchedulingState,
+        core: Arc<ThreadCore>,
+        rt_quota_exempt: bool,
+        migration_capable: bool,
+        metadata: RqTaskMetadata,
+    ) -> Result<(), TaskError> {
+        if self.current_thread() != Some(thread) {
+            return Err(TaskError::InvalidConfiguration);
+        }
+        let linked = matches!(
+            active.policy(),
+            SchedulePolicy::Deadline(_)
+                | SchedulePolicy::Fifo { .. }
+                | SchedulePolicy::RoundRobin { .. }
+        );
+        let policy = active.policy();
+        if linked {
+            self.queue.link_running(QueuedThread::new(
+                thread,
+                active,
+                core,
+                rt_quota_exempt,
+                migration_capable,
+                metadata,
+            ))?;
+            self.queue
+                .current_mut()
+                .expect("current identity must retain its dispatch")
+                .install_reclassified_schedule(CurrentClassState::Linked { policy });
+        } else {
+            self.queue
+                .current_mut()
+                .expect("current identity must retain its dispatch")
+                .install_reclassified_schedule(CurrentClassState::Owned(active));
+        }
+        Ok(())
+    }
+
+    /// Accounts the running task in place under the rq lock.
+    ///
+    /// RT and Deadline entities remain linked in their class structure, while
+    /// Fair/stop entities remain in `CurrentDispatch`. A clock tick therefore
+    /// never has to take the dispatch out of the rq and reinstall it merely to
+    /// update runtime, matching Linux `update_curr_*()` ownership.
+    pub(crate) fn task_tick_current(
+        &mut self,
+        runtime_ns: u64,
+        reclaimed_ns: u64,
+        deadline_extra_bw_scaled: u64,
+    ) -> Result<(DispatchCharge, bool, bool, bool), TaskError> {
+        let now_ns = self
+            .clock
+            .snapshot()
+            .ok_or(TaskError::InvalidConfiguration)?
+            .task()
+            .as_nanos();
+        let current_thread = self.current_thread().ok_or(TaskError::NoRunnableThread)?;
+        if self.idle() == Some(current_thread) {
+            self.queue
+                .current_mut()
+                .expect("current identity must retain its dispatch")
+                .account_dedicated_idle_until(now_ns);
+            return Ok((DispatchCharge::default(), false, false, false));
+        }
+
+        let bandwidth = self.queue.deadline_bandwidth();
+        let (charge, policy, current_entity, rt_quota_exempt) = self.queue.charge_current(
+            runtime_ns,
+            now_ns,
+            bandwidth.inactive_bw_scaled(),
+            deadline_extra_bw_scaled,
+            bandwidth.max_bw_scaled(),
+            reclaimed_ns,
+        )?;
+        let deadline_replenish_reschedule = if charge.deadline_replenished {
+            self.queue
+                .requeue_replenished_deadline_current(current_thread)?
+        } else {
+            false
+        };
+        self.queue.update_fair_virtual_time(current_entity.fair());
+        let class_tick = SchedulerClass::for_policy(policy).task_tick(charge);
+        Ok((
+            charge,
+            class_tick.request_reschedule || deadline_replenish_reschedule,
+            class_tick.realtime,
+            rt_quota_exempt,
+        ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_schedule_owner_count(&self, thread: ThreadId) -> usize {
+        usize::from(
+            self.queue.current().is_some_and(|dispatch| {
+                dispatch.thread() == thread && dispatch.owns_active_schedule()
+            }),
+        ) + usize::from(self.queue.debug_owns_schedule_state(thread))
+    }
+
+    pub(crate) fn install_idle(
+        &mut self,
+        core: Arc<ThreadCore>,
+        active: ActiveSchedulingState,
+        metadata: RqTaskMetadata,
+        rt_quota_exempt: bool,
+    ) {
+        if !matches!(
+            active.policy(),
+            SchedulePolicy::Fair {
+                mode: FairMode::Idle,
+                ..
+            }
+        ) {
+            task_runtime::fatal_invariant(0x5251_0003, core.id().as_u64() as usize);
+        }
+        let idle = IdleRqTask {
+            core,
+            active: Some(active),
+            metadata,
+            rt_quota_exempt,
+        };
+        if self.idle.replace(idle).is_some() {
+            task_runtime::fatal_invariant(0x5251_0002, self.owner.as_u32() as usize);
+        }
+    }
+
+    pub(crate) fn idle(&self) -> Option<ThreadId> {
+        self.idle.as_ref().map(|idle| idle.core.id())
+    }
+
+    pub(crate) fn take_idle_schedule(
+        &mut self,
+    ) -> Option<(Arc<ThreadCore>, ActiveSchedulingState, RqTaskMetadata, bool)> {
+        let idle = self.idle.as_mut()?;
+        Some((
+            Arc::clone(&idle.core),
+            idle.active
+                .take()
+                .expect("idle schedule cannot be current on two CPUs"),
+            idle.metadata.clone(),
+            idle.rt_quota_exempt,
+        ))
+    }
+
+    pub(crate) fn return_idle_schedule(
+        &mut self,
+        thread: ThreadId,
+        active: ActiveSchedulingState,
+    ) -> Result<(), TaskError> {
+        let idle = self.idle.as_mut().ok_or(TaskError::InvalidConfiguration)?;
+        if idle.core.id() != thread || idle.active.replace(active).is_some() {
+            return Err(TaskError::InvalidConfiguration);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn has_exempt_rt(&self) -> bool {
+        self.queue.has_exempt_rt()
     }
 
     pub(crate) fn has_runnable_rt(&self) -> bool {
+        // RT current remains linked in the active priority array, so the
+        // class-owned index already includes both queued and running RT work.
         self.queue.has_rt()
-            || self
-                .current
-                .is_some_and(|current| current.schedule_policy().rt_priority().is_some())
     }
 
     pub(crate) fn highest_rt_priority_including_current(&self) -> Option<u8> {
-        let current = self
-            .current
-            .and_then(|current| current.schedule_policy().rt_priority())
-            .map(RtPriority::get);
-        match (current, self.highest_rt_priority()) {
-            (Some(current), Some(queued)) => Some(current.max(queued)),
-            (Some(priority), None) | (None, Some(priority)) => Some(priority),
-            (None, None) => None,
-        }
+        self.highest_rt_priority()
     }
 
     pub(crate) fn earliest_deadline_including_current(&self) -> Option<u64> {
-        let current = self.current.and_then(CurrentSchedule::absolute_deadline_ns);
-        match (current, self.earliest_deadline_ns()) {
-            (Some(current), Some(queued)) => Some(current.min(queued)),
-            (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
-            (None, None) => None,
-        }
+        // Deadline current remains linked in the augmented EDF tree.
+        self.earliest_deadline_ns()
     }
 
     pub(crate) fn deadline_members_are_empty(&self) -> bool {
-        self.deadline_members.is_empty()
+        self.queue.deadline_members_are_empty()
+    }
+
+    /// Acquires the scheduler-owned lifetime anchor for one DL hrtimer event.
+    ///
+    /// Linux embeds the hrtimer in `sched_dl_entity`, so the owning `task_struct`
+    /// remains reachable without a process-registry lookup in hard IRQ. The
+    /// per-rq Deadline member set is the equivalent lifetime authority here:
+    /// every CBS/zero-lag registration is cancelled before membership leaves
+    /// this rq, and the returned Arc remains valid after the rq lock is released.
+    pub(crate) fn deadline_member(&self, thread: ThreadId) -> Option<Arc<ThreadCore>> {
+        self.queue.deadline_member(thread)
     }
 
     pub(crate) fn register_deadline_member(&mut self, core: &Arc<ThreadCore>) -> bool {
-        if self
-            .deadline_members
-            .iter()
-            .any(|member| Arc::ptr_eq(member, core))
-        {
-            return false;
-        }
-        assert!(
-            self.deadline_members.len() < self.deadline_members.capacity(),
-            "thread construction must reserve every Deadline member slot"
-        );
-        self.deadline_members.push(Arc::clone(core));
-        true
+        self.queue.register_deadline_member(core)
     }
 
     pub(crate) fn unregister_deadline_member(&mut self, core: &Arc<ThreadCore>) {
-        if let Some(index) = self
-            .deadline_members
-            .iter()
-            .position(|member| Arc::ptr_eq(member, core))
-        {
-            self.deadline_members.swap_remove(index);
-        }
+        self.queue.unregister_deadline_member(core);
     }
 
     pub(crate) fn add_deadline_bandwidth(&mut self, utilization_scaled: u64, active: bool) {
-        self.deadline_bandwidth.add(utilization_scaled, active);
+        self.queue
+            .add_deadline_bandwidth(utilization_scaled, active);
     }
 
     pub(crate) fn remove_deadline_bandwidth(&mut self, utilization_scaled: u64, active: bool) {
-        self.deadline_bandwidth.remove(utilization_scaled, active);
+        self.queue
+            .remove_deadline_bandwidth(utilization_scaled, active);
     }
 
     pub(crate) fn activate_deadline_bandwidth(&mut self, utilization_scaled: u64) {
-        self.deadline_bandwidth.activate(utilization_scaled);
+        self.queue.activate_deadline_bandwidth(utilization_scaled);
     }
 
     pub(crate) fn deactivate_deadline_bandwidth(&mut self, utilization_scaled: u64) {
-        self.deadline_bandwidth.deactivate(utilization_scaled);
+        self.queue.deactivate_deadline_bandwidth(utilization_scaled);
     }
 
     pub(crate) const fn deadline_bandwidth(&self) -> DeadlineBandwidthSnapshot {
-        self.deadline_bandwidth.snapshot()
+        self.queue.deadline_bandwidth()
     }
 
     /// Applies Linux EEVDF wakeup preemption to the complete owner runqueue.
@@ -280,17 +433,20 @@ impl CpuRunQueueState {
     /// protected current request and is itself the earliest eligible queued
     /// entity. Comparing only the wakee with current creates needless
     /// reschedule IPIs when an older queued contender would be selected.
-    pub(crate) fn wakee_preemption(
+    pub(crate) fn wakeup_preempt(
         &self,
         wakee: ThreadId,
         policy: SchedulePolicy,
         entity: SchedulingEntity,
         fair_virtual_time: u64,
     ) -> WakePreemptionDecision {
-        let Some(current) = self.current else {
+        let Some(current) = self.current() else {
             return WakePreemptionDecision::WakeeSelected;
         };
-        if !current.should_preempt(policy, entity, fair_virtual_time) {
+        let current_entity = self
+            .current_scheduling_entity()
+            .expect("current dispatch must have one rq-owned scheduling entity");
+        if !current.should_preempt(current_entity, policy, entity, fair_virtual_time) {
             return WakePreemptionDecision::KeepCurrent;
         }
         match policy {

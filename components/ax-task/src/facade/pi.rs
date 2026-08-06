@@ -17,7 +17,7 @@ pub fn pi_mutex_lock_slow<'lock>(
 
 /// Blocks the calling waiter until it is selected to claim or granted.
 pub fn pi_block_current(token: &PiWaitToken<'_>) -> Result<(), TaskError> {
-    if token.is_selected() || token.is_granted() {
+    if token.can_claim() || token.is_granted() {
         return Ok(());
     }
     let system = runtime_task_system()?;
@@ -27,12 +27,12 @@ pub fn pi_block_current(token: &PiWaitToken<'_>) -> Result<(), TaskError> {
             PiParkAttempt::Retry => continue,
             PiParkAttempt::Prepared(ticket) => ticket,
         };
-        if token.is_selected() || token.is_granted() {
+        if token.can_claim() || token.is_granted() {
             cancel_current_park(&mut ticket)?;
             return Ok(());
         }
         commit_current_park(&mut ticket)?;
-        if token.is_selected() || token.is_granted() {
+        if token.can_claim() || token.is_granted() {
             return Ok(());
         }
     }
@@ -49,7 +49,7 @@ pub(super) fn prepare_pi_park_attempt(
         return Err(TaskError::InvalidPiState);
     }
     system.drain_policy_updates(cpu.as_mut())?;
-    if token.is_selected() || token.is_granted() {
+    if token.can_claim() || token.is_granted() {
         return Ok(PiParkAttempt::Complete);
     }
     match system.prepare_park(cpu.as_mut())? {

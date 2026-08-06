@@ -31,6 +31,14 @@ impl HardIrqTime {
         }
     }
 
+    fn begins_outer_interval(&self) -> bool {
+        self.depth.load(Ordering::Relaxed) == 0
+    }
+
+    fn ends_outer_interval(&self) -> bool {
+        self.depth.load(Ordering::Relaxed) == 1
+    }
+
     fn exit(&self, now_ns: u64) {
         let depth = self.depth.fetch_sub(1, Ordering::Relaxed);
         assert_ne!(depth, 0, "hard-IRQ exit without a matching entry");
@@ -73,13 +81,24 @@ fn scheduler_clock_now(cpu_id: usize) -> u64 {
         .unwrap_or_else(|error| panic!("hard-IRQ scheduler clock is unavailable: {error}"))
 }
 
+fn scheduler_clock_outer_hardirq_entry() -> u64 {
+    // SAFETY: common hard-IRQ entry has disabled local interrupts and calls
+    // this boundary before publishing the outer accounting interval.
+    unsafe { ax_hal::time::scheduler_clock_hardirq_sample() }
+        .unwrap_or_else(|error| panic!("hard-IRQ scheduler clock is unavailable: {error}"))
+}
+
 pub(crate) fn enter() {
     assert!(
         !ax_hal::asm::irqs_enabled(),
         "hard-IRQ accounting requires local IRQ exclusion"
     );
-    let cpu_id = current_cpu_id();
-    let now_ns = scheduler_clock_now(cpu_id);
+    let is_outer = with_current_state(HardIrqTime::begins_outer_interval);
+    let now_ns = if is_outer {
+        scheduler_clock_outer_hardirq_entry()
+    } else {
+        0
+    };
     with_current_state(|state| state.enter(now_ns));
 }
 
@@ -88,8 +107,12 @@ pub(crate) fn exit() {
         !ax_hal::asm::irqs_enabled(),
         "hard-IRQ accounting requires local IRQ exclusion"
     );
-    let cpu_id = current_cpu_id();
-    let now_ns = scheduler_clock_now(cpu_id);
+    let is_outer = with_current_state(HardIrqTime::ends_outer_interval);
+    let now_ns = if is_outer {
+        scheduler_clock_now(current_cpu_id())
+    } else {
+        0
+    };
     with_current_state(|state| state.exit(now_ns));
 }
 

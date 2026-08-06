@@ -5,11 +5,10 @@ use core::{marker::PhantomData, mem::align_of, ops::Deref, pin::Pin, ptr};
 
 use crate::{
     CpuId, CpuLocal, CpuLocalOwnerBorrow, CpuRemote, CpuSet, CurrentExitPermit, CurrentThreadToken,
-    IrqRegisterResult, IrqWaitCell, IrqWaitRegistration, IrqWaitToken, Nice, ParkCommit,
-    ParkPrepare, PiMutexLockResult, PiMutexRef, PiWaitToken, RtPriority, ScheduleDecision,
-    SchedulePolicy, SchedulerOutcome, TaskError, TaskSystem, ThreadBuilder, ThreadCore,
-    ThreadExtensionLease, ThreadHandle, ThreadId, ThreadRuntimeSnapshot, ThreadState,
-    ThreadWakeHandle, WaitQueue, WakeResult,
+    IrqRegisterResult, IrqWaitCell, IrqWaitRegistration, IrqWaitToken, ParkCommit, ParkPrepare,
+    PiMutexLockResult, PiMutexRef, PiWaitToken, ScheduleDecision, SchedulePolicy, SchedulerOutcome,
+    TaskError, TaskSystem, ThreadBuilder, ThreadCore, ThreadExtensionLease, ThreadHandle, ThreadId,
+    ThreadRuntimeSnapshot, ThreadState, ThreadWakeHandle, WaitQueue, WakeResult,
     executor::CoroutineHeader,
     inbox::PublishResult,
     lock::PreemptScope,
@@ -309,7 +308,8 @@ pub fn set_current_thread_affinity(affinity: CpuSet) -> Result<(), TaskError> {
         let thread = cpu.current().unwrap_or_else(|| {
             task_runtime::fatal_invariant(0x4558_0020, 0);
         });
-        system.yield_current(cpu.as_mut()).unwrap_or_else(|_| {
+        // SAFETY: `scheduler_frame` owns the IRQ-off scheduler baton.
+        unsafe { system.yield_current_in_scheduler_frame(cpu.as_mut()) }.unwrap_or_else(|_| {
             // Affinity publication cannot be rolled back safely after another CPU
             // may have observed the migration target. Scheduler commit failures are
             // therefore runtime invariants, like failures after exit publication.
@@ -318,29 +318,6 @@ pub fn set_current_thread_affinity(affinity: CpuSet) -> Result<(), TaskError> {
     };
     execute_switch_plan(&mut scheduler_frame, decision);
     Ok(())
-}
-
-/// Returns the configured RR quantum in nanoseconds.
-pub fn thread_round_robin_interval_ns(thread: ThreadId) -> Result<u64, TaskError> {
-    runtime_task_system()?.round_robin_interval_ns(thread)
-}
-
-/// Returns an RT priority, or `None` for fair/Deadline policies.
-pub fn thread_rt_priority(thread: ThreadId) -> Result<Option<RtPriority>, TaskError> {
-    Ok(match thread_policy(thread)? {
-        SchedulePolicy::Fifo { priority } | SchedulePolicy::RoundRobin { priority, .. } => {
-            Some(priority)
-        }
-        _ => None,
-    })
-}
-
-/// Returns a nice value, or `None` for RT/Deadline policies.
-pub fn thread_nice(thread: ThreadId) -> Result<Option<Nice>, TaskError> {
-    Ok(match thread_policy(thread)? {
-        SchedulePolicy::Fair { nice, .. } => Some(nice),
-        _ => None,
-    })
 }
 
 /// Tests the sticky reschedule state of the calling CPU.

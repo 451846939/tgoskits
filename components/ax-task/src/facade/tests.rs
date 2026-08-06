@@ -5,7 +5,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        CpuId, SchedulePolicy, SwitchReason, ThreadExtension, ThreadExtensionOps, ThreadSpec,
+        CpuId, Nice, RtPriority, SchedulePolicy, SwitchReason, ThreadExtension,
+        ThreadExtensionOps, ThreadSpec,
         inbox::{InboxKind, InboxMessage, InboxNode, PublishResult},
         runtime::{AddressSpaceHandle, AddressSpaceToken},
         test_runtime,
@@ -24,6 +25,23 @@ mod tests {
         MonotonicDeadline::from_nanos(nanos).unwrap()
     }
 
+    fn arm_test_deadline(
+        cpu: Pin<&CpuLocal>,
+        node: &crate::timer::TaskDeadlineNode,
+        deadline: MonotonicDeadline,
+        kind: TaskDeadlineKind,
+    ) -> crate::timer::TaskDeadlineRegistration {
+        cpu.remote()
+            .lock_deadline_base()
+            .queue
+            .arm(node, deadline, kind)
+            .unwrap()
+    }
+
+    fn next_test_deadline(cpu: Pin<&CpuLocal>) -> Option<MonotonicDeadline> {
+        cpu.remote().lock_deadline_base().queue.next_deadline()
+    }
+
     fn owner_snapshot(system: &TaskSystem, cpu: Pin<&CpuLocal>) -> crate::CpuSnapshot {
         let _irq = RuntimeIrqGuard::enter();
         system.snapshot(cpu).unwrap()
@@ -31,21 +49,18 @@ mod tests {
 
     fn publish_unrelated_expired_deadline(
         system: &TaskSystem,
-        mut cpu: Pin<&mut CpuLocal>,
+        cpu: Pin<&mut CpuLocal>,
         now_ns: u64,
     ) -> ThreadHandle {
         let unrelated = system
             .create_thread(ThreadSpec::new(SchedulePolicy::default()))
             .unwrap();
-        let _registration = cpu
-            .as_mut()
-            .task_deadlines()
-            .arm(
-                unrelated.sleep_timer(),
-                deadline(now_ns),
-                TaskDeadlineKind::park_timeout(0),
-            )
-            .unwrap();
+        let _registration = arm_test_deadline(
+            cpu.as_ref(),
+            unrelated.sleep_timer(),
+            deadline(now_ns),
+            TaskDeadlineKind::park_timeout(0),
+        );
         assert_eq!(on_clock_event(instant(now_ns), 1).unwrap().expired(), 1);
         unrelated
     }
@@ -183,7 +198,11 @@ mod tests {
             crate::ThreadState::Parking,
             "hard IRQ only publishes soft-timer work"
         );
-        assert_eq!(owner_snapshot(&system, cpu.as_ref()).runnable(), 0);
+        assert_eq!(
+            owner_snapshot(&system, cpu.as_ref()).runnable(),
+            1,
+            "Linux rq->nr_running still accounts current until the owner park transaction commits"
+        );
         let mut irq_return_passes = 0;
         while current_cpu_needs_resched().unwrap() {
             assert!(
@@ -205,8 +224,15 @@ mod tests {
             system.thread_state(running.id()).unwrap(),
             crate::ThreadState::Running
         );
-        assert_eq!(owner_snapshot(&system, cpu.as_ref()).runnable(), 0);
-        assert!(owner_snapshot(&system, cpu.as_ref()).need_resched());
+        assert_eq!(
+            owner_snapshot(&system, cpu.as_ref()).runnable(),
+            1,
+            "a timeout which wins before park commit keeps current runnable"
+        );
+        assert!(
+            !owner_snapshot(&system, cpu.as_ref()).need_resched(),
+            "a timeout which wins before park commit leaves current running and consumes the request"
+        );
         assert!(!cancel_current_park_deadline(&running, &mut ticket).unwrap());
     }
 
@@ -240,7 +266,7 @@ mod tests {
         system.bring_cpu_online(cpu.as_mut()).unwrap();
         let _runtime_handles = InstalledTaskHandles::new(system.as_ref(), cpu.as_mut());
 
-        system.service_soft_timer_work(cpu.as_mut(), 0).unwrap();
+        system.service_soft_timer_work(cpu.as_mut()).unwrap();
         assert_eq!(
             cpu.deadline_expire_passes_for_test(),
             0,
@@ -282,9 +308,8 @@ mod tests {
 
         let initial = {
             let _irq = RuntimeIrqGuard::enter();
-            let clock = cpu.update_rq_clock();
             cpu.as_mut()
-                .next_scheduler_deadline_update(clock, instant(0))
+                .next_scheduler_deadline_update(instant(0))
                 .unwrap()
         };
         task_runtime::publish_scheduler_deadline(initial);
@@ -468,24 +493,18 @@ mod tests {
         let second = system
             .create_thread(ThreadSpec::new(SchedulePolicy::default()))
             .unwrap();
-        let _first_registration = cpu
-            .as_mut()
-            .task_deadlines()
-            .arm(
-                first.sleep_timer(),
-                deadline(10),
-                TaskDeadlineKind::park_timeout(0),
-            )
-            .unwrap();
-        let _second_registration = cpu
-            .as_mut()
-            .task_deadlines()
-            .arm(
-                second.sleep_timer(),
-                deadline(10),
-                TaskDeadlineKind::park_timeout(0),
-            )
-            .unwrap();
+        let _first_registration = arm_test_deadline(
+            cpu.as_ref(),
+            first.sleep_timer(),
+            deadline(10),
+            TaskDeadlineKind::park_timeout(0),
+        );
+        let _second_registration = arm_test_deadline(
+            cpu.as_ref(),
+            second.sleep_timer(),
+            deadline(10),
+            TaskDeadlineKind::park_timeout(0),
+        );
 
         test_runtime::set_monotonic_ns(10);
         test_runtime::set_scheduler_ns(10);
@@ -529,24 +548,18 @@ mod tests {
         let second = system
             .create_thread(ThreadSpec::new(SchedulePolicy::default()))
             .unwrap();
-        let _first_registration = cpu
-            .as_mut()
-            .task_deadlines()
-            .arm(
-                first.sleep_timer(),
-                deadline(10),
-                TaskDeadlineKind::park_timeout(1),
-            )
-            .unwrap();
-        let _second_registration = cpu
-            .as_mut()
-            .task_deadlines()
-            .arm(
-                second.sleep_timer(),
-                deadline(10),
-                TaskDeadlineKind::park_timeout(1),
-            )
-            .unwrap();
+        let _first_registration = arm_test_deadline(
+            cpu.as_ref(),
+            first.sleep_timer(),
+            deadline(10),
+            TaskDeadlineKind::park_timeout(1),
+        );
+        let _second_registration = arm_test_deadline(
+            cpu.as_ref(),
+            second.sleep_timer(),
+            deadline(10),
+            TaskDeadlineKind::park_timeout(1),
+        );
 
         assert_eq!(on_clock_event(instant(10), 2).unwrap().expired(), 2);
         let mut first_event = [ExpiredTaskDeadline::EMPTY; 1];
@@ -590,14 +603,12 @@ mod tests {
         let _registrations = threads
             .iter()
             .map(|thread| {
-                cpu.as_mut()
-                    .task_deadlines()
-                    .arm(
-                        thread.sleep_timer(),
-                        deadline(10),
-                        TaskDeadlineKind::park_timeout(1),
-                    )
-                    .unwrap()
+                arm_test_deadline(
+                    cpu.as_ref(),
+                    thread.sleep_timer(),
+                    deadline(10),
+                    TaskDeadlineKind::park_timeout(1),
+                )
             })
             .collect::<alloc::vec::Vec<_>>();
 
@@ -617,7 +628,7 @@ mod tests {
             );
         }
         assert_eq!(passes, 3);
-        assert!(cpu.as_mut().task_deadlines().is_empty());
+        assert!(cpu.remote().lock_deadline_base().queue.is_empty());
     }
 
     #[test]
@@ -655,7 +666,7 @@ mod tests {
             "a retryable owner mismatch must not consume the move-only deadline token"
         );
         assert_eq!(
-            cpu.as_mut().task_deadlines().next_deadline(),
+            next_test_deadline(cpu.as_ref()),
             Some(deadline(10)),
             "a failed cancellation must leave the physical queue entry intact"
         );
@@ -665,7 +676,7 @@ mod tests {
             .register_sleep_timer(CpuId::new(0), token.generation());
         assert!(cancel_current_park_deadline(&running, &mut ticket).unwrap());
         assert!(!ticket.has_deadline());
-        assert_eq!(cpu.as_mut().task_deadlines().next_deadline(), None);
+        assert_eq!(next_test_deadline(cpu.as_ref()), None);
         cancel_current_park(&mut ticket).unwrap();
     }
 
@@ -730,7 +741,7 @@ mod tests {
         );
         assert!(!ticket.has_deadline());
         assert_eq!(running.core.sleep_timer_cpu(), None);
-        assert_eq!(cpu.as_mut().task_deadlines().next_deadline(), None);
+        assert_eq!(next_test_deadline(cpu.as_ref()), None);
 
         cancel_current_park(&mut ticket).unwrap();
     }
@@ -762,7 +773,7 @@ mod tests {
         );
         assert_eq!(running.core.sleep_timer_cpu(), Some(CpuId::new(0)));
         assert_eq!(
-            cpu.as_mut().task_deadlines().next_deadline(),
+            next_test_deadline(cpu.as_ref()),
             Some(deadline(10))
         );
 
@@ -1388,8 +1399,8 @@ mod tests {
         );
         assert_eq!(
             test_runtime::scheduler_reads(),
-            1,
-            "exit commit must use one runqueue-clock transition sample"
+            3,
+            "pre-switch validation, switch tail, and exit commit each own one rq transaction"
         );
         let mut expired = [ExpiredTaskDeadline::EMPTY; 1];
         assert_eq!(take_current_expired_task_deadlines(&mut expired).unwrap(), 1);
@@ -1483,6 +1494,8 @@ mod tests {
             .create_thread(ThreadSpec::new(SchedulePolicy::default()))
             .unwrap();
         system.bring_cpu_online(cpu.as_mut()).unwrap();
+        system.make_ready(owner.id()).unwrap();
+        system.enqueue(cpu.as_mut(), owner.id()).unwrap();
         let _runtime_handles = InstalledTaskHandles::new(system.as_ref(), cpu.as_mut());
         let lock = PiMutexCore::new();
         assert_eq!(

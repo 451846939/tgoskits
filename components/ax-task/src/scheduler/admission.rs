@@ -6,7 +6,7 @@ pub(crate) const DEADLINE_UTILIZATION_SCALE: u64 = 1_000_000_000;
 
 /// Admission accounting for one online root domain.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DeadlineAdmission {
+pub(crate) struct DeadlineAdmission {
     cap_percent: u8,
     online_cpus: u32,
     reserved_scaled: u64,
@@ -14,7 +14,7 @@ pub struct DeadlineAdmission {
 
 impl DeadlineAdmission {
     /// Creates empty admission state.
-    pub const fn new(cap_percent: u8) -> Self {
+    pub(crate) const fn new(cap_percent: u8) -> Self {
         Self {
             cap_percent,
             online_cpus: 0,
@@ -23,7 +23,7 @@ impl DeadlineAdmission {
     }
 
     /// Updates the number of CPUs belonging to the online root domain.
-    pub const fn set_online_cpus(&mut self, online_cpus: u32) {
+    pub(crate) const fn set_online_cpus(&mut self, online_cpus: u32) {
         self.online_cpus = online_cpus;
     }
 
@@ -33,7 +33,8 @@ impl DeadlineAdmission {
     ///
     /// Returns [`TaskError::DeadlineAdmission`] if the reservation exceeds the
     /// configured root-domain cap.
-    pub fn reserve(&mut self, policy: DeadlinePolicy) -> Result<u64, TaskError> {
+    #[cfg(test)]
+    pub(crate) fn reserve(&mut self, policy: DeadlinePolicy) -> Result<u64, TaskError> {
         let utilization = Self::utilization(policy);
         self.reserve_utilization(utilization)?;
         Ok(utilization)
@@ -67,7 +68,8 @@ impl DeadlineAdmission {
     }
 
     /// Releases a value returned by [`Self::reserve`].
-    pub fn release(&mut self, utilization: u64) -> Result<(), TaskError> {
+    #[cfg(test)]
+    pub(crate) fn release(&mut self, utilization: u64) -> Result<(), TaskError> {
         self.replace_utilization(utilization, 0)
     }
 

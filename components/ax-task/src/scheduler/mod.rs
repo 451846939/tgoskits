@@ -8,9 +8,9 @@ mod fair_queue;
 mod queue;
 mod rt;
 
-pub use admission::*;
+pub(crate) use admission::*;
 pub use clock::*;
-pub use entity::*;
-pub use fair::*;
+pub(crate) use entity::*;
+pub(crate) use fair::*;
 pub(crate) use queue::*;
 pub(crate) use rt::*;

@@ -37,7 +37,7 @@ fn need_resched_remains_sticky_until_scheduler_entry() {
 }
 
 #[test]
-fn rt_bandwidth_throttles_at_quota_but_pi_owner_may_unlock() {
+fn rt_bandwidth_throttles_at_quota_until_the_next_period() {
     let (system, mut cpu) = online_system(TaskSystemConfig::new(1));
     let thread = ready_thread(&system, SchedulePolicy::fifo(RtPriority::new(80).unwrap()));
     let fair = ready_thread(&system, SchedulePolicy::default());
@@ -49,8 +49,7 @@ fn rt_bandwidth_throttles_at_quota_but_pi_owner_may_unlock() {
         .charge_current_at(cpu.as_mut(), 0, 950_000_001, 0)
         .unwrap();
 
-    assert!(!system.rt_may_run_at(cpu.as_mut(), 0, false).unwrap());
-    assert!(system.rt_may_run_at(cpu.as_mut(), 0, true).unwrap());
+    assert!(!system.rt_run_queue_may_run_at(cpu.as_mut(), 0).unwrap());
     assert_eq!(
         system.schedule_at(cpu.as_mut(), 0).unwrap().next(),
         fair.id()
@@ -68,7 +67,7 @@ fn rt_bandwidth_throttles_at_quota_but_pi_owner_may_unlock() {
     .unwrap();
     assert!(
         system
-            .rt_may_run_at(cpu.as_mut(), 1_000_000_000, false)
+            .rt_run_queue_may_run_at(cpu.as_mut(), 1_000_000_000)
             .unwrap()
     );
     support::clear_handles();

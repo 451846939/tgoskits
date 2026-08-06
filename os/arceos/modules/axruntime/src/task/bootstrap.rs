@@ -129,9 +129,9 @@ pub(crate) fn start_deferred_task_work_service() -> Result<(), TaskError> {
 /// Runs the owner CPU's scheduler/idle handshake forever.
 pub(crate) fn run_idle() -> ! {
     let (current, idle) = with_irq_cpu_pin(|pin| {
-        current_cpu_remote(pin)
-            .map(|cpu| (cpu.current_thread(), cpu.idle_thread()))
-            .unwrap_or((None, None))
+        let cpu = current_cpu_remote(pin)
+            .expect("idle entry requires the initialized current-CPU scheduler endpoint");
+        (cpu.current_thread(), cpu.idle_thread())
     });
     let entry_action = idle_entry_action(current, idle)
         .unwrap_or_else(|error| panic!("idle loop entered without scheduler ownership: {error}"));
@@ -354,7 +354,12 @@ pub(super) fn current_cpu_owner_handles(cpu_pin: &CpuPin) -> CurrentCpuOwnerHand
     let cpu = u32::try_from(ax_hal::percpu::this_cpu_id_pinned(cpu_pin))
         .expect("logical CPU ID must fit the TaskRuntime ABI");
     let local = CPU_LOCAL_OWNER_HANDLE.read_current(cpu_pin);
-    let remote = CPU_REMOTE_HANDLE.with_current(cpu_pin, |slot| slot.get().copied().unwrap_or(0));
+    assert_ne!(local, 0, "online scheduler CPU must own a CpuLocal handle");
+    let remote = CPU_REMOTE_HANDLE.with_current(cpu_pin, |slot| {
+        *slot
+            .get()
+            .expect("online scheduler CPU must own a CpuRemote handle")
+    });
     // SAFETY: initialization publishes all three values from one exclusive CPU
     // transaction before that CPU is admitted to scheduler traffic. The
     // containing runtime keeps both endpoint allocations live until shutdown.
@@ -373,9 +378,18 @@ pub(super) fn current_cpu_owner_handles(cpu_pin: &CpuPin) -> CurrentCpuOwnerHand
 ///
 /// The caller must prevent migration, context switches, and local IRQ re-entry
 /// for the complete observation.
-pub(super) unsafe fn scheduler_current_cpu_remote_handle() -> usize {
-    unsafe { CPU_REMOTE_HANDLE.with_scheduler_cpu(|slot| slot.get().copied().unwrap_or(0)) }
-        .unwrap_or(0)
+pub(super) unsafe fn scheduler_current_cpu_remote_handle() -> CpuRemoteHandle {
+    let raw = unsafe {
+        CPU_REMOTE_HANDLE.with_scheduler_cpu(|slot| {
+            *slot
+                .get()
+                .expect("scheduler current CPU must own a CpuRemote handle")
+        })
+    }
+    .expect("scheduler current CPU area must be installed");
+    // SAFETY: bootstrap publishes the Arc-backed endpoint before this CPU can
+    // enter the scheduler and retains the owning TaskSystem until shutdown.
+    unsafe { CpuRemoteHandle::from_raw(raw) }
 }
 
 pub(super) fn primary_bootstrap_thread() -> Option<ThreadId> {

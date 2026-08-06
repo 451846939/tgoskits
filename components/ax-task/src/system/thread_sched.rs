@@ -6,11 +6,14 @@ mod placement;
 mod policy_state;
 mod runtime_state;
 
-use alloc::sync::Weak;
+use alloc::sync::{Arc, Weak};
+
+pub(in crate::system) use pi_state::PiScheduleUpdate;
+pub(in crate::system) use placement::SchedulerPlacement;
 
 use crate::{
-    CpuId, CpuSet, SchedulePolicy, SchedulingEntity, TaskError, ThreadCore, ThreadId,
-    ThreadLifecycle, ThreadState,
+    ActiveSchedulingState, CpuId, CpuSet, DeadlineServer, SchedulePolicy, SchedulerTimestamp,
+    SchedulingEntity, TaskError, ThreadCore, ThreadId, ThreadLifecycle, ThreadState,
     lock::{IrqTicketGuard, IrqTicketLock},
     runtime::{AddressSpaceHandle, ExecutionContextHandle},
     timer::TaskDeadlineRegistration,
@@ -35,13 +38,22 @@ pub enum DeadlineActivity {
 #[derive(Debug)]
 pub(crate) struct ThreadSchedCell {
     id: ThreadId,
+    lifecycle: alloc::sync::Arc<ThreadLifecycle>,
+    placement: alloc::sync::Arc<placement::SchedulerPlacement>,
+    deadline_server: DeadlineServer,
     state: IrqTicketLock<ThreadSchedState>,
 }
 
 impl ThreadSchedCell {
     pub(super) fn new(id: ThreadId, state: ThreadSchedState) -> Self {
+        let lifecycle = alloc::sync::Arc::clone(&state.lifecycle);
+        let placement = alloc::sync::Arc::clone(&state.placement);
+        let deadline_server = state.deadline.server.clone();
         Self {
             id,
+            lifecycle,
+            placement,
+            deadline_server,
             state: IrqTicketLock::new(state),
         }
     }
@@ -55,21 +67,36 @@ impl ThreadSchedCell {
     }
 
     pub(crate) fn scheduler_fence_cpu(&self) -> Option<CpuId> {
-        self.state.lock().placement.on_cpu()
+        self.placement.on_cpu()
     }
 
     pub(crate) fn assigned_cpu(&self) -> Option<CpuId> {
-        self.state.lock().placement.assigned_cpu()
+        self.placement.assigned_cpu()
+    }
+
+    pub(in crate::system) fn placement(&self) -> &placement::SchedulerPlacement {
+        self.placement.as_ref()
+    }
+
+    pub(crate) fn lifecycle(&self) -> &alloc::sync::Arc<ThreadLifecycle> {
+        &self.lifecycle
+    }
+
+    pub(crate) fn deadline_server(&self) -> DeadlineServer {
+        self.deadline_server.clone()
     }
 
     #[cfg(test)]
     pub(crate) fn new_test(id: ThreadId, policy: SchedulePolicy) -> Self {
-        let entity = SchedulingEntity::new(policy, 1, 0);
+        let deadline_server = DeadlineServer::unbound();
+        let entity =
+            SchedulingEntity::new_with_deadline_server(policy, 1, 0, deadline_server.clone());
         Self::new(
             id,
             ThreadSchedState::new(
                 policy,
                 entity,
+                deadline_server,
                 CpuSet::all(1),
                 0,
                 ExecutionContextHandle::NONE,
@@ -81,28 +108,34 @@ impl ThreadSchedCell {
 
 #[derive(Debug)]
 pub(super) struct ThreadSchedState {
-    pub(super) lifecycle: ThreadLifecycle,
+    pub(super) lifecycle: alloc::sync::Arc<ThreadLifecycle>,
     pub(super) policy: policy_state::ThreadPolicyState,
-    pub(super) placement: placement::ThreadPlacementState,
+    pub(super) placement: alloc::sync::Arc<placement::SchedulerPlacement>,
+    pub(super) affinity: placement::ThreadAffinityState,
     pub(super) deadline: deadline_state::ThreadDeadlineState,
     pub(super) pi: pi_state::ThreadPiState,
     pub(super) runtime: runtime_state::ThreadRuntimeState,
 }
 
 impl ThreadSchedState {
-    pub(super) const fn new(
+    pub(super) fn new(
         policy: SchedulePolicy,
         entity: SchedulingEntity,
+        deadline_server: DeadlineServer,
         affinity: CpuSet,
         deadline_reservation: u64,
         context: ExecutionContextHandle,
         address_space: AddressSpaceHandle,
     ) -> Self {
         Self {
-            lifecycle: ThreadLifecycle::new(),
+            lifecycle: alloc::sync::Arc::new(ThreadLifecycle::new()),
             policy: policy_state::ThreadPolicyState::new(policy, entity),
-            placement: placement::ThreadPlacementState::new(affinity),
-            deadline: deadline_state::ThreadDeadlineState::new(deadline_reservation),
+            placement: alloc::sync::Arc::new(placement::SchedulerPlacement::new()),
+            affinity: placement::ThreadAffinityState::new(affinity),
+            deadline: deadline_state::ThreadDeadlineState::new(
+                deadline_server,
+                deadline_reservation,
+            ),
             pi: pi_state::ThreadPiState::new(),
             runtime: runtime_state::ThreadRuntimeState::new(context, address_space),
         }
@@ -113,27 +146,47 @@ impl ThreadSchedState {
         core: &ThreadCore,
         state: ThreadState,
     ) -> Result<(), TaskError> {
-        self.lifecycle.transition(state)?;
-        core.publish_state(state);
-        Ok(())
+        core.transition_state(state)
     }
 
-    pub(super) fn throttle_ready_deadline(&mut self, core: &ThreadCore) -> Result<(), TaskError> {
-        self.lifecycle.throttle_ready_deadline()?;
-        core.publish_state(ThreadState::Blocked);
-        Ok(())
-    }
-
-    pub(super) fn is_pi_boosted_rt_owner(&self) -> bool {
-        self.pi.donating_locks != 0
+    pub(super) fn is_pi_boosted_rt_owner_for(&self, policy: SchedulePolicy) -> bool {
+        !self.pi.donors.is_empty()
             && self.is_pi_boosted()
             && matches!(
-                self.policy.effective,
+                policy,
                 SchedulePolicy::Fifo { .. } | SchedulePolicy::RoundRobin { .. }
             )
     }
 
     pub(super) const fn is_pi_boosted(&self) -> bool {
         self.pi.donor.is_some()
+    }
+
+    /// Returns the root-domain reservation retained by the applied policy or
+    /// by the one not-yet-applied owner transaction.
+    ///
+    /// Admission accounts the maximum, not the sum: publishing a replacement
+    /// transaction transfers one reservation to another without admitting two
+    /// Deadline entities for the same task.
+    pub(super) fn held_deadline_reservation(&self) -> u64 {
+        self.deadline.bandwidth.reservation_scaled().max(
+            self.policy
+                .pending_update()
+                .map_or(0, |pending| pending.reservation_scaled),
+        )
+    }
+
+    /// Builds the task-control snapshot published with an rq entity.
+    ///
+    /// Callers hold this task's scheduler lock and then acquire the owner rq,
+    /// matching Linux's `p->pi_lock` to rq publication order.
+    pub(super) fn rq_task_metadata(&self) -> Result<crate::scheduler::RqTaskMetadata, TaskError> {
+        Ok(crate::scheduler::RqTaskMetadata {
+            affinity: Arc::clone(&self.affinity.affinity),
+            deadline_donor: self.pi.deadline_donor,
+            deadline_bandwidth_scaled: self.deadline.bandwidth.reservation_scaled(),
+            policy_generation: self.policy.dispatch_generation,
+            runtime_binding: self.runtime.binding(),
+        })
     }
 }

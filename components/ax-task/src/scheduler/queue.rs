@@ -1,93 +1,26 @@
 //! Per-CPU runqueue protected by the target CPU's IRQ-safe scheduler lock.
 
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
-use core::{cell::UnsafeCell, fmt};
+use alloc::{sync::Arc, vec::Vec};
 
+mod class;
 mod deadline;
 mod realtime;
+mod task;
 
+pub(crate) use class::{SchedulerClass, wakeup_preempts};
 use deadline::{DeadlineQueueKey, DeadlineRunQueue};
 use realtime::RealtimeRunQueue;
-
-use super::{fair_queue::FairRunQueue, virtual_before};
-use crate::{
-    DEADLINE_CLASS_RANK, FairEntity, FairMode, REALTIME_CLASS_RANK, SchedulePolicy,
-    SchedulingEntity, SchedulingKey, TaskError, ThreadCore, ThreadId,
+pub(crate) use task::{
+    PickedThread, QueuedThread, QueuedThreadSnapshot, RqTaskMetadata, RunQueueNodeStorage,
 };
 
-/// Scheduling-class linkage prepared with each thread, like Linux embedding
-/// `sched_entity`, `sched_rt_entity`, and `sched_dl_entity` in `task_struct`.
-///
-/// A slot contains its node exactly while the thread is not linked in that
-/// class runqueue. Placement plus the owner rq lock serialize every transfer;
-/// no allocator is entered from enqueue, dequeue, pick, or migration.
-pub(crate) struct RunQueueNodeStorage {
-    deadline: UnsafeCell<Option<Box<deadline::DeadlineNode>>>,
-    fair: UnsafeCell<Option<Box<super::fair_queue::FairNode>>>,
-    realtime: UnsafeCell<Option<Box<realtime::RealtimeNode>>>,
-}
-
-impl RunQueueNodeStorage {
-    pub(crate) fn new() -> Self {
-        Self {
-            deadline: UnsafeCell::new(Some(deadline::DeadlineNode::empty())),
-            fair: UnsafeCell::new(Some(super::fair_queue::FairNode::empty())),
-            realtime: UnsafeCell::new(Some(realtime::RealtimeNode::empty())),
-        }
-    }
-
-    pub(crate) unsafe fn take_deadline(&self) -> Box<deadline::DeadlineNode> {
-        unsafe { &mut *self.deadline.get() }
-            .take()
-            .expect("one thread cannot own two Deadline runqueue links")
-    }
-
-    pub(crate) unsafe fn return_deadline(&self, node: Box<deadline::DeadlineNode>) {
-        assert!(
-            unsafe { &mut *self.deadline.get() }.replace(node).is_none(),
-            "unlinked Deadline node must have one storage owner"
-        );
-    }
-
-    pub(crate) unsafe fn take_fair(&self) -> Box<super::fair_queue::FairNode> {
-        unsafe { &mut *self.fair.get() }
-            .take()
-            .expect("one thread cannot own two fair runqueue links")
-    }
-
-    pub(crate) unsafe fn return_fair(&self, node: Box<super::fair_queue::FairNode>) {
-        assert!(
-            unsafe { &mut *self.fair.get() }.replace(node).is_none(),
-            "unlinked fair node must have one storage owner"
-        );
-    }
-
-    pub(crate) unsafe fn take_realtime(&self) -> Box<realtime::RealtimeNode> {
-        unsafe { &mut *self.realtime.get() }
-            .take()
-            .expect("one thread cannot own two RT runqueue links")
-    }
-
-    pub(crate) unsafe fn return_realtime(&self, node: Box<realtime::RealtimeNode>) {
-        assert!(
-            unsafe { &mut *self.realtime.get() }.replace(node).is_none(),
-            "unlinked RT node must have one storage owner"
-        );
-    }
-}
-
-// SAFETY: individual node transfers are serialized by ThreadSchedState
-// placement and the owning CpuRunQueueState IRQ lock. The UnsafeCell fields are
-// never accessed from a handle or an unrelated thread-control path.
-unsafe impl Sync for RunQueueNodeStorage {}
-
-impl fmt::Debug for RunQueueNodeStorage {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("RunQueueNodeStorage")
-            .finish_non_exhaustive()
-    }
-}
+use super::fair_queue::FairRunQueue;
+#[cfg(test)]
+use crate::ActiveSchedulingState;
+use crate::{
+    CurrentDispatch, DispatchCharge, FairEntity, FairMode, SchedulePolicy, SchedulingEntity,
+    TaskError, ThreadCore, ThreadId,
+};
 
 #[cfg(test)]
 std::thread_local! {
@@ -162,238 +95,34 @@ pub enum EnqueueReason {
 /// Which fixed-priority RT entities are eligible in this owner selection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RtEligibility {
-    /// The runqueue still owns ordinary RT bandwidth.
-    Ordinary,
-    /// The RT runqueue is throttled; only a contended PI owner may run.
-    PiOwnerOnly,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct QueuedThread {
-    pub(crate) id: ThreadId,
-    pub(crate) policy: SchedulePolicy,
-    pub(crate) entity: SchedulingEntity,
-    pub(crate) core: Arc<ThreadCore>,
-    pub(crate) rt_quota_exempt: bool,
-    /// The affinity snapshot allows this queued entity to leave its owner rq.
-    migration_capable: bool,
-    balance_scan_epoch: u64,
-    pub(super) sequence: u64,
-}
-
-impl QueuedThread {
-    pub(crate) fn new(
-        id: ThreadId,
-        policy: SchedulePolicy,
-        entity: SchedulingEntity,
-        core: Arc<ThreadCore>,
-        rt_quota_exempt: bool,
-        migration_capable: bool,
-    ) -> Self {
-        Self {
-            id,
-            policy,
-            entity,
-            core,
-            rt_quota_exempt,
-            migration_capable,
-            balance_scan_epoch: 0,
-            sequence: 0,
-        }
-    }
-
-    pub(crate) fn balance_key(&self) -> SchedulingKey {
-        self.entity.fair().map_or_else(
-            || self.entity.scheduling_key(self.policy, self.id.as_u64()),
-            |fair| {
-                SchedulingKey::new(
-                    self.policy.class_rank(),
-                    fair.virtual_deadline(),
-                    self.id.as_u64(),
-                )
-            },
-        )
-    }
-
-    pub(crate) const fn placement_demand(&self) -> u64 {
-        self.policy.placement_demand()
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PushableSummary {
-    thread: ThreadId,
-    key: SchedulingKey,
-    fair: bool,
-}
-
-impl PushableSummary {
-    fn precedes(self, other: Self) -> bool {
-        if self.key.class_rank() != other.key.class_rank() {
-            return self.key.class_rank() < other.key.class_rank();
-        }
-        if self.fair && other.fair && self.key.primary() != other.key.primary() {
-            return virtual_before(self.key.primary(), other.key.primary());
-        }
-        self.key < other.key
-    }
-}
-
-/// Preallocated migration index independent from class active structures.
-///
-/// Linux keeps RT/DL current in the active array/tree and removes only its
-/// pushable linkage. This fixed binary heap provides the same ownership split
-/// without allocating under the rq lock. `positions` carries the thread
-/// generation so a reused registry slot cannot remove its predecessor's key.
-#[derive(Debug)]
-struct PushableIndex {
-    heap: Vec<Option<PushableSummary>>,
-    positions: Vec<Option<(u32, usize)>>,
-    class_counts: [usize; 5],
-    len: usize,
-}
-
-impl PushableIndex {
-    const fn new() -> Self {
-        Self {
-            heap: Vec::new(),
-            positions: Vec::new(),
-            class_counts: [0; 5],
-            len: 0,
-        }
-    }
-
-    fn has_class(&self, class_rank: u8) -> bool {
-        self.class_counts
-            .get(class_rank as usize)
-            .is_some_and(|count| *count != 0)
-    }
-
-    fn prepare_thread_slot(&mut self, slot: usize) {
-        if self.positions.len() <= slot {
-            let required = slot.saturating_add(1);
-            self.positions.resize(required, None);
-            self.heap.resize(required, None);
-        }
-    }
-
-    fn first(&self) -> Option<PushableSummary> {
-        (self.len != 0).then(|| self.heap[0].expect("non-empty pushable heap must retain its root"))
-    }
-
-    fn insert(&mut self, summary: PushableSummary) {
-        let slot = summary.thread.slot() as usize;
-        let class = summary.key.class_rank() as usize;
-        assert!(
-            slot < self.positions.len()
-                && self.len < self.heap.len()
-                && class < self.class_counts.len(),
-            "thread construction must prepare pushable index storage"
-        );
-        assert!(
-            self.positions[slot]
-                .replace((summary.thread.generation(), self.len))
-                .is_none(),
-            "one thread cannot own two pushable keys"
-        );
-        assert!(self.heap[self.len].replace(summary).is_none());
-        self.class_counts[class] = self.class_counts[class]
-            .checked_add(1)
-            .expect("pushable scheduler-class count must fit usize");
-        self.len += 1;
-        self.sift_up(self.len - 1);
-    }
-
-    fn remove(&mut self, thread: ThreadId) -> Option<PushableSummary> {
-        let slot = thread.slot() as usize;
-        let (generation, index) = self.positions.get(slot).and_then(|entry| *entry)?;
-        if generation != thread.generation() {
-            return None;
-        }
-        self.positions[slot] = None;
-        self.len -= 1;
-        self.swap(index, self.len);
-        let removed = self.heap[self.len]
-            .take()
-            .expect("pushable position must identify a heap entry");
-        let class = removed.key.class_rank() as usize;
-        self.class_counts[class] = self.class_counts[class]
-            .checked_sub(1)
-            .expect("pushable scheduler-class count must match heap membership");
-        self.positions[removed.thread.slot() as usize] = None;
-        if index < self.len {
-            let parent = index.saturating_sub(1) / 2;
-            if index != 0 && self.summary(index).precedes(self.summary(parent)) {
-                self.sift_up(index);
-            } else {
-                self.sift_down(index);
-            }
-        }
-        Some(removed)
-    }
-
-    fn update(&mut self, summary: Option<PushableSummary>, thread: ThreadId) {
-        self.remove(thread);
-        if let Some(summary) = summary {
-            self.insert(summary);
-        }
-    }
-
-    fn sift_up(&mut self, mut index: usize) {
-        while index != 0 {
-            let parent = (index - 1) / 2;
-            if !self.summary(index).precedes(self.summary(parent)) {
-                break;
-            }
-            self.swap(parent, index);
-            index = parent;
-        }
-    }
-
-    fn sift_down(&mut self, mut index: usize) {
-        loop {
-            let left = index.saturating_mul(2).saturating_add(1);
-            if left >= self.len {
-                break;
-            }
-            let right = left + 1;
-            let smallest = if right < self.len && self.summary(right).precedes(self.summary(left)) {
-                right
-            } else {
-                left
-            };
-            if !self.summary(smallest).precedes(self.summary(index)) {
-                break;
-            }
-            self.swap(index, smallest);
-            index = smallest;
-        }
-    }
-
-    fn summary(&self, index: usize) -> PushableSummary {
-        self.heap[index].expect("live pushable heap slot must contain a key")
-    }
-
-    fn swap(&mut self, left: usize, right: usize) {
-        if left == right {
-            return;
-        }
-        self.heap.swap(left, right);
-        for index in [left, right] {
-            let summary = self.heap[index].expect("swapped live heap slot must remain populated");
-            self.positions[summary.thread.slot() as usize] =
-                Some((summary.thread.generation(), index));
-        }
-    }
+    /// Linux `rt_rq_throttled()` is false for this runqueue.
+    Runnable,
+    /// No boosted entity keeps this runqueue runnable after quota exhaustion.
+    Throttled,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum QueueMembershipClass {
     Stop,
     Deadline(DeadlineQueueKey),
+    /// Linux `p->on_rq == TASK_ON_RQ_QUEUED` while `dl_throttled` keeps the
+    /// entity outside `dl_rq->root` and `rq->nr_running`.
+    DeadlineThrottled,
     Realtime(u8),
     Fair,
     IdleFair,
+}
+
+impl QueueMembershipClass {
+    const fn scheduler_class(self) -> SchedulerClass {
+        match self {
+            Self::Stop => SchedulerClass::Stop,
+            Self::Deadline(_) | Self::DeadlineThrottled => SchedulerClass::Deadline,
+            Self::Realtime(_) => SchedulerClass::Realtime,
+            Self::Fair => SchedulerClass::Fair,
+            Self::IdleFair => SchedulerClass::IdleFair,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -404,38 +133,140 @@ struct QueueMembership {
 
 #[derive(Debug)]
 pub(crate) struct RunQueue {
+    /// Linux `rq->curr`: the sole running-task identity owned by this rq.
+    ///
+    /// RT/DL retain their class nodes while running, but those nodes do not
+    /// carry a second "current" marker. Every class operation derives current
+    /// status from this dispatch token while holding the rq lock.
+    current: Option<CurrentDispatch>,
     stop: Option<QueuedThread>,
     deadline: DeadlineRunQueue,
     rt: RealtimeRunQueue,
     fair: FairRunQueue,
     idle_fair: FairRunQueue,
     membership: Vec<Option<QueueMembership>>,
-    pushable: PushableIndex,
     fixed_placement_demand: u64,
     balance_scan_epoch: u64,
     next_sequence: u64,
-    /// RT/DL current remains physically linked in its class active structure.
-    /// It is excluded from queued load and migration views until `put_prev`.
-    linked_current: Option<ThreadId>,
-    len: usize,
+    /// Linux `rq->nr_running`: runnable non-idle tasks, including current.
+    nr_running: usize,
 }
 
 impl RunQueue {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn configured(deadline_max_bw_scaled: u64, thread_capacity: usize) -> Self {
         Self {
+            current: None,
             stop: None,
-            deadline: DeadlineRunQueue::new(),
+            deadline: DeadlineRunQueue::new(deadline_max_bw_scaled, thread_capacity),
             rt: RealtimeRunQueue::new(),
             fair: FairRunQueue::new(),
             idle_fair: FairRunQueue::new(),
             membership: Vec::new(),
-            pushable: PushableIndex::new(),
             fixed_placement_demand: 0,
             balance_scan_epoch: 0,
             next_sequence: 0,
-            linked_current: None,
-            len: 0,
+            nr_running: 0,
         }
+    }
+
+    #[cfg(test)]
+    fn new() -> Self {
+        Self::configured(u64::MAX, 64)
+    }
+
+    pub(crate) const fn current(&self) -> Option<&CurrentDispatch> {
+        self.current.as_ref()
+    }
+
+    pub(crate) fn current_mut(&mut self) -> Option<&mut CurrentDispatch> {
+        self.current.as_mut()
+    }
+
+    pub(crate) fn install_current(&mut self, current: CurrentDispatch) {
+        assert!(
+            self.current.replace(current).is_none(),
+            "rq->curr must be cleared before installing a successor"
+        );
+    }
+
+    pub(crate) fn take_current(&mut self) -> Option<CurrentDispatch> {
+        self.current.take()
+    }
+
+    fn linked_current(&self) -> Option<ThreadId> {
+        let current = self.current.as_ref()?.thread();
+        matches!(
+            self.membership_class(current),
+            Some(QueueMembershipClass::Deadline(_) | QueueMembershipClass::Realtime(_))
+        )
+        .then_some(current)
+    }
+
+    /// Charges `rq->curr` and its class-owned entity in one rq transaction.
+    ///
+    /// The common dispatch token and RT/DL active nodes are disjoint fields
+    /// of the same rq. Keeping this operation here prevents callers from
+    /// temporarily clearing `rq->curr` merely to obtain two mutable borrows.
+    pub(crate) fn charge_current(
+        &mut self,
+        runtime_ns: u64,
+        now_ns: u64,
+        inactive_bw_scaled: u64,
+        extra_bw_scaled: u64,
+        max_bw_scaled: u64,
+        reclaimed_ns: u64,
+    ) -> Result<(DispatchCharge, SchedulePolicy, SchedulingEntity, bool), TaskError> {
+        let current = self.current.as_ref().ok_or(TaskError::NoRunnableThread)?;
+        let id = current.thread();
+        let policy = current.schedule_policy();
+        let rt_quota_exempt = current.rt_quota_exempt();
+        let membership = self.membership_class(id);
+        let current_entity = match membership {
+            Some(QueueMembershipClass::Deadline(key)) => self
+                .deadline
+                .get(key)
+                .map(QueuedThread::entity)
+                .ok_or(TaskError::InvalidConfiguration)?,
+            Some(QueueMembershipClass::Realtime(priority)) => self
+                .rt
+                .get(priority, id)
+                .map(QueuedThread::entity)
+                .ok_or(TaskError::InvalidConfiguration)?,
+            _ => current
+                .owned_scheduling_entity()
+                .ok_or(TaskError::InvalidConfiguration)?,
+        };
+        let dispatch = self.current.as_mut().ok_or(TaskError::NoRunnableThread)?;
+        let grub_reclaimed_ns = dispatch.grub_reclaimed_ns(
+            &current_entity,
+            runtime_ns,
+            inactive_bw_scaled,
+            extra_bw_scaled,
+            max_bw_scaled,
+        );
+        let reclaimed_ns = reclaimed_ns.saturating_add(grub_reclaimed_ns);
+        let charge = match membership {
+            Some(QueueMembershipClass::Deadline(key)) => {
+                let entity = &mut self
+                    .deadline
+                    .get_mut(key)
+                    .ok_or(TaskError::InvalidConfiguration)?
+                    .active
+                    .entity_mut();
+                dispatch.charge_linked(entity, runtime_ns, now_ns, reclaimed_ns)
+            }
+            Some(QueueMembershipClass::Realtime(priority)) => {
+                let entity = &mut self
+                    .rt
+                    .get_mut(priority, id)
+                    .ok_or(TaskError::InvalidConfiguration)?
+                    .active
+                    .entity_mut();
+                dispatch.charge_linked(entity, runtime_ns, now_ns, reclaimed_ns)
+            }
+            _ => dispatch.charge(runtime_ns, now_ns, reclaimed_ns),
+        };
+        Ok((charge, policy, current_entity, rt_quota_exempt))
     }
 
     /// Reserves every class index before a thread becomes externally visible.
@@ -448,11 +279,38 @@ impl RunQueue {
         self.deadline.prepare_thread_slot(slot);
         self.fair.prepare_thread_slot(slot);
         self.idle_fair.prepare_thread_slot(slot);
-        self.pushable.prepare_thread_slot(slot);
     }
 
-    pub(crate) const fn len(&self) -> usize {
-        self.len
+    pub(crate) const fn nr_running(&self) -> usize {
+        self.nr_running
+    }
+
+    pub(crate) fn nr_queued(&self) -> usize {
+        let current_runnable = self
+            .current
+            .as_ref()
+            .is_some_and(|current| !current.is_dedicated_idle());
+        self.nr_running
+            .checked_sub(usize::from(current_runnable))
+            .expect("rq->curr runnable state must be included in rq->nr_running")
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.nr_queued()
+    }
+
+    /// Deactivates a Fair/stop current whose entity is intentionally outside
+    /// every active class structure while it runs.
+    pub(crate) fn deactivate_unlinked_current(&mut self, id: ThreadId) {
+        assert!(
+            !self.contains(id),
+            "an rq-linked current must be deactivated through its class"
+        );
+        self.nr_running = self
+            .nr_running
+            .checked_sub(1)
+            .expect("current deactivation must match one runnable entity");
     }
 
     pub(crate) fn fair_demand(&self) -> u64 {
@@ -535,45 +393,111 @@ impl RunQueue {
         queue.earliest_eligible(virtual_time) == Some(wakee)
     }
 
-    pub(crate) fn earliest_deadline_event_ns(&self) -> Option<u64> {
-        self.deadline.earliest_event_ns()
-    }
-
     pub(crate) fn earliest_deadline_ns(&self) -> Option<u64> {
         self.deadline.earliest_deadline_ns()
     }
 
-    pub(crate) fn pushable_key(&self) -> Option<SchedulingKey> {
-        self.pushable.first().map(|summary| summary.key)
+    pub(crate) fn deadline_members_are_empty(&self) -> bool {
+        self.deadline.members_are_empty()
+    }
+
+    pub(crate) fn deadline_member(&self, thread: ThreadId) -> Option<Arc<ThreadCore>> {
+        self.deadline.member(thread)
+    }
+
+    pub(crate) fn register_deadline_member(&mut self, core: &Arc<ThreadCore>) -> bool {
+        self.deadline.register_member(core)
+    }
+
+    pub(crate) fn unregister_deadline_member(&mut self, core: &Arc<ThreadCore>) {
+        self.deadline.unregister_member(core);
+    }
+
+    pub(crate) fn add_deadline_bandwidth(&mut self, utilization_scaled: u64, active: bool) {
+        self.deadline.add_bandwidth(utilization_scaled, active);
+    }
+
+    pub(crate) fn remove_deadline_bandwidth(&mut self, utilization_scaled: u64, active: bool) {
+        self.deadline.remove_bandwidth(utilization_scaled, active);
+    }
+
+    pub(crate) fn activate_deadline_bandwidth(&mut self, utilization_scaled: u64) {
+        self.deadline.activate_bandwidth(utilization_scaled);
+    }
+
+    pub(crate) fn deactivate_deadline_bandwidth(&mut self, utilization_scaled: u64) {
+        self.deadline.deactivate_bandwidth(utilization_scaled);
+    }
+
+    pub(crate) const fn deadline_bandwidth(&self) -> crate::DeadlineBandwidthSnapshot {
+        self.deadline.bandwidth()
     }
 
     pub(crate) fn has_pushable_deadline(&self) -> bool {
-        self.pushable.has_class(DEADLINE_CLASS_RANK)
+        self.deadline.has_pushable()
     }
 
     pub(crate) fn has_pushable_realtime(&self) -> bool {
-        self.pushable.has_class(REALTIME_CLASS_RANK)
+        self.rt.has_pushable()
     }
 
-    pub(crate) fn update_deadline_entity(
+    pub(crate) fn has_pushable_fair(&self) -> bool {
+        self.fair.has_migratable()
+    }
+
+    fn refresh_class_pushable(
+        &mut self,
+        thread: ThreadId,
+        policy: SchedulePolicy,
+        current: Option<ThreadId>,
+    ) {
+        match policy {
+            SchedulePolicy::Deadline(_) => self.deadline.refresh_pushable(thread, current),
+            SchedulePolicy::Fifo { priority } | SchedulePolicy::RoundRobin { priority, .. } => {
+                self.rt.refresh_pushable_priority(priority.get(), current);
+            }
+            SchedulePolicy::KernelStop | SchedulePolicy::Fair { .. } => {}
+        }
+    }
+
+    /// Updates the configured-policy Deadline server retained inside a task.
+    ///
+    /// When a Deadline PI entity owns the active EDF key, its base CBS is
+    /// parked inside the same rq-owned scheduling state. Updating that base
+    /// server must not rebuild the donor's active key.
+    pub(crate) fn update_base_deadline_entity(
         &mut self,
         id: ThreadId,
         entity: SchedulingEntity,
     ) -> bool {
-        let Some(QueueMembershipClass::Deadline(key)) = self.membership_class(id) else {
+        let Some(class) = self.membership_class(id) else {
             return false;
         };
-        let Some(new_key) = self.deadline.update_entity(key, entity) else {
-            return false;
-        };
-        self.replace_membership_class(id, QueueMembershipClass::Deadline(new_key));
-        let summary = self
-            .queued_thread_including_current(id)
-            .filter(|_| self.linked_current != Some(id))
-            .as_ref()
-            .and_then(Self::pushable_summary_for);
-        self.pushable.update(summary, id);
-        true
+        match class {
+            QueueMembershipClass::Deadline(key) => {
+                let Some(thread) = self.deadline.get_mut(key) else {
+                    return false;
+                };
+                if thread.active.uses_inherited_entity() {
+                    thread.active.replace_base_entity(entity);
+                    return true;
+                }
+                let Some(new_key) = self.deadline.update_entity(key, entity) else {
+                    return false;
+                };
+                self.replace_membership_class(id, QueueMembershipClass::Deadline(new_key));
+                self.deadline.refresh_pushable(id, self.linked_current());
+                true
+            }
+            QueueMembershipClass::DeadlineThrottled => {
+                let Some(thread) = self.deadline.throttled_mut(id) else {
+                    return false;
+                };
+                thread.active.replace_base_entity(entity);
+                true
+            }
+            _ => false,
+        }
     }
 
     pub(crate) fn update_migration_capability(
@@ -596,12 +520,21 @@ impl RunQueue {
                     .get_mut(key)
                     .expect("Deadline membership must retain its queue node")
                     .migration_capable = migration_capable;
+                self.deadline.refresh_pushable(id, self.linked_current());
+            }
+            QueueMembershipClass::DeadlineThrottled => {
+                self.deadline
+                    .throttled_mut(id)
+                    .expect("throttled Deadline membership must retain its entity")
+                    .migration_capable = migration_capable;
             }
             QueueMembershipClass::Realtime(priority) => {
                 self.rt
                     .get_mut(priority, id)
                     .expect("RT membership must retain its queue node")
                     .migration_capable = migration_capable;
+                self.rt
+                    .refresh_pushable_priority(priority, self.linked_current());
             }
             QueueMembershipClass::Fair => {
                 let mut thread = self
@@ -620,12 +553,6 @@ impl RunQueue {
                 self.idle_fair.insert(thread);
             }
         }
-        let summary = self
-            .queued_thread_including_current(id)
-            .filter(|_| self.linked_current != Some(id))
-            .as_ref()
-            .and_then(Self::pushable_summary_for);
-        self.pushable.update(summary, id);
         true
     }
 
@@ -641,8 +568,8 @@ impl RunQueue {
         &mut self,
         scan_epoch: u64,
         mut may_migrate: impl FnMut(&QueuedThread) -> bool,
-    ) -> Option<QueuedThread> {
-        let linked_current = self.linked_current;
+    ) -> Option<QueuedThreadSnapshot> {
+        let linked_current = self.linked_current();
         let candidate = self
             .deadline
             .find_first_matching(&mut |thread| {
@@ -666,14 +593,19 @@ impl RunQueue {
         Some(candidate)
     }
 
-    pub(crate) fn queued_thread(&self, id: ThreadId) -> Option<QueuedThread> {
-        if self.linked_current == Some(id) {
+    pub(crate) fn queued_thread(&self, id: ThreadId) -> Option<QueuedThreadSnapshot> {
+        if self.linked_current() == Some(id) {
             return None;
         }
         match self.membership_class(id)? {
-            QueueMembershipClass::Stop => self.stop.clone(),
-            QueueMembershipClass::Deadline(key) => self.deadline.get(key).cloned(),
-            QueueMembershipClass::Realtime(priority) => self.rt.get(priority, id).cloned(),
+            QueueMembershipClass::Stop => self.stop.as_ref().map(QueuedThreadSnapshot::from),
+            QueueMembershipClass::Deadline(key) => {
+                self.deadline.get(key).map(QueuedThreadSnapshot::from)
+            }
+            QueueMembershipClass::DeadlineThrottled => None,
+            QueueMembershipClass::Realtime(priority) => {
+                self.rt.get(priority, id).map(QueuedThreadSnapshot::from)
+            }
             QueueMembershipClass::Fair => {
                 self.fair.find_first_matching(&mut |thread| thread.id == id)
             }
@@ -683,7 +615,7 @@ impl RunQueue {
         }
     }
 
-    pub(crate) fn enqueue(
+    pub(crate) fn enqueue_task(
         &mut self,
         mut entry: QueuedThread,
         reason: EnqueueReason,
@@ -694,102 +626,104 @@ impl RunQueue {
         }
         entry.sequence = self.allocate_sequence();
         let id = entry.id;
-        let policy = entry.policy;
-        if let SchedulingEntity::Fair(fair) = &mut entry.entity {
-            let virtual_time = self.virtual_time_for_mode(fair.mode());
-            match reason {
-                EnqueueReason::Wake => {
-                    let (queue_weight, current_weight) =
-                        self.fair_placement_weights(*fair, current_fair);
-                    fair.place_after_activation(
-                        virtual_time,
-                        queue_weight.saturating_add(current_weight),
-                    )?;
-                }
-                EnqueueReason::Preempted => {}
-                EnqueueReason::Yield => fair.yield_request(virtual_time),
-                EnqueueReason::Migrated => {
-                    let (queue_weight, current_weight) =
-                        self.fair_placement_weights(*fair, current_fair);
-                    fair.place_after_transfer(
-                        virtual_time,
-                        queue_weight.saturating_add(current_weight),
-                    )?;
-                }
-                EnqueueReason::PolicyChanged => {
-                    let (queue_weight, current_weight) =
-                        self.fair_placement_weights(*fair, current_fair);
-                    fair.place_after_transfer(
-                        virtual_time,
-                        queue_weight.saturating_add(current_weight),
-                    )?;
-                }
-                EnqueueReason::Replenished => {
-                    fair.place_at_least(virtual_time);
-                }
-            }
-            if reason != EnqueueReason::Wake
-                && reason != EnqueueReason::Yield
-                && fair.request_exhausted()
-            {
-                fair.renew_request(virtual_time);
-            }
+        let policy = entry.active.policy();
+        let class_enqueue =
+            SchedulerClass::for_policy(policy).enqueue_task(self, entry, reason, current_fair)?;
+        let membership_class = class_enqueue.membership;
+        let queued_entity = class_enqueue.entity;
+        let reason = class_enqueue.reason;
+        if matches!(
+            reason,
+            EnqueueReason::Wake | EnqueueReason::Replenished | EnqueueReason::Migrated
+        ) {
+            self.nr_running += 1;
         }
-        let reason = if matches!(reason, EnqueueReason::Yield)
-            || (matches!(reason, EnqueueReason::Preempted)
-                && entry.entity.round_robin_quantum_expired())
-        {
-            entry.entity.reset_round_robin_quantum(policy);
-            EnqueueReason::Yield
-        } else {
-            reason
-        };
-        let queued_entity = entry.entity;
-        let pushable_summary = Self::pushable_summary_for(&entry);
-        let membership_class = match policy {
-            SchedulePolicy::KernelStop => {
-                entry.migration_capable = false;
-                assert!(
-                    self.stop.replace(entry).is_none(),
-                    "one CPU runqueue can own only one stopper task"
-                );
-                QueueMembershipClass::Stop
-            }
-            SchedulePolicy::Deadline(_) => {
-                if entry.entity.deadline().is_none_or(|deadline| {
-                    deadline.absolute_deadline_ns().is_none() || deadline.is_throttled()
-                }) {
-                    return Err(TaskError::NotReady);
-                }
-                let key = self.deadline.insert(entry);
-                QueueMembershipClass::Deadline(key)
-            }
-            SchedulePolicy::Fifo { priority } | SchedulePolicy::RoundRobin { priority, .. } => {
-                let queued_priority = self.rt.enqueue(entry, reason);
-                debug_assert_eq!(queued_priority, priority.get());
-                QueueMembershipClass::Realtime(priority.get())
-            }
-            SchedulePolicy::Fair {
-                mode: FairMode::Idle,
-                ..
-            } => {
-                self.idle_fair.insert(entry);
-                QueueMembershipClass::IdleFair
-            }
-            SchedulePolicy::Fair { .. } => {
-                self.fair.insert(entry);
-                QueueMembershipClass::Fair
-            }
-        };
-        self.len += 1;
         self.fixed_placement_demand = self
             .fixed_placement_demand
             .saturating_add(fixed_placement_demand(policy));
         self.register_membership(id, membership_class);
-        if let Some(summary) = pushable_summary {
-            self.pushable.insert(summary);
-        }
+        self.refresh_class_pushable(id, policy, self.linked_current());
         Ok(queued_entity)
+    }
+
+    /// Activates an already-throttled Deadline task without linking it into
+    /// the EDF tree. Linux publishes `TASK_ON_RQ_QUEUED` in this state while
+    /// leaving the task out of `rq->nr_running` until the CBS timer fires.
+    pub(crate) fn enqueue_throttled_deadline(
+        &mut self,
+        mut thread: QueuedThread,
+    ) -> Result<(), TaskError> {
+        if self.contains(thread.id)
+            || !matches!(thread.active.policy(), SchedulePolicy::Deadline(_))
+            || !thread.active.entity().is_deadline_throttled()
+        {
+            return Err(TaskError::InvalidConfiguration);
+        }
+        thread.sequence = self.allocate_sequence();
+        let id = thread.id;
+        self.deadline.install_throttled(thread)?;
+        self.register_membership(id, QueueMembershipClass::DeadlineThrottled);
+        Ok(())
+    }
+
+    /// Linux `update_curr_dl()` throttle transition for the linked current.
+    pub(crate) fn throttle_current_deadline(
+        &mut self,
+        id: ThreadId,
+    ) -> Result<SchedulingEntity, TaskError> {
+        if self.linked_current() != Some(id) {
+            return Err(TaskError::NotReady);
+        }
+        let QueueMembershipClass::Deadline(key) =
+            self.membership_class(id).ok_or(TaskError::NotReady)?
+        else {
+            return Err(TaskError::InvalidConfiguration);
+        };
+        let thread = self.deadline.remove(key).ok_or(TaskError::NotReady)?;
+        let entity = thread.active.entity().clone();
+        self.deadline.install_throttled(thread)?;
+        self.replace_membership_class(id, QueueMembershipClass::DeadlineThrottled);
+        self.nr_running = self
+            .nr_running
+            .checked_sub(1)
+            .ok_or(TaskError::InvalidConfiguration)?;
+        Ok(entity)
+    }
+
+    /// Re-enables one throttled CBS entity after its hard replenishment timer.
+    pub(crate) fn replenish_throttled_deadline(
+        &mut self,
+        id: ThreadId,
+        entity: SchedulingEntity,
+    ) -> Result<(), TaskError> {
+        if !matches!(
+            self.membership_class(id),
+            Some(QueueMembershipClass::DeadlineThrottled)
+        ) || entity.is_deadline_throttled()
+        {
+            return Err(TaskError::NotReady);
+        }
+        let mut thread = self
+            .deadline
+            .take_throttled(id)
+            .ok_or(TaskError::NotReady)?;
+        *thread.active.entity_mut() = entity;
+        let policy = thread.active.policy();
+        let key = self.deadline.insert(thread);
+        self.replace_membership_class(id, QueueMembershipClass::Deadline(key));
+        self.nr_running = self
+            .nr_running
+            .checked_add(1)
+            .ok_or(TaskError::InvalidConfiguration)?;
+        self.fixed_placement_demand = self
+            .fixed_placement_demand
+            .saturating_add(fixed_placement_demand(policy));
+        self.deadline.refresh_pushable(id, self.linked_current());
+        Ok(())
+    }
+
+    pub(crate) fn is_deadline_throttled_member(&self, id: ThreadId) -> bool {
+        self.membership_class(id) == Some(QueueMembershipClass::DeadlineThrottled)
     }
 
     fn fair_placement_weights(
@@ -821,6 +755,9 @@ impl RunQueue {
                     .get_mut(key)
                     .expect("deadline balance candidate must remain linked")
                     .balance_scan_epoch = scan_epoch;
+            }
+            QueueMembershipClass::DeadlineThrottled => {
+                unreachable!("a throttled Deadline task is not a push candidate")
             }
             QueueMembershipClass::Realtime(priority) => {
                 self.rt
@@ -859,11 +796,30 @@ impl RunQueue {
         self.prepare_thread_slot(id.slot() as usize);
         let sched = Arc::new(crate::ThreadSchedCell::new_test(id, policy));
         let core = Arc::new(ThreadCore::new(id, policy, sched, None, None, None));
-        self.enqueue(
-            QueuedThread::new(id, policy, entity, core, false, true),
+        let already_runnable = matches!(reason, EnqueueReason::Preempted);
+        let entity = self.enqueue_task(
+            QueuedThread::new(
+                id,
+                ActiveSchedulingState::new(policy, entity),
+                core,
+                false,
+                true,
+                RqTaskMetadata::test(1),
+            ),
             reason,
             None,
-        )
+        )?;
+        if already_runnable {
+            // Production reaches `Preempted` from a Fair current which is
+            // already included in rq->nr_running. Unit tests inject that
+            // post-put-prev state directly, so establish the same common-rq
+            // accounting without reapplying the wake placement rule.
+            self.nr_running = self
+                .nr_running
+                .checked_add(1)
+                .ok_or(TaskError::InvalidConfiguration)?;
+        }
+        Ok(entity)
     }
 
     #[cfg(test)]
@@ -876,172 +832,199 @@ impl RunQueue {
         self.prepare_thread_slot(id.slot() as usize);
         let sched = Arc::new(crate::ThreadSchedCell::new_test(id, policy));
         let core = Arc::new(ThreadCore::new(id, policy, sched, None, None, None));
-        self.enqueue(
+        self.enqueue_task(
             QueuedThread::new(
                 id,
-                policy,
-                SchedulingEntity::new(policy, 1, 0),
+                ActiveSchedulingState::new(policy, SchedulingEntity::new(policy, 1, 0)),
                 core,
                 quota_exempt,
                 true,
+                RqTaskMetadata::test(1),
             ),
             EnqueueReason::Wake,
             None,
         )
     }
 
-    pub(crate) fn dequeue(&mut self, id: ThreadId) -> Option<QueuedThread> {
+    fn unlink_task(&mut self, id: ThreadId, deactivate: bool) -> Option<QueuedThread> {
         let class = self.membership_class(id)?;
-        let was_linked_current = self.linked_current == Some(id);
-        let removed = match class {
-            QueueMembershipClass::Stop => self.stop.take(),
-            QueueMembershipClass::Deadline(key) => self.deadline.remove(key),
-            QueueMembershipClass::Realtime(priority) => self.rt.remove(priority, id),
-            QueueMembershipClass::Fair => self.fair.remove(id),
-            QueueMembershipClass::IdleFair => self.idle_fair.remove(id),
+        if class == QueueMembershipClass::DeadlineThrottled {
+            let thread = self.deadline.take_throttled(id)?;
+            self.unregister_membership(id);
+            return Some(thread);
         }
-        .expect("runqueue membership must identify a linked scheduling entity");
-        if was_linked_current {
-            self.linked_current = None;
-        } else {
-            self.len -= 1;
+        let was_linked_current = self.linked_current() == Some(id);
+        let scheduler_class = class.scheduler_class();
+        let removed = scheduler_class
+            .dequeue_task(self, class, id)
+            .expect("runqueue membership must identify a linked scheduling entity");
+        if !was_linked_current {
             self.fixed_placement_demand = self
                 .fixed_placement_demand
-                .saturating_sub(fixed_placement_demand(removed.policy));
+                .saturating_sub(fixed_placement_demand(removed.active.policy()));
         }
         self.unregister_membership(removed.id);
-        self.pushable.remove(removed.id);
+        self.refresh_class_pushable(removed.id, removed.active.policy(), self.linked_current());
+        if deactivate {
+            self.nr_running = self
+                .nr_running
+                .checked_sub(1)
+                .expect("deactivate_task must match one runnable entity");
+        }
         Some(removed)
+    }
+
+    /// Linux `deactivate_task()`: removes one runnable entity from `nr_running`.
+    pub(crate) fn deactivate_task(&mut self, id: ThreadId) -> Option<QueuedThread> {
+        self.unlink_task(id, true)
+    }
+
+    /// Linux scheduler-class change: unlinks an entity without deactivating it.
+    pub(crate) fn reclassify_task(&mut self, id: ThreadId) -> Option<QueuedThread> {
+        let was_throttled =
+            self.membership_class(id) == Some(QueueMembershipClass::DeadlineThrottled);
+        let thread = self.unlink_task(id, false)?;
+        if was_throttled {
+            // The replacement class becomes eligible immediately. Common
+            // PolicyChanged enqueue preserves `nr_running`, so establish the
+            // runnable count here just as Linux dequeues a throttled DL class
+            // before installing the new scheduler class.
+            self.nr_running = self.nr_running.checked_add(1)?;
+        }
+        Some(thread)
+    }
+
+    #[cfg(test)]
+    fn dequeue(&mut self, id: ThreadId) -> Option<QueuedThread> {
+        self.deactivate_task(id)
     }
 
     /// Returns whether `id` is the RT/DL entity retained as current.
     pub(crate) fn is_linked_current(&self, id: ThreadId) -> bool {
-        self.linked_current == Some(id)
+        self.linked_current() == Some(id)
+    }
+
+    pub(crate) fn linked_current_entity_mut(
+        &mut self,
+        id: ThreadId,
+    ) -> Option<&mut SchedulingEntity> {
+        if self.linked_current() != Some(id) {
+            return None;
+        }
+        match self.membership_class(id)? {
+            QueueMembershipClass::Deadline(key) => {
+                Some(self.deadline.get_mut(key)?.active.entity_mut())
+            }
+            QueueMembershipClass::Realtime(priority) => {
+                Some(self.rt.get_mut(priority, id)?.active.entity_mut())
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn linked_current_entity(&self, id: ThreadId) -> Option<SchedulingEntity> {
+        if self.linked_current() != Some(id) {
+            return None;
+        }
+        self.queued_thread_including_current(id)
+            .map(|thread| thread.entity)
+    }
+
+    /// Rebuilds the active EDF key after Linux-style boosted replenishment.
+    pub(crate) fn requeue_replenished_deadline_current(
+        &mut self,
+        id: ThreadId,
+    ) -> Result<bool, TaskError> {
+        if self.linked_current() != Some(id) {
+            return Err(TaskError::NotReady);
+        }
+        let QueueMembershipClass::Deadline(key) =
+            self.membership_class(id).ok_or(TaskError::NotReady)?
+        else {
+            return Err(TaskError::InvalidConfiguration);
+        };
+        let (new_key, _entity) = self
+            .deadline
+            .put_prev_current(key)
+            .ok_or(TaskError::NotReady)?;
+        self.replace_membership_class(id, QueueMembershipClass::Deadline(new_key));
+        Ok(self.deadline.first().is_some_and(|thread| thread.id != id))
+    }
+
+    pub(crate) fn scheduling_entity(&self, id: ThreadId) -> Option<SchedulingEntity> {
+        self.queued_thread_including_current(id)
+            .map(|thread| thread.entity)
+    }
+
+    pub(crate) fn base_scheduling_entity(&self, id: ThreadId) -> Option<SchedulingEntity> {
+        self.queued_thread_including_current(id)
+            .map(|thread| thread.base_entity)
+    }
+
+    pub(crate) fn scheduling_state(
+        &self,
+        id: ThreadId,
+    ) -> Option<(SchedulePolicy, SchedulingEntity)> {
+        self.queued_thread_including_current(id)
+            .map(|thread| (thread.policy, thread.entity))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_owns_schedule_state(&self, id: ThreadId) -> bool {
+        self.queued_thread_including_current(id).is_some()
     }
 
     /// Installs a newly applied RT/DL policy as the physically linked current.
     pub(crate) fn link_running(&mut self, thread: QueuedThread) -> Result<(), TaskError> {
-        if self.linked_current.is_some() || !retains_running_link(thread.policy) {
+        if self
+            .linked_current()
+            .is_some_and(|current| self.contains(current))
+            || !retains_running_link(thread.active.policy())
+        {
             return Err(TaskError::InvalidConfiguration);
         }
         let id = thread.id;
-        let policy = thread.policy;
-        self.enqueue(thread, EnqueueReason::Preempted, None)?;
-        self.linked_current = Some(id);
-        self.len -= 1;
+        let policy = thread.active.policy();
+        self.enqueue_task(thread, EnqueueReason::PolicyChanged, None)?;
         self.fixed_placement_demand = self
             .fixed_placement_demand
             .saturating_sub(fixed_placement_demand(policy));
-        self.pushable.remove(id);
+        self.refresh_class_pushable(id, policy, Some(id));
         Ok(())
     }
 
-    /// Restores a selection whose fallible placement preparation did not
-    /// commit. RT/DL current linkage is converted back to queued state without
-    /// membership churn; Fair selection is inserted with its active request.
-    pub(crate) fn rollback_pick(&mut self, mut thread: QueuedThread) {
-        if self.linked_current == Some(thread.id) {
-            self.put_prev_linked(thread, EnqueueReason::Preempted)
-                .expect("selected RT/DL entity must remain linked for rollback");
-            return;
+    /// Restores a class pick whose owner-rq validation did not reach set-next.
+    pub(crate) fn rollback_pick(&mut self, picked: PickedThread) {
+        match picked {
+            PickedThread::Linked(_) => {}
+            PickedThread::Owned(mut thread) => {
+                thread.active.entity_mut().cancel_fair_migration();
+                SchedulerClass::for_policy(thread.active.policy()).rollback_pick(self, thread);
+            }
         }
-        thread.entity.cancel_fair_migration();
-        self.enqueue(thread, EnqueueReason::Preempted, None)
-            .expect("selected Fair entity must remain eligible for rollback");
     }
 
     /// Makes the retained RT/DL current queued again without transferring its
     /// intrusive node or membership identity.
-    pub(crate) fn put_prev_linked(
+    pub(crate) fn put_prev_task(
         &mut self,
-        mut thread: QueuedThread,
+        id: ThreadId,
         reason: EnqueueReason,
     ) -> Result<SchedulingEntity, TaskError> {
-        if self.linked_current != Some(thread.id) {
+        if self.linked_current() != Some(id) {
             return Err(TaskError::NotReady);
         }
-        let class = self
-            .membership_class(thread.id)
-            .ok_or(TaskError::NotReady)?;
-        thread.sequence = self
-            .queued_thread_including_current(thread.id)
+        let class = self.membership_class(id).ok_or(TaskError::NotReady)?;
+        let policy = self
+            .queued_thread_including_current(id)
             .ok_or(TaskError::NotReady)?
-            .sequence;
-        let id = thread.id;
-        let policy = thread.policy;
-        let entity = match class {
-            QueueMembershipClass::Deadline(key)
-                if matches!(policy, SchedulePolicy::Deadline(_)) =>
-            {
-                let new_key = self
-                    .deadline
-                    .put_prev(key, thread)
-                    .ok_or(TaskError::NotReady)?;
-                self.replace_membership_class(id, QueueMembershipClass::Deadline(new_key));
-                self.deadline
-                    .get(new_key)
-                    .expect("put-prev Deadline entity must remain linked")
-                    .entity
-            }
-            QueueMembershipClass::Realtime(priority)
-                if matches!(
-                    policy,
-                    SchedulePolicy::Fifo { .. } | SchedulePolicy::RoundRobin { .. }
-                ) =>
-            {
-                self.rt
-                    .put_prev(priority, thread, reason)
-                    .ok_or(TaskError::NotReady)?
-            }
-            _ => return Err(TaskError::InvalidConfiguration),
-        };
-        self.linked_current = None;
-        self.len = self.len.saturating_add(1);
+            .policy;
+        let entity = SchedulerClass::for_policy(policy).put_prev_task(self, class, id, reason)?;
         self.fixed_placement_demand = self
             .fixed_placement_demand
             .saturating_add(fixed_placement_demand(policy));
-        let summary = self
-            .queued_thread_including_current(id)
-            .as_ref()
-            .and_then(Self::pushable_summary_for);
-        if let Some(summary) = summary {
-            self.pushable.insert(summary);
-        }
+        self.refresh_class_pushable(id, policy, None);
         Ok(entity)
-    }
-
-    /// Refreshes mutable accounting in a retained current node. The class and
-    /// absolute Deadline key must stay stable during one dispatch interval.
-    pub(crate) fn update_linked_current(
-        &mut self,
-        id: ThreadId,
-        policy: SchedulePolicy,
-        entity: SchedulingEntity,
-    ) -> Result<(), TaskError> {
-        if self.linked_current != Some(id) {
-            return Ok(());
-        }
-        match self.membership_class(id) {
-            Some(QueueMembershipClass::Deadline(key))
-                if matches!(policy, SchedulePolicy::Deadline(_)) =>
-            {
-                self.deadline
-                    .update_linked_entity(key, entity)
-                    .ok_or(TaskError::InvalidConfiguration)?;
-            }
-            Some(QueueMembershipClass::Realtime(priority))
-                if matches!(
-                    policy,
-                    SchedulePolicy::Fifo { .. } | SchedulePolicy::RoundRobin { .. }
-                ) =>
-            {
-                self.rt
-                    .update_linked_entity(priority, id, entity)
-                    .ok_or(TaskError::InvalidConfiguration)?;
-            }
-            _ => return Err(TaskError::InvalidConfiguration),
-        }
-        Ok(())
     }
 
     pub(crate) fn detach_for_transfer(
@@ -1050,133 +1033,64 @@ impl RunQueue {
         current_fair: Option<FairEntity>,
         timing_granularity_ns: u64,
     ) -> Option<QueuedThread> {
-        if self.linked_current == Some(id) {
+        if self.linked_current() == Some(id) {
             return None;
         }
         self.update_fair_virtual_time(current_fair);
         let class = self.membership_class(id)?;
-        let mut thread = match class {
-            QueueMembershipClass::Stop => return None,
-            QueueMembershipClass::Deadline(key) => self.deadline.remove(key)?,
-            QueueMembershipClass::Realtime(priority) => self.rt.remove(priority, id)?,
-            QueueMembershipClass::Fair => self.fair.remove(id)?,
-            QueueMembershipClass::IdleFair => self.idle_fair.remove(id)?,
-        };
-        if let Some(fair) = thread.entity.fair() {
-            thread.entity.capture_fair_migration(
-                self.virtual_time_for_mode(fair.mode()),
-                timing_granularity_ns,
-            );
+        if class == QueueMembershipClass::DeadlineThrottled {
+            // Linux keeps a throttled DL task at
+            // `TASK_ON_RQ_QUEUED`, but it is absent from both the DL rb-tree
+            // and `rq->nr_running`. Migration moves that queued ownership
+            // without applying the ordinary runnable accounting below. The
+            // destination preserves the same throttled membership until its
+            // hard CBS timer replenishes it.
+            let thread = self.deadline.take_throttled(id)?;
+            self.unregister_membership(id);
+            return Some(thread);
         }
-        self.len -= 1;
+        let thread = SchedulerClass::for_policy(self.queued_thread_including_current(id)?.policy())
+            .migrate_task_rq(self, class, id, timing_granularity_ns)?;
+        self.nr_running = self
+            .nr_running
+            .checked_sub(1)
+            .expect("migration must detach one runnable entity");
         self.fixed_placement_demand = self
             .fixed_placement_demand
-            .saturating_sub(fixed_placement_demand(thread.policy));
+            .saturating_sub(fixed_placement_demand(thread.active.policy()));
         self.unregister_membership(thread.id);
-        self.pushable.remove(thread.id);
+        self.refresh_class_pushable(thread.id, thread.active.policy(), self.linked_current());
         self.update_fair_virtual_time(current_fair);
         Some(thread)
     }
 
-    /// Detaches one queued entity for an owner-local policy transaction.
-    ///
-    /// Unlike migration, this preserves Fair lag in its local representation.
-    /// Every recoverable policy preparation completes before this commit.
-    pub(crate) fn detach_for_policy_update(&mut self, id: ThreadId) -> Option<QueuedThread> {
-        if self.linked_current == Some(id) {
-            return None;
-        }
-        let class = self.membership_class(id)?;
-        let thread = match class {
-            QueueMembershipClass::Stop => return None,
-            QueueMembershipClass::Deadline(key) => self.deadline.remove(key)?,
-            QueueMembershipClass::Realtime(priority) => self.rt.remove(priority, id)?,
-            QueueMembershipClass::Fair => self.fair.remove(id)?,
-            QueueMembershipClass::IdleFair => self.idle_fair.remove(id)?,
-        };
-        self.len -= 1;
+    pub(crate) fn pick_next_task(&mut self, rt_eligibility: RtEligibility) -> Option<PickedThread> {
+        SchedulerClass::PICK_ORDER
+            .into_iter()
+            .find_map(|class| class.pick_task(self, rt_eligibility))
+    }
+
+    /// Linux `set_next_task()`: commits one class pick as current.
+    pub(crate) fn set_next_task(&mut self, picked: &PickedThread) {
         self.fixed_placement_demand = self
             .fixed_placement_demand
-            .saturating_sub(fixed_placement_demand(thread.policy));
-        self.unregister_membership(thread.id);
-        self.pushable.remove(thread.id);
-        Some(thread)
+            .saturating_sub(fixed_placement_demand(picked.policy()));
+        SchedulerClass::for_policy(picked.policy()).set_next_task(self, picked);
+        self.refresh_class_pushable(picked.id(), picked.policy(), Some(picked.id()));
     }
 
-    pub(crate) fn pick_next(&mut self, rt_eligibility: RtEligibility) -> Option<QueuedThread> {
-        let picked = self
-            .pick_stop()
-            .or_else(|| self.pick_deadline())
-            .or_else(|| self.pick_rt(rt_eligibility))
-            .or_else(|| self.pick_fair(false))
-            .or_else(|| self.pick_fair(true));
-        if let Some(picked_entry) = &picked {
-            self.len -= 1;
-            self.fixed_placement_demand = self
-                .fixed_placement_demand
-                .saturating_sub(fixed_placement_demand(picked_entry.policy));
-            if retains_running_link(picked_entry.policy) {
-                assert!(
-                    self.linked_current.replace(picked_entry.id).is_none(),
-                    "put-prev must finish before selecting another linked current"
-                );
-            } else {
-                self.unregister_membership(picked_entry.id);
-            }
-            self.pushable.remove(picked_entry.id);
-        }
-        picked
-    }
-
-    fn pick_deadline(&mut self) -> Option<QueuedThread> {
-        self.deadline.select_first()
-    }
-
-    fn pick_stop(&mut self) -> Option<QueuedThread> {
-        self.stop.take()
-    }
-
-    fn pick_rt(&mut self, eligibility: RtEligibility) -> Option<QueuedThread> {
-        self.rt
-            .select(matches!(eligibility, RtEligibility::Ordinary))
-    }
-
-    fn pick_fair(&mut self, idle: bool) -> Option<QueuedThread> {
-        self.update_fair_virtual_time(None);
-        let queue = if idle {
-            &mut self.idle_fair
-        } else {
-            &mut self.fair
-        };
-        let virtual_time = queue.virtual_time();
-        if queue.is_empty() {
-            return None;
-        }
-        queue.pick_eligible(virtual_time)
-    }
-
-    fn pushable_summary_for(thread: &QueuedThread) -> Option<PushableSummary> {
-        (thread.migration_capable
-            && !matches!(
-                thread.policy,
-                SchedulePolicy::KernelStop
-                    | SchedulePolicy::Fair {
-                        mode: FairMode::Idle,
-                        ..
-                    }
-            ))
-        .then(|| PushableSummary {
-            thread: thread.id,
-            key: thread.balance_key(),
-            fair: thread.entity.fair().is_some(),
-        })
-    }
-
-    fn queued_thread_including_current(&self, id: ThreadId) -> Option<QueuedThread> {
+    fn queued_thread_including_current(&self, id: ThreadId) -> Option<QueuedThreadSnapshot> {
         match self.membership_class(id)? {
-            QueueMembershipClass::Stop => self.stop.clone(),
-            QueueMembershipClass::Deadline(key) => self.deadline.get(key).cloned(),
-            QueueMembershipClass::Realtime(priority) => self.rt.get(priority, id).cloned(),
+            QueueMembershipClass::Stop => self.stop.as_ref().map(QueuedThreadSnapshot::from),
+            QueueMembershipClass::Deadline(key) => {
+                self.deadline.get(key).map(QueuedThreadSnapshot::from)
+            }
+            QueueMembershipClass::DeadlineThrottled => {
+                self.deadline.throttled(id).map(QueuedThreadSnapshot::from)
+            }
+            QueueMembershipClass::Realtime(priority) => {
+                self.rt.get(priority, id).map(QueuedThreadSnapshot::from)
+            }
             QueueMembershipClass::Fair => {
                 self.fair.find_first_matching(&mut |thread| thread.id == id)
             }
@@ -1262,8 +1176,44 @@ const fn retains_running_link(policy: SchedulePolicy) -> bool {
 mod tests {
     use super::*;
     use crate::{
-        CurrentSchedule, DeadlineFlags, DeadlinePolicy, FairEntity, FairMode, Nice, RtPriority,
+        CurrentClassState, CurrentDispatch, CurrentDispatchState, CurrentSchedule, DeadlineFlags,
+        DeadlinePolicy, FairEntity, FairMode, Nice, RqTaskTime, RtPriority,
     };
+
+    fn pick_next(queue: &mut RunQueue, eligibility: RtEligibility) -> PickedThread {
+        let picked = queue.pick_next_task(eligibility).unwrap();
+        queue.set_next_task(&picked);
+        picked
+    }
+
+    fn pick_linked_current(queue: &mut RunQueue) -> ThreadId {
+        let picked = queue.pick_next_task(RtEligibility::Runnable).unwrap();
+        assert!(
+            matches!(picked, PickedThread::Linked(_)),
+            "only RT and Deadline retain their running entity in the class structure"
+        );
+        queue.set_next_task(&picked);
+        let metadata = picked.metadata().clone();
+        let core = Arc::clone(picked.core());
+        let thread = picked.id();
+        let dispatch = CurrentDispatch::new(
+            CurrentDispatchState {
+                thread,
+                schedule: CurrentClassState::Linked {
+                    policy: picked.policy(),
+                },
+                deadline_donor: metadata.deadline_donor,
+                rt_quota_exempt: picked.rt_quota_exempt(),
+                deadline_bandwidth_scaled: metadata.deadline_bandwidth_scaled,
+                policy_generation: metadata.policy_generation,
+                runtime_binding: metadata.runtime_binding,
+            },
+            &core,
+            RqTaskTime::test(0),
+        );
+        queue.install_current(dispatch);
+        thread
+    }
 
     #[test]
     fn fair_wakeup_preemption_requires_the_wakee_to_be_the_eevdf_pick() {
@@ -1295,11 +1245,7 @@ mod tests {
         assert!(current_entity.charge(1, 0));
         queue.update_fair_virtual_time(Some(current_entity));
         let virtual_time = queue.virtual_time_for_mode(FairMode::Normal);
-        let current = CurrentSchedule::test_state(
-            ThreadId::from_parts(0, 1),
-            policy,
-            SchedulingEntity::Fair(current_entity),
-        );
+        let current = CurrentSchedule::test_state(policy, SchedulingEntity::Fair(current_entity));
 
         assert!(queue.fair_wakee_is_selected(contender, FairMode::Normal, virtual_time));
         assert!(!queue.fair_wakee_is_selected(wakee, FairMode::Normal, virtual_time));
@@ -1350,7 +1296,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            queue.pick_next(RtEligibility::Ordinary).unwrap().id,
+            pick_next(&mut queue, RtEligibility::Runnable).id(),
             ThreadId::from_parts(2, 1)
         );
     }
@@ -1375,7 +1321,7 @@ mod tests {
         }
 
         assert_eq!(
-            queue.pick_next(RtEligibility::Ordinary).unwrap().id,
+            pick_next(&mut queue, RtEligibility::Runnable).id(),
             earlier_id
         );
     }
@@ -1408,7 +1354,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            queue.pick_next(RtEligibility::PiOwnerOnly).unwrap().id,
+            pick_next(&mut queue, RtEligibility::Throttled).id(),
             ThreadId::from_parts(1, 1),
             "stopper work must bypass ordinary RT bandwidth throttling"
         );
@@ -1443,12 +1389,11 @@ mod tests {
         ] {
             let mut entity = SchedulingEntity::new(policy, 1, 0);
             entity.activate_deadline(0);
-            let current = CurrentSchedule::test_state(ThreadId::from_parts(0, 1), policy, entity);
-            assert!(current.should_preempt(stopper, stopper_entity, 0));
+            let current = CurrentSchedule::test_state(policy, entity);
+            assert!(current.should_preempt(stopper, stopper_entity.clone(), 0));
         }
 
-        let current =
-            CurrentSchedule::test_state(ThreadId::from_parts(0, 1), stopper, stopper_entity);
+        let current = CurrentSchedule::test_state(stopper, stopper_entity);
         assert!(!current.should_preempt(
             SchedulePolicy::default(),
             SchedulingEntity::new(SchedulePolicy::default(), 1, 0),
@@ -1481,7 +1426,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            queue.pick_next(RtEligibility::Ordinary).unwrap().id,
+            pick_next(&mut queue, RtEligibility::Runnable).id(),
             ThreadId::from_parts(0, 1)
         );
     }
@@ -1503,7 +1448,7 @@ mod tests {
             )
             .unwrap();
 
-        let entity = queue.dequeue(thread).unwrap().entity.fair().unwrap();
+        let entity = queue.dequeue(thread).unwrap().entity().fair().unwrap();
         assert_eq!(entity.vruntime(), 10_000);
         assert_eq!(entity.virtual_deadline(), 10_500);
     }
@@ -1530,7 +1475,7 @@ mod tests {
             )
             .unwrap();
 
-        let entity = queue.dequeue(thread).unwrap().entity.fair().unwrap();
+        let entity = queue.dequeue(thread).unwrap().entity().fair().unwrap();
         assert_eq!(
             (entity.vruntime(), entity.virtual_deadline()),
             (900, 950),
@@ -1593,13 +1538,13 @@ mod tests {
             )
             .unwrap();
         destination
-            .enqueue(detached, EnqueueReason::Migrated, None)
+            .enqueue_task(detached, EnqueueReason::Migrated, None)
             .unwrap();
 
         let entity = destination
             .dequeue(migrating)
             .unwrap()
-            .entity
+            .entity()
             .fair()
             .unwrap();
         assert_eq!(
@@ -1636,7 +1581,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            queue.pick_next(RtEligibility::Ordinary).unwrap().id,
+            pick_next(&mut queue, RtEligibility::Runnable).id(),
             waiting,
             "yield must forfeit the active request so positive-lag peers become eligible",
         );
@@ -1667,7 +1612,7 @@ mod tests {
         }
 
         assert_eq!(
-            queue.pick_next(RtEligibility::Ordinary).unwrap().id,
+            pick_next(&mut queue, RtEligibility::Runnable).id(),
             ThreadId::from_parts(1, 1),
             "weighted V must make both vruntime 0 and 4 eligible, then choose vd=8",
         );
@@ -1702,7 +1647,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            queue.pick_next(RtEligibility::Ordinary).unwrap().id,
+            pick_next(&mut queue, RtEligibility::Runnable).id(),
             earlier,
             "EEVDF must order wrapped virtual deadlines by signed distance",
         );
@@ -1764,10 +1709,15 @@ mod tests {
                 .unwrap();
         }
 
+        assert!(queue.has_pushable_fair());
+        let epoch = queue.begin_balance_scan();
         assert_eq!(
-            queue.pushable_key().unwrap().primary(),
-            u64::MAX - 1,
-            "published fair summaries must name the owner runqueue's modular minimum",
+            queue
+                .next_balance_candidate(epoch, |_| true)
+                .expect("one Fair candidate must be movable")
+                .id,
+            ThreadId::from_parts(1, 1),
+            "the Fair class must retain the owner runqueue's modular EEVDF order",
         );
     }
 
@@ -1785,13 +1735,14 @@ mod tests {
             .enqueue_test(thread, policy, entity, 4, EnqueueReason::Preempted)
             .unwrap();
 
-        let deadline = queue.dequeue(thread).unwrap().entity.deadline().unwrap();
+        let entity = queue.dequeue(thread).unwrap().entity();
+        let deadline = entity.deadline().unwrap();
         assert_eq!(deadline.absolute_deadline_ns(), Some(8));
         assert_eq!(deadline.remaining_runtime_ns(), 3);
     }
 
     #[test]
-    fn pushable_summary_tracks_the_top_non_idle_thread() {
+    fn pushable_membership_tracks_each_non_idle_scheduler_class() {
         let mut queue = RunQueue::new();
         let idle = SchedulePolicy::fair(Nice::ZERO, FairMode::Idle);
         let fair = SchedulePolicy::fair(Nice::ZERO, FairMode::Normal);
@@ -1812,7 +1763,9 @@ mod tests {
                 EnqueueReason::Wake,
             )
             .unwrap();
-        assert_eq!(queue.pushable_key(), None);
+        assert!(!queue.has_pushable_deadline());
+        assert!(!queue.has_pushable_realtime());
+        assert!(!queue.has_pushable_fair());
         for (id, policy) in [(fair_id, fair), (rt_id, rt), (deadline_id, deadline)] {
             let mut entity = SchedulingEntity::new(policy, 1, 0);
             if matches!(policy, SchedulePolicy::Deadline(_)) {
@@ -1822,14 +1775,18 @@ mod tests {
                 .enqueue_test(id, policy, entity, 0, EnqueueReason::Wake)
                 .unwrap();
         }
-        assert_eq!(queue.pushable_key().unwrap().class_rank(), 1);
+        assert!(queue.has_pushable_deadline());
+        assert!(queue.has_pushable_realtime());
+        assert!(queue.has_pushable_fair());
 
         queue.dequeue(deadline_id).unwrap();
-        assert_eq!(queue.pushable_key().unwrap().class_rank(), 2);
-        assert_eq!(queue.pick_next(RtEligibility::Ordinary).unwrap().id, rt_id);
-        assert_eq!(queue.pushable_key().unwrap().class_rank(), 3);
+        assert!(!queue.has_pushable_deadline());
+        assert!(queue.has_pushable_realtime());
+        assert_eq!(pick_next(&mut queue, RtEligibility::Runnable).id(), rt_id);
+        assert!(!queue.has_pushable_realtime());
+        assert!(queue.has_pushable_fair());
         queue.dequeue(fair_id).unwrap();
-        assert_eq!(queue.pushable_key(), None);
+        assert!(!queue.has_pushable_fair());
         assert_eq!(queue.dequeue(idle_id).unwrap().id, idle_id);
     }
 
@@ -1860,7 +1817,7 @@ mod tests {
         queue.fair.assert_invariants();
         while queue.has_fair() {
             reset_fair_runqueue_visits();
-            queue.pick_next(RtEligibility::Ordinary).unwrap();
+            pick_next(&mut queue, RtEligibility::Runnable);
             assert!(
                 fair_runqueue_visits() <= 32,
                 "EEVDF selection must remain logarithmic, observed {} visits",
@@ -1975,7 +1932,7 @@ mod tests {
         assert_eq!(queue.highest_rt_priority(), Some(99));
         assert_eq!(queue.dequeue(high_id).unwrap().id, high_id);
         assert_eq!(queue.highest_rt_priority(), Some(1));
-        assert_eq!(queue.pick_next(RtEligibility::Ordinary).unwrap().id, low_id);
+        assert_eq!(pick_next(&mut queue, RtEligibility::Runnable).id(), low_id);
         assert!(
             queue.has_rt(),
             "selected RT current remains represented in the active bitmap"
@@ -1999,16 +1956,13 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(
-            queue.pick_next(RtEligibility::Ordinary).unwrap().id,
-            running
-        );
+        assert_eq!(pick_linked_current(&mut queue), running);
         assert!(
             queue.contains(running),
             "Linux RT keeps current in the active priority array"
         );
         assert_eq!(queue.len(), 0, "current is not a queued balance candidate");
-        assert_eq!(queue.pushable_key(), None);
+        assert!(!queue.has_pushable_realtime());
     }
 
     #[test]
@@ -2023,20 +1977,17 @@ mod tests {
             .enqueue_test(running, policy, entity, 0, EnqueueReason::Wake)
             .unwrap();
 
-        assert_eq!(
-            queue.pick_next(RtEligibility::Ordinary).unwrap().id,
-            running
-        );
+        assert_eq!(pick_linked_current(&mut queue), running);
         assert!(
             queue.contains(running),
             "Linux Deadline keeps current in the active EDF tree"
         );
         assert_eq!(queue.len(), 0, "current is not a queued balance candidate");
-        assert_eq!(queue.pushable_key(), None);
+        assert!(!queue.has_pushable_deadline());
     }
 
     #[test]
-    fn throttled_rt_rq_selects_only_the_highest_pi_owner() {
+    fn rt_class_throttle_is_all_or_nothing() {
         let mut queue = RunQueue::new();
         let ordinary = ThreadId::from_parts(0, 1);
         let lower_pi_owner = ThreadId::from_parts(1, 1);
@@ -2063,15 +2014,14 @@ mod tests {
             )
             .unwrap();
 
-        let selected_pi_owner = queue.pick_next(RtEligibility::PiOwnerOnly).unwrap();
-        assert_eq!(selected_pi_owner.id, higher_pi_owner);
-        queue
-            .put_prev_linked(selected_pi_owner, EnqueueReason::Preempted)
-            .unwrap();
+        assert!(
+            queue.pick_next_task(RtEligibility::Throttled).is_none(),
+            "Linux skips a throttled RT class only when no boosted entity keeps the rq runnable"
+        );
         assert_eq!(
-            queue.pick_next(RtEligibility::Ordinary).unwrap().id,
+            pick_next(&mut queue, RtEligibility::Runnable).id(),
             ordinary,
-            "restoring RT bandwidth must reveal the highest ordinary priority"
+            "one boosted entity makes the whole RT rq runnable at normal priority order"
         );
     }
 
@@ -2095,7 +2045,7 @@ mod tests {
         }
 
         reset_deadline_runqueue_visits();
-        queue.pick_next(RtEligibility::Ordinary).unwrap();
+        pick_next(&mut queue, RtEligibility::Runnable);
         queue.deadline.assert_invariants();
         assert!(
             deadline_runqueue_visits() <= 32,

@@ -8,7 +8,7 @@ use super::*;
 /// this exact candidate once, but a caller cannot accidentally scan the source
 /// runqueue again after choosing a destination.
 pub(super) struct OwnerBalanceSelection {
-    candidate: QueuedThread,
+    candidate: QueuedThreadSnapshot,
     target: CpuId,
     reason: BalanceReason,
 }
@@ -99,26 +99,21 @@ impl TaskSystem {
 
     /// Returns the number of CPUs currently available for placement.
     pub fn online_cpu_count(&self) -> usize {
-        loop {
-            let sequence = self.topology_sequence.read_begin();
-            let count = self.online_count.load(Ordering::Acquire);
-            if !self.topology_sequence.read_retry(sequence) {
-                return count;
-            }
-        }
+        self.root_domain.lock().online.count()
     }
 
-    pub(super) fn publish_owner_cpu_load_summary(&self, cpu: Pin<&mut CpuLocal>) {
-        #[cfg(test)]
-        LOAD_SUMMARY_PUBLICATIONS.set(LOAD_SUMMARY_PUBLICATIONS.get().saturating_add(1));
-        // Every caller already owns either the scheduler baton or an owner IRQ
-        // guard. Like Linux's rq clock/load update under rq ownership, this
-        // nested publication needs no second IRQ-state transaction.
-        let run_queue = cpu.lock_run_queue();
-        self.publish_run_queue_summary(cpu.remote(), &run_queue);
+    /// Samples one rq clock through the same explicit transaction used by
+    /// scheduling state changes. Timer and owner-work callers that need only a
+    /// timestamp therefore cannot mutate `rq->clock` outside the rq commit
+    /// protocol.
+    pub(crate) fn sample_owner_rq_clock(&self, cpu: &CpuLocal) -> RunQueueClockSnapshot {
+        let transaction = OwnerRqTxn::begin(self, cpu.remote());
+        let clock = transaction.clock();
+        transaction.commit();
+        clock
     }
 
-    pub(super) fn publish_run_queue_summary(
+    pub(crate) fn publish_run_queue_summary(
         &self,
         remote: &CpuRemote,
         run_queue: &CpuRunQueueState,
@@ -136,7 +131,7 @@ impl TaskSystem {
         // A concurrent hotplug can only make this observation conservative;
         // the owner-side balance pass revalidates the topology before moving a
         // thread.
-        self.online_count.load(Ordering::Acquire) > 1
+        self.root_domain.has_multiple_online_priority_cpus()
             && self
                 .root_domain
                 .cpu_has_rt_deadline_overload(remote.owner())
@@ -162,57 +157,90 @@ impl TaskSystem {
         {
             return;
         }
-        self.root_domain.request_rt_deadline_push(owner);
+        let class = match previous.class_rank() {
+            DEADLINE_CLASS_RANK => RootDomainPushClass::Deadline,
+            REALTIME_CLASS_RANK => RootDomainPushClass::Realtime,
+            _ => return,
+        };
+        self.root_domain.request_rt_deadline_push(class, owner);
     }
 
     fn select_owner_balance_transfer_by(
         &self,
         cpu: &CpuLocal,
         reason: BalanceReason,
-        mut select_target: impl FnMut(&QueuedThread, &ThreadSchedState) -> Option<CpuId>,
+        class_filter: Option<SchedulingClass>,
+        mut select_target: impl FnMut(&QueuedThreadSnapshot, &ThreadSchedState) -> Option<CpuId>,
     ) -> Option<OwnerBalanceSelection> {
         let source = cpu.owner();
-        let state = cpu.dispatch_state();
-        let current_policy = state
-            .current_dispatch
-            .as_ref()
-            .map(CurrentDispatch::schedule_policy);
-        let scan_epoch = cpu.lock_run_queue().begin_balance_scan();
+        let (current_policy, scan_epoch) = {
+            let mut transaction = OwnerRqTxn::begin(self, cpu.remote());
+            let current_policy = transaction.current().map(CurrentDispatch::schedule_policy);
+            let scan_epoch = transaction.begin_balance_scan();
+            transaction.commit();
+            (current_policy, scan_epoch)
+        };
         loop {
             let candidate = {
-                let mut run_queue = cpu.lock_run_queue();
-                let queued_top_rt = run_queue.highest_rt_priority();
+                let mut transaction = OwnerRqTxn::begin(self, cpu.remote());
+                let queued_top_rt = transaction.highest_rt_priority();
                 let top_rt_count =
-                    queued_top_rt.map_or(0, |priority| run_queue.rt_count_at_priority(priority));
-                run_queue.next_balance_candidate(scan_epoch, |candidate| {
+                    queued_top_rt.map_or(0, |priority| transaction.rt_count_at_priority(priority));
+                let candidate = transaction.next_balance_candidate(scan_epoch, |candidate| {
                     #[cfg(test)]
                     BALANCE_CANDIDATE_VISITS.set(BALANCE_CANDIDATE_VISITS.get().saturating_add(1));
                     let class_allowed = match reason {
                         BalanceReason::IdlePull => !matches!(
-                            candidate.policy,
+                            candidate.policy(),
                             SchedulePolicy::Fair {
                                 mode: FairMode::Idle,
                                 ..
                             }
                         ),
                         BalanceReason::RtDeadlinePush => matches!(
-                            candidate.policy,
+                            candidate.policy(),
                             SchedulePolicy::Deadline(_)
                                 | SchedulePolicy::Fifo { .. }
                                 | SchedulePolicy::RoundRobin { .. }
                         ),
                         BalanceReason::FairPeriodic => matches!(
-                            candidate.policy,
+                            candidate.policy(),
                             SchedulePolicy::Fair {
                                 mode: FairMode::Normal | FairMode::Batch,
                                 ..
                             }
                         ),
                     };
-                    if !class_allowed {
+                    let matches_filter = class_filter.is_none_or(|class| match class {
+                        SchedulingClass::Deadline => {
+                            matches!(candidate.policy(), SchedulePolicy::Deadline(_))
+                        }
+                        SchedulingClass::Realtime => matches!(
+                            candidate.policy(),
+                            SchedulePolicy::Fifo { .. } | SchedulePolicy::RoundRobin { .. }
+                        ),
+                        SchedulingClass::Fair => matches!(
+                            candidate.policy(),
+                            SchedulePolicy::Fair {
+                                mode: FairMode::Normal | FairMode::Batch,
+                                ..
+                            }
+                        ),
+                        SchedulingClass::Idle => matches!(
+                            candidate.policy(),
+                            SchedulePolicy::Fair {
+                                mode: FairMode::Idle,
+                                ..
+                            }
+                        ),
+                        SchedulingClass::Stop => {
+                            matches!(candidate.policy(), SchedulePolicy::KernelStop)
+                        }
+                    });
+                    if !class_allowed || !matches_filter {
                         return false;
                     }
-                    let candidate_priority = match candidate.policy {
+                    let candidate_priority = match candidate.policy() {
                         SchedulePolicy::Fifo { priority }
                         | SchedulePolicy::RoundRobin { priority, .. } => priority.get(),
                         _ => return true,
@@ -228,7 +256,9 @@ impl TaskSystem {
                                 || (candidate_priority == top && top_rt_count > 1)
                         }),
                     }
-                })
+                });
+                transaction.commit();
+                candidate
             }?;
             let sched = candidate.core.sched().lock();
             let Some(target) = select_target(&candidate, &sched) else {
@@ -240,15 +270,14 @@ impl TaskSystem {
                     .is_some_and(|remote| {
                         remote.accepts_placement()
                             && remote.is_scheduler_ready()
-                            && sched.placement.affinity.contains(target)
+                            && sched.affinity.affinity.contains(target)
                     })
             };
-            let deadline_covers_online =
-                !matches!(sched.policy.applied, SchedulePolicy::Deadline(_))
-                    || self.cpu_remotes.iter().enumerate().all(|(index, remote)| {
-                        !remote.accepts_placement()
-                            || sched.placement.affinity.contains(CpuId::new(index as u32))
-                    });
+            let deadline_covers_online = !matches!(sched.policy.base, SchedulePolicy::Deadline(_))
+                || self.cpu_remotes.iter().enumerate().all(|(index, remote)| {
+                    !remote.accepts_placement()
+                        || sched.affinity.affinity.contains(CpuId::new(index as u32))
+                });
             if target == source
                 || !target_is_allowed(target)
                 || sched.placement.queued_cpu() != Some(source)
@@ -259,7 +288,12 @@ impl TaskSystem {
             {
                 continue;
             }
-            let queued = cpu.lock_run_queue().queued_thread(candidate.id);
+            let queued = {
+                let transaction = OwnerRqTxn::begin(self, cpu.remote());
+                let queued = transaction.queued_thread(candidate.id);
+                transaction.commit();
+                queued
+            };
             if let Some(queued) = queued {
                 return Some(OwnerBalanceSelection {
                     candidate: queued,
@@ -275,46 +309,28 @@ impl TaskSystem {
         cpu: &CpuLocal,
         target: CpuId,
         reason: BalanceReason,
+        class_filter: Option<SchedulingClass>,
     ) -> Option<OwnerBalanceSelection> {
-        self.select_owner_balance_transfer_by(cpu, reason, |_, _| Some(target))
+        self.select_owner_balance_transfer_by(cpu, reason, class_filter, |_, _| Some(target))
     }
 
     pub(super) fn select_rt_deadline_balance_transfer(
         &self,
         cpu: &CpuLocal,
-        source_load: usize,
+        class: Option<SchedulingClass>,
     ) -> Option<OwnerBalanceSelection> {
         let source = cpu.owner();
         self.select_owner_balance_transfer_by(
             cpu,
             BalanceReason::RtDeadlinePush,
+            class,
             |candidate, sched| {
-                let key = candidate.balance_key();
-                self.cpu_remotes
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, remote)| {
-                        let target = CpuId::new(index as u32);
-                        if target == source
-                            || !remote.accepts_placement()
-                            || !remote.is_scheduler_ready()
-                            || !sched.placement.affinity.contains(target)
-                        {
-                            return None;
-                        }
-                        let target_summary = remote.try_load_summary()?;
-                        if target_summary.runnable_count() >= source_load
-                            || target_summary.current_key().is_some_and(|current| {
-                                current <= key
-                                    && current.class_rank() != SchedulingClass::Idle as u8
-                            })
-                        {
-                            return None;
-                        }
-                        Some((target_summary.runnable_count(), target))
-                    })
-                    .min_by_key(|(load, target)| (*load, target.as_u32()))
-                    .map(|(_, target)| target)
+                self.select_rt_deadline_push_cpu(
+                    candidate.policy,
+                    candidate.entity.clone(),
+                    &sched.affinity.affinity,
+                    source,
+                )
             },
         )
     }
@@ -341,19 +357,19 @@ impl TaskSystem {
         if source == target {
             return Ok(BalanceTransferOutcome::NoCandidate);
         }
-        let migrated_fair = matches!(candidate.policy, SchedulePolicy::Fair { .. });
+        let migrated_fair = matches!(candidate.policy(), SchedulePolicy::Fair { .. });
         let core = candidate.core;
         let mut sched = core.sched().lock();
-        let deadline_covers_online = !matches!(sched.policy.applied, SchedulePolicy::Deadline(_))
+        let deadline_covers_online = !matches!(sched.policy.base, SchedulePolicy::Deadline(_))
             || self.cpu_remotes.iter().enumerate().all(|(index, remote)| {
                 !remote.accepts_placement()
-                    || sched.placement.affinity.contains(CpuId::new(index as u32))
+                    || sched.affinity.affinity.contains(CpuId::new(index as u32))
             });
         if sched.lifecycle.state() != ThreadState::Ready
             || sched.placement.queued_cpu() != Some(source)
             || sched.placement.has_pending_migration()
             || sched.placement.on_cpu().is_some()
-            || !sched.placement.affinity.contains(target)
+            || !sched.affinity.affinity.contains(target)
             || core.sleep_timer_cpu().is_some()
             || !deadline_covers_online
         {
@@ -376,34 +392,35 @@ impl TaskSystem {
         };
         #[cfg(test)]
         drop(publication_exit);
+        let remote = Arc::clone(cpu.remote());
+        let mut transaction = OwnerRqTxn::begin(self, &remote);
         let detached = {
-            let current_fair = cpu
-                .dispatch_state()
-                .current_dispatch
-                .as_ref()
-                .and_then(|current| current.entity.fair());
-            let Some(detached) = cpu.lock_run_queue().detach_for_transfer(
+            let current_fair = transaction
+                .current_scheduling_entity()
+                .and_then(|entity| entity.fair());
+            let Some(detached) = transaction.detach_for_transfer(
                 core.id(),
                 current_fair,
                 self.config.timing_granularity_ns(),
             ) else {
+                transaction.commit();
                 return Ok(BalanceTransferOutcome::Retry);
             };
             detached
         };
-        let queued_entity = detached.entity;
-        Self::detach_owner_deadline_bandwidth_locked(&core, &mut sched, cpu.as_mut());
-        sched.policy.effective_entity = queued_entity;
-        if !sched.is_pi_boosted() {
-            sched.policy.base_entity = queued_entity;
-        }
-        self.capture_owner_fair_migration(cpu.as_ref().get_ref(), &mut sched);
+        Self::detach_owner_deadline_bandwidth_in_rq(
+            &core,
+            &mut sched,
+            cpu.remote(),
+            &mut transaction,
+        );
+        sched.policy.install_active(detached.into_active());
+        self.capture_owner_fair_migration_in_rq(&transaction, &mut sched);
         sched.placement.begin_migration(source, target);
         core.set_wake_cpu_hint(target);
+        transaction.commit();
         drop(sched);
-        drop(detached);
         carrier.commit();
-        self.publish_owner_cpu_load_summary(cpu.as_mut());
         if migrated_fair && reason != BalanceReason::FairPeriodic {
             cpu.as_mut().reset_fair_balance(
                 task_runtime::monotonic_now(),
@@ -418,11 +435,15 @@ impl TaskSystem {
         cpu: Pin<&mut CpuLocal>,
         target: CpuId,
         reason: BalanceReason,
+        class_filter: Option<SchedulingClass>,
     ) -> Result<BalanceTransferOutcome, TaskError> {
         self.ensure_owner_cpu_online(&cpu)?;
-        let Some(selection) =
-            self.select_owner_balance_transfer(cpu.as_ref().get_ref(), target, reason)
-        else {
+        let Some(selection) = self.select_owner_balance_transfer(
+            cpu.as_ref().get_ref(),
+            target,
+            reason,
+            class_filter,
+        ) else {
             return Ok(BalanceTransferOutcome::NoCandidate);
         };
         self.commit_owner_balance_transfer(cpu, selection)
@@ -455,11 +476,14 @@ impl TaskSystem {
         let push_claim = self.root_domain.claim_rt_deadline_push(cpu.owner());
         let balance = (|| -> Result<Option<ThreadId>, TaskError> {
             if cpu.idle() == Some(next) {
-                let _requested = self.request_idle_pull(cpu.as_ref())?;
+                let _requested = self.request_idle_pull(cpu.as_mut())?;
                 let _fair = self.balance_fair(cpu.as_mut())?;
                 Ok(None)
             } else {
-                let pushed = self.push_overloaded_from_published_summary(cpu.as_mut())?;
+                let class = push_claim
+                    .as_ref()
+                    .map(|claim| claim.class().scheduling_class());
+                let pushed = self.push_rt_deadline_from_root_domain(cpu.as_mut(), class)?;
                 let _fair = self.balance_fair(cpu.as_mut())?;
                 Ok(pushed)
             }
@@ -494,21 +518,20 @@ impl TaskSystem {
             return Ok(None);
         }
         self.ensure_owner_cpu_online(&cpu)?;
-        self.publish_owner_cpu_load_summary(cpu.as_mut());
         let source = cpu.owner();
-        let result = if let Some(source_demand) = cpu.remote().try_placement_demand() {
+        let source_demand = cpu.remote().placement_demand();
+        let result = {
             let lower_load_target_seen =
                 self.cpu_remotes.iter().enumerate().any(|(index, remote)| {
                     let target = CpuId::new(index as u32);
                     remote.accepts_placement()
                         && target != source
-                        && remote
-                            .try_placement_demand()
-                            .is_some_and(|demand| demand < source_demand)
+                        && remote.placement_demand() < source_demand
                 });
             let selection = self.select_owner_balance_transfer_by(
                 cpu.as_ref().get_ref(),
                 BalanceReason::FairPeriodic,
+                None,
                 |candidate, sched| {
                     let candidate_demand = candidate.placement_demand();
                     self.cpu_remotes
@@ -519,11 +542,11 @@ impl TaskSystem {
                             if target == source
                                 || !remote.accepts_placement()
                                 || !remote.is_scheduler_ready()
-                                || !sched.placement.affinity.contains(target)
+                                || !sched.affinity.affinity.contains(target)
                             {
                                 return None;
                             }
-                            let target_demand = remote.try_placement_demand()?;
+                            let target_demand = remote.placement_demand();
                             fair_migration_imbalance(source_demand, target_demand, candidate_demand)
                                 .map(|imbalance| (imbalance, target_demand, target))
                         })
@@ -545,8 +568,6 @@ impl TaskSystem {
             } else {
                 FairBalanceResult::Balanced
             }
-        } else {
-            FairBalanceResult::Balanced
         };
         // Linux records a completed balance pass from the clock observed at
         // the end of the pass (`sd->last_balance = jiffies`). Do not reuse the
@@ -597,6 +618,10 @@ mod tests {
                 )
                 .unwrap();
             system.bring_cpu_online(cpu.as_mut()).unwrap();
+            let idle = cpu
+                .idle()
+                .expect("registered CPU must retain its idle task");
+            assert_eq!(system.schedule(cpu.as_mut()).unwrap().next(), idle);
         }
         (system, cpu0, cpu1)
     }
@@ -615,6 +640,7 @@ mod tests {
                 cpu0.as_ref().get_ref(),
                 CpuId::new(1),
                 BalanceReason::FairPeriodic,
+                Some(SchedulingClass::Fair),
             )
             .expect("the initial affinity permits a CPU 1 transfer");
         let mut cpu0_only = CpuSet::empty(2);
@@ -647,6 +673,7 @@ mod tests {
                 cpu0.as_mut(),
                 CpuId::new(1),
                 BalanceReason::RtDeadlinePush,
+                Some(SchedulingClass::Realtime),
             ),
             Ok(BalanceTransferOutcome::Retry)
         );

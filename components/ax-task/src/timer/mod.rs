@@ -10,7 +10,7 @@ pub use node::{
 
 use self::{
     heap::{TimerEntry, TimerHeap},
-    node::{TASK_DEADLINE_CLASS_COUNT, TaskDeadlineNodeId},
+    node::{TASK_DEADLINE_CLASS_COUNT, TaskDeadlineClass, TaskDeadlineNodeId},
 };
 use crate::runtime::{MonotonicDeadline, MonotonicInstant};
 
@@ -79,9 +79,8 @@ impl TaskDeadlineExpireBatch {
 /// and expiring never grow or shrink the allocation.
 #[derive(Debug)]
 pub struct TaskDeadlineQueue {
-    heap: TimerHeap,
+    heaps: [TimerHeap; TASK_DEADLINE_CLASS_COUNT],
     capacity_per_class: usize,
-    class_counts: [usize; TASK_DEADLINE_CLASS_COUNT],
 }
 
 /// Reversible removal of one task-deadline queue entry.
@@ -118,14 +117,18 @@ impl TaskDeadlineCancelTxn {
 impl TaskDeadlineQueue {
     /// Preallocates `capacity` independent slots for each typed timer class.
     pub fn new(capacity: usize) -> Self {
-        let total_capacity = capacity
-            .checked_mul(TASK_DEADLINE_CLASS_COUNT)
-            .expect("task deadline capacity exceeds addressable storage");
         Self {
-            heap: TimerHeap::new(total_capacity),
+            heaps: core::array::from_fn(|_| TimerHeap::new(capacity)),
             capacity_per_class: capacity,
-            class_counts: [0; TASK_DEADLINE_CLASS_COUNT],
         }
+    }
+
+    fn heap(&self, class: TaskDeadlineClass) -> &TimerHeap {
+        &self.heaps[class.index()]
+    }
+
+    fn heap_mut(&mut self, class: TaskDeadlineClass) -> &mut TimerHeap {
+        &mut self.heaps[class.index()]
     }
 
     /// Arms a typed task deadline for an absolute monotonic deadline.
@@ -167,8 +170,9 @@ impl TaskDeadlineQueue {
             return Err(TaskDeadlineError::KindMismatch);
         }
         let identity = node.identity()?;
-        let replacing = self.heap.contains_node(identity);
-        if self.class_counts[class.index()] == self.capacity_per_class && !replacing {
+        let heap = self.heap(class);
+        let replacing = heap.contains_node(identity);
+        if heap.is_full() && !replacing {
             return Err(TaskDeadlineError::Capacity);
         }
         let token = node.next_token(identity)?;
@@ -181,21 +185,15 @@ impl TaskDeadlineQueue {
     pub(crate) fn commit_arm(&mut self, plan: TaskDeadlineArmPlan) -> TaskDeadlineRegistration {
         let TaskDeadlineArmPlan { entry, replacing } = plan;
         let identity = entry.token().node();
+        let heap = self.heap_mut(entry.kind().class());
         if replacing {
-            let removed = self.heap.remove_node(identity);
+            let removed = heap.remove_node(identity);
             assert!(
                 removed.is_some(),
                 "prepared replacement must retain its physical task deadline entry"
             );
-        } else {
-            let class = entry.kind().class();
-            assert!(
-                self.class_counts[class.index()] < self.capacity_per_class,
-                "prepared task deadline must retain its reserved class capacity"
-            );
-            self.class_counts[class.index()] += 1;
         }
-        self.heap.push(entry);
+        heap.push(entry);
         TaskDeadlineRegistration::new(
             entry.thread(),
             entry.token(),
@@ -220,39 +218,46 @@ impl TaskDeadlineQueue {
         &mut self,
         registration: &TaskDeadlineRegistration,
     ) -> Option<TaskDeadlineCancelTxn> {
-        let entry = self.heap.remove(
-            registration.thread(),
-            registration.token(),
-            registration.kind(),
-        )?;
-        self.class_counts[registration.kind().class().index()] -= 1;
-        Some(TaskDeadlineCancelTxn { entry })
+        self.heap_mut(registration.kind().class())
+            .remove(
+                registration.thread(),
+                registration.token(),
+                registration.kind(),
+            )
+            .map(|entry| TaskDeadlineCancelTxn { entry })
     }
 
     fn restore_cancelled(&mut self, entry: TimerEntry) {
-        let class = entry.kind().class();
+        let heap = self.heap_mut(entry.kind().class());
         assert!(
-            !self.heap.contains_node(entry.token().node()),
+            !heap.contains_node(entry.token().node()),
             "cancelled task deadline node was reused before transaction completion"
         );
-        assert!(
-            self.class_counts[class.index()] < self.capacity_per_class,
-            "cancelled task deadline class lost its reserved rollback capacity"
-        );
-        self.class_counts[class.index()] += 1;
-        self.heap.push(entry);
+        heap.push(entry);
     }
 
     /// Returns the earliest logical task deadline without mutating the queue.
     pub fn next_deadline(&self) -> Option<MonotonicDeadline> {
-        self.heap.peek().map(TimerEntry::deadline)
+        self.next_entry_in(&[
+            TaskDeadlineClass::Park,
+            TaskDeadlineClass::DeadlineCbs,
+            TaskDeadlineClass::DeadlineZeroLag,
+        ])
+        .map(TimerEntry::deadline)
     }
 
-    pub(crate) fn has_immediately_actionable_entry(&self, now: MonotonicInstant) -> bool {
-        let Some(entry) = self.heap.peek() else {
-            return false;
-        };
-        now.reached(entry.deadline())
+    pub(crate) fn has_immediately_actionable_soft_entry(&self, now: MonotonicInstant) -> bool {
+        self.heap(TaskDeadlineClass::Park)
+            .peek()
+            .is_some_and(|entry| now.reached(entry.deadline()))
+    }
+
+    pub(crate) fn has_immediately_actionable_scheduler_entry(&self, now: MonotonicInstant) -> bool {
+        self.next_entry_in(&[
+            TaskDeadlineClass::DeadlineCbs,
+            TaskDeadlineClass::DeadlineZeroLag,
+        ])
+        .is_some_and(|entry| now.reached(entry.deadline()))
     }
 
     /// Expires timers into caller-provided storage without allocating or invoking
@@ -262,11 +267,51 @@ impl TaskDeadlineQueue {
         request: TaskDeadlineExpireRequest,
         output: &mut [ExpiredTaskDeadline],
     ) -> TaskDeadlineExpireBatch {
+        self.expire_classes(
+            request,
+            output,
+            &[
+                TaskDeadlineClass::Park,
+                TaskDeadlineClass::DeadlineCbs,
+                TaskDeadlineClass::DeadlineZeroLag,
+            ],
+        )
+    }
+
+    pub(crate) fn expire_soft(
+        &mut self,
+        request: TaskDeadlineExpireRequest,
+        output: &mut [ExpiredTaskDeadline],
+    ) -> TaskDeadlineExpireBatch {
+        self.expire_classes(request, output, &[TaskDeadlineClass::Park])
+    }
+
+    pub(crate) fn expire_scheduler(
+        &mut self,
+        request: TaskDeadlineExpireRequest,
+        output: &mut [ExpiredTaskDeadline],
+    ) -> TaskDeadlineExpireBatch {
+        self.expire_classes(
+            request,
+            output,
+            &[
+                TaskDeadlineClass::DeadlineCbs,
+                TaskDeadlineClass::DeadlineZeroLag,
+            ],
+        )
+    }
+
+    fn expire_classes(
+        &mut self,
+        request: TaskDeadlineExpireRequest,
+        output: &mut [ExpiredTaskDeadline],
+        classes: &[TaskDeadlineClass],
+    ) -> TaskDeadlineExpireBatch {
         let mut processed = 0;
         let mut expired = 0;
 
         while processed < request.batch_limit {
-            let Some(entry) = self.heap.peek() else {
+            let Some(entry) = self.next_entry_in(classes) else {
                 break;
             };
             if !request.now.reached(entry.deadline()) {
@@ -277,10 +322,9 @@ impl TaskDeadlineQueue {
             }
 
             let entry = self
-                .heap
+                .heap_mut(entry.kind().class())
                 .pop_min()
                 .expect("peek proved the fixed timer heap is non-empty");
-            self.class_counts[entry.kind().class().index()] -= 1;
             processed += 1;
             output[expired] = ExpiredTaskDeadline::new(
                 entry.thread(),
@@ -291,7 +335,8 @@ impl TaskDeadlineQueue {
             expired += 1;
         }
 
-        let (pending, next_deadline) = self.next_wakeup(request);
+        let next_deadline = self.next_entry_in(classes).map(TimerEntry::deadline);
+        let pending = next_deadline.is_some_and(|deadline| request.now.reached(deadline));
         TaskDeadlineExpireBatch {
             processed,
             expired,
@@ -307,22 +352,25 @@ impl TaskDeadlineQueue {
 
     /// Returns the number of active task deadline entries in storage.
     pub fn len(&self) -> usize {
-        self.heap.len()
+        self.heaps.iter().map(TimerHeap::len).sum()
     }
 
     /// Reports whether no timer entries remain.
     pub fn is_empty(&self) -> bool {
-        self.heap.is_empty()
+        self.heaps.iter().all(TimerHeap::is_empty)
     }
 
-    fn next_wakeup(&self, request: TaskDeadlineExpireRequest) -> (bool, Option<MonotonicDeadline>) {
-        let Some(entry) = self.heap.peek() else {
-            return (false, None);
-        };
-        (
-            request.now.reached(entry.deadline()),
-            Some(entry.deadline()),
-        )
+    fn next_entry_in(&self, classes: &[TaskDeadlineClass]) -> Option<TimerEntry> {
+        classes
+            .iter()
+            .filter_map(|class| self.heap(*class).peek())
+            .reduce(|earliest, candidate| {
+                if candidate.precedes(earliest) {
+                    candidate
+                } else {
+                    earliest
+                }
+            })
     }
 }
 

@@ -165,7 +165,6 @@ impl CpuRemote {
 
     pub(crate) fn finish_offline(&self) {
         self.reset_scheduler_for_offline();
-        self.reset_fair_balance_for_offline();
         if self
             .publication
             .state

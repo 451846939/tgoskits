@@ -28,18 +28,19 @@ impl TaskSystem {
             (Arc::clone(&record.core), Arc::clone(&record.sched))
         };
         let sched = sched_cell.lock();
-        let running_now_ns = sched
-            .placement
-            .execution_cpu()
-            .map(|cpu| {
-                self.cpu_remotes
-                    .get(cpu.as_usize())
-                    .ok_or(TaskError::InvalidCpu(cpu.as_u32()))
-                    .map(|remote| remote.lock_run_queue().update_clock().task_nanos())
-            })
-            .transpose()?;
+        let running_now_ns = if let Some(cpu) = sched.placement.execution_cpu() {
+            let remote = self
+                .cpu_remotes
+                .get(cpu.as_usize())
+                .ok_or(TaskError::InvalidCpu(cpu.as_u32()))?;
+            let transaction = OwnerRqTxn::begin(self, remote);
+            let now_ns = transaction.clock().task().as_nanos();
+            transaction.commit();
+            Some(now_ns)
+        } else {
+            None
+        };
         let snapshot = core.runtime_snapshot(running_now_ns);
-        debug_assert!(snapshot.charged_runtime_ns() >= sched.runtime.charged_runtime_ns);
         Ok(snapshot)
     }
 
@@ -69,8 +70,13 @@ impl TaskSystem {
         {
             return Err(TaskError::InvalidConfiguration);
         }
+        let next_handle = address_space.handle();
+        let binding = crate::runtime::ThreadRuntimeBinding::new(sched.runtime.context, next_handle);
+        let remote = Arc::clone(cpu.remote());
+        let mut transaction = OwnerRqTxn::begin(self, &remote);
+        transaction.update_current_runtime_binding(current, binding);
         let next = core::mem::replace(address_space, crate::runtime::AddressSpaceToken::NONE);
-        let next_handle = next.handle();
+        transaction.commit();
         let previous = record.resources.replace_address_space(next);
         sched.runtime.address_space = next_handle;
         Ok(previous)
@@ -98,7 +104,15 @@ impl TaskSystem {
         {
             return Err(TaskError::InvalidConfiguration);
         }
+        let binding = crate::runtime::ThreadRuntimeBinding::new(
+            sched.runtime.context,
+            crate::runtime::AddressSpaceHandle::NONE,
+        );
+        let remote = Arc::clone(cpu.remote());
+        let mut transaction = OwnerRqTxn::begin(self, &remote);
+        transaction.update_current_runtime_binding(current, binding);
         let previous = record.resources.take_address_space();
+        transaction.commit();
         sched.runtime.address_space = crate::runtime::AddressSpaceHandle::NONE;
         Ok(previous)
     }
@@ -152,7 +166,7 @@ impl TaskSystem {
             .sched
             .lock()
             .policy
-            .requested)
+            .requested_policy())
     }
 
     /// Publishes a new base-policy generation for owner-CPU application.
@@ -176,20 +190,26 @@ impl TaskSystem {
             if sched.lifecycle.state() == ThreadState::Exited {
                 return Err(TaskError::NotReady);
             }
-            affinity.copy_from_set(&sched.placement.affinity)?;
-            let active_reservation = sched.deadline.active_reservation;
-            let desired_reservation = sched.deadline.desired_reservation;
-            let owner = sched
-                .placement
-                .execution_cpu()
-                .or(sched.placement.queued_cpu())
-                .or(sched.deadline.bandwidth_cpu);
-            let generation = sched
+            affinity.copy_from_set(&sched.affinity.affinity)?;
+            let applied_reservation = sched.deadline.bandwidth.reservation_scaled();
+            let pending_reservation = sched
                 .policy
-                .generation
-                .checked_add(1)
-                .ok_or(TaskError::InvalidConfiguration)?;
-            let owner_publication = owner
+                .pending_update()
+                .map_or(0, |pending| pending.reservation_scaled);
+            let placement_owner = sched.placement.control_owner();
+            let reservation_owner = sched.deadline.bandwidth.reservation_owner();
+            if let (Some(placement_owner), Some(reservation_owner)) =
+                (placement_owner, reservation_owner)
+                && placement_owner != reservation_owner
+            {
+                task_runtime::fatal_invariant(0x444c_1201, core.id().as_u64() as usize);
+            }
+            // A sleeping Deadline task owns no physical rq entity, but policy
+            // replacement must still run on the rq that owns this_bw and its
+            // typed CBS timers. Keep that explicit reservation owner separate
+            // from SchedulerPlacement::control_owner().
+            let apply_owner = placement_owner.or(reservation_owner);
+            let owner_publication = apply_owner
                 .map(|owner| {
                     self.cpu_remotes
                         .get(owner.as_usize())
@@ -199,13 +219,12 @@ impl TaskSystem {
                 })
                 .transpose()?;
             let reservation = root_domain.deadline_reservation_for(policy, &affinity)?;
-            let old_held = active_reservation.max(desired_reservation);
-            let new_held = active_reservation.max(reservation);
+            let pending = sched.policy.prepare_update(policy, reservation)?;
+            let old_held = applied_reservation.max(pending_reservation);
+            let new_held = applied_reservation.max(reservation);
             root_domain.replace_deadline_utilization(old_held, new_held)?;
-            sched.deadline.desired_reservation = reservation;
-            sched.policy.requested = policy;
-            sched.policy.generation = generation;
-            (core, owner, generation, owner_publication)
+            sched.policy.publish_update(pending);
+            (core, apply_owner, pending.generation, owner_publication)
         };
         core.publish_base_policy(policy);
         if let Some(owner_publication) = owner_publication {
@@ -217,8 +236,15 @@ impl TaskSystem {
             );
         } else {
             let applied = self.apply_policy_generation(&core, generation, None, None, false)?;
+            debug_assert!(applied);
             if applied {
-                self.recompute_pi_after_policy_update(thread)?;
+                // A blocked task has no rq owner, but its rtmutex waiter key
+                // is still ordered by the newly committed effective policy.
+                // Linux follows sched_setattr() with
+                // rt_mutex_adjust_prio_chain(); do the same after the task
+                // policy transaction is visible instead of leaving the lock
+                // waiter and owner donor trees on the old key.
+                self.recompute_pi_after_policy_update(core.id())?;
             }
         }
         Ok(())
@@ -232,16 +258,9 @@ impl TaskSystem {
             .thread_record(thread)?
             .sched
             .lock()
-            .placement
             .affinity
+            .affinity
+            .as_ref()
             .clone())
-    }
-
-    /// Returns the RR quantum for a round-robin thread.
-    pub fn round_robin_interval_ns(&self, thread: ThreadId) -> Result<u64, TaskError> {
-        match self.thread_policy(thread)? {
-            SchedulePolicy::RoundRobin { quantum_ns, .. } => Ok(quantum_ns),
-            _ => Err(TaskError::InvalidConfiguration),
-        }
     }
 }

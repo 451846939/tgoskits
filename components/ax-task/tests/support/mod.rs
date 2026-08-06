@@ -78,11 +78,10 @@ pub trait TaskSystemClockTestExt {
         now_ns: u64,
     ) -> Result<(), TaskError>;
 
-    fn rt_may_run_at(
+    fn rt_run_queue_may_run_at(
         &self,
         cpu: Pin<&mut CpuLocal>,
         now_ns: u64,
-        pi_boosted_owner: bool,
     ) -> Result<bool, TaskError>;
 
     fn drain_policy_updates_at(
@@ -189,14 +188,13 @@ impl TaskSystemClockTestExt for TaskSystem {
         self.replenish_deadline(cpu, thread)
     }
 
-    fn rt_may_run_at(
+    fn rt_run_queue_may_run_at(
         &self,
         cpu: Pin<&mut CpuLocal>,
         now_ns: u64,
-        pi_boosted_owner: bool,
     ) -> Result<bool, TaskError> {
         set_scheduler_ns_for_cpu(cpu.owner().as_u32(), now_ns);
-        self.rt_may_run(cpu, pi_boosted_owner)
+        self.rt_run_queue_may_run(cpu)
     }
 
     fn drain_policy_updates_at(
@@ -289,7 +287,6 @@ std::thread_local! {
     static CPU_LOCALS: RefCell<[usize; MAX_TEST_CPUS]> = const { RefCell::new([0; MAX_TEST_CPUS]) };
     static CPU_REMOTES: RefCell<[usize; MAX_TEST_CPUS]> = const { RefCell::new([0; MAX_TEST_CPUS]) };
     static VIRTUAL_RUNTIME: RefCell<VirtualRuntimeState> = const { RefCell::new(VirtualRuntimeState::new()) };
-    static ONLINE_CPU_COUNT: Cell<usize> = const { Cell::new(1) };
     static DESTROYED_CONTEXTS: Cell<usize> = const { Cell::new(0) };
     static DESTROYED_ADDRESS_SPACES: Cell<usize> = const { Cell::new(0) };
     static DEALLOCATED_STACKS: Cell<usize> = const { Cell::new(0) };
@@ -386,9 +383,6 @@ impl_trait! {
 
         unsafe fn current_cpu_id() -> RuntimeCpuId {
             CURRENT_CPU.with(|cpu| RuntimeCpuId::new(cpu.get()))
-        }
-        fn online_cpu_count() -> u32 {
-            ONLINE_CPU_COUNT.with(|count| count.get() as u32)
         }
 
         fn prepare_cpu_online(_cpu: RuntimeCpuId) -> RuntimeStatus {
@@ -735,7 +729,6 @@ pub fn install_handles(task_system: usize, cpu_local: Pin<&mut CpuLocal>) {
     install_cpu_raw(0, owner_cpu_handle(cpu_local));
     install_cpu_remote_raw(0, task_system);
     CURRENT_CPU.with(|cpu| cpu.set(0));
-    ONLINE_CPU_COUNT.with(|count| count.set(1));
 }
 
 pub fn install_cpu(cpu: u32, cpu_local: Pin<&mut CpuLocal>) {
@@ -789,7 +782,6 @@ fn install_cpu_remote_raw(cpu: u32, task_system: usize) {
 }
 
 pub fn set_online_cpu_count(count: usize) {
-    ONLINE_CPU_COUNT.with(|online| online.set(count));
     VIRTUAL_RUNTIME.with(|runtime| {
         let mut runtime = runtime.borrow_mut();
         for (index, cpu) in runtime.cpus.iter_mut().enumerate() {

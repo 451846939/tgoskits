@@ -23,11 +23,7 @@ mod thread_callbacks;
 mod thread_creation;
 
 use alloc::{sync::Arc, vec::Vec};
-use core::{
-    pin::Pin,
-    ptr,
-    sync::atomic::{AtomicUsize, Ordering},
-};
+use core::{pin::Pin, ptr};
 
 use exited_work::ExitedThreadWork;
 use model::{
@@ -45,37 +41,39 @@ pub(crate) use park_exit::CurrentExitPermit;
 pub use pi::PiMutexLockResult;
 use priority_index::RootDomainPriorityIndex;
 use registry::{
-    CpuRegistration, DeadlineCallbackClaim, DetachedThreadRecord, PiWaitRegistration,
-    TaskSystemState, ThreadRecord, ThreadSlot,
+    CpuRegistration, DeadlineCallbackClaim, DetachedThreadRecord, TaskSystemState, ThreadRecord,
+    ThreadSlot,
 };
-use root_domain::{DeadlineBandwidthRebuild, RootDomain, RootDomainState};
+use root_domain::{DeadlineBandwidthRebuild, RootDomain, RootDomainPushClass, RootDomainState};
 use thread_callbacks::ThreadCallbackState;
 
-use super::thread_sched::{DeadlineActivity, ThreadSchedCell, ThreadSchedState};
+use super::thread_sched::{PiScheduleUpdate, ThreadSchedCell, ThreadSchedState};
 #[cfg(test)]
 use crate::runtime::ExecutionContextHandle;
 #[cfg(feature = "qperf-metrics")]
 use crate::system::cpu::WakePreemptionDecision;
 use crate::{
-    CpuId, CpuLocal, CpuRemote, CpuRemotePublication, CpuSet, CpuSnapshot, DEADLINE_CLASS_RANK,
-    DeadlineAdmission, DeadlineBandwidthSnapshot, DeadlineEntity, EnqueueReason, FairMode,
-    OwnedThreadSchedulerExit, ParkCommit, ParkPrepare, ParkTicket, PiMutexRaw, PiWaitKey,
-    PiWaitToken, PiWaitTree, QueuedThread, REALTIME_CLASS_RANK, SchedulePolicy, SchedulingClass,
-    SchedulingEntity, SchedulingUrgency, SwitchReason, TaskError, TaskSystemConfig,
-    ThreadAffinityChange, ThreadCore, ThreadExtension, ThreadExtensionBorrow, ThreadExtensionLease,
-    ThreadExtensionView, ThreadHandle, ThreadId, ThreadResources, ThreadRuntimeSnapshot,
-    ThreadSpec, ThreadState, WakeResult,
+    ActiveSchedulingState, CpuId, CpuLocal, CpuRemote, CpuRemotePublication, CpuSet, CpuSnapshot,
+    DEADLINE_CLASS_RANK, DeadlineAdmission, DeadlineBandwidthSnapshot, DeadlineEntity,
+    DeadlineServer, EnqueueReason, FairMode, OwnedThreadSchedulerExit, ParkCommit, ParkPrepare,
+    ParkTicket, PiDonation, PiMutexRaw, PiWaitKey, PiWaitRegistration, PiWaitToken, PickedThread,
+    QueuedThread, QueuedThreadSnapshot, REALTIME_CLASS_RANK, RqTaskMetadata, SchedulePolicy,
+    SchedulerTimestamp, SchedulingClass, SchedulingEntity, SchedulingUrgency, SwitchReason,
+    TaskError, TaskSystemConfig, ThreadAffinityChange, ThreadCore, ThreadExtension,
+    ThreadExtensionBorrow, ThreadExtensionLease, ThreadExtensionView, ThreadHandle, ThreadId,
+    ThreadResources, ThreadRuntimeSnapshot, ThreadSpec, ThreadState, WakeResult,
     executor::CoroutineHeader,
     inbox::{InboxKind, InboxMessage, InboxOperation, PublishResult, SchedulerInbox},
-    lock::{IrqScope, IrqTicketLock, PreemptTicketLock, SequenceCounter},
+    lock::{IrqScope, IrqTicketLock, PreemptTicketLock},
     runtime::{
         AddressSpaceDestroyOutcome, AddressSpaceReclaimArmOutcome, ContextThreadBinding,
         CpuRemoteHandle, CurrentThreadPublication, MonotonicDeadline, MonotonicInstant,
         RuntimeCpuId, RuntimeStatus, task_runtime,
     },
     system::cpu::{
-        CpuRunQueueState, CurrentDispatch, CurrentDispatchState, CurrentSchedule,
-        IdlePullReservation, PreparedMigrationDelivery, RunQueueClockSnapshot,
+        CpuRunQueueState, CurrentClassState, CurrentDispatch, CurrentDispatchState,
+        IdlePullReservation, OwnerRqEntry, OwnerRqTxn, PreparedMigrationDelivery, RqTaskTime,
+        RunQueueClockSnapshot,
     },
     task_work::{TaskWorkConsumerGuard, TaskWorkDoorbell},
     timer::{
@@ -89,9 +87,130 @@ struct UnpublishedThreadGuard<'system> {
     spec: Option<ThreadSpec>,
 }
 
+fn apply_pi_schedule_update(
+    sched: &mut ThreadSchedState,
+    mut active: ActiveSchedulingState,
+    update: PiScheduleUpdate,
+    owner_now_ns: u64,
+    fair_placement: Option<FairPolicyPlacement>,
+) -> Result<ActiveSchedulingState, TaskError> {
+    if update.generation != sched.policy.dispatch_generation {
+        return Err(TaskError::InvalidPiState);
+    }
+
+    let PiScheduleUpdate {
+        policy,
+        donor,
+        deadline_donor,
+        deadline_donor_core,
+        generation: _,
+    } = update;
+    let old_donor = sched.pi.donor;
+    let old_deadline_donor = sched.pi.deadline_donor;
+    let base = sched.policy.base;
+    let old_uses_inherited = active.uses_inherited_entity();
+    let next_uses_inherited = donor.is_some() && !pi_reuses_base_entity(base, policy);
+    if old_uses_inherited && !next_uses_inherited {
+        active.use_base_entity(base);
+    }
+
+    let source_changed = old_donor != donor || old_deadline_donor != deadline_donor;
+    let donor_server = match deadline_donor_core.as_ref() {
+        Some(core) => Some(
+            core.upgrade()
+                .ok_or(TaskError::InvalidPiState)?
+                .sched()
+                .deadline_server(),
+        ),
+        None => None,
+    };
+    match (donor, policy) {
+        (None, base_policy) if base_policy == base => {
+            active.use_base_entity(base_policy);
+        }
+        (Some(_), SchedulePolicy::Deadline(_)) => {
+            if !next_uses_inherited {
+                return Err(TaskError::InvalidPiState);
+            }
+            if !old_uses_inherited || source_changed {
+                active.use_inherited_entity(
+                    policy,
+                    SchedulingEntity::Deadline(crate::DeadlineEntity::from_donor_server(
+                        sched.deadline.server.clone(),
+                        donor_server.ok_or(TaskError::InvalidPiState)?,
+                    )),
+                );
+            } else {
+                active.update_inherited_effective_policy(policy);
+            }
+            let SchedulingEntity::Deadline(deadline) = active.entity() else {
+                return Err(TaskError::InvalidPiState);
+            };
+            deadline.replenish_for_pi(owner_now_ns);
+        }
+        (Some(_), SchedulePolicy::Fifo { .. }) => {
+            if next_uses_inherited {
+                active.use_inherited_entity(policy, SchedulingEntity::Fifo);
+            } else if !matches!(active.base_entity(), SchedulingEntity::Fifo) {
+                return Err(TaskError::InvalidPiState);
+            } else {
+                active.use_base_entity_with_effective_policy(policy);
+            }
+        }
+        (Some(_), SchedulePolicy::RoundRobin { quantum_ns, .. }) => {
+            if next_uses_inherited {
+                return Err(TaskError::InvalidPiState);
+            }
+            if !matches!(active.base_entity(), SchedulingEntity::RoundRobin { .. }) {
+                return Err(TaskError::InvalidPiState);
+            }
+            if old_donor.is_none()
+                && let SchedulingEntity::RoundRobin {
+                    remaining_quantum_ns,
+                } = active.base_entity_mut()
+                && *remaining_quantum_ns > quantum_ns
+            {
+                *remaining_quantum_ns = quantum_ns;
+            }
+            active.use_base_entity_with_effective_policy(policy);
+        }
+        (Some(_), SchedulePolicy::Fair { nice, mode }) => {
+            if next_uses_inherited {
+                return Err(TaskError::InvalidPiState);
+            }
+            let SchedulingEntity::Fair(fair) = *active.base_entity() else {
+                return Err(TaskError::InvalidPiState);
+            };
+            let placement = fair_placement.ok_or(TaskError::InvalidPiState)?;
+            active.replace_base_entity(SchedulingEntity::Fair(fair.reconfigure(
+                nice,
+                mode,
+                placement.source_virtual_time,
+                placement.destination_virtual_time,
+            )));
+            active.use_base_entity_with_effective_policy(policy);
+        }
+        _ => return Err(TaskError::InvalidPiState),
+    }
+
+    sched.pi.donor = donor;
+    sched.pi.deadline_donor = deadline_donor;
+    sched.pi.deadline_donor_core = deadline_donor_core;
+    Ok(active)
+}
+
+fn pi_reuses_base_entity(base: SchedulePolicy, effective: SchedulePolicy) -> bool {
+    matches!(
+        (base, effective),
+        (
+            SchedulePolicy::Fifo { .. } | SchedulePolicy::RoundRobin { .. },
+            SchedulePolicy::Fifo { .. } | SchedulePolicy::RoundRobin { .. }
+        ) | (SchedulePolicy::Fair { .. }, SchedulePolicy::Fair { .. })
+    )
+}
+
 struct OwnerNext {
     core: Arc<ThreadCore>,
-    outgoing_migration: Option<PreparedMigrationDelivery>,
 }
 
 impl<'system> UnpublishedThreadGuard<'system> {
@@ -133,13 +252,6 @@ impl Drop for UnpublishedThreadGuard<'_> {
 }
 
 impl TaskSystem {
-    fn replace_deadline_admission(&self, old_reservation: u64, new_reservation: u64) {
-        self.root_domain
-            .lock()
-            .replace_deadline_utilization(old_reservation, new_reservation)
-            .expect("owner policy apply must replace its admitted Deadline reservation");
-    }
-
     /// Creates an empty scheduler instance for a fixed topology.
     ///
     /// # Errors
@@ -176,8 +288,6 @@ impl TaskSystem {
             deferred_deadline_callbacks: SchedulerInbox::new(InboxKind::TaskWork),
             deferred_scheduler_ticks: SchedulerInbox::new(InboxKind::TaskWork),
             task_work,
-            topology_sequence: SequenceCounter::default(),
-            online_count: AtomicUsize::new(0),
         })
     }
 }
@@ -202,16 +312,18 @@ fn validate_config(config: TaskSystemConfig) -> Result<(), TaskError> {
     Ok(())
 }
 
-fn deadline_zero_lag_ns(deadline: DeadlineEntity) -> u64 {
+fn deadline_zero_lag(deadline: &DeadlineEntity) -> SchedulerTimestamp {
     let policy = deadline.policy();
     let lag_ns = deadline.remaining_runtime_ns() as u128 * policy.period_ns() as u128
         / policy.runtime_ns() as u128;
     let lag_ns = u64::try_from(lag_ns)
         .expect("Deadline zero-lag interval cannot exceed one scheduler period");
-    deadline
-        .absolute_deadline_ns()
-        .expect("an active Deadline entity must own a zero-lag anchor")
-        .wrapping_sub(lag_ns)
+    SchedulerTimestamp::from_nanos(
+        deadline
+            .absolute_deadline_ns()
+            .expect("an active Deadline entity must own a zero-lag anchor"),
+    )
+    .retreat(lag_ns)
 }
 
 fn ensure_runtime_success(status: RuntimeStatus) -> Result<(), TaskError> {

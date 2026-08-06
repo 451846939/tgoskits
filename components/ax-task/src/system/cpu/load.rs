@@ -1,5 +1,3 @@
-use super::*;
-
 /// Scheduler class carried by a remotely observed CPU load summary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -16,30 +14,15 @@ pub enum SchedulingClass {
     Idle     = 4,
 }
 
-impl SchedulingClass {
-    pub(super) const fn from_rank(rank: u8) -> Self {
-        match rank {
-            0 => Self::Stop,
-            1 => Self::Deadline,
-            2 => Self::Realtime,
-            3 => Self::Fair,
-            _ => Self::Idle,
-        }
-    }
-}
-
 /// Coherent, allocation-free snapshot used by remote placement and balancing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CpuLoadSummary {
     pub(super) epoch: u64,
-    pub(super) runnable_count: usize,
-    pub(super) workload_count: usize,
+    pub(super) queued_count: usize,
+    pub(super) nr_running: usize,
     pub(super) fair_demand: u64,
     pub(super) workload_demand: u64,
-    pub(super) current_key: Option<SchedulingKey>,
-    pub(super) pushable_key: Option<SchedulingKey>,
-    pub(super) pushable_class: Option<SchedulingClass>,
-    pub(super) overloaded: bool,
+    pub(super) fair_pushable: bool,
 }
 
 /// Per-runqueue GRUB utilization snapshot in billionths of one CPU.
@@ -51,6 +34,18 @@ pub struct DeadlineBandwidthSnapshot {
 }
 
 impl DeadlineBandwidthSnapshot {
+    pub(crate) const fn new(
+        this_bw_scaled: u64,
+        running_bw_scaled: u64,
+        max_bw_scaled: u64,
+    ) -> Self {
+        Self {
+            this_bw_scaled,
+            running_bw_scaled,
+            max_bw_scaled,
+        }
+    }
+
     /// Returns all Deadline utilization assigned to this runqueue.
     pub const fn this_bw_scaled(self) -> u64 {
         self.this_bw_scaled
@@ -79,14 +74,14 @@ impl CpuLoadSummary {
         self.epoch
     }
 
-    /// Returns queued non-idle work owned by this CPU.
-    pub const fn runnable_count(self) -> usize {
-        self.runnable_count
+    /// Returns candidates available to `pick_next_task()`, excluding current.
+    pub const fn queued_count(self) -> usize {
+        self.queued_count
     }
 
-    /// Returns queued work plus the currently running non-idle thread.
-    pub const fn workload_count(self) -> usize {
-        self.workload_count
+    /// Returns Linux `rq->nr_running`, including a non-idle current task.
+    pub const fn nr_running(self) -> usize {
+        self.nr_running
     }
 
     /// Returns the Linux nice-weighted Fair demand owned by this CPU.
@@ -103,31 +98,15 @@ impl CpuLoadSummary {
         self.workload_demand
     }
 
-    /// Returns the effective urgency of the current dispatch, including PI.
-    pub const fn current_key(self) -> Option<SchedulingKey> {
-        self.current_key
-    }
-
-    /// Returns the most urgent queued candidate that can leave this CPU.
-    pub const fn pushable_key(self) -> Option<SchedulingKey> {
-        self.pushable_key
-    }
-
-    /// Returns the scheduler class of the top pushable candidate.
-    pub const fn pushable_class(self) -> Option<SchedulingClass> {
-        self.pushable_class
-    }
-
-    /// Reports whether this CPU owns more runnable work than it can execute.
-    pub const fn is_overloaded(self) -> bool {
-        self.overloaded
+    /// Reports whether this CPU has migratable Fair work.
+    ///
+    /// RT and Deadline overload are deliberately absent from this load
+    /// snapshot. Their sole remote authority is the root-domain `rto`/`dlo`
+    /// index, matching Linux's separation between sched-domain load and
+    /// priority-class overload state.
+    pub const fn has_pushable_fair(self) -> bool {
+        self.fair_pushable
     }
 }
 
-pub(super) const SUMMARY_CURRENT_PRESENT: u16 = 1 << 0;
-pub(super) const SUMMARY_PUSHABLE_PRESENT: u16 = 1 << 1;
-pub(super) const SUMMARY_OVERLOADED: u16 = 1 << 2;
-pub(super) const SUMMARY_CURRENT_CLASS_SHIFT: u32 = 3;
-pub(super) const SUMMARY_PUSHABLE_CLASS_SHIFT: u32 = 6;
-pub(super) const SUMMARY_CLASS_MASK: u16 = 0b111;
-pub(super) const LOAD_SUMMARY_READ_RETRIES: usize = 8;
+pub(super) const SUMMARY_FAIR_PUSHABLE: u16 = 1 << 0;

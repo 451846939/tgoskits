@@ -26,11 +26,10 @@ mod scheduler_ipi_tests {
         system.enqueue(cpu.as_mut(), contender.id()).unwrap();
 
         crate::test_runtime::set_scheduler_ns_for_cpu(cpu.owner().as_u32(), 10_000);
-        let clock = cpu.update_rq_clock();
         let monotonic_now = MonotonicInstant::from_nanos(100).unwrap();
 
         assert_eq!(
-            cpu.as_mut().next_oneshot_deadline(clock, monotonic_now),
+            cpu.as_mut().next_oneshot_deadline(monotonic_now),
             MonotonicDeadline::from_nanos(BALANCE_INTERVAL_NS),
             "an unrelated runqueue-clock epoch must not expire the periodic balance clockevent"
         );
@@ -54,13 +53,9 @@ mod scheduler_ipi_tests {
         system.make_ready(contender.id()).unwrap();
         system.enqueue(cpu.as_mut(), contender.id()).unwrap();
         let deadline = cpu
-            .remote()
-            .fair_balance_deadline()
+            .fair_balance_deadline_for_test()
             .expect("online fair balancing must own a monotonic deadline");
-        let clock = cpu.update_rq_clock();
-
         let next = cpu.as_mut().next_oneshot_deadline(
-            clock,
             MonotonicInstant::from_nanos(deadline.as_nanos()).unwrap(),
         );
         assert!(
@@ -74,7 +69,7 @@ mod scheduler_ipi_tests {
     }
 
     #[test]
-    fn load_summary_reader_does_not_wait_for_stalled_writer() {
+    fn load_summary_reader_waits_for_the_authoritative_publication() {
         let remote = CpuRemote::create(CpuId::new(0), TaskSystemConfig::new(1));
         remote.set_load_summary_sequence_for_test(1);
 
@@ -83,23 +78,21 @@ mod scheduler_ipi_tests {
         let (finished_tx, finished_rx) = mpsc::channel();
         let reader = thread::spawn(move || {
             started_tx.send(()).unwrap();
-            let summary = reader_remote.try_load_summary();
+            let summary = reader_remote.load_summary();
             finished_tx.send(summary).unwrap();
         });
 
         started_rx.recv().unwrap();
-        let completed_while_writer_stalled =
-            finished_rx.recv_timeout(Duration::from_millis(100)).is_ok();
-
-        // Always release the old implementation's unbounded reader so a red
-        // result cannot leak a host thread or hang the test process.
-        remote.set_load_summary_sequence_for_test(2);
-        reader.join().unwrap();
-
         assert!(
-            completed_while_writer_stalled,
-            "remote balancing must not spin forever behind a stalled owner writer"
+            finished_rx.recv_timeout(Duration::from_millis(20)).is_err(),
+            "a reader must not invent an unavailable snapshot while the rq publication is incomplete"
         );
+        remote.set_load_summary_sequence_for_test(2);
+        let summary = finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the coherent publication must release the reader");
+        reader.join().unwrap();
+        assert_eq!(summary.epoch(), 2);
     }
 
     #[test]

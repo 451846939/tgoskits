@@ -44,7 +44,13 @@ impl TaskSystem {
         // Runtime construction may allocate, fault, or call into platform
         // code. Keep it outside the IRQ-disabled registry domain. The removed
         // slot is a private reservation until the short commit below.
-        let entity = SchedulingEntity::new(policy, self.config.fair_slice_ns(), 0);
+        let deadline_server = DeadlineServer::unbound();
+        let entity = SchedulingEntity::new_with_deadline_server(
+            policy,
+            self.config.fair_slice_ns(),
+            0,
+            deadline_server.clone(),
+        );
         let (extension, resources) = unpublished.into_owned_parts();
         let switch_extension = extension.as_ref().map(ThreadExtension::as_view);
         let scheduler_tick_work = extension
@@ -55,6 +61,7 @@ impl TaskSystem {
             ThreadSchedState::new(
                 policy,
                 entity,
+                deadline_server,
                 affinity.clone(),
                 reservation,
                 resources.context(),
@@ -74,8 +81,6 @@ impl TaskSystem {
             sched,
             resources,
             extension,
-            blocked_on: None,
-            pi_donors: PiWaitTree::new(),
             callbacks: ThreadCallbackState::new(),
         };
         let context = record.resources.context();
@@ -179,24 +184,32 @@ impl TaskSystem {
 
         let thread = self.create_thread(unpublished.into_spec())?;
         let setup = (|| {
-            let now_ns = cpu.update_rq_clock().task_nanos();
-            let state = self.state.lock();
-            let record = state.thread_record(thread.id())?;
-            let core = Arc::clone(&record.core);
-            let dispatch = {
-                let mut sched = record.sched.lock();
-                sched.transition(&core, ThreadState::Ready)?;
-                sched.transition(&core, ThreadState::Running)?;
-                let dispatch = Self::owner_dispatch(&core, &sched, now_ns)?;
-                sched.placement.activate(cpu.owner());
-                sched.placement.set_next_task(cpu.owner());
-                core.set_wake_cpu_hint(cpu.owner());
-                dispatch
+            let core = {
+                let state = self.state.lock();
+                Arc::clone(&state.thread_record(thread.id())?.core)
             };
-            cpu.as_mut().set_current_core(Arc::clone(&core));
-            cpu.as_mut().install_dispatch(dispatch);
-            drop(state);
-            self.publish_owner_cpu_load_summary(cpu.as_mut());
+            let mut sched = core.sched().lock();
+            sched.transition(&core, ThreadState::Ready)?;
+            let remote = Arc::clone(cpu.remote());
+            let mut transaction = OwnerRqTxn::begin(self, &remote);
+            let now_ns = transaction.clock().wall().as_nanos();
+            if matches!(sched.policy.active().policy(), SchedulePolicy::Deadline(_)) {
+                let mut entity = sched.policy.active().entity().clone();
+                entity.activate_deadline(now_ns);
+                *sched.policy.active_mut().entity_mut() = entity;
+            }
+            self.link_owner_ready_thread_locked(
+                cpu.as_ref().get_ref(),
+                &mut transaction,
+                &core,
+                &mut sched,
+                EnqueueReason::Wake,
+            );
+            let next = self.pick_owner_next_in_rq(cpu.as_mut(), &mut transaction, None);
+            if !Arc::ptr_eq(&next.core, &core) {
+                task_runtime::fatal_invariant(0x4254_0001, core.id().as_u64() as usize);
+            }
+            transaction.commit();
             Ok(())
         })();
         if let Err(error) = setup {
@@ -240,8 +253,8 @@ impl TaskSystem {
         let setup = self.make_ready(thread.id()).and_then(|()| {
             let state = self.state.lock();
             let core = Arc::clone(&state.thread_record(thread.id())?.core);
-            cpu.as_mut().set_idle(thread.id(), core);
-            Ok(())
+            drop(state);
+            self.install_idle_core(cpu.as_mut(), core)
         });
         if let Err(error) = setup {
             return match self.discard_unpublished_thread(thread) {
@@ -250,6 +263,50 @@ impl TaskSystem {
             };
         }
         Ok(thread)
+    }
+
+    /// Installs the dedicated idle task directly into its owner rq, matching
+    /// Linux `init_idle()` rather than passing idle through a scheduling-class
+    /// enqueue/dequeue cycle.
+    pub(super) fn install_idle_core(
+        &self,
+        mut cpu: Pin<&mut CpuLocal>,
+        core: Arc<ThreadCore>,
+    ) -> Result<(), TaskError> {
+        let owner = cpu.owner();
+        if cpu.idle().is_some() {
+            return Err(TaskError::InvalidConfiguration);
+        }
+        let mut sched = core.sched().lock();
+        let policy = sched.policy.active().policy();
+        if sched.lifecycle.state() != ThreadState::Ready
+            || !matches!(
+                policy,
+                SchedulePolicy::Fair {
+                    mode: crate::FairMode::Idle,
+                    ..
+                }
+            )
+            || !sched.affinity.affinity.contains(owner)
+            || sched.placement.assigned_cpu().is_some()
+            || sched.placement.on_cpu().is_some()
+            || sched.placement.requested_migration().is_some()
+        {
+            return Err(TaskError::InvalidConfiguration);
+        }
+        let metadata = sched.rq_task_metadata()?;
+        let rt_quota_exempt = sched.is_pi_boosted_rt_owner_for(policy);
+        let active = sched.policy.take_active();
+        cpu.as_mut().install_idle(
+            self,
+            core.id(),
+            Arc::clone(&core),
+            active,
+            metadata,
+            rt_quota_exempt,
+        );
+        core.set_wake_cpu_hint(owner);
+        Ok(())
     }
 
     fn discard_unpublished_thread(&self, handle: ThreadHandle) -> Result<(), TaskError> {

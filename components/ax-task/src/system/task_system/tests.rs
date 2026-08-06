@@ -2,9 +2,7 @@ use alloc::{boxed::Box, vec::Vec};
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use super::*;
-use crate::{
-    FairEntity, PiMutexAcquire, PiMutexCore, PiMutexLockResult, system::cpu::DispatchRole,
-};
+use crate::{FairEntity, PiMutexAcquire, PiMutexCore, PiMutexLockResult};
 
 trait TaskSystemClockTestExt {
     fn enqueue_at(
@@ -211,6 +209,17 @@ fn commit_pi_wait<'lock>(
     }
 }
 
+fn create_online_pi_cpu(system: &TaskSystem) -> Pin<Box<CpuLocal>> {
+    let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
+    system.bring_cpu_online(cpu.as_mut()).unwrap();
+    cpu
+}
+
+fn place_pi_owner(system: &TaskSystem, mut cpu: Pin<&mut CpuLocal>, owner: &ThreadHandle) {
+    system.make_ready(owner.id()).unwrap();
+    system.enqueue_at(cpu.as_mut(), owner.id(), 0).unwrap();
+}
+
 fn acquire_pi_for_thread(
     lock: &PiMutexCore,
     thread: ThreadId,
@@ -327,7 +336,8 @@ fn remote_deadline_wake_uses_the_target_runqueue_clock() {
         .sched()
         .lock()
         .policy
-        .effective_entity
+        .active()
+        .entity()
         .deadline()
         .and_then(DeadlineEntity::absolute_deadline_ns);
     assert_eq!(absolute_deadline, Some(15));
@@ -346,8 +356,9 @@ fn scheduler_safe_point_does_not_expire_a_future_monotonic_deadline() {
         .create_thread(ThreadSpec::new(SchedulePolicy::default()))
         .unwrap();
     let registration = cpu
-        .as_mut()
-        .task_deadlines()
+        .remote()
+        .lock_deadline_base()
+        .queue
         .arm(
             timer_owner.sleep_timer(),
             MonotonicDeadline::from_nanos(50).unwrap(),
@@ -359,7 +370,10 @@ fn scheduler_safe_point_does_not_expire_a_future_monotonic_deadline() {
     system.schedule_at(cpu.as_mut(), 1_000).unwrap();
 
     assert!(
-        cpu.as_mut().task_deadlines().cancel(&registration),
+        cpu.remote()
+            .lock_deadline_base()
+            .queue
+            .cancel(&registration),
         "rq clock 1000 must not be interpreted as monotonic time past deadline 50"
     );
 }
@@ -453,7 +467,6 @@ fn remote_publication_cannot_be_preempted_before_doorbell() {
     let node = Box::pin(crate::inbox::InboxNode::new(InboxKind::OwnerControl));
     let system = TaskSystem::new(TaskSystemConfig::new(2)).unwrap();
     let remote = &system.cpu_remotes[1];
-    remote.mark_scheduler_ready();
     assert!(remote.mark_online());
     crate::test_runtime::reset_irq_state();
     crate::test_runtime::configure_scheduler_ipi(RuntimeStatus::Success);
@@ -589,12 +602,11 @@ fn fair_service_thread_woken_from_irq_preempts_without_waiting_for_timer() {
         service.id()
     );
     system.complete_context_switch(cpu.as_mut()).unwrap();
-    cpu.as_mut()
-        .dispatch_state_mut()
-        .current_dispatch
-        .as_mut()
+    *cpu.lock_run_queue()
+        .current_mut()
         .unwrap()
-        .entity = SchedulingEntity::Fair(FairEntity::test_state(
+        .active_mut()
+        .entity_mut() = SchedulingEntity::Fair(FairEntity::test_state(
         Nice::ZERO,
         FairMode::Normal,
         19_000_000,
@@ -614,7 +626,8 @@ fn fair_service_thread_woken_from_irq_preempts_without_waiting_for_timer() {
             .sched()
             .lock()
             .policy
-            .effective_entity
+            .active()
+            .entity()
             .fair()
             .unwrap()
             .saved_sleep_lag(),
@@ -623,8 +636,11 @@ fn fair_service_thread_woken_from_irq_preempts_without_waiting_for_timer() {
 
     let current_entity =
         FairEntity::test_state(Nice::ZERO, FairMode::Normal, 20_000_000, 20_400_000);
-    let dispatch = cpu.as_mut().dispatch_state_mut();
-    dispatch.current_dispatch.as_mut().unwrap().entity = SchedulingEntity::Fair(current_entity);
+    *cpu.lock_run_queue()
+        .current_mut()
+        .unwrap()
+        .active_mut()
+        .entity_mut() = SchedulingEntity::Fair(current_entity);
     cpu.lock_run_queue()
         .update_fair_virtual_time(Some(current_entity));
     let _runtime_handles = InstalledTaskHandles::new(system.as_ref(), cpu.as_mut());
@@ -648,7 +664,8 @@ fn fair_service_thread_woken_from_irq_preempts_without_waiting_for_timer() {
         .sched()
         .lock()
         .policy
-        .effective_entity
+        .active()
+        .entity()
         .fair()
         .unwrap();
     assert_eq!(queued.vruntime(), 19_000_000);
@@ -676,24 +693,19 @@ fn eligible_fair_current_keeps_latest_eevdf_slice_protection_on_wake() {
 
     let current = FairEntity::test_state(Nice::ZERO, FairMode::Normal, 900, 1_200);
     let woken = FairEntity::test_state(Nice::ZERO, FairMode::Normal, 800, 1_000);
-    let dispatch = cpu
-        .as_mut()
-        .dispatch_state_mut()
-        .current_dispatch
-        .as_mut()
-        .unwrap();
-    dispatch.entity = SchedulingEntity::Fair(current);
+    let mut run_queue = cpu.lock_run_queue();
+    let dispatch = run_queue.current_mut().unwrap();
+    *dispatch.active_mut().entity_mut() = SchedulingEntity::Fair(current);
 
     assert!(current.is_eligible(1_000));
     assert!(woken.deadline_precedes(current));
     assert!(
-        !dispatch
-            .schedule_snapshot(DispatchRole::Task)
-            .should_preempt(
-                SchedulePolicy::default(),
-                SchedulingEntity::Fair(woken),
-                1_000,
-            ),
+        !dispatch.should_preempt(
+            SchedulingEntity::Fair(current),
+            SchedulePolicy::default(),
+            SchedulingEntity::Fair(woken),
+            1_000,
+        ),
         "latest EEVDF keeps an eligible current request protected until its request boundary"
     );
 }
@@ -895,7 +907,7 @@ fn direct_wake_activates_the_target_runqueue_before_its_owner_safe_point() {
          point",
     );
     assert_eq!(
-        cpu1.lock_run_queue().len(),
+        cpu1.lock_run_queue().nr_queued(),
         1,
         "the target runqueue must expose the newly runnable thread before the wake returns",
     );
@@ -954,8 +966,8 @@ fn remote_fifo_wake_fixture(
 fn lower_priority_remote_wake_uses_lower_priority_cpu_with_one_doorbell() {
     crate::test_runtime::reset_irq_state();
     let (system, mut cpu0, cpu1, sleeper) = remote_fifo_wake_fixture(10, 1);
-    let local_runnable_before = cpu0.lock_run_queue().len();
-    let remote_runnable_before = cpu1.lock_run_queue().len();
+    let local_runnable_before = cpu0.lock_run_queue().nr_queued();
+    let remote_runnable_before = cpu1.lock_run_queue().nr_queued();
     let _runtime_handles = InstalledTaskHandles::new(system.as_ref(), cpu0.as_mut());
     crate::test_runtime::configure_scheduler_ipi(RuntimeStatus::Success);
 
@@ -965,8 +977,8 @@ fn lower_priority_remote_wake_uses_lower_priority_cpu_with_one_doorbell() {
         system.thread_state(sleeper.id()).unwrap(),
         ThreadState::Ready
     );
-    assert_eq!(cpu0.lock_run_queue().len(), local_runnable_before + 1);
-    assert_eq!(cpu1.lock_run_queue().len(), remote_runnable_before);
+    assert_eq!(cpu0.lock_run_queue().nr_queued(), local_runnable_before + 1);
+    assert_eq!(cpu1.lock_run_queue().nr_queued(), remote_runnable_before);
     assert_eq!(
         crate::test_runtime::scheduler_ipi_send_count(),
         1,
@@ -983,7 +995,7 @@ fn higher_priority_remote_wake_sends_one_reschedule_ipi() {
     system.set_affinity(sleeper.id(), cpu1_only).unwrap();
     let _runtime_handles = InstalledTaskHandles::new(system.as_ref(), cpu0.as_mut());
     crate::test_runtime::configure_scheduler_ipi(RuntimeStatus::Success);
-    let runnable_before = cpu1.lock_run_queue().len();
+    let runnable_before = cpu1.lock_run_queue().nr_queued();
 
     assert_eq!(sleeper.wake_handle().wake(), crate::WakeResult::Notified);
 
@@ -991,7 +1003,7 @@ fn higher_priority_remote_wake_sends_one_reschedule_ipi() {
         system.thread_state(sleeper.id()).unwrap(),
         ThreadState::Ready
     );
-    assert_eq!(cpu1.lock_run_queue().len(), runnable_before + 1);
+    assert_eq!(cpu1.lock_run_queue().nr_queued(), runnable_before + 1);
     assert_eq!(
         crate::test_runtime::scheduler_ipi_send_count(),
         1,
@@ -1321,7 +1333,13 @@ fn lowering_rt_priority_notifies_overloaded_root_domain_owner() {
     drop(runtime_handles);
 
     let _source_handles = InstalledTaskHandles::new(system.as_ref(), cpu0.as_mut());
+    priority_index::reset_priority_index_lookups();
     let _outcome = system.schedule_if_requested_at(cpu0.as_mut(), 5).unwrap();
+    assert_eq!(
+        priority_index::priority_index_lookups(),
+        1,
+        "an RT push must consume cpupri once instead of scanning every CPU load summary"
+    );
     assert_eq!(
         pushable
             .core
@@ -1493,25 +1511,33 @@ fn queued_affinity_update_refreshes_pushability_summary() {
         .unwrap();
     system.make_ready(queued.id()).unwrap();
     system.enqueue_at(cpu0.as_mut(), queued.id(), 2).unwrap();
-    assert!(cpu0.try_load_summary().unwrap().is_overloaded());
+    assert!(
+        system
+            .root_domain
+            .cpu_has_overload(CpuId::new(0), SchedulingClass::Realtime)
+    );
 
     let mut cpu0_only = CpuSet::empty(2);
     assert!(cpu0_only.insert(CpuId::new(0)));
     let narrow = system.request_affinity(queued.id(), cpu0_only).unwrap();
     system.drain_policy_updates_at(cpu0.as_mut(), 3).unwrap();
     assert_eq!(narrow.try_result(), Some(Ok(())));
-    let pinned = cpu0.try_load_summary().unwrap();
-    assert!(!pinned.is_overloaded());
-    assert_eq!(pinned.pushable_key(), None);
+    assert!(
+        !system
+            .root_domain
+            .cpu_has_overload(CpuId::new(0), SchedulingClass::Realtime)
+    );
 
     let widen = system
         .request_affinity(queued.id(), CpuSet::all(2))
         .unwrap();
     system.drain_policy_updates_at(cpu0.as_mut(), 4).unwrap();
     assert_eq!(widen.try_result(), Some(Ok(())));
-    let movable = cpu0.try_load_summary().unwrap();
-    assert!(movable.is_overloaded());
-    assert!(movable.pushable_key().is_some());
+    assert!(
+        system
+            .root_domain
+            .cpu_has_overload(CpuId::new(0), SchedulingClass::Realtime)
+    );
 }
 
 #[test]
@@ -1652,7 +1678,6 @@ fn registered_remote_endpoint_is_separate_from_owner_mutable_state() {
         endpoint_address
     );
 
-    cpu.as_mut().clear_current();
     assert_eq!(
         (system.state.lock().cpu_remote(CpuId::new(0)).unwrap() as *const CpuRemote).addr(),
         endpoint_address,
@@ -2067,16 +2092,20 @@ fn unsuccessful_fair_balance_backs_off_from_monotonic_completion_time() {
     system.make_ready(contender.id()).unwrap();
     system.enqueue_at(cpu.as_mut(), contender.id(), 0).unwrap();
     let _runtime_handles = InstalledTaskHandles::new(system.as_ref(), cpu.as_mut());
-    assert!(cpu.publish_fair_balance_due(MonotonicInstant::from_nanos(ENTRY_NOW_NS).unwrap()));
+    assert!(
+        cpu.as_mut()
+            .publish_fair_balance_due(MonotonicInstant::from_nanos(ENTRY_NOW_NS).unwrap())
+    );
     crate::test_runtime::set_monotonic_ns(COMPLETION_NOW_NS);
 
     assert_eq!(system.balance_fair(cpu.as_mut()), Ok(None));
     assert!(
-        !cpu.publish_fair_balance_due(MonotonicInstant::from_nanos(COMPLETION_NOW_NS).unwrap()),
+        !cpu.as_mut()
+            .publish_fair_balance_due(MonotonicInstant::from_nanos(COMPLETION_NOW_NS).unwrap()),
         "completed balance work must not leave its next period already overdue"
     );
     assert!(
-        !cpu.publish_fair_balance_due(
+        !cpu.as_mut().publish_fair_balance_due(
             MonotonicInstant::from_nanos(COMPLETION_NOW_NS.saturating_add(BALANCE_INTERVAL_NS))
                 .unwrap()
         ),
@@ -2084,7 +2113,7 @@ fn unsuccessful_fair_balance_backs_off_from_monotonic_completion_time() {
          interval"
     );
     assert!(
-        cpu.publish_fair_balance_due(
+        cpu.as_mut().publish_fair_balance_due(
             MonotonicInstant::from_nanos(
                 COMPLETION_NOW_NS.saturating_add(BALANCE_INTERVAL_NS.saturating_mul(2))
             )
@@ -2117,24 +2146,28 @@ fn affinity_constrained_fair_balance_keeps_backing_off() {
     system.make_ready(pinned.id()).unwrap();
     system.enqueue_at(cpu0.as_mut(), pinned.id(), 0).unwrap();
 
-    assert!(cpu0.publish_fair_balance_due(MonotonicInstant::from_nanos(INTERVAL_NS).unwrap()));
+    assert!(
+        cpu0.as_mut()
+            .publish_fair_balance_due(MonotonicInstant::from_nanos(INTERVAL_NS).unwrap())
+    );
     crate::test_runtime::set_monotonic_ns(INTERVAL_NS);
     assert_eq!(system.balance_fair(cpu0.as_mut()), Ok(None));
     let second_balance_ns = INTERVAL_NS.saturating_mul(3);
     assert!(
-        cpu0.publish_fair_balance_due(MonotonicInstant::from_nanos(second_balance_ns).unwrap())
+        cpu0.as_mut()
+            .publish_fair_balance_due(MonotonicInstant::from_nanos(second_balance_ns).unwrap())
     );
 
     crate::test_runtime::set_monotonic_ns(second_balance_ns);
     assert_eq!(system.balance_fair(cpu0.as_mut()), Ok(None));
     assert!(
-        !cpu0.publish_fair_balance_due(
+        !cpu0.as_mut().publish_fair_balance_due(
             MonotonicInstant::from_nanos(second_balance_ns.saturating_add(INTERVAL_NS * 2))
                 .unwrap()
         ),
         "an affinity-constrained domain must continue exponential backoff"
     );
-    assert!(cpu0.publish_fair_balance_due(
+    assert!(cpu0.as_mut().publish_fair_balance_due(
         MonotonicInstant::from_nanos(second_balance_ns.saturating_add(INTERVAL_NS * 4)).unwrap()
     ));
 }
@@ -2166,7 +2199,10 @@ fn successful_fair_balance_resets_the_minimum_interval() {
     }
 
     crate::test_runtime::set_monotonic_ns(INTERVAL_NS);
-    assert!(cpu0.publish_fair_balance_due(MonotonicInstant::from_nanos(INTERVAL_NS).unwrap()));
+    assert!(
+        cpu0.as_mut()
+            .publish_fair_balance_due(MonotonicInstant::from_nanos(INTERVAL_NS).unwrap())
+    );
     balance::reset_balance_candidate_visits();
     assert_eq!(system.balance_fair(cpu0.as_mut()), Ok(Some(movable.id())));
     assert_eq!(
@@ -2175,7 +2211,7 @@ fn successful_fair_balance_resets_the_minimum_interval() {
         "a periodic balance transaction must select its source candidate only once"
     );
     assert!(
-        cpu0.publish_fair_balance_due(
+        cpu0.as_mut().publish_fair_balance_due(
             MonotonicInstant::from_nanos(INTERVAL_NS.saturating_mul(2)).unwrap()
         ),
         "successful migration must restore the configured minimum interval"
@@ -2209,7 +2245,11 @@ fn fair_balance_selects_one_candidate_across_multiple_destinations() {
     }
 
     crate::test_runtime::set_monotonic_ns(INTERVAL_NS);
-    assert!(cpus[0].publish_fair_balance_due(MonotonicInstant::from_nanos(INTERVAL_NS).unwrap()));
+    assert!(
+        cpus[0]
+            .as_mut()
+            .publish_fair_balance_due(MonotonicInstant::from_nanos(INTERVAL_NS).unwrap())
+    );
     balance::reset_balance_candidate_visits();
     assert_eq!(
         system.balance_fair(cpus[0].as_mut()),
@@ -2251,7 +2291,10 @@ fn fair_balance_scans_past_an_affinity_constrained_candidate() {
     }
 
     crate::test_runtime::set_monotonic_ns(INTERVAL_NS);
-    assert!(cpu0.publish_fair_balance_due(MonotonicInstant::from_nanos(INTERVAL_NS).unwrap()));
+    assert!(
+        cpu0.as_mut()
+            .publish_fair_balance_due(MonotonicInstant::from_nanos(INTERVAL_NS).unwrap())
+    );
     assert_eq!(
         system.balance_fair(cpu0.as_mut()),
         Ok(Some(movable.id())),
@@ -2289,7 +2332,10 @@ fn periodic_fair_balance_does_not_move_light_work_toward_a_heavier_cpu() {
     system.enqueue_at(cpu1.as_mut(), heavy.id(), 0).unwrap();
 
     crate::test_runtime::set_monotonic_ns(INTERVAL_NS);
-    assert!(cpu0.publish_fair_balance_due(MonotonicInstant::from_nanos(INTERVAL_NS).unwrap()));
+    assert!(
+        cpu0.as_mut()
+            .publish_fair_balance_due(MonotonicInstant::from_nanos(INTERVAL_NS).unwrap())
+    );
     assert_eq!(
         system.balance_fair(cpu0.as_mut()),
         Ok(None),
@@ -2327,7 +2373,7 @@ fn local_timer_is_programmed_from_scheduler_completion_time() {
 
     crate::test_runtime::set_monotonic_ns(COMPLETION_NOW_NS);
     crate::test_runtime::set_scheduler_ns(ENTRY_NOW_NS);
-    TaskSystem::program_local_timer(cpu.as_mut()).unwrap();
+    system.program_local_timer(cpu.as_mut()).unwrap();
     let update = crate::test_runtime::take_scheduler_deadline_update()
         .expect("local timer programming must publish one complete update");
     let deadline_ns = update
@@ -3228,8 +3274,10 @@ fn prepared_exit_rejects_new_remote_affinity_delivery() {
         system.bring_cpu_online(cpu.as_mut()).unwrap();
     }
 
+    crate::test_runtime::set_scheduler_ns(0);
+    let _clock = system.sample_owner_rq_clock(cpu0.as_ref().get_ref());
     let permit = system
-        .prepare_current_exit_inner(cpu0.as_mut(), 0, false)
+        .prepare_current_exit_inner(cpu0.as_mut(), false)
         .unwrap();
     let mut target_only = CpuSet::empty(2);
     assert!(target_only.insert(CpuId::new(1)));
@@ -3239,12 +3287,14 @@ fn prepared_exit_rejects_new_remote_affinity_delivery() {
         "a prepared exit must reject new affinity delivery reservations"
     );
 
+    crate::test_runtime::set_scheduler_ns(1);
+    let _clock = system.sample_owner_rq_clock(cpu0.as_ref().get_ref());
     system
-        .commit_current_exit_after_owner_drain(cpu0.as_mut(), permit, 1)
+        .commit_current_exit_after_owner_drain(cpu0.as_mut(), permit)
         .unwrap();
     drop(exiting);
     system.complete_context_switch(cpu0.as_mut()).unwrap();
-    assert_eq!(cpu1.try_runnable_summary(), Some(0));
+    assert_eq!(cpu1.load_summary().queued_count(), 0);
     let core = exiting_core
         .upgrade()
         .expect("the registry still retains the exited core before reaping");
@@ -3287,8 +3337,10 @@ fn prepared_exit_rejects_new_remote_deadline_policy_delivery() {
         system.bring_cpu_online(cpu.as_mut()).unwrap();
     }
 
+    crate::test_runtime::set_scheduler_ns(0);
+    let _clock = system.sample_owner_rq_clock(cpu0.as_ref().get_ref());
     let permit = system
-        .prepare_current_exit_inner(cpu0.as_mut(), 0, false)
+        .prepare_current_exit_inner(cpu0.as_mut(), false)
         .unwrap();
     let deadline =
         SchedulePolicy::deadline(DeadlinePolicy::new(1, 2, 10, DeadlineFlags::NONE).unwrap());
@@ -3298,8 +3350,10 @@ fn prepared_exit_rejects_new_remote_deadline_policy_delivery() {
         "a prepared exit must reject new policy delivery reservations"
     );
 
+    crate::test_runtime::set_scheduler_ns(1);
+    let _clock = system.sample_owner_rq_clock(cpu0.as_ref().get_ref());
     system
-        .commit_current_exit_after_owner_drain(cpu0.as_mut(), permit, 1)
+        .commit_current_exit_after_owner_drain(cpu0.as_mut(), permit)
         .unwrap();
     drop(exiting);
     system.complete_context_switch(cpu0.as_mut()).unwrap();
@@ -3524,6 +3578,33 @@ fn scheduler_work_without_preemption_preserves_current_dispatch() {
 }
 
 #[test]
+fn running_rt_task_has_one_active_schedule_owner() {
+    let system = TaskSystem::new(TaskSystemConfig::new(1)).unwrap();
+    let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
+    let running = system
+        .install_bootstrap_thread(
+            cpu.as_mut(),
+            ThreadSpec::new(SchedulePolicy::round_robin(RtPriority::new(1).unwrap())),
+        )
+        .unwrap();
+    system.bring_cpu_online(cpu.as_mut()).unwrap();
+
+    let thread_owner = {
+        let state = system.state.lock();
+        let sched = state.thread_record(running.id()).unwrap().sched.lock();
+        usize::from(sched.policy.owns_active())
+    };
+    let rq_owners = cpu
+        .lock_run_queue()
+        .debug_schedule_owner_count(running.id());
+    assert_eq!(
+        thread_owner + rq_owners,
+        1,
+        "one runnable entity must have exactly one mutable schedule-state owner",
+    );
+}
+
+#[test]
 fn policy_safe_point_drains_only_owner_control() {
     let system = TaskSystem::new(TaskSystemConfig::new(1)).unwrap();
     let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
@@ -3677,11 +3758,9 @@ fn fair_policy_update_reweights_lag_without_resetting_service_history() {
         .unwrap();
 
     let before = cpu
-        .dispatch_state()
-        .current_dispatch
-        .as_ref()
+        .lock_run_queue()
+        .current_scheduling_entity()
         .unwrap()
-        .entity
         .fair()
         .unwrap();
     assert_eq!(before.vruntime(), 650_000);
@@ -3704,7 +3783,8 @@ fn fair_policy_update_reweights_lag_without_resetting_service_history() {
         .sched
         .lock()
         .policy
-        .effective_entity
+        .active()
+        .entity()
         .fair()
         .unwrap();
     let lag =
@@ -3734,7 +3814,8 @@ fn fair_policy_update_reweights_lag_without_resetting_service_history() {
         .sched
         .lock()
         .policy
-        .effective_entity
+        .active()
+        .entity()
         .fair()
         .unwrap();
     assert_eq!(batch.vruntime(), reweighted.vruntime());
@@ -3758,7 +3839,8 @@ fn fair_policy_update_reweights_lag_without_resetting_service_history() {
         .sched
         .lock()
         .policy
-        .effective_entity
+        .active()
+        .entity()
         .fair()
         .unwrap();
     assert_eq!(idle.nice(), Nice::LOWEST);
@@ -3856,7 +3938,8 @@ fn running_idle_to_normal_transition_uses_both_class_virtual_times() {
         .sched
         .lock()
         .policy
-        .effective_entity
+        .active()
+        .entity()
         .fair()
         .unwrap();
     assert_eq!(
@@ -3888,8 +3971,7 @@ fn running_normal_to_idle_transition_settles_then_rebases_lag() {
     let state = system.state.lock();
     let record = state.thread_record(normal.id()).unwrap();
     let sched = record.sched.lock();
-    let transitioned = sched.policy.effective_entity.fair().unwrap();
-    assert_eq!(sched.runtime.charged_runtime_ns, 1_000_000);
+    let transitioned = sched.policy.active().entity().fair().unwrap();
     assert_eq!(transitioned.mode(), FairMode::Idle);
     assert_eq!(
         transitioned.vruntime(),
@@ -3948,48 +4030,6 @@ fn bounded_inbox_remainder_stays_sticky_across_scheduler_entry() {
 }
 
 #[test]
-fn bounded_deadline_expiration_retains_only_due_work() {
-    let system = TaskSystem::new(TaskSystemConfig::new(1).with_batch_limit(1)).unwrap();
-    let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
-    system
-        .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
-        .unwrap();
-    system.bring_cpu_online(cpu.as_mut()).unwrap();
-
-    for _ in 0..2 {
-        let policy =
-            SchedulePolicy::deadline(DeadlinePolicy::new(1, 10, 100, DeadlineFlags::NONE).unwrap());
-        let thread = system.create_thread(ThreadSpec::new(policy)).unwrap();
-        system.make_ready(thread.id()).unwrap();
-        system.enqueue_at(cpu.as_mut(), thread.id(), 0).unwrap();
-    }
-    // Discard the preemption requested by initial Deadline placement. Both CBS
-    // events are due at 10, but hard IRQ may publish only one per batch.
-    assert!(cpu.remote().take_preempt_requested());
-    crate::test_runtime::set_monotonic_ns(10);
-    let irq_budget = cpu.batch_limit();
-    let irq_batch = cpu
-        .as_mut()
-        .on_task_clock_event(MonotonicInstant::from_nanos(10).unwrap(), irq_budget);
-    assert_eq!(irq_batch.expired(), 1);
-    assert!(irq_batch.pending());
-    system.service_soft_timer_work(cpu.as_mut(), 10).unwrap();
-    assert!(
-        cpu.needs_reschedule(),
-        "the first bounded batch must retain the second expired event"
-    );
-
-    let _ = cpu.remote().take_preempt_requested();
-    system.service_soft_timer_work(cpu.as_mut(), 10).unwrap();
-    let _ = cpu.remote().take_preempt_requested();
-    assert!(
-        !cpu.needs_reschedule(),
-        "draining the second expired event must finish bounded owner work: {:?}",
-        cpu.remote().scheduler_request_state_for_test()
-    );
-}
-
-#[test]
 fn future_deadline_members_do_not_create_scheduler_work() {
     let system = TaskSystem::new(TaskSystemConfig::new(1).with_batch_limit(1)).unwrap();
     let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
@@ -4036,15 +4076,17 @@ fn elapsed_deadline_event_is_reconciled_without_a_physical_timer_node() {
     crate::test_runtime::set_monotonic_ns(10);
     {
         let mut sched = core.sched().lock();
-        system
-            .refresh_owner_deadline_timers_locked(&core, &mut sched, cpu.as_mut(), 10)
-            .unwrap();
+        system.refresh_owner_deadline_timers_locked(&core, &mut sched, cpu.as_mut());
         assert!(
             sched.deadline.cbs_timer.is_none(),
             "Linux start_dl_timer() does not arm an already elapsed scheduler deadline"
         );
         assert_eq!(
-            sched.policy.base_entity.deadline().unwrap().misses(),
+            cpu.lock_run_queue()
+                .scheduling_entity(core.id())
+                .and_then(|entity| entity.deadline().cloned())
+                .unwrap()
+                .misses(),
             1,
             "the owner must reconcile the elapsed CBS state in the same scheduler transaction"
         );
@@ -4086,7 +4128,8 @@ fn single_runnable_fair_yield_preserves_the_active_request() {
         .sched()
         .lock()
         .policy
-        .effective_entity
+        .active()
+        .entity()
         .fair()
         .unwrap();
     let decision = system.yield_current_at(cpu.as_mut(), 0).unwrap();
@@ -4095,7 +4138,8 @@ fn single_runnable_fair_yield_preserves_the_active_request() {
         .sched()
         .lock()
         .policy
-        .effective_entity
+        .active()
+        .entity()
         .fair()
         .unwrap();
 
@@ -4169,10 +4213,9 @@ fn dequeue_removes_obsolete_scheduler_clockevent() {
     system.enqueue_at(cpu.as_mut(), contender.id(), 0).unwrap();
 
     crate::test_runtime::set_scheduler_ns_for_cpu(cpu.owner().as_u32(), 0);
-    let clock = cpu.update_rq_clock();
     assert!(
         cpu.as_mut()
-            .next_oneshot_deadline(clock, MonotonicInstant::from_nanos(0).unwrap())
+            .next_oneshot_deadline(MonotonicInstant::from_nanos(0).unwrap())
             .is_some(),
         "two fair entities require a scheduler clockevent"
     );
@@ -4180,7 +4223,7 @@ fn dequeue_removes_obsolete_scheduler_clockevent() {
 
     assert_eq!(
         cpu.as_mut()
-            .next_oneshot_deadline(clock, MonotonicInstant::from_nanos(0).unwrap()),
+            .next_oneshot_deadline(MonotonicInstant::from_nanos(0).unwrap()),
         None,
         "removing the only queued contender must remove the obsolete scheduler clockevent"
     );
@@ -4264,22 +4307,21 @@ fn queued_affinity_migration_captures_lag_before_detaching_from_source() {
             deadline,
         ));
         cpu0.lock_run_queue()
-            .enqueue(
+            .enqueue_task(
                 QueuedThread::new(
                     thread.id(),
-                    policy,
-                    entity,
+                    ActiveSchedulingState::new(policy, entity.clone()),
                     Arc::clone(&thread.core),
                     false,
                     true,
+                    RqTaskMetadata::test(2),
                 ),
                 EnqueueReason::Preempted,
                 None,
             )
             .unwrap();
         let mut sched = thread.core.sched().lock();
-        sched.policy.base_entity = entity;
-        sched.policy.effective_entity = entity;
+        *sched.policy.active_mut().entity_mut() = entity;
         sched.placement.activate(CpuId::new(0));
         thread.core.set_wake_cpu_hint(CpuId::new(0));
     }
@@ -4295,7 +4337,8 @@ fn queued_affinity_migration_captures_lag_before_detaching_from_source() {
             .sched()
             .lock()
             .policy
-            .effective_entity
+            .active()
+            .entity()
             .fair()
             .unwrap()
             .saved_migration(),
@@ -4434,7 +4477,7 @@ fn schedule_out_rechecks_affinity_under_the_thread_lock() {
     assert!(target_only.insert(CpuId::new(1)));
     {
         let mut sched = running.core.sched().lock();
-        sched.placement.affinity = target_only;
+        sched.affinity.affinity = Arc::new(target_only);
         sched.placement.request_migration(None);
     }
     running.core.set_wake_cpu_hint(CpuId::new(1));
@@ -4491,10 +4534,15 @@ fn owner_pick_reconciles_affinity_changed_after_inbox_drain() {
     assert!(cpu1_only.insert(CpuId::new(1)));
     system.set_affinity(candidate.id(), cpu1_only).unwrap();
 
-    let next = system
-        .pick_owner_next(cpu0.as_mut(), 1, Some(running.id()))
-        .expect("pick-next must skip and transfer a newly disallowed candidate")
-        .core;
+    crate::test_runtime::set_scheduler_ns(1);
+    let remote = Arc::clone(cpu0.remote());
+    let next = {
+        let mut transaction = OwnerRqTxn::begin(&system, &remote);
+        let next =
+            system.pick_owner_next_in_rq(cpu0.as_mut(), &mut transaction, Some(running.id()));
+        transaction.commit();
+        next.core
+    };
     assert_eq!(next.id(), idle0.id());
     assert_eq!(
         candidate
@@ -4531,15 +4579,22 @@ fn affinity_update_preserves_an_in_flight_switch_handoff() {
     system.bring_cpu_online(cpu0.as_mut()).unwrap();
     system.bring_cpu_online(cpu1.as_mut()).unwrap();
 
-    let initial_target = system
-        .schedule_out_owner_running(
+    let remote = Arc::clone(cpu0.remote());
+    let initial_target = {
+        let mut sched = running.core.sched().lock();
+        let mut transaction = OwnerRqTxn::begin(&system, &remote);
+        let initial_target = system.schedule_out_owner_running_in_rq(
             cpu0.as_mut(),
+            &mut transaction,
             Arc::clone(&running.core),
+            &mut sched,
             1,
             EnqueueReason::Yield,
-        )
-        .unwrap();
-    assert!(initial_target.is_none());
+        );
+        transaction.commit();
+        initial_target
+    };
+    assert!(initial_target.migration.is_none());
     {
         let sched = running.core.sched().lock();
         assert_eq!(sched.placement.queued_cpu(), Some(CpuId::new(0)));
@@ -4559,30 +4614,50 @@ fn affinity_update_preserves_an_in_flight_switch_handoff() {
         assert!(!sched.placement.has_pending_migration());
     }
 
-    let next = system
-        .pick_owner_next(cpu0.as_mut(), 2, Some(running.id()))
-        .unwrap();
-    assert_eq!(next.core.id(), idle0.id());
-    assert_eq!(
-        next.outgoing_migration
-            .as_ref()
-            .map(PreparedMigrationDelivery::target),
-        Some(CpuId::new(1)),
-        "the owner must carry the late affinity change in switch tail"
-    );
+    crate::test_runtime::set_scheduler_ns(2);
+    let next = {
+        let mut transaction = OwnerRqTxn::begin(&system, &remote);
+        let next =
+            system.pick_owner_next_in_rq(cpu0.as_mut(), &mut transaction, Some(running.id()));
+        transaction.commit();
+        next
+    };
+    assert_eq!(next.core.id(), running.id());
     TaskSystem::stage_switch_handoff(
         cpu0.as_mut(),
         Some(running.id()),
         Some(Arc::clone(&running.core)),
         next.core.id(),
-        next.outgoing_migration,
-    )
-    .unwrap();
+        None,
+    );
+    assert!(
+        cpu0.switch_handoff().is_none(),
+        "reselecting current creates no artificial context-switch tail"
+    );
     assert!(
         !cpu1.has_remote_work(),
         "migration cannot publish before the outgoing stack is inactive"
     );
 
+    assert!(
+        cpu0.has_remote_work(),
+        "the affinity request remains owned by the source rq after a concurrent stale pick"
+    );
+    assert!(
+        !cpu1.has_remote_work(),
+        "an owner-control publication cannot mutate a remote rq"
+    );
+    system.drain_owner_work(cpu0.as_mut()).unwrap();
+    assert_eq!(
+        running.core.sched().lock().placement.requested_migration(),
+        Some(CpuId::new(1))
+    );
+    let decision = system.schedule_at(cpu0.as_mut(), 3).unwrap();
+    assert_eq!(decision.next(), idle0.id());
+    assert!(
+        !cpu1.has_remote_work(),
+        "the prepared migration remains pinned until switch tail releases on_cpu"
+    );
     system.complete_context_switch(cpu0.as_mut()).unwrap();
     assert!(cpu1.has_remote_work());
 }
@@ -4613,15 +4688,21 @@ fn rt_deadline_put_prev_keeps_one_runqueue_owner() {
     );
     system.complete_context_switch(cpu.as_mut()).unwrap();
     assert!(cpu.lock_run_queue().is_linked_current(deadline.id()));
-    let queued_before = cpu.lock_run_queue().len();
-    system
-        .schedule_out_owner_running(
+    let queued_before = cpu.lock_run_queue().nr_queued();
+    let remote = Arc::clone(cpu.remote());
+    {
+        let mut sched = deadline.core.sched().lock();
+        let mut transaction = OwnerRqTxn::begin(&system, &remote);
+        system.schedule_out_owner_running_in_rq(
             cpu.as_mut(),
+            &mut transaction,
             Arc::clone(&deadline.core),
+            &mut sched,
             2,
             EnqueueReason::Preempted,
-        )
-        .unwrap();
+        );
+        transaction.commit();
+    }
 
     let sched = deadline.core.sched().lock();
     assert_eq!(sched.lifecycle.state(), ThreadState::Ready);
@@ -4631,7 +4712,7 @@ fn rt_deadline_put_prev_keeps_one_runqueue_owner() {
     assert_eq!(cpu.current(), None);
     let run_queue = cpu.lock_run_queue();
     assert!(run_queue.queued_thread(deadline.id()).is_some());
-    assert_eq!(run_queue.len(), queued_before + 1);
+    assert_eq!(run_queue.nr_queued(), queued_before + 1);
 }
 
 #[test]
@@ -4746,7 +4827,7 @@ fn load_summary_publication_does_not_scan_runnable_threads() {
         .collect::<Vec<_>>();
 
     balance::reset_balance_candidate_visits();
-    system.publish_owner_cpu_load_summary(cpu0.as_mut());
+    OwnerRqTxn::begin(&system, cpu0.remote()).commit();
 
     assert_eq!(
         balance::balance_candidate_visits(),
@@ -4958,31 +5039,46 @@ fn effective_rt_entity_never_replaces_the_base_rr_accounting() {
     let wait = commit_pi_wait(&system, &lock, donor.id(), owner.id()).unwrap();
     system.drain_policy_updates_at(cpu.as_mut(), 0).unwrap();
 
-    let state = system.state.lock();
-    let sched = state.thread_record(owner.id()).unwrap().sched.lock();
-    assert!(
-        sched.policy.base_entity.matches_policy(base),
-        "PI effective entity must not become base RR accounting"
+    let rq = cpu.lock_run_queue();
+    let (effective_policy, effective_entity) = rq.scheduling_state(owner.id()).unwrap();
+    assert_eq!(
+        effective_policy,
+        SchedulePolicy::round_robin_with_quantum(RtPriority::new(80).unwrap(), 10).unwrap(),
+        "Linux RT PI changes effective priority without changing RR policy"
     );
-    assert!(matches!(
-        sched.policy.effective,
-        SchedulePolicy::Fifo { .. }
-    ));
+    assert!(effective_entity.matches_policy(base));
     assert!(
-        sched
-            .policy
-            .effective_entity
-            .matches_policy(sched.policy.effective),
-        "effective policy and entity must be published as one coherent snapshot"
+        rq.base_scheduling_entity(owner.id())
+            .unwrap()
+            .matches_policy(base)
     );
-    drop(sched);
-    drop(state);
+    drop(rq);
+    assert_eq!(
+        system.schedule_at(cpu.as_mut(), 0).unwrap().next(),
+        owner.id()
+    );
+    assert!(
+        !system
+            .charge_current_at(cpu.as_mut(), 4, 4, 0)
+            .unwrap()
+            .slice_expired()
+    );
     system.pi_wait_cancel(wait).unwrap();
+    system.drain_policy_updates_at(cpu.as_mut(), 4).unwrap();
+    system.schedule_at(cpu.as_mut(), 4).unwrap();
+    assert!(
+        system
+            .charge_current_at(cpu.as_mut(), 10, 6, 0)
+            .unwrap()
+            .slice_expired(),
+        "RR quantum must accumulate across PI boost and deboost"
+    );
 }
 
 #[test]
 fn chained_and_multi_lock_donations_are_withdrawn_independently() {
     let system = TaskSystem::new(TaskSystemConfig::new(1)).unwrap();
+    let mut cpu = create_online_pi_cpu(&system);
     let first_owner = system
         .create_thread(ThreadSpec::new(SchedulePolicy::fair(
             Nice::new(19).unwrap(),
@@ -5000,6 +5096,8 @@ fn chained_and_multi_lock_donations_are_withdrawn_independently() {
             RtPriority::new(99).unwrap(),
         )))
         .unwrap();
+    place_pi_owner(&system, cpu.as_mut(), &first_owner);
+    place_pi_owner(&system, cpu.as_mut(), &second_owner);
     let first_lock = PiMutexCore::new();
     let second_lock = PiMutexCore::new();
     let chained =
@@ -5022,6 +5120,7 @@ fn chained_and_multi_lock_donations_are_withdrawn_independently() {
 #[test]
 fn pi_registration_does_not_scan_unrelated_registry_slots() {
     let system = TaskSystem::new(TaskSystemConfig::new(1)).unwrap();
+    let mut cpu = create_online_pi_cpu(&system);
     let unrelated = (0..128)
         .map(|_| {
             system
@@ -5037,6 +5136,7 @@ fn pi_registration_does_not_scan_unrelated_registry_slots() {
             RtPriority::new(90).unwrap(),
         )))
         .unwrap();
+    place_pi_owner(&system, cpu.as_mut(), &owner);
     registry::reset_pi_donor_record_visits();
 
     let lock = PiMutexCore::new();
@@ -5054,6 +5154,7 @@ fn pi_registration_does_not_scan_unrelated_registry_slots() {
 #[test]
 fn equal_urgency_pi_registration_does_not_rescan_owner_donors() {
     let system = TaskSystem::new(TaskSystemConfig::new(1)).unwrap();
+    let mut cpu = create_online_pi_cpu(&system);
     let owner = system
         .create_thread(ThreadSpec::new(SchedulePolicy::default()))
         .unwrap();
@@ -5063,6 +5164,7 @@ fn equal_urgency_pi_registration_does_not_rescan_owner_donors() {
     let second = system
         .create_thread(ThreadSpec::new(SchedulePolicy::default()))
         .unwrap();
+    place_pi_owner(&system, cpu.as_mut(), &owner);
     let lock = PiMutexCore::new();
     let first_wait = commit_pi_wait(&system, &lock, first.id(), owner.id()).unwrap();
     registry::reset_pi_donor_record_visits();
@@ -5082,6 +5184,8 @@ fn equal_urgency_pi_registration_does_not_rescan_owner_donors() {
 #[test]
 fn blocked_waiter_policy_change_updates_the_cached_lock_top_without_owner_scan() {
     let system = TaskSystem::new(TaskSystemConfig::new(1)).unwrap();
+    let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
+    system.bring_cpu_online(cpu.as_mut()).unwrap();
     let owner = system
         .create_thread(ThreadSpec::new(SchedulePolicy::fair(
             Nice::new(19).unwrap(),
@@ -5098,6 +5202,8 @@ fn blocked_waiter_policy_change_updates_the_cached_lock_top_without_owner_scan()
             RtPriority::new(90).unwrap(),
         )))
         .unwrap();
+    system.make_ready(owner.id()).unwrap();
+    system.enqueue(cpu.as_mut(), owner.id()).unwrap();
     let lock = PiMutexCore::new();
     let first_wait = commit_pi_wait(&system, &lock, first.id(), owner.id()).unwrap();
     let second_wait = commit_pi_wait(&system, &lock, second.id(), owner.id()).unwrap();
@@ -5125,7 +5231,7 @@ fn blocked_waiter_policy_change_updates_the_cached_lock_top_without_owner_scan()
     let owner_sched = state.thread_record(owner.id()).unwrap().sched.lock();
     assert_eq!(owner_sched.pi.donor, Some(first.id()));
     assert_eq!(
-        owner_sched.policy.effective,
+        owner.effective_policy(),
         SchedulePolicy::fifo(RtPriority::new(80).unwrap())
     );
     drop(owner_sched);
@@ -5143,6 +5249,7 @@ fn blocked_waiter_policy_change_updates_the_cached_lock_top_without_owner_scan()
 #[test]
 fn failed_pi_registration_does_not_publish_a_partial_edge() {
     let system = TaskSystem::new(TaskSystemConfig::new(1)).unwrap();
+    let mut cpu = create_online_pi_cpu(&system);
     let owner = system
         .create_thread(ThreadSpec::new(SchedulePolicy::default()))
         .unwrap();
@@ -5151,6 +5258,7 @@ fn failed_pi_registration_does_not_publish_a_partial_edge() {
             RtPriority::new(90).unwrap(),
         )))
         .unwrap();
+    place_pi_owner(&system, cpu.as_mut(), &owner);
     {
         let state = system.state.lock();
         state
@@ -5168,22 +5276,32 @@ fn failed_pi_registration_does_not_publish_a_partial_edge() {
     assert_eq!(result.unwrap_err(), TaskError::InvalidConfiguration);
     assert!(release_pi_for_thread(&lock, owner.id()).unwrap());
     let state = system.state.lock();
-    assert_eq!(state.thread_record(waiter.id()).unwrap().blocked_on, None);
     assert_eq!(
+        state
+            .thread_record(waiter.id())
+            .unwrap()
+            .sched
+            .lock()
+            .pi
+            .blocked_on,
+        None
+    );
+    assert!(
         state
             .thread_record(owner.id())
             .unwrap()
             .sched
             .lock()
             .pi
-            .donating_locks,
-        0
+            .donors
+            .is_empty()
     );
 }
 
 #[test]
 fn failed_pi_release_preserves_the_unselected_wait_transaction() {
     let system = TaskSystem::new(TaskSystemConfig::new(1)).unwrap();
+    let mut cpu = create_online_pi_cpu(&system);
     let owner = system
         .create_thread(ThreadSpec::new(SchedulePolicy::default()))
         .unwrap();
@@ -5192,6 +5310,7 @@ fn failed_pi_release_preserves_the_unselected_wait_transaction() {
             RtPriority::new(90).unwrap(),
         )))
         .unwrap();
+    place_pi_owner(&system, cpu.as_mut(), &owner);
     let lock = PiMutexCore::new();
     let token = commit_pi_wait(&system, &lock, waiter.id(), owner.id()).unwrap();
     {
@@ -5214,26 +5333,32 @@ fn failed_pi_release_preserves_the_unselected_wait_transaction() {
     assert!(!token.is_granted());
     let state = system.state.lock();
     assert_eq!(
-        state.thread_record(waiter.id()).unwrap().blocked_on,
+        state
+            .thread_record(waiter.id())
+            .unwrap()
+            .sched
+            .lock()
+            .pi
+            .blocked_on,
         Some(PiWaitRegistration {
             lock: lock.mutex_ref().unwrap().raw(),
             key: PiWaitKey::new(
-                waiter.effective_scheduling_urgency(),
+                waiter.core.effective_pi_wait_urgency(),
                 waiter.id().as_u64(),
                 waiter.id()
             ),
             generation: token.generation,
         })
     );
-    assert_eq!(
-        state
+    assert!(
+        !state
             .thread_record(owner.id())
             .unwrap()
             .sched
             .lock()
             .pi
-            .donating_locks,
-        1
+            .donors
+            .is_empty()
     );
     drop(state);
     {
@@ -5265,6 +5390,7 @@ fn pi_release_atomically_selects_and_preserves_the_wait_transaction() {
             RtPriority::new(90).unwrap(),
         )))
         .unwrap();
+    place_pi_owner(&system, cpu.as_mut(), &owner);
     system.make_ready(waiter.id()).unwrap();
     let lock = PiMutexCore::new();
     let token = commit_pi_wait(&system, &lock, waiter.id(), owner.id()).unwrap();
@@ -5274,29 +5400,35 @@ fn pi_release_atomically_selects_and_preserves_the_wait_transaction() {
         .unwrap();
 
     assert!(!token.is_granted());
-    assert!(token.is_selected());
+    assert!(token.can_claim());
     let state = system.state.lock();
     assert_eq!(
-        state.thread_record(waiter.id()).unwrap().blocked_on,
+        state
+            .thread_record(waiter.id())
+            .unwrap()
+            .sched
+            .lock()
+            .pi
+            .blocked_on,
         Some(PiWaitRegistration {
             lock: lock.mutex_ref().unwrap().raw(),
             key: PiWaitKey::new(
-                waiter.effective_scheduling_urgency(),
+                waiter.core.effective_pi_wait_urgency(),
                 waiter.id().as_u64(),
                 waiter.id()
             ),
             generation: token.generation,
         })
     );
-    assert_eq!(
+    assert!(
         state
             .thread_record(owner.id())
             .unwrap()
             .sched
             .lock()
             .pi
-            .donating_locks,
-        0
+            .donors
+            .is_empty()
     );
     drop(state);
     system.pi_mutex_claim(&token).unwrap();
@@ -5320,6 +5452,7 @@ fn pi_release_wakes_the_selected_waiter_before_returning() {
             RtPriority::new(90).unwrap(),
         )))
         .unwrap();
+    place_pi_owner(&system, cpu.as_mut(), &owner);
     system.make_ready(waiter.id()).unwrap();
     system.enqueue_at(cpu.as_mut(), waiter.id(), 0).unwrap();
     assert_eq!(
@@ -5349,7 +5482,7 @@ fn pi_release_wakes_the_selected_waiter_before_returning() {
 }
 
 #[test]
-fn deadline_donor_budget_is_debited_and_overrun_callback_is_deferred() {
+fn deadline_pi_charges_the_owner_local_cbs_without_debiting_the_donor() {
     DEADLINE_OVERRUN_CALLBACKS.store(0, Ordering::Relaxed);
     let system = TaskSystem::new(TaskSystemConfig::new(1)).unwrap();
     let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
@@ -5382,27 +5515,28 @@ fn deadline_donor_budget_is_debited_and_overrun_callback_is_deferred() {
 
     let charged = system.charge_current_at(cpu.as_mut(), 10, 10, 0).unwrap();
     assert!(!charged.slice_expired());
-    assert!(charged.deadline_overrun());
+    assert!(
+        !charged.deadline_overrun(),
+        "Linux reports DL overrun from the boosted owner's local flags, not donor flags"
+    );
     assert_eq!(DEADLINE_OVERRUN_CALLBACKS.load(Ordering::Relaxed), 0);
     system.schedule_at(cpu.as_mut(), 10).unwrap();
 
     let donor_runtime = system.deadline_runtime(donor.id()).unwrap();
-    assert_eq!(donor_runtime.remaining_runtime_ns(), 0);
-    assert_eq!(donor_runtime.overruns(), 1);
+    assert_eq!(donor_runtime.remaining_runtime_ns(), 10);
+    assert_eq!(donor_runtime.overruns(), 0);
     let owner_runtime = system.deadline_runtime(owner.id()).unwrap();
     assert_eq!(owner_runtime.donor(), Some(donor.id()));
-    assert!(owner_runtime.pi_critical_rescue());
-    system
-        .set_thread_policy(donor.id(), SchedulePolicy::default())
-        .unwrap();
-    system.drain_policy_updates_at(cpu.as_mut(), 10).unwrap();
-    assert_eq!(system.dispatch_deadline_overruns(1), Ok(1));
-    assert_eq!(DEADLINE_OVERRUN_CALLBACKS.load(Ordering::Relaxed), 1);
+    assert!(owner_runtime.pi_boosted());
+    assert_eq!(owner_runtime.remaining_runtime_ns(), 10);
+    assert_eq!(owner_runtime.overruns(), 1);
+    assert_eq!(system.dispatch_deadline_overruns(1), Ok(0));
+    assert_eq!(DEADLINE_OVERRUN_CALLBACKS.load(Ordering::Relaxed), 0);
     system.pi_wait_cancel(wait).unwrap();
 }
 
 #[test]
-fn remote_pi_owner_exclusively_borrows_the_donor_cbs_entity() {
+fn remote_pi_owner_charges_its_local_cbs_with_donor_parameters() {
     let system = TaskSystem::new(TaskSystemConfig::new(2)).unwrap();
     let mut cpu0 = system.create_cpu_local(CpuId::new(0)).unwrap();
     let mut cpu1 = system.create_cpu_local(CpuId::new(1)).unwrap();
@@ -5444,114 +5578,92 @@ fn remote_pi_owner_exclusively_borrows_the_donor_cbs_entity() {
     system.complete_context_switch(cpu0.as_mut()).unwrap();
     system.drain_policy_updates_at(cpu1.as_mut(), 0).unwrap();
 
-    let (borrowed_generation, budget_before_timer) = {
-        let state = system.state.lock();
-        let sched = state.thread_record(donor.id()).unwrap().sched.lock();
-        assert_eq!(sched.pi.deadline_cbs_borrower, Some(owner.id()));
-        (
-            sched.pi.deadline_cbs_generation,
-            sched
-                .policy
-                .base_entity
-                .deadline()
-                .expect("Deadline donor must retain CBS state"),
-        )
-    };
-    crate::test_runtime::set_monotonic_ns(20);
-    let irq_budget = cpu0.batch_limit();
-    let irq_batch = cpu0
-        .as_mut()
-        .on_task_clock_event(MonotonicInstant::from_nanos(20).unwrap(), irq_budget);
-    assert_eq!(irq_batch.expired(), 1);
-    system.service_soft_timer_work(cpu0.as_mut(), 20).unwrap();
-    {
-        let state = system.state.lock();
-        let sched = state.thread_record(donor.id()).unwrap().sched.lock();
-        assert_eq!(sched.pi.deadline_cbs_borrower, Some(owner.id()));
-        assert_eq!(sched.pi.deadline_cbs_generation, borrowed_generation);
-        assert_eq!(
-            sched.policy.base_entity.deadline(),
-            Some(budget_before_timer)
-        );
-        assert!(
-            sched.deadline.cbs_timer.is_none(),
-            "the expired donor CBS event must stay detached while the borrower owns the baton"
-        );
-    }
-    let _ = cpu0.remote().take_preempt_requested();
-    assert!(
-        !cpu0.needs_reschedule(),
-        "the donor CPU must start the baton-return check without stale work"
-    );
+    let owner_runtime = system.deadline_runtime(owner.id()).unwrap();
+    assert_eq!(owner_runtime.donor(), Some(donor.id()));
+    assert!(owner_runtime.pi_boosted());
 
-    cpu1.as_mut().add_deadline_bandwidth(500_000_000, false);
     system.charge_current_at(cpu1.as_mut(), 5, 5, 0).unwrap();
-    system.commit_owner_current_dispatch(cpu1.as_mut()).unwrap();
-    assert!(
-        cpu0.needs_reschedule(),
-        "returning a remote CBS baton must publish donor-CPU reconciliation work"
-    );
     {
-        let state = system.state.lock();
-        let sched = state.thread_record(donor.id()).unwrap().sched.lock();
-        assert_eq!(sched.pi.deadline_cbs_borrower, None);
-        assert!(sched.pi.deadline_cbs_generation > borrowed_generation);
-        assert_eq!(
-            sched
-                .policy
-                .base_entity
-                .deadline()
-                .expect("committed donor budget must remain Deadline")
-                .remaining_runtime_ns(),
-            5
-        );
+        let mut transaction = OwnerRqTxn::begin(&system, cpu1.remote());
+        system.commit_owner_current_dispatch_in_rq(&mut transaction);
+        transaction.commit();
     }
-    system.drain_policy_updates_at(cpu0.as_mut(), 20).unwrap();
-    system.service_soft_timer_work(cpu0.as_mut(), 20).unwrap();
-    assert_eq!(system.deadline_runtime(donor.id()).unwrap().misses(), 1);
+    assert_eq!(
+        system
+            .deadline_runtime(donor.id())
+            .unwrap()
+            .remaining_runtime_ns(),
+        10
+    );
+    assert_eq!(
+        system
+            .deadline_runtime(owner.id())
+            .unwrap()
+            .remaining_runtime_ns(),
+        5
+    );
     system.pi_wait_cancel(wait).unwrap();
 }
 
 #[test]
-fn coalesced_old_deadline_refresh_reconciles_the_latest_cbs_state() {
+fn coalesced_deadline_refresh_recomputes_the_owner_cbs_state() {
+    crate::test_runtime::set_monotonic_ns(0);
     let system = TaskSystem::new(TaskSystemConfig::new(1)).unwrap();
     let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
+    system
+        .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
+        .unwrap();
     system.bring_cpu_online(cpu.as_mut()).unwrap();
     let policy =
         SchedulePolicy::deadline(DeadlinePolicy::new(10, 20, 100, DeadlineFlags::NONE).unwrap());
     let thread = system.create_thread(ThreadSpec::new(policy)).unwrap();
     system.make_ready(thread.id()).unwrap();
     system.enqueue_at(cpu.as_mut(), thread.id(), 0).unwrap();
+    assert_eq!(
+        system.schedule_at(cpu.as_mut(), 0).unwrap().next(),
+        thread.id()
+    );
+    assert!(
+        system
+            .charge_current_at(cpu.as_mut(), 10, 10, 0)
+            .unwrap()
+            .slice_expired()
+    );
+    system.schedule_at(cpu.as_mut(), 10).unwrap();
+    system.complete_context_switch(cpu.as_mut()).unwrap();
 
     let core = {
         let state = system.state.lock();
         Arc::clone(&state.thread_record(thread.id()).unwrap().core)
     };
-    let latest_generation = {
+    assert_eq!(
+        system
+            .deadline_runtime(thread.id())
+            .unwrap()
+            .remaining_runtime_ns(),
+        0
+    );
+    assert!(core.sched().lock().deadline.cbs_timer.is_some());
+    {
         let mut sched = core.sched().lock();
-        TaskSystem::cancel_owner_deadline_timers_locked(&core, &mut sched, cpu.as_mut());
-        sched.pi.deadline_cbs_generation += 2;
-        sched.pi.deadline_cbs_generation
-    };
+        TaskSystem::cancel_owner_deadline_timers_locked(&core, &mut sched, cpu.remote());
+    }
     assert!(core.sched().lock().deadline.cbs_timer.is_none());
-
-    system
-        .publish_owner_deadline_refresh(&core, CpuId::new(0), latest_generation - 1)
-        .unwrap();
-    system
-        .publish_owner_deadline_refresh(&core, CpuId::new(0), latest_generation)
-        .unwrap();
+    let first = cpu.remote().begin_owner_delivery().unwrap();
+    system.publish_owner_deadline_refresh_reserved(&core, CpuId::new(0), first);
+    let second = cpu.remote().begin_owner_delivery().unwrap();
+    system.publish_owner_deadline_refresh_reserved(&core, CpuId::new(0), second);
     assert_eq!(
         core.scheduler_inbox_delivery_count(),
         1,
         "the dedicated intrusive node must coalesce the newer refresh"
     );
 
-    system.drain_policy_updates_at(cpu.as_mut(), 0).unwrap();
+    system.drain_policy_updates_at(cpu.as_mut(), 10).unwrap();
 
     assert!(
         core.sched().lock().deadline.cbs_timer.is_some(),
-        "the retained old message must reconcile current CBS state rather than replay old state"
+        "the coalesced message must recompute CBS state from the owner rq"
     );
     assert_eq!(core.scheduler_inbox_delivery_count(), 0);
 }

@@ -23,7 +23,8 @@ pub(super) struct RootDomain {
     state: PreemptTicketLock<RootDomainState>,
     priority: RootDomainPriorityIndex,
     overload: RootDomainOverloadIndex,
-    push: RootDomainPushIterator,
+    realtime_push: RootDomainPushIterator,
+    deadline_push: RootDomainPushIterator,
     runqueues: Vec<Arc<CpuRemote>>,
     rt_bandwidth: Arc<RootRtBandwidth>,
     deadline_max_bw_scaled: u64,
@@ -60,6 +61,21 @@ struct RootDomainPushIterator {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RootDomainPushClass {
+    Realtime,
+    Deadline,
+}
+
+impl RootDomainPushClass {
+    pub(super) const fn scheduling_class(self) -> SchedulingClass {
+        match self {
+            Self::Realtime => SchedulingClass::Realtime,
+            Self::Deadline => SchedulingClass::Deadline,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RootDomainPushPhase {
     Idle,
     Published(CpuId),
@@ -78,6 +94,13 @@ struct RootDomainPushState {
 pub(super) struct RootDomainPushClaim {
     source: CpuId,
     generation: u64,
+    class: RootDomainPushClass,
+}
+
+impl RootDomainPushClaim {
+    pub(super) const fn class(&self) -> RootDomainPushClass {
+        self.class
+    }
 }
 
 #[derive(Debug)]
@@ -110,7 +133,8 @@ impl RootDomain {
             }),
             priority: RootDomainPriorityIndex::new(config.cpu_count()),
             overload: RootDomainOverloadIndex::new(config.cpu_count()),
-            push: RootDomainPushIterator::new(),
+            realtime_push: RootDomainPushIterator::new(),
+            deadline_push: RootDomainPushIterator::new(),
             runqueues,
             rt_bandwidth: Arc::new(RootRtBandwidth::new(config)),
             deadline_max_bw_scaled,
@@ -121,6 +145,10 @@ impl RootDomain {
         &self.rt_bandwidth
     }
 
+    pub(super) fn has_multiple_online_priority_cpus(&self) -> bool {
+        self.priority.has_multiple_online_cpus()
+    }
+
     pub(super) fn lock(&self) -> RootDomainGuard<'_> {
         RootDomainGuard {
             owner: self,
@@ -129,10 +157,24 @@ impl RootDomain {
     }
 
     pub(super) fn publish_run_queue(&self, cpu: CpuId, run_queue: &CpuRunQueueState, online: bool) {
-        self.priority.publish_run_queue(cpu, run_queue, online);
+        let rt_throttled = self.runqueues[cpu.as_usize()]
+            .lock_rt_runtime()
+            .is_throttled();
+        let rt_effectively_throttled = rt_throttled && !run_queue.has_exempt_rt();
+        let highest_rt = if rt_effectively_throttled {
+            None
+        } else {
+            run_queue.highest_rt_priority_including_current()
+        };
+        self.priority.publish_run_queue(
+            cpu,
+            highest_rt,
+            run_queue.earliest_deadline_including_current(),
+            online,
+        );
         self.overload.publish(
             cpu,
-            online && run_queue.has_pushable_realtime(),
+            online && !rt_effectively_throttled && run_queue.has_pushable_realtime(),
             online && run_queue.has_pushable_deadline(),
         );
     }
@@ -142,47 +184,89 @@ impl RootDomain {
         self.overload.publish(cpu, false, false);
     }
 
-    pub(super) fn cpu_has_rt_deadline_overload(&self, cpu: CpuId) -> bool {
-        self.overload.contains(cpu)
+    pub(super) fn cpu_has_overload(&self, cpu: CpuId, class: SchedulingClass) -> bool {
+        self.overload.contains(cpu, class)
     }
 
-    pub(super) fn request_rt_deadline_push(&self, requester: CpuId) {
+    pub(super) fn cpu_has_rt_deadline_overload(&self, cpu: CpuId) -> bool {
+        self.overload.contains_any(cpu)
+    }
+
+    /// Selects an overloaded rq for an idle target from the class-specific
+    /// root-domain masks. Deadline is considered before fixed-priority RT,
+    /// matching Linux's class order; Fair load balancing remains a separate
+    /// sched-domain decision.
+    pub(super) fn find_idle_pull_source(
+        &self,
+        target: CpuId,
+        visited: &CpuSet,
+    ) -> Option<(CpuId, SchedulingClass)> {
+        for class in [RootDomainPushClass::Deadline, RootDomainPushClass::Realtime] {
+            let source = self.overload.find_next_class(class, None, target, |cpu| {
+                self.runqueues
+                    .get(cpu.as_usize())
+                    .is_some_and(|remote| !visited.contains(cpu) && remote.is_scheduler_ready())
+            });
+            if let Some(source) = source {
+                return Some((source, class.scheduling_class()));
+            }
+        }
+        None
+    }
+
+    fn push_iterator(&self, class: RootDomainPushClass) -> &RootDomainPushIterator {
+        match class {
+            RootDomainPushClass::Realtime => &self.realtime_push,
+            RootDomainPushClass::Deadline => &self.deadline_push,
+        }
+    }
+
+    pub(super) fn request_rt_deadline_push(&self, class: RootDomainPushClass, requester: CpuId) {
+        let push = self.push_iterator(class);
         let target = {
-            let mut state = self.push.state.lock();
+            let mut state = push.state.lock();
             state.requested_generation = state.requested_generation.wrapping_add(1);
             if state.phase != RootDomainPushPhase::Idle {
                 None
             } else {
                 state.scan_generation = state.requested_generation;
                 state.cursor = None;
-                self.publish_next_push_target(&mut state, requester)
+                self.publish_next_push_target(class, &mut state, requester)
             }
         };
-        self.deliver_push_target(target);
+        self.deliver_push_target(class, target);
     }
 
     pub(super) fn push_target_pending(&self, source: CpuId) -> bool {
-        matches!(
-            self.push.state.lock().phase,
-            RootDomainPushPhase::Published(target) if target == source
-        )
+        [RootDomainPushClass::Deadline, RootDomainPushClass::Realtime]
+            .into_iter()
+            .any(|class| {
+                matches!(
+                    self.push_iterator(class).state.lock().phase,
+                    RootDomainPushPhase::Published(target) if target == source
+                )
+            })
     }
 
     pub(super) fn claim_rt_deadline_push(&self, source: CpuId) -> Option<RootDomainPushClaim> {
-        let mut state = self.push.state.lock();
-        if state.phase != RootDomainPushPhase::Published(source) {
-            return None;
+        for class in [RootDomainPushClass::Deadline, RootDomainPushClass::Realtime] {
+            let mut state = self.push_iterator(class).state.lock();
+            if state.phase != RootDomainPushPhase::Published(source) {
+                continue;
+            }
+            state.phase = RootDomainPushPhase::Claimed(source);
+            return Some(RootDomainPushClaim {
+                source,
+                generation: state.scan_generation,
+                class,
+            });
         }
-        state.phase = RootDomainPushPhase::Claimed(source);
-        Some(RootDomainPushClaim {
-            source,
-            generation: state.scan_generation,
-        })
+        None
     }
 
     pub(super) fn finish_rt_deadline_push(&self, claim: RootDomainPushClaim, made_progress: bool) {
         let target = {
-            let mut state = self.push.state.lock();
+            let mut state = self.push_iterator(claim.class).state.lock();
             assert_eq!(
                 state.phase,
                 RootDomainPushPhase::Claimed(claim.source),
@@ -193,7 +277,7 @@ impl RootDomain {
                 "root-domain push completion must match the claimed scan generation"
             );
             if made_progress
-                && self.overload.contains(claim.source)
+                && self.overload.contains_class(claim.source, claim.class)
                 && self
                     .runqueues
                     .get(claim.source.as_usize())
@@ -203,10 +287,10 @@ impl RootDomain {
                 Some(claim.source)
             } else {
                 state.cursor = Some(claim.source);
-                self.advance_push_scan(&mut state, claim.source)
+                self.advance_push_scan(claim.class, &mut state, claim.source)
             }
         };
-        self.deliver_push_target(target);
+        self.deliver_push_target(claim.class, target);
     }
 
     pub(super) fn find_lowest_rt_cpu(
@@ -295,14 +379,19 @@ impl RootDomain {
         }
     }
 
-    fn advance_push_scan(&self, state: &mut RootDomainPushState, current: CpuId) -> Option<CpuId> {
-        if let Some(target) = self.publish_next_push_target(state, current) {
+    fn advance_push_scan(
+        &self,
+        class: RootDomainPushClass,
+        state: &mut RootDomainPushState,
+        current: CpuId,
+    ) -> Option<CpuId> {
+        if let Some(target) = self.publish_next_push_target(class, state, current) {
             return Some(target);
         }
         if state.scan_generation != state.requested_generation {
             state.scan_generation = state.requested_generation;
             state.cursor = None;
-            return self.publish_next_push_target(state, current);
+            return self.publish_next_push_target(class, state, current);
         }
         state.phase = RootDomainPushPhase::Idle;
         None
@@ -310,28 +399,24 @@ impl RootDomain {
 
     fn publish_next_push_target(
         &self,
+        class: RootDomainPushClass,
         state: &mut RootDomainPushState,
         excluded: CpuId,
     ) -> Option<CpuId> {
-        if !self.overload.any() {
+        if !self.overload.any_class(class) {
             state.phase = RootDomainPushPhase::Idle;
             return None;
         }
-        let first = state
-            .cursor
-            .map_or(0, |cpu| cpu.as_usize().saturating_add(1));
-        let target = (first..self.runqueues.len())
-            .map(|index| CpuId::new(index as u32))
-            .find(|cpu| {
-                *cpu != excluded
-                    && self.overload.contains(*cpu)
-                    && self.runqueues[cpu.as_usize()].is_online()
+        let target = self
+            .overload
+            .find_next_class(class, state.cursor, excluded, |cpu| {
+                self.runqueues[cpu.as_usize()].is_online()
             });
         state.phase = target.map_or(RootDomainPushPhase::Idle, RootDomainPushPhase::Published);
         target
     }
 
-    fn deliver_push_target(&self, mut target: Option<CpuId>) {
+    fn deliver_push_target(&self, class: RootDomainPushClass, mut target: Option<CpuId>) {
         while let Some(source) = target {
             let Some(remote) = self.runqueues.get(source.as_usize()) else {
                 return;
@@ -340,12 +425,12 @@ impl RootDomain {
                 return;
             }
             target = {
-                let mut state = self.push.state.lock();
+                let mut state = self.push_iterator(class).state.lock();
                 if state.phase != RootDomainPushPhase::Published(source) {
                     return;
                 }
                 state.cursor = Some(source);
-                self.advance_push_scan(&mut state, source)
+                self.advance_push_scan(class, &mut state, source)
             };
         }
     }
@@ -364,13 +449,47 @@ impl RootDomainOverloadIndex {
         self.deadline.publish(cpu, deadline);
     }
 
-    fn contains(&self, cpu: CpuId) -> bool {
+    fn contains_any(&self, cpu: CpuId) -> bool {
         self.deadline.contains(cpu) || self.realtime.contains(cpu)
     }
 
-    fn any(&self) -> bool {
-        self.deadline.count.load(Ordering::Acquire) != 0
-            || self.realtime.count.load(Ordering::Acquire) != 0
+    fn contains(&self, cpu: CpuId, class: SchedulingClass) -> bool {
+        match class {
+            SchedulingClass::Realtime => self.realtime.contains(cpu),
+            SchedulingClass::Deadline => self.deadline.contains(cpu),
+            SchedulingClass::Stop | SchedulingClass::Fair | SchedulingClass::Idle => false,
+        }
+    }
+
+    fn contains_class(&self, cpu: CpuId, class: RootDomainPushClass) -> bool {
+        match class {
+            RootDomainPushClass::Realtime => self.realtime.contains(cpu),
+            RootDomainPushClass::Deadline => self.deadline.contains(cpu),
+        }
+    }
+
+    fn any_class(&self, class: RootDomainPushClass) -> bool {
+        match class {
+            RootDomainPushClass::Realtime => self.realtime.count.load(Ordering::Acquire) != 0,
+            RootDomainPushClass::Deadline => self.deadline.count.load(Ordering::Acquire) != 0,
+        }
+    }
+
+    fn find_next_class(
+        &self,
+        class: RootDomainPushClass,
+        cursor: Option<CpuId>,
+        excluded: CpuId,
+        accepts: impl FnMut(CpuId) -> bool,
+    ) -> Option<CpuId> {
+        match class {
+            RootDomainPushClass::Realtime => {
+                self.realtime.find_next_after(cursor, excluded, accepts)
+            }
+            RootDomainPushClass::Deadline => {
+                self.deadline.find_next_after(cursor, excluded, accepts)
+            }
+        }
     }
 
     #[cfg(test)]
@@ -436,6 +555,41 @@ impl RootDomainOverloadMask {
         self.words
             .get(word_index)
             .is_some_and(|word| word.load(Ordering::Acquire) & bit != 0)
+    }
+
+    fn find_next_after(
+        &self,
+        cursor: Option<CpuId>,
+        excluded: CpuId,
+        mut accepts: impl FnMut(CpuId) -> bool,
+    ) -> Option<CpuId> {
+        if self.count.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        let first = cursor.map_or(0, |cpu| cpu.as_usize().saturating_add(1));
+        let first_word = first / usize::BITS as usize;
+        let first_bit = first % usize::BITS as usize;
+        for (word_index, word) in self.words.iter().enumerate().skip(first_word) {
+            let mut members = word.load(Ordering::Acquire);
+            if word_index == first_word {
+                members &= usize::MAX << first_bit;
+            }
+            if excluded.as_usize() / usize::BITS as usize == word_index {
+                members &= !(1usize << (excluded.as_usize() % usize::BITS as usize));
+            }
+            while members != 0 {
+                let bit = members.trailing_zeros() as usize;
+                members &= members - 1;
+                let index = word_index
+                    .saturating_mul(usize::BITS as usize)
+                    .saturating_add(bit);
+                let cpu = CpuId::new(index as u32);
+                if accepts(cpu) {
+                    return Some(cpu);
+                }
+            }
+        }
+        None
     }
 
     #[cfg(test)]
@@ -586,7 +740,7 @@ mod tests {
         assert_eq!(overload.deadline.count.load(Ordering::Acquire), 2);
         overload.publish(cpu2, false, false);
         assert_eq!(overload.deadline.count.load(Ordering::Acquire), 1);
-        assert!(!overload.contains(cpu2));
+        assert!(!overload.contains_any(cpu2));
     }
 
     #[test]
@@ -607,27 +761,29 @@ mod tests {
         root.overload.publish(cpu0, true, false);
         root.overload.publish(cpu1, true, false);
 
-        root.request_rt_deadline_push(cpu2);
-        root.request_rt_deadline_push(cpu2);
+        root.request_rt_deadline_push(RootDomainPushClass::Realtime, cpu2);
+        root.request_rt_deadline_push(RootDomainPushClass::Realtime, cpu2);
         {
-            let state = root.push.state.lock();
+            let state = root.realtime_push.state.lock();
             assert_eq!(state.requested_generation, 2);
             assert_eq!(state.scan_generation, 1);
             assert_eq!(state.phase, RootDomainPushPhase::Published(cpu0));
         }
 
         let first = root.claim_rt_deadline_push(cpu0).unwrap();
+        assert_eq!(first.class(), RootDomainPushClass::Realtime);
         root.overload.publish(cpu0, false, false);
         root.finish_rt_deadline_push(first, false);
         assert_eq!(
-            root.push.state.lock().phase,
+            root.realtime_push.state.lock().phase,
             RootDomainPushPhase::Published(cpu1)
         );
 
         let second = root.claim_rt_deadline_push(cpu1).unwrap();
+        assert_eq!(second.class(), RootDomainPushClass::Realtime);
         root.overload.publish(cpu1, false, false);
         root.finish_rt_deadline_push(second, false);
-        let state = root.push.state.lock();
+        let state = root.realtime_push.state.lock();
         assert_eq!(state.phase, RootDomainPushPhase::Idle);
         assert_eq!(state.scan_generation, state.requested_generation);
     }

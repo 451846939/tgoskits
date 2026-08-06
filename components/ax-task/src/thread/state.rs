@@ -1,5 +1,7 @@
 //! Checked thread lifecycle transitions.
 
+use core::sync::atomic::{AtomicU8, Ordering};
+
 use crate::TaskError;
 
 /// Observable lifecycle state of a thread.
@@ -22,51 +24,60 @@ pub enum ThreadState {
     Exited  = 6,
 }
 
-/// Checked lifecycle state owned by the task registry.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Single atomic publication for task lifecycle and wake/schedule races.
+#[derive(Debug)]
 pub(crate) struct ThreadLifecycle {
-    state: ThreadState,
+    state: AtomicU8,
 }
 
 impl ThreadLifecycle {
     pub(crate) const fn new() -> Self {
         Self {
-            state: ThreadState::New,
+            state: AtomicU8::new(ThreadState::New as u8),
         }
     }
 
-    pub(crate) const fn state(self) -> ThreadState {
-        self.state
+    pub(crate) fn state(&self) -> ThreadState {
+        decode_state(self.state.load(Ordering::Acquire))
     }
 
-    pub(crate) fn transition(&mut self, next: ThreadState) -> Result<(), TaskError> {
-        if transition_is_valid(self.state, next) {
-            self.state = next;
-            Ok(())
-        } else {
-            Err(TaskError::InvalidTransition {
-                from: self.state,
+    pub(crate) fn transition(&self, next: ThreadState) -> Result<(), TaskError> {
+        let current = self.state();
+        if !transition_is_valid(current, next) {
+            return Err(TaskError::InvalidTransition {
+                from: current,
+                to: next,
+            });
+        }
+        self.state
+            .compare_exchange(
+                current as u8,
+                next as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(|_| ())
+            .map_err(|observed| TaskError::InvalidTransition {
+                from: decode_state(observed),
                 to: next,
             })
-        }
-    }
-
-    /// Returns one ready Deadline wake to the blocked state after the CBS
-    /// constrained-wakeup rule defers it to the next release.
-    pub(crate) fn throttle_ready_deadline(&mut self) -> Result<(), TaskError> {
-        if self.state == ThreadState::Ready {
-            self.state = ThreadState::Blocked;
-            Ok(())
-        } else {
-            Err(TaskError::InvalidTransition {
-                from: self.state,
-                to: ThreadState::Blocked,
-            })
-        }
     }
 }
 
-const fn transition_is_valid(from: ThreadState, to: ThreadState) -> bool {
+pub(crate) const fn decode_state(state: u8) -> ThreadState {
+    match state {
+        0 => ThreadState::New,
+        1 => ThreadState::Ready,
+        2 => ThreadState::Running,
+        3 => ThreadState::Parking,
+        4 => ThreadState::Blocked,
+        5 => ThreadState::Waking,
+        6 => ThreadState::Exited,
+        _ => panic!("invalid thread lifecycle publication"),
+    }
+}
+
+pub(crate) const fn transition_is_valid(from: ThreadState, to: ThreadState) -> bool {
     matches!(
         (from, to),
         (ThreadState::New, ThreadState::Ready | ThreadState::Exited)
@@ -105,7 +116,7 @@ mod tests {
 
     #[test]
     fn accepts_the_documented_wake_transition() {
-        let mut lifecycle = ThreadLifecycle::new();
+        let lifecycle = ThreadLifecycle::new();
         lifecycle.transition(ThreadState::Ready).unwrap();
         lifecycle.transition(ThreadState::Running).unwrap();
         lifecycle.transition(ThreadState::Parking).unwrap();
@@ -116,21 +127,9 @@ mod tests {
 
     #[test]
     fn rejects_ready_to_blocked_shortcut() {
-        let mut lifecycle = ThreadLifecycle::new();
-        lifecycle.transition(ThreadState::Ready).unwrap();
-        assert!(matches!(
-            lifecycle.transition(ThreadState::Blocked),
-            Err(TaskError::InvalidTransition { .. })
+        assert!(!transition_is_valid(
+            ThreadState::Ready,
+            ThreadState::Blocked
         ));
-    }
-
-    #[test]
-    fn deadline_throttle_has_a_dedicated_ready_to_blocked_transition() {
-        let mut lifecycle = ThreadLifecycle::new();
-        lifecycle.transition(ThreadState::Ready).unwrap();
-
-        lifecycle.throttle_ready_deadline().unwrap();
-
-        assert_eq!(lifecycle.state(), ThreadState::Blocked);
     }
 }

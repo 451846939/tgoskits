@@ -36,6 +36,22 @@ impl<T> IrqTicketLock<T> {
         }
     }
 
+    /// Locks scheduler state when the caller already owns the architecture
+    /// scheduler IRQ-off baton.
+    ///
+    /// # Safety
+    ///
+    /// Local IRQs must remain disabled until the returned guard is dropped.
+    /// The caller must not use this entry from ordinary task context; doing so
+    /// would allow a local hard IRQ to deadlock on the same raw ticket lock.
+    pub(crate) unsafe fn lock_irq_disabled(&self) -> IrqTicketGuard<'_, T> {
+        IrqTicketGuard {
+            raw: Some(self.raw.lock()),
+            irq: None,
+            _not_send: PhantomData,
+        }
+    }
+
     /// Attempts acquisition and restores local IRQ state on failure.
     #[cfg(test)]
     pub(crate) fn try_lock(&self) -> Option<IrqTicketGuard<'_, T>> {

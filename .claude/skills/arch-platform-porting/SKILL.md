@@ -69,6 +69,15 @@ Current Axvisor LoongArch QEMU bring-up uses the dynamic UEFI platform path. The
   previous binding epoch before that task can run elsewhere.
   AArch64 final aliases need cache maintenance consistent with their shareability attributes;
   RISC-V secondary boot must initialize `sscratch`; LoongArch must keep r21 and KS3 coherent.
+- **Scheduler current-thread register**: the architecture/HAL boundary exposes
+  `scheduler_current_thread_unpinned()` as a checked, non-null current-header capability. A bound
+  scheduler context must never turn a missing CPU anchor, register mismatch, or stale binding into
+  `None`, the local CPU, or a retry path; those are fatal switch/current invariants. Only the
+  runtime publication layer may represent the permanently unbound early-bootstrap header as
+  `CurrentThreadPublication::NONE`. Keep x86 GS/FS, AArch64 `SP_EL0`/`TPIDR_EL0`, RISC-V
+  `sscratch`/`tp`, and LoongArch r21/KS3 differences inside the architecture register adapter;
+  common switch-tail ordering and scheduler baton ownership must stay identical on all four
+  architectures.
 - **CPU runtime**: update `components/axcpu/src/<arch>` for trap entry, context switch, user/kernel context, syscall return path, FP/SIMD state, and per-CPU assumptions.
 - **Platform bridge**: update `platforms/axplat-dyn`, `platforms/somehal`, platform config, memory regions, IRQ routing, timer source, power operations, and CPU boot operations.
 - **Scheduler-clock ownership**: keep comparable scheduler time in `ax-plat::time`, not in `ax-task` or an architecture trap module. `someboot` reports only whether its raw counter is synchronized across runtime CPUs; `axplat-dyn` initializes each bound CPU's clock anchor before scheduler/IRQ publication and stamps it from the local timer IRQ. On x86 SMP, an invariant TSC is not by itself proof of cross-CPU synchronization, so use the corrected per-CPU path unless boot code has established that proof. Remote readers may couple only the calling and target CPUs' published clocks; they must never substitute the calling CPU's raw TSC for a target sample. CPU-offline flow must close remote admission before withdrawing the target publication.
@@ -167,7 +176,9 @@ Current Axvisor LoongArch QEMU bring-up uses the dynamic UEFI platform path. The
    only after it can use the final stack, page table, metadata, and common secondary entry, then
    waits for the control CPU release. Keep this mutable state outside the copyable trampoline
    metadata. Do not replace it with a global last-CPU ID, an architecture-only completion, a
-   timeout retry, or an OS scheduler-online flag. On x86, encode SIPI as Linux
+   timeout retry, or an OS scheduler-online flag. `ax_plat::power::cpu_boot(cpu_id)` carries only
+   the logical target; do not add an OS-provided stack argument because someboot exclusively owns
+   the prepared secondary boot record and stack. On x86, encode SIPI as Linux
    `APIC_DM_STARTUP` (`0x600`); the INIT level bits do not belong to SIPI.
 
 ## Validation Ladder

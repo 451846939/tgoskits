@@ -22,7 +22,7 @@ impl TaskSystem {
         let Some(core) = cpu.current_core() else {
             return;
         };
-        self.publish_scheduler_tick_work(core, observed_ns);
+        self.publish_scheduler_tick_work(&core, observed_ns);
     }
 
     fn publish_scheduler_tick_work(&self, core: &Arc<ThreadCore>, observed_ns: u64) {

@@ -3,8 +3,106 @@
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::cmp::Ordering;
 
-use super::QueuedThread;
-use crate::{SchedulingEntity, ThreadId};
+use super::{QueuedThread, QueuedThreadSnapshot};
+use crate::{
+    DeadlineBandwidthSnapshot, SchedulingEntity, TaskError, ThreadCore, ThreadId,
+    runtime::task_runtime,
+};
+
+/// Linux `dl_rq` bandwidth ledger. It lives beside the active EDF tree,
+/// throttled entities, and timer lifetime anchors under the same rq lock.
+#[derive(Debug)]
+struct DeadlineRunQueueBandwidth {
+    this_bw_scaled: u64,
+    running_bw_scaled: u64,
+    max_bw_scaled: u64,
+}
+
+impl DeadlineRunQueueBandwidth {
+    const fn new(max_bw_scaled: u64) -> Self {
+        Self {
+            this_bw_scaled: 0,
+            running_bw_scaled: 0,
+            max_bw_scaled,
+        }
+    }
+
+    fn add(&mut self, utilization_scaled: u64, active: bool) {
+        let this_bw_scaled = self
+            .this_bw_scaled
+            .checked_add(utilization_scaled)
+            .unwrap_or_else(|| {
+                task_runtime::fatal_invariant(0x444c_1001, utilization_scaled as usize)
+            });
+        let running_bw_scaled = if active {
+            self.running_bw_scaled
+                .checked_add(utilization_scaled)
+                .unwrap_or_else(|| {
+                    task_runtime::fatal_invariant(0x444c_1002, utilization_scaled as usize)
+                })
+        } else {
+            self.running_bw_scaled
+        };
+        if running_bw_scaled > this_bw_scaled {
+            task_runtime::fatal_invariant(0x444c_1003, utilization_scaled as usize);
+        }
+        self.this_bw_scaled = this_bw_scaled;
+        self.running_bw_scaled = running_bw_scaled;
+    }
+
+    fn remove(&mut self, utilization_scaled: u64, active: bool) {
+        let this_bw_scaled = self
+            .this_bw_scaled
+            .checked_sub(utilization_scaled)
+            .unwrap_or_else(|| {
+                task_runtime::fatal_invariant(0x444c_1004, utilization_scaled as usize)
+            });
+        let running_bw_scaled = if active {
+            self.running_bw_scaled
+                .checked_sub(utilization_scaled)
+                .unwrap_or_else(|| {
+                    task_runtime::fatal_invariant(0x444c_1005, utilization_scaled as usize)
+                })
+        } else {
+            self.running_bw_scaled
+        };
+        if running_bw_scaled > this_bw_scaled {
+            task_runtime::fatal_invariant(0x444c_1006, utilization_scaled as usize);
+        }
+        self.this_bw_scaled = this_bw_scaled;
+        self.running_bw_scaled = running_bw_scaled;
+    }
+
+    fn activate(&mut self, utilization_scaled: u64) {
+        let running_bw_scaled = self
+            .running_bw_scaled
+            .checked_add(utilization_scaled)
+            .unwrap_or_else(|| {
+                task_runtime::fatal_invariant(0x444c_1007, utilization_scaled as usize)
+            });
+        if running_bw_scaled > self.this_bw_scaled {
+            task_runtime::fatal_invariant(0x444c_1008, utilization_scaled as usize);
+        }
+        self.running_bw_scaled = running_bw_scaled;
+    }
+
+    fn deactivate(&mut self, utilization_scaled: u64) {
+        self.running_bw_scaled = self
+            .running_bw_scaled
+            .checked_sub(utilization_scaled)
+            .unwrap_or_else(|| {
+                task_runtime::fatal_invariant(0x444c_1009, utilization_scaled as usize)
+            });
+    }
+
+    const fn snapshot(&self) -> DeadlineBandwidthSnapshot {
+        DeadlineBandwidthSnapshot::new(
+            self.this_bw_scaled,
+            self.running_bw_scaled,
+            self.max_bw_scaled,
+        )
+    }
+}
 
 /// Stable linkage for one entity in the Deadline runqueue.
 ///
@@ -53,7 +151,6 @@ pub(crate) struct DeadlineNode {
     left: DeadlineLink,
     right: DeadlineLink,
     height: usize,
-    min_event_ns: Option<u64>,
 }
 
 impl DeadlineNode {
@@ -68,13 +165,11 @@ impl DeadlineNode {
             left: None,
             right: None,
             height: 1,
-            min_event_ns: None,
         })
     }
 
     fn reset(&mut self, thread: QueuedThread) {
         self.key = DeadlineQueueKey::for_thread(&thread);
-        self.min_event_ns = scheduler_event(&thread);
         self.thread = Some(thread);
         self.left = None;
         self.right = None;
@@ -91,10 +186,6 @@ impl DeadlineNode {
         self.height = link_height(&self.left)
             .max(link_height(&self.right))
             .saturating_add(1);
-        self.min_event_ns = earliest(
-            scheduler_event(self.thread()),
-            earliest(link_min_event(&self.left), link_min_event(&self.right)),
-        );
     }
 }
 
@@ -107,14 +198,24 @@ impl DeadlineNode {
 pub(super) struct DeadlineRunQueue {
     root: DeadlineLink,
     keys: Vec<Option<(u32, DeadlineQueueKey)>>,
+    throttled: Vec<Option<(u32, QueuedThread)>>,
+    members: Vec<Arc<ThreadCore>>,
+    bandwidth: DeadlineRunQueueBandwidth,
+    pushable: Vec<Option<u32>>,
+    pushable_count: usize,
     len: usize,
 }
 
 impl DeadlineRunQueue {
-    pub(super) const fn new() -> Self {
+    pub(super) fn new(max_bw_scaled: u64, thread_capacity: usize) -> Self {
         Self {
             root: None,
             keys: Vec::new(),
+            throttled: Vec::new(),
+            members: Vec::with_capacity(thread_capacity),
+            bandwidth: DeadlineRunQueueBandwidth::new(max_bw_scaled),
+            pushable: Vec::new(),
+            pushable_count: 0,
             len: 0,
         }
     }
@@ -123,6 +224,135 @@ impl DeadlineRunQueue {
         if self.keys.len() <= slot {
             self.keys.resize(slot.saturating_add(1), None);
         }
+        if self.throttled.len() <= slot {
+            self.throttled.resize_with(slot.saturating_add(1), || None);
+        }
+        if self.pushable.len() <= slot {
+            self.pushable.resize(slot.saturating_add(1), None);
+        }
+    }
+
+    pub(super) fn install_throttled(&mut self, thread: QueuedThread) -> Result<(), TaskError> {
+        let entry = self
+            .throttled
+            .get_mut(thread.id.slot() as usize)
+            .ok_or(TaskError::InvalidConfiguration)?;
+        if entry.is_some() {
+            return Err(TaskError::AlreadyQueued);
+        }
+        *entry = Some((thread.id.generation(), thread));
+        Ok(())
+    }
+
+    pub(super) fn throttled(&self, id: ThreadId) -> Option<&QueuedThread> {
+        let (generation, thread) = self.throttled.get(id.slot() as usize)?.as_ref()?;
+        (*generation == id.generation()).then_some(thread)
+    }
+
+    pub(super) fn throttled_mut(&mut self, id: ThreadId) -> Option<&mut QueuedThread> {
+        let (generation, thread) = self.throttled.get_mut(id.slot() as usize)?.as_mut()?;
+        (*generation == id.generation()).then_some(thread)
+    }
+
+    pub(super) fn take_throttled(&mut self, id: ThreadId) -> Option<QueuedThread> {
+        let entry = self.throttled.get_mut(id.slot() as usize)?;
+        if entry
+            .as_ref()
+            .is_none_or(|(generation, _)| *generation != id.generation())
+        {
+            return None;
+        }
+        entry.take().map(|(_, thread)| thread)
+    }
+
+    pub(super) fn members_are_empty(&self) -> bool {
+        self.members.is_empty()
+    }
+
+    pub(super) fn member(&self, thread: ThreadId) -> Option<Arc<ThreadCore>> {
+        self.members
+            .iter()
+            .find(|member| member.id() == thread)
+            .map(Arc::clone)
+    }
+
+    pub(super) fn register_member(&mut self, core: &Arc<ThreadCore>) -> bool {
+        if self.members.iter().any(|member| Arc::ptr_eq(member, core)) {
+            return false;
+        }
+        assert!(
+            self.members.len() < self.members.capacity(),
+            "thread construction must reserve every Deadline member slot"
+        );
+        self.members.push(Arc::clone(core));
+        true
+    }
+
+    pub(super) fn unregister_member(&mut self, core: &Arc<ThreadCore>) {
+        if let Some(index) = self
+            .members
+            .iter()
+            .position(|member| Arc::ptr_eq(member, core))
+        {
+            self.members.swap_remove(index);
+        }
+    }
+
+    pub(super) fn add_bandwidth(&mut self, utilization_scaled: u64, active: bool) {
+        self.bandwidth.add(utilization_scaled, active);
+    }
+
+    pub(super) fn remove_bandwidth(&mut self, utilization_scaled: u64, active: bool) {
+        self.bandwidth.remove(utilization_scaled, active);
+    }
+
+    pub(super) fn activate_bandwidth(&mut self, utilization_scaled: u64) {
+        self.bandwidth.activate(utilization_scaled);
+    }
+
+    pub(super) fn deactivate_bandwidth(&mut self, utilization_scaled: u64) {
+        self.bandwidth.deactivate(utilization_scaled);
+    }
+
+    pub(super) const fn bandwidth(&self) -> DeadlineBandwidthSnapshot {
+        self.bandwidth.snapshot()
+    }
+
+    pub(super) const fn has_pushable(&self) -> bool {
+        self.pushable_count != 0
+    }
+
+    fn set_pushable(&mut self, thread: ThreadId, pushable: bool) {
+        let entry = &mut self.pushable[thread.slot() as usize];
+        let present = entry.is_some_and(|generation| generation == thread.generation());
+        match (present, pushable) {
+            (false, true) => {
+                assert!(entry.replace(thread.generation()).is_none());
+                self.pushable_count = self
+                    .pushable_count
+                    .checked_add(1)
+                    .expect("Deadline pushable count must fit usize");
+            }
+            (true, false) => {
+                *entry = None;
+                self.pushable_count = self
+                    .pushable_count
+                    .checked_sub(1)
+                    .expect("Deadline pushable count must match membership");
+            }
+            _ => {}
+        }
+    }
+
+    pub(super) fn refresh_pushable(&mut self, thread: ThreadId, current: Option<ThreadId>) {
+        let pushable = self
+            .keys
+            .get(thread.slot() as usize)
+            .and_then(|entry| *entry)
+            .filter(|(generation, _)| *generation == thread.generation())
+            .and_then(|(_, key)| self.get(key))
+            .is_some_and(|entry| entry.migration_capable && current != Some(thread));
+        self.set_pushable(thread, pushable);
     }
 
     pub(super) fn insert(&mut self, thread: QueuedThread) -> DeadlineQueueKey {
@@ -157,6 +387,7 @@ impl DeadlineRunQueue {
             self.keys[key.thread.slot() as usize] = Some(indexed);
             return None;
         }
+        self.set_pushable(key.thread, false);
         let (root, removed) = remove_node(self.root.take(), key);
         self.root = root;
         let removed = removed.expect("Deadline identity index must match its ordered tree");
@@ -170,7 +401,7 @@ impl DeadlineRunQueue {
         entity: SchedulingEntity,
     ) -> Option<DeadlineQueueKey> {
         let mut thread = self.remove(key)?;
-        thread.entity = entity;
+        *thread.active.entity_mut() = entity;
         Some(self.insert(thread))
     }
 
@@ -190,49 +421,27 @@ impl DeadlineRunQueue {
         find_node_mut(self.root.as_deref_mut(), key).and_then(|node| node.thread.as_mut())
     }
 
-    pub(super) fn select_first(&self) -> Option<QueuedThread> {
+    pub(super) fn select_first(&self) -> Option<QueuedThreadSnapshot> {
         #[cfg(test)]
         super::record_deadline_runqueue_visit();
-        self.first().cloned()
+        self.first().map(QueuedThreadSnapshot::from)
     }
 
-    pub(super) fn put_prev(
+    pub(super) fn put_prev_current(
         &mut self,
         key: DeadlineQueueKey,
-        thread: QueuedThread,
-    ) -> Option<DeadlineQueueKey> {
-        let new_key = DeadlineQueueKey::for_thread(&thread);
-        if new_key == key {
-            replace_thread(self.root.as_deref_mut(), key, thread)?;
-            return Some(key);
-        }
-        self.remove(key)?;
-        Some(self.insert(thread))
-    }
-
-    pub(super) fn update_linked_entity(
-        &mut self,
-        key: DeadlineQueueKey,
-        entity: SchedulingEntity,
-    ) -> Option<()> {
-        let current = self.get(key)?;
-        let mut updated = current.clone();
-        updated.entity = entity;
-        if DeadlineQueueKey::for_thread(&updated) != key {
-            return None;
-        }
-        replace_thread(self.root.as_deref_mut(), key, updated)
+    ) -> Option<(DeadlineQueueKey, SchedulingEntity)> {
+        let thread = self.remove(key)?;
+        let entity = thread.entity();
+        let new_key = self.insert(thread);
+        Some((new_key, entity))
     }
 
     pub(super) fn find_first_matching(
         &self,
         predicate: &mut impl FnMut(&QueuedThread) -> bool,
-    ) -> Option<QueuedThread> {
-        find_first_matching(self.root.as_deref(), predicate).cloned()
-    }
-
-    pub(super) fn earliest_event_ns(&self) -> Option<u64> {
-        link_min_event(&self.root)
+    ) -> Option<QueuedThreadSnapshot> {
+        find_first_matching(self.root.as_deref(), predicate).map(QueuedThreadSnapshot::from)
     }
 
     pub(super) fn earliest_deadline_ns(&self) -> Option<u64> {
@@ -248,7 +457,6 @@ impl DeadlineRunQueue {
         removed.left = None;
         removed.right = None;
         removed.height = 1;
-        removed.min_event_ns = None;
         unsafe {
             // SAFETY: removal has unlinked this node from the sole owner rq;
             // placement cannot re-enqueue until the caller completes the rq
@@ -263,7 +471,6 @@ impl DeadlineRunQueue {
         let mut previous = None;
         let summary = validate_node(self.root.as_deref(), &mut previous);
         assert_eq!(summary.count, self.len);
-        assert_eq!(summary.min_event_ns, self.earliest_event_ns());
         assert_eq!(
             self.keys.iter().filter(|entry| entry.is_some()).count(),
             self.len
@@ -271,27 +478,16 @@ impl DeadlineRunQueue {
     }
 }
 
-fn deadline_entity(thread: &QueuedThread) -> crate::DeadlineEntity {
+fn deadline_entity(thread: &QueuedThread) -> &crate::DeadlineEntity {
     thread
-        .entity
+        .active
+        .entity()
         .deadline()
         .expect("DeadlineRunQueue accepts only Deadline scheduling entities")
 }
 
-fn scheduler_event(thread: &QueuedThread) -> Option<u64> {
-    deadline_entity(thread).next_scheduler_event_ns()
-}
-
-fn earliest(left: Option<u64>, right: Option<u64>) -> Option<u64> {
-    crate::earliest_scheduler_time(left, right)
-}
-
 fn link_height(link: &DeadlineLink) -> usize {
     link.as_deref().map_or(0, |node| node.height)
-}
-
-fn link_min_event(link: &DeadlineLink) -> Option<u64> {
-    link.as_deref().and_then(|node| node.min_event_ns)
 }
 
 fn balance_factor(node: &DeadlineNode) -> isize {
@@ -432,21 +628,6 @@ fn find_node_mut(
     }
 }
 
-fn replace_thread(
-    node: Option<&mut DeadlineNode>,
-    key: DeadlineQueueKey,
-    thread: QueuedThread,
-) -> Option<()> {
-    let node = node?;
-    match key.cmp(&node.key) {
-        Ordering::Less => replace_thread(node.left.as_deref_mut(), key, thread)?,
-        Ordering::Greater => replace_thread(node.right.as_deref_mut(), key, thread)?,
-        Ordering::Equal => node.thread = Some(thread),
-    }
-    node.refresh();
-    Some(())
-}
-
 fn find_first_matching<'queue>(
     node: Option<&'queue DeadlineNode>,
     predicate: &mut impl FnMut(&QueuedThread) -> bool,
@@ -462,7 +643,6 @@ fn find_first_matching<'queue>(
 struct ValidationSummary {
     count: usize,
     height: usize,
-    min_event_ns: Option<u64>,
 }
 
 #[cfg(test)]
@@ -474,7 +654,6 @@ fn validate_node(
         return ValidationSummary {
             count: 0,
             height: 0,
-            min_event_ns: None,
         };
     };
     let left = validate_node(node.left.as_deref(), previous);
@@ -482,16 +661,10 @@ fn validate_node(
     *previous = Some(node.key);
     let right = validate_node(node.right.as_deref(), previous);
     let height = left.height.max(right.height).saturating_add(1);
-    let min_event_ns = earliest(
-        scheduler_event(node.thread()),
-        earliest(left.min_event_ns, right.min_event_ns),
-    );
     assert_eq!(node.height, height);
-    assert_eq!(node.min_event_ns, min_event_ns);
     assert!(left.height.abs_diff(right.height) <= 1);
     ValidationSummary {
         count: left.count.saturating_add(right.count).saturating_add(1),
         height,
-        min_event_ns,
     }
 }

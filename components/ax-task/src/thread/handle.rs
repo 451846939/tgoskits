@@ -14,7 +14,7 @@ use crate::{
     CpuId, DeadlineFlags, DeadlinePolicy, FairMode, Nice, PiWaitNodeStorage, PiWaitState,
     RtPriority, RunQueueNodeStorage, SchedulePolicy, SchedulerTickWork, SchedulerTickWorkClaim,
     SchedulingKey, SchedulingUrgency, TaskError, ThreadAffinityCompletion, ThreadExtensionView,
-    ThreadId, ThreadSchedCell, ThreadState,
+    ThreadId, ThreadLifecycle, ThreadSchedCell, ThreadState,
     inbox::{InboxKind, InboxNode},
     runtime::{PreemptGuardToken, task_runtime},
     task_work::TaskWorkDoorbell,
@@ -107,16 +107,6 @@ impl ThreadHandle {
     /// Creates a direct wake handle that does not consult the thread registry.
     pub fn wake_handle(&self) -> ThreadWakeHandle {
         ThreadWakeHandle::from_core(Arc::clone(&self.core))
-    }
-
-    /// Returns the current scheduling urgency key used by PI waiter ordering.
-    pub fn effective_scheduling_key(&self) -> SchedulingKey {
-        self.core.effective_scheduling_key()
-    }
-
-    /// Returns effective urgency without a thread-identity tie-break.
-    pub fn effective_scheduling_urgency(&self) -> SchedulingUrgency {
-        self.core.effective_scheduling_urgency()
     }
 
     /// Returns the physical CPU that must cross a scheduler boundary.
@@ -410,7 +400,7 @@ pub(crate) struct ThreadCore {
     effective_key_sequence: AtomicUsize,
     effective_deadline_active: AtomicBool,
     effective_deadline_ns: AtomicU64,
-    state: AtomicU8,
+    state: Arc<ThreadLifecycle>,
     reap_signal: Arc<ThreadReapSignal>,
     reap_gate: AtomicUsize,
     scheduler_activity_gate: AtomicUsize,
@@ -447,6 +437,7 @@ impl ThreadCore {
         task_work: Option<Arc<TaskWorkDoorbell>>,
     ) -> Self {
         debug_assert_eq!(id, sched.id());
+        let lifecycle = Arc::clone(sched.lifecycle());
         let reap_signal = Arc::new(ThreadReapSignal::new(task_work));
         Self {
             id,
@@ -464,7 +455,7 @@ impl ThreadCore {
             effective_key_sequence: AtomicUsize::new(0),
             effective_deadline_active: AtomicBool::new(false),
             effective_deadline_ns: AtomicU64::new(0),
-            state: AtomicU8::new(ThreadState::New as u8),
+            state: lifecycle,
             reap_signal,
             reap_gate: AtomicUsize::new(0),
             scheduler_activity_gate: AtomicUsize::new(0),
@@ -562,11 +553,12 @@ impl ThreadCore {
         debug_assert_eq!(sequence & 1, 1, "runtime accounting writer lost ownership");
     }
 
-    pub(crate) fn publish_state(&self, state: ThreadState) {
-        if state == ThreadState::Exited {
+    pub(crate) fn transition_state(&self, next: ThreadState) -> Result<(), TaskError> {
+        self.state.transition(next)?;
+        if next == ThreadState::Exited {
             self.reap_signal.mark_exited();
         }
-        self.state.store(state as u8, Ordering::Release);
+        Ok(())
     }
 
     pub(crate) fn begin_scheduler_tick_work(&self, observed_ns: u64) -> bool {
@@ -841,7 +833,7 @@ impl ThreadCore {
     pub(crate) fn publish_effective_schedule(
         &self,
         policy: SchedulePolicy,
-        entity: crate::SchedulingEntity,
+        entity: &crate::SchedulingEntity,
     ) {
         self.effective_key_sequence.fetch_add(1, Ordering::AcqRel);
         self.effective_policy.store(policy);
@@ -860,6 +852,10 @@ impl ThreadCore {
         // which also needs a coherent Deadline timestamp. Avoid waiting on a
         // preempted sequence writer from migration publication context.
         self.effective_policy.load().placement_demand()
+    }
+
+    pub(crate) fn effective_policy_snapshot(&self) -> SchedulePolicy {
+        self.effective_policy.load()
     }
 
     fn effective_scheduling_key(&self) -> SchedulingKey {
@@ -890,6 +886,20 @@ impl ThreadCore {
     pub(crate) fn effective_scheduling_urgency(&self) -> SchedulingUrgency {
         let key = self.effective_scheduling_key();
         SchedulingUrgency::new(key.class_rank(), key.primary())
+    }
+
+    /// Returns the rtmutex waiter ordering key.
+    ///
+    /// Linux maps every non-RT/non-Deadline task to `DEFAULT_PRIO` in
+    /// `__waiter_prio()`. Nice and idle weight affect the fair rq, but never
+    /// lock handoff order or PI donation.
+    pub(crate) fn effective_pi_wait_urgency(&self) -> SchedulingUrgency {
+        let urgency = self.effective_scheduling_urgency();
+        if urgency.class_rank() >= 3 {
+            SchedulingUrgency::new(3, 0)
+        } else {
+            urgency
+        }
     }
 
     pub(crate) fn set_wake_cpu_hint(&self, cpu: CpuId) {
@@ -1047,16 +1057,7 @@ impl ThreadCore {
     }
 
     pub(crate) fn state(&self) -> ThreadState {
-        match self.state.load(Ordering::Acquire) {
-            0 => ThreadState::New,
-            1 => ThreadState::Ready,
-            2 => ThreadState::Running,
-            3 => ThreadState::Parking,
-            4 => ThreadState::Blocked,
-            5 => ThreadState::Waking,
-            6 => ThreadState::Exited,
-            _ => unreachable!("thread state is published only from ThreadState"),
-        }
+        self.state.state()
     }
 }
 

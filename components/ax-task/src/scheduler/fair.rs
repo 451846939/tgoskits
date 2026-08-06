@@ -32,7 +32,7 @@ pub(crate) const fn virtual_max(lhs: u64, rhs: u64) -> u64 {
 
 /// Per-thread EEVDF service and lag state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct FairEntity {
+pub(crate) struct FairEntity {
     nice: Nice,
     mode: FairMode,
     vruntime: u64,
@@ -286,6 +286,7 @@ impl FairEntity {
     }
 
     /// Returns the entity's nice value.
+    #[cfg(test)]
     pub const fn nice(self) -> Nice {
         self.nice
     }
@@ -321,6 +322,7 @@ impl FairEntity {
     }
 
     /// Returns the physical service request used for this EEVDF slice.
+    #[cfg(test)]
     pub const fn service_request_ns(self) -> u64 {
         self.service_request_ns
     }

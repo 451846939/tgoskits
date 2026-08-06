@@ -14,17 +14,10 @@
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-static SECONDARY_CPUID_BY_SLOT: [AtomicUsize; crate::build_info::CPU_CAPACITY - 1] =
-    [const { AtomicUsize::new(usize::MAX) }; crate::build_info::CPU_CAPACITY - 1];
-
 static ENTERED_CPUS: AtomicUsize = AtomicUsize::new(1);
 
 const fn secondary_cpu_is_usable(cpu_id: usize, runtime_cpu_count: usize) -> bool {
     cpu_id < runtime_cpu_count
-}
-
-fn prepare_secondary_boot_stack(slot: usize, cpu_id: usize) {
-    SECONDARY_CPUID_BY_SLOT[slot].store(cpu_id, Ordering::Release);
 }
 
 #[allow(clippy::absurd_extreme_comparisons)]
@@ -33,12 +26,8 @@ pub fn start_secondary_cpus(primary_cpu_id: usize) {
     let cpu_num = ax_hal::cpu_num();
     for i in 0..cpu_num {
         if i != primary_cpu_id && slot < cpu_num.saturating_sub(1) {
-            prepare_secondary_boot_stack(slot, i);
-
-            let stack_top = 0;
-
             debug!("starting CPU {i}...");
-            ax_hal::power::cpu_boot(i, stack_top);
+            ax_hal::power::cpu_boot(i);
             slot += 1;
 
             while ENTERED_CPUS.load(Ordering::Acquire) <= slot {

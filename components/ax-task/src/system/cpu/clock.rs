@@ -13,15 +13,36 @@ pub(crate) struct RunQueueClockSnapshot {
     task: SchedulerTimestamp,
 }
 
-impl RunQueueClockSnapshot {
-    /// Returns Linux `rq_clock()`, including hard-interrupt time.
-    pub(crate) const fn wall_nanos(self) -> u64 {
-        self.wall.as_nanos()
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RqWallTime(SchedulerTimestamp);
+
+impl RqWallTime {
+    pub(crate) const fn as_nanos(self) -> u64 {
+        self.0.as_nanos()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RqTaskTime(SchedulerTimestamp);
+
+impl RqTaskTime {
+    pub(crate) const fn as_nanos(self) -> u64 {
+        self.0.as_nanos()
     }
 
-    /// Returns Linux `rq_clock_task()`, excluding accounted hard IRQ time.
-    pub(crate) const fn task_nanos(self) -> u64 {
-        self.task.as_nanos()
+    #[cfg(test)]
+    pub(crate) const fn test(nanos: u64) -> Self {
+        Self(SchedulerTimestamp::from_nanos(nanos))
+    }
+}
+
+impl RunQueueClockSnapshot {
+    pub(crate) const fn wall(self) -> RqWallTime {
+        RqWallTime(self.wall)
+    }
+
+    pub(crate) const fn task(self) -> RqTaskTime {
+        RqTaskTime(self.task)
     }
 }
 
@@ -101,13 +122,15 @@ mod tests {
         assert_eq!(
             clock
                 .update(RqClockSample::new(SchedulerTimestamp::from_nanos(100), 0))
-                .wall_nanos(),
+                .wall()
+                .as_nanos(),
             100
         );
         assert_eq!(
             clock
                 .update(RqClockSample::new(SchedulerTimestamp::from_nanos(90), 0))
-                .wall_nanos(),
+                .wall()
+                .as_nanos(),
             100
         );
     }
@@ -124,7 +147,8 @@ mod tests {
         assert_eq!(
             clock
                 .update(RqClockSample::new(SchedulerTimestamp::from_nanos(2), 0))
-                .wall_nanos(),
+                .wall()
+                .as_nanos(),
             2
         );
     }
@@ -136,8 +160,8 @@ mod tests {
         clock.update(RqClockSample::new(SchedulerTimestamp::from_nanos(100), 5));
         let snapshot = clock.update(RqClockSample::new(SchedulerTimestamp::from_nanos(160), 25));
 
-        assert_eq!(snapshot.wall_nanos(), 160);
-        assert_eq!(snapshot.task_nanos(), 140);
+        assert_eq!(snapshot.wall().as_nanos(), 160);
+        assert_eq!(snapshot.task().as_nanos(), 140);
     }
 
     #[test]
@@ -149,9 +173,9 @@ mod tests {
         let second = clock.update(RqClockSample::new(SchedulerTimestamp::from_nanos(115), 20));
         let third = clock.update(RqClockSample::new(SchedulerTimestamp::from_nanos(125), 20));
 
-        assert_eq!(first.task_nanos(), 100);
-        assert_eq!(second.task_nanos(), 100);
-        assert_eq!(third.task_nanos(), 105);
+        assert_eq!(first.task().as_nanos(), 100);
+        assert_eq!(second.task().as_nanos(), 100);
+        assert_eq!(third.task().as_nanos(), 105);
     }
 
     #[test]
@@ -164,7 +188,7 @@ mod tests {
         ));
         let snapshot = clock.update(RqClockSample::new(SchedulerTimestamp::from_nanos(2), 1));
 
-        assert_eq!(snapshot.wall_nanos(), 2);
-        assert_eq!(snapshot.task_nanos(), u64::MAX);
+        assert_eq!(snapshot.wall().as_nanos(), 2);
+        assert_eq!(snapshot.task().as_nanos(), u64::MAX);
     }
 }

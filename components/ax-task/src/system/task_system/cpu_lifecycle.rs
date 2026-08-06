@@ -118,9 +118,9 @@ impl TaskSystem {
             .filter_map(|slot| slot.record.as_ref())
             .any(|record| {
                 let sched = record.sched.lock();
-                (matches!(sched.policy.applied, SchedulePolicy::Deadline(_))
-                    || matches!(sched.policy.requested, SchedulePolicy::Deadline(_)))
-                    && !sched.placement.affinity.contains(id)
+                (matches!(sched.policy.base, SchedulePolicy::Deadline(_))
+                    || matches!(sched.policy.requested_policy(), SchedulePolicy::Deadline(_)))
+                    && !sched.affinity.affinity.contains(id)
             })
         {
             return Err(TaskError::DeadlineAffinity);
@@ -128,33 +128,29 @@ impl TaskSystem {
         ensure_runtime_success(task_runtime::prepare_cpu_online(RuntimeCpuId::new(
             id.as_u32(),
         )))?;
-        let _clock = cpu.update_rq_clock();
+        let _clock = self.sample_owner_rq_clock(cpu.as_ref().get_ref());
         let monotonic_now = task_runtime::monotonic_now();
         cpu.as_mut()
             .reset_fair_balance(monotonic_now, self.config.balance_interval_ns());
-        let online_count = state
-            .online_cpu_count()
+        let online_count = root_domain
+            .online
+            .count()
             .checked_add(1)
             .ok_or(TaskError::InvalidConfiguration)?;
         let deadline_rebuild = state.deadline_bandwidth_rebuild(online_count)?;
-        self.topology_sequence.write_begin();
+        self.root_domain.enable_rt_runtime(id);
         assert!(
             root_domain.insert_online(id, deadline_rebuild),
             "validated offline CPU must be absent from the root domain"
         );
-        self.online_count.store(online_count, Ordering::Release);
-        {
-            let run_queue = cpu.lock_run_queue();
-            self.root_domain.publish_run_queue(id, &run_queue, true);
-        }
         assert!(
             cpu.as_ref().get_ref().remote().mark_online(),
             "validated offline CPU must accept final publication"
         );
+        OwnerRqTxn::begin(self, cpu.remote()).commit();
         if cpu.lock_run_queue().has_runnable_rt() {
             self.root_domain.activate_rt_period(id, monotonic_now);
         }
-        self.topology_sequence.write_end();
         Ok(())
     }
 
@@ -165,7 +161,7 @@ impl TaskSystem {
     /// remote lifecycle closes publication only when its active publisher count
     /// is zero, so a successful transition cannot strand an inbox node between
     /// queue insertion and its doorbell.
-    pub fn take_cpu_offline(&self, cpu: Pin<&mut CpuLocal>) -> Result<(), TaskError> {
+    pub fn take_cpu_offline(&self, mut cpu: Pin<&mut CpuLocal>) -> Result<(), TaskError> {
         self.ensure_owner_cpu_context(&cpu)?;
         let _irq = IrqScope::enter();
         let id = cpu.owner();
@@ -182,14 +178,15 @@ impl TaskSystem {
             }
             crate::CpuLifecycleState::Online => {}
         }
-        if state.online_cpu_count() <= 1 {
+        if root_domain.online.count() <= 1 {
             return Err(TaskError::LastOnlineCpu(id.as_u32()));
         }
         if !root_domain.can_deactivate_cpu(id) {
             return Err(TaskError::DeadlineAdmission);
         }
-        let remaining_online = state
-            .online_cpu_count()
+        let remaining_online = root_domain
+            .online
+            .count()
             .checked_sub(1)
             .ok_or(TaskError::InvalidConfiguration)?;
         let deadline_rebuild = state.deadline_bandwidth_rebuild(remaining_online)?;
@@ -198,7 +195,8 @@ impl TaskSystem {
             .find(|candidate| *candidate != id && root_domain.online.contains(*candidate))
             .ok_or(TaskError::LastOnlineCpu(id.as_u32()))?;
 
-        self.topology_sequence.write_begin();
+        self.migrate_dormant_deadline_bandwidth_for_cpu_offline(&state, &root_domain, id)?;
+
         let result = if !remote.try_deactivate() {
             Err(TaskError::CpuNotQuiescent(id.as_u32()))
         } else if !Self::prepare_thread_targets_for_cpu_offline(&state, &root_domain, id)
@@ -220,8 +218,8 @@ impl TaskSystem {
             remote.cancel_draining();
             Err(TaskError::InvalidConfiguration)
         } else {
-            let online_count = state.online_cpu_count();
-            self.online_count.store(online_count, Ordering::Release);
+            cpu.as_mut().clear_fair_balance();
+            self.root_domain.disable_rt_runtime(id);
             remote.finish_offline();
             self.root_domain.publish_offline(id);
             if self
@@ -233,8 +231,73 @@ impl TaskSystem {
             }
             Ok(())
         };
-        self.topology_sequence.write_end();
         result
+    }
+
+    /// Mirrors Linux `dl_task_offline_migration()` for blocked DL tasks.
+    ///
+    /// Runnable/on-CPU tasks must already leave through the normal placement
+    /// carrier. A dormant reservation, however, still owns `this_bw`, optional
+    /// `running_bw`, and inactive/CBS timer entries. Those facts move together
+    /// before the source CPU closes placement publication.
+    fn migrate_dormant_deadline_bandwidth_for_cpu_offline(
+        &self,
+        state: &TaskSystemState,
+        root_domain: &RootDomainState,
+        source: CpuId,
+    ) -> Result<(), TaskError> {
+        let source_remote = &self.cpu_remotes[source.as_usize()];
+        for record in state.slots.iter().filter_map(|slot| slot.record.as_ref()) {
+            let core = &record.core;
+            let mut sched = record.sched.lock();
+            if sched.deadline.bandwidth.reservation_owner() != Some(source) {
+                continue;
+            }
+            if sched.placement.queued_cpu().is_some()
+                || sched.placement.execution_cpu().is_some()
+                || sched.placement.on_cpu().is_some()
+                || sched.placement.has_pending_migration()
+            {
+                return Err(TaskError::CpuNotQuiescent(source.as_u32()));
+            }
+            let target = (0..root_domain.online.topology_len())
+                .map(|index| CpuId::new(index as u32))
+                .find(|candidate| {
+                    *candidate != source
+                        && root_domain.online.contains(*candidate)
+                        && sched.affinity.affinity.contains(*candidate)
+                        && self.cpu_remotes[candidate.as_usize()].accepts_placement()
+                })
+                .ok_or(TaskError::DeadlineAffinity)?;
+            let target_remote = &self.cpu_remotes[target.as_usize()];
+            let publication = target_remote
+                .begin_publication()
+                .ok_or(TaskError::CpuNotQuiescent(target.as_u32()))?;
+
+            let mut source_rq = OwnerRqTxn::begin(self, source_remote);
+            Self::detach_owner_deadline_bandwidth_in_rq(
+                core,
+                &mut sched,
+                source_remote,
+                &mut source_rq,
+            );
+            source_rq.commit();
+
+            let active = sched.deadline.bandwidth.is_active();
+            let mut target_rq = OwnerRqTxn::begin(self, target_remote);
+            Self::attach_deadline_bandwidth_locked(
+                core,
+                &mut sched,
+                &mut target_rq,
+                target,
+                active,
+            );
+            target_rq.commit();
+            core.set_wake_cpu_hint(target);
+            drop(sched);
+            self.publish_owner_deadline_refresh_reserved(core, target, publication);
+        }
+        Ok(())
     }
 
     /// Stops dormant threads from retaining an inactive preferred target.
@@ -278,14 +341,14 @@ impl TaskSystem {
             if sched.lifecycle.state() == ThreadState::Exited {
                 continue;
             }
-            if fallback_for(&sched.placement.affinity).is_none() {
+            if fallback_for(&sched.affinity.affinity).is_none() {
                 return false;
             }
             let physically_owned = sched.placement.queued_cpu() == Some(cpu)
                 || sched.placement.execution_cpu() == Some(cpu)
                 || sched.placement.on_cpu() == Some(cpu)
                 || sched.placement.committed_migration_target() == Some(cpu)
-                || sched.deadline.bandwidth_cpu == Some(cpu)
+                || sched.deadline.bandwidth.reservation_owner() == Some(cpu)
                 || record.core.sleep_timer_cpu() == Some(cpu);
             if physically_owned {
                 return false;
@@ -294,7 +357,7 @@ impl TaskSystem {
                 || sched.placement.execution_cpu().is_some()
                 || sched.placement.on_cpu().is_some()
                 || sched.placement.has_pending_migration()
-                || sched.deadline.bandwidth_cpu.is_some()
+                || sched.deadline.bandwidth.reservation_owner().is_some()
                 || record.core.sleep_timer_cpu().is_some();
             if record.core.wake_cpu_hint() == Some(cpu) && has_other_placement {
                 return false;
@@ -309,7 +372,7 @@ impl TaskSystem {
             if sched.lifecycle.state() == ThreadState::Exited {
                 continue;
             }
-            let Some(fallback) = fallback_for(&sched.placement.affinity) else {
+            let Some(fallback) = fallback_for(&sched.affinity.affinity) else {
                 return false;
             };
             // Linux deliberately leaves task_cpu() unchanged for blocked
@@ -346,13 +409,13 @@ impl TaskSystem {
                     let candidate = CpuId::new(index as u32);
                     candidate != cpu
                         && root_domain.online.contains(candidate)
-                        && sched.placement.affinity.contains(candidate)
+                        && sched.affinity.affinity.contains(candidate)
                 });
                 let owned_by_cpu = sched.placement.queued_cpu() == Some(cpu)
                     || sched.placement.execution_cpu() == Some(cpu)
                     || sched.placement.on_cpu() == Some(cpu)
                     || sched.placement.committed_migration_target() == Some(cpu)
-                    || sched.deadline.bandwidth_cpu == Some(cpu)
+                    || sched.deadline.bandwidth.reservation_owner() == Some(cpu)
                     || record.core.sleep_timer_cpu() == Some(cpu)
                     || record.core.wake_cpu_hint() == Some(cpu);
                 has_remaining_destination && !owned_by_cpu
@@ -366,11 +429,12 @@ impl TaskSystem {
         thread: ThreadId,
     ) -> Result<(), TaskError> {
         self.ensure_owner_cpu_context(&cpu)?;
-        let state = self.state.lock();
-        state.cpu_registration(cpu.owner())?;
-        let core = Arc::clone(&state.thread_record(thread)?.core);
-        cpu.as_mut().set_idle(thread, core);
-        Ok(())
+        let core = {
+            let state = self.state.lock();
+            state.cpu_registration(cpu.owner())?;
+            Arc::clone(&state.thread_record(thread)?.core)
+        };
+        self.install_idle_core(cpu.as_mut(), core)
     }
 }
 
@@ -467,16 +531,16 @@ mod tests {
         let policy =
             SchedulePolicy::deadline(DeadlinePolicy::new(3, 4, 4, DeadlineFlags::NONE).unwrap());
         let _deadline = system.create_thread(ThreadSpec::new(policy)).unwrap();
-        assert_eq!(cpu0.deadline_extra_bw_scaled(), 200_000_000);
+        assert_eq!(cpu0.remote().deadline_extra_bw_scaled(), 200_000_000);
 
         system.bring_cpu_online(cpu1.as_mut()).unwrap();
-        assert_eq!(cpu0.deadline_extra_bw_scaled(), 575_000_000);
-        assert_eq!(cpu1.deadline_extra_bw_scaled(), 575_000_000);
+        assert_eq!(cpu0.remote().deadline_extra_bw_scaled(), 575_000_000);
+        assert_eq!(cpu1.remote().deadline_extra_bw_scaled(), 575_000_000);
 
         system.take_cpu_offline(cpu1.as_mut()).unwrap();
-        assert_eq!(cpu0.deadline_extra_bw_scaled(), 200_000_000);
+        assert_eq!(cpu0.remote().deadline_extra_bw_scaled(), 200_000_000);
         assert_eq!(
-            cpu1.deadline_extra_bw_scaled(),
+            cpu1.remote().deadline_extra_bw_scaled(),
             950_000_000,
             "an offline dl_rq resets to its configured maximum before reuse"
         );

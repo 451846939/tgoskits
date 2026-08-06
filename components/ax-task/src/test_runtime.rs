@@ -159,7 +159,7 @@ impl TaskRuntime for UnitTestRuntime {
         local
             .current_core()
             .map_or(CurrentThreadPublication::NONE, |core| {
-                CurrentThreadPublication::from_core(core.id(), core)
+                CurrentThreadPublication::from_core(core.id(), &core)
             })
     }
     unsafe fn cpu_remote_handle(cpu: RuntimeCpuId) -> CpuRemoteHandle {
@@ -186,10 +186,6 @@ impl TaskRuntime for UnitTestRuntime {
     unsafe fn current_cpu_id() -> RuntimeCpuId {
         RuntimeCpuId::new(0)
     }
-    fn online_cpu_count() -> u32 {
-        1
-    }
-
     fn prepare_cpu_online(cpu: RuntimeCpuId) -> RuntimeStatus {
         CPU_LIFECYCLE_EVENTS.with(|events| {
             events.borrow_mut().push(CpuLifecycleEvent::Online(cpu));
@@ -485,8 +481,8 @@ impl TaskRuntime for UnitTestRuntime {
                 .push(SwitchObservation::Trace(record));
         });
     }
-    fn fatal_invariant(_code: u32, _argument: usize) -> ! {
-        panic!("scheduler invariant reported by unit test")
+    fn fatal_invariant(code: u32, argument: usize) -> ! {
+        panic!("scheduler invariant {code:#010x} reported with argument {argument:#x}")
     }
 }
 

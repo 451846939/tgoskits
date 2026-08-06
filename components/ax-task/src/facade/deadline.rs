@@ -174,16 +174,37 @@ pub fn on_clock_event_with_scheduler_tick(
     let (charge, clock) = system.charge_current_until_with_clock(cpu.as_mut(), 0)?;
     let rt_unthrottled = system.service_rt_period(&cpu, now);
     if scheduler_tick {
-        system.publish_current_scheduler_tick_work(&cpu, clock.task_nanos());
+        system.publish_current_scheduler_tick_work(&cpu, clock.task().as_nanos());
     }
-    let batch = cpu.as_mut().on_task_clock_event(now, budget);
-    let scheduler_due = cpu.as_mut().scheduler_work_due(clock, now);
-    let pending = batch.pending() || scheduler_due || rt_unthrottled;
-    let update = cpu.as_mut().next_scheduler_deadline_update(clock, now)?;
+    let mut hard_processed = 0;
+    let mut hard_pending = false;
+    while hard_processed < budget {
+        let (event, pending) = cpu.as_mut().take_due_scheduler_deadline(now);
+        hard_pending = pending;
+        let Some(event) = event else {
+            break;
+        };
+        system.service_expired_scheduler_deadline(cpu.as_mut(), event)?;
+        hard_processed += 1;
+    }
+    hard_pending |= cpu.has_due_scheduler_deadline(now);
+    if hard_pending {
+        // The hard-IRQ budget is an execution bound, not a progress source.
+        // Transfer the remainder to the owner scheduler safe point and keep a
+        // sticky reschedule request so idle cannot wait for another timer IRQ.
+        cpu.publish_hard_timer_work();
+        cpu.request_reschedule();
+    }
+    let batch = cpu
+        .as_mut()
+        .on_task_clock_event(now, budget.saturating_sub(hard_processed));
+    let scheduler_due = cpu.as_mut().scheduler_work_due(now);
+    let pending = hard_pending || batch.pending() || scheduler_due || rt_unthrottled;
+    let update = cpu.as_mut().next_scheduler_deadline_update(now)?;
     Ok(TaskClockEventOutcome {
         slice_expired: charge.slice_expired(),
         deadline_overrun: charge.deadline_overrun(),
-        expired: batch.expired(),
+        expired: hard_processed.saturating_add(batch.expired()),
         pending,
         update,
     })
@@ -216,7 +237,8 @@ pub(crate) fn commit_current_park(ticket: &mut crate::ParkTicket) -> Result<(), 
     let system = runtime_task_system()?;
     let commit = {
         let mut cpu = runtime_current_cpu_mut(&mut scheduler_frame)?;
-        system.commit_park(cpu.as_mut(), ticket)?
+        // SAFETY: `scheduler_frame` owns the IRQ-off scheduler baton.
+        unsafe { system.commit_park_in_scheduler_frame(cpu.as_mut(), ticket)? }
     };
     match commit {
         ParkCommit::Notified => Ok(()),
@@ -250,8 +272,8 @@ pub(crate) fn arm_current_park_deadline(
     let (registration, update) = {
         let owner = cpu.owner();
         let registration = cpu
-            .as_mut()
-            .task_deadlines()
+            .lock_deadline_base()
+            .queue
             .arm(
                 thread.sleep_timer(),
                 deadline,
@@ -264,15 +286,11 @@ pub(crate) fn arm_current_park_deadline(
             })?;
         let token = registration.token();
         thread.core.register_sleep_timer(owner, token.generation());
-        let clock = cpu.update_rq_clock();
         let monotonic_now = task_runtime::monotonic_now();
-        let update = match cpu
-            .as_mut()
-            .next_scheduler_deadline_update(clock, monotonic_now)
-        {
+        let update = match cpu.as_mut().next_scheduler_deadline_update(monotonic_now) {
             Ok(update) => update,
             Err(error) => {
-                let removed = cpu.as_mut().task_deadlines().cancel(&registration);
+                let removed = cpu.lock_deadline_base().queue.cancel(&registration);
                 let completed = thread.core.complete_sleep_timer(token.generation());
                 if !removed || !completed {
                     task_runtime::fatal_invariant(0x5444_0005, thread.id().as_u64() as usize);
@@ -321,9 +339,17 @@ pub(crate) fn cancel_current_park_deadline(
         let registration = ticket
             .deadline()
             .expect("the deadline registration remains owned until cancellation");
-        let cancellation = match cpu.as_mut().task_deadlines().begin_cancel(registration) {
-            Some(cancellation) => cancellation,
-            None if cpu.owns_buffered_expiration(registration) => {
+        let cancellation = match {
+            let mut deadline_base = cpu.lock_deadline_base();
+            let cancellation = deadline_base.queue.begin_cancel(registration);
+            let buffered = cancellation
+                .is_none()
+                .then(|| deadline_base.owns_buffered_expiration(registration))
+                .unwrap_or(false);
+            (cancellation, buffered)
+        } {
+            (Some(cancellation), _) => cancellation,
+            (None, true) => {
                 if !thread.core.complete_sleep_timer(token.generation())
                     || !ticket.clear_deadline(token)
                 {
@@ -331,19 +357,15 @@ pub(crate) fn cancel_current_park_deadline(
                 }
                 return Ok(false);
             }
-            None => {
+            (None, false) => {
                 task_runtime::fatal_invariant(0x5444_0006, thread.id().as_u64() as usize);
             }
         };
-        let clock = cpu.update_rq_clock();
         let monotonic_now = task_runtime::monotonic_now();
-        let update = match cpu
-            .as_mut()
-            .next_scheduler_deadline_update(clock, monotonic_now)
-        {
+        let update = match cpu.as_mut().next_scheduler_deadline_update(monotonic_now) {
             Ok(update) => update,
             Err(error) => {
-                cancellation.rollback(cpu.as_mut().task_deadlines());
+                cancellation.rollback(&mut cpu.lock_deadline_base().queue);
                 cpu.as_mut().invalidate_scheduler_deadline_publication();
                 return Err(error);
             }
@@ -373,7 +395,7 @@ impl TaskClockEventOutcome {
     pub const fn slice_expired(self) -> bool {
         self.slice_expired
     }
-    /// Returns whether CBS exhaustion entered PI-critical rescue.
+    /// Returns whether the current Deadline reservation exhausted its CBS budget.
     pub const fn deadline_overrun(self) -> bool {
         self.deadline_overrun
     }

@@ -16,7 +16,7 @@ mod epoch_mpsc;
 mod error;
 pub mod executor;
 mod facade;
-pub mod inbox;
+mod inbox;
 mod irq_wait;
 mod lock;
 #[cfg(feature = "qperf-metrics")]

@@ -43,6 +43,12 @@ impl SchedulerTimestamp {
         Self(self.0.wrapping_add(delta_ns))
     }
 
+    /// Moves backwards by one validated relative interval.
+    pub(crate) const fn retreat(self, delta_ns: u64) -> Self {
+        assert!(delta_ns < SCHEDULER_TIME_HALF_RANGE);
+        Self(self.0.wrapping_sub(delta_ns))
+    }
+
     /// Returns the forward distance from `earlier` to this timestamp.
     pub(crate) const fn since(self, earlier: Self) -> u64 {
         let delta = self.0.wrapping_sub(earlier.0);
@@ -85,26 +91,6 @@ pub(crate) fn scheduler_time_cmp(left: u64, right: u64) -> Ordering {
 pub(crate) const fn scheduler_time_reached(now_ns: u64, deadline_ns: u64) -> bool {
     SchedulerTimestamp::from_nanos(deadline_ns)
         .is_reached_by(SchedulerTimestamp::from_nanos(now_ns))
-}
-
-pub(crate) const fn scheduler_time_advance(now_ns: u64, delta_ns: u64) -> u64 {
-    SchedulerTimestamp::from_nanos(now_ns)
-        .advance(delta_ns)
-        .as_nanos()
-}
-
-pub(crate) fn earliest_scheduler_time(left: Option<u64>, right: Option<u64>) -> Option<u64> {
-    match (left, right) {
-        (Some(left), Some(right)) => {
-            Some(if scheduler_time_cmp(left, right) == Ordering::Greater {
-                right
-            } else {
-                left
-            })
-        }
-        (Some(value), None) | (None, Some(value)) => Some(value),
-        (None, None) => None,
-    }
 }
 
 /// Maps one future scheduler timestamp onto the finite physical clock domain.

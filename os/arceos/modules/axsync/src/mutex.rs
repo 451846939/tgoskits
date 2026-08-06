@@ -135,7 +135,7 @@ impl RawMutex {
             if self.try_claim_waiter(&token, current) {
                 break;
             }
-            if !token.is_selected() && !self.spin_on_owner(&token) {
+            if !token.can_claim() && !self.spin_on_owner(&token) {
                 task_result(pi_block_current(&token), "block on PI mutex");
             }
         }
@@ -152,16 +152,16 @@ impl RawMutex {
     fn spin_on_owner(&self, token: &PiWaitToken<'_>) -> bool {
         let _preempt_guard = PreemptGuard::new();
         let Some(owner) = token.initial_owner() else {
-            return token.is_selected() || token.is_granted();
+            return token.can_claim() || token.is_granted();
         };
 
         loop {
-            if token.is_selected() || token.is_granted() {
+            if token.can_claim() || token.is_granted() {
                 return true;
             }
 
             if !self.core.is_owned_by(owner) {
-                return token.is_selected() || token.is_granted();
+                return token.can_claim() || token.is_granted();
             }
             let owner_on_cpu = token.initial_owner_is_on_cpu();
             // SAFETY: `_preempt_guard` pins this caller to one CPU throughout
@@ -178,15 +178,15 @@ impl RawMutex {
                 waiter_is_top,
                 need_resched,
             ) {
-                return token.is_selected() || token.is_granted();
+                return token.can_claim() || token.is_granted();
             }
 
             for _ in 0..OWNER_SPIN_BATCH {
-                if token.is_selected() || token.is_granted() {
+                if token.can_claim() || token.is_granted() {
                     return true;
                 }
                 if !self.core.is_owned_by(owner) {
-                    return token.is_selected() || token.is_granted();
+                    return token.can_claim() || token.is_granted();
                 }
                 core::hint::spin_loop();
             }

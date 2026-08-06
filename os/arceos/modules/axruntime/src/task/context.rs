@@ -346,22 +346,26 @@ pub(super) fn bind_runtime_context_thread(binding: ContextThreadBinding) -> Runt
 /// been copied. The architecture current-thread register must retain its live
 /// pinned [`CurrentThreadHeader`] publication for that complete interval.
 pub(super) unsafe fn scheduler_current_thread_publication() -> CurrentThreadPublication {
-    let header = unsafe { ax_hal::percpu::current_thread_raw() };
-    if header.is_null() {
-        return CurrentThreadPublication::NONE;
-    }
-    // SAFETY: the current-thread register points to a live pinned header.
-    let header = unsafe { &*header };
+    let header = unsafe { ax_hal::percpu::scheduler_current_thread_unpinned() }
+        .unwrap_or_else(|error| panic!("scheduler current-thread register is invalid: {error}"));
+    // SAFETY: the scheduler owns the current task allocation and the caller's
+    // preemption pin prevents a context switch for this complete observation.
+    let header = unsafe { header.as_ref() };
     let Some(publication) = header.runtime_thread_cookie() else {
+        // Only the permanent pre-scheduler bootstrap header has no runtime
+        // cookie. A runtime context receives its immutable cookie before it
+        // can enter any runqueue.
         return CurrentThreadPublication::NONE;
     };
     let context = header as *const CurrentThreadHeader as *const RuntimeContext;
     // SAFETY: `RuntimeContext::header` is at offset zero and the current header
     // remains live under the caller's migration pin.
     let expected = unsafe { (*context).publication.get() };
-    if publication.get() != expected.expose_provenance() {
-        return CurrentThreadPublication::NONE;
-    }
+    assert_eq!(
+        publication.get(),
+        expected.expose_provenance(),
+        "current-thread cookie must identify its owning runtime publication"
+    );
     // SAFETY: binding initialized this immutable field before the context
     // entered any run queue, and the cookie publication points to it exactly.
     unsafe { *expected }

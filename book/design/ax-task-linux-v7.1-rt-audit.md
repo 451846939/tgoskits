@@ -235,14 +235,14 @@ USB/vsock 控制器协议属于外围驱动；除非它们违反上述调度交�
 | --- | --- | --- | --- |
 | placement | `try_to_wake_up()`、rq locking | rq 独占 queued/running，CPU switch baton 独占 outgoing stack | 已删除 `target_cpu` CPU 身份双真相和 task 级 `SwitchingOut/ExitedAwaitingTail`；线程只保存最终 rq/migration placement 与独立 `on_cpu` 发布位，outgoing stack 生命周期唯一归 per-CPU `SwitchHandoff` |
 | Fair/EEVDF | `avg_vruntime()`、`place_entity()`、`pick_eevdf()` | 唯一加权平均 V；sleep/migration 保存 `vlag`；eligible current 保留请求保护 | 已删除旧 wakeup granularity 与重复单调 V，迁移使用 detach 事务 |
-| RT/DL 选核 | `cpupri`、`cpudl`、`rto_mask/rto_count`、`dlo_mask/dlo_count`、`RT_PUSH_IPI` | 优先级与 load 正交；DL runnable CPU 属于 cpupri HIGHER；只有可迁移候选才能发布 overload；优先级下降启动单一 root-domain push iterator | root-domain cpupri/cpudl 已接入 wake placement；cpupri 包含 101 个桶，DL current/queued 发布 HIGHER；pushable membership 在 rq 事务内直接发布 RT/DL overload mask/count；priority-drop 通过 generation-bearing root-domain iterator 串行通知 owner，不广播 IPI |
+| RT/DL 选核 | `cpupri`、`cpudl`、`rto_mask/rto_count`、`dlo_mask/dlo_count`、`RT_PUSH_IPI` | 优先级与 load 正交；DL runnable CPU 属于 cpupri HIGHER；只有可迁移候选才能发布 overload；RT 与 DL 各自维护 root-domain push iterator | root-domain cpupri/cpudl 已接入 wake placement；cpupri 包含 101 个桶，DL current/queued 发布 HIGHER；pushable membership 在 rq 事务内直接发布 RT/DL overload mask/count；两类 priority-drop 各自通过 generation-bearing iterator 串行通知 owner，不广播 IPI，也不跨类选择候选 |
 | 远程投递 | `try_to_wake_up()`、`ttwu_queue()`、`resched_curr()`、`irq_work_claim()` | PREEMPT_RT 关闭 `TTWU_QUEUE`，waker 直接锁目标 rq 激活；仅实际需要抢占时发送 reschedule IPI；IPI claim 必须先于 callback/drain | 已删除 task-level remote-wake inbox；migration/control 继续使用 typed owner inbox；runtime 门铃改为 generation + physical edge ownership，coalescing 只返回成功，不再把 `Busy` 暴露为模糊的 transport 状态 |
 | CPU 生命周期 | `sched_cpu_deactivate()`、`dl_bw_deactivate()`、`sched_cpu_dying()` | 先验证剩余 Deadline capacity，再关 placement、drain producer，最后 offline | `Online/Inactive/Draining/Offline` 已实现；Deadline 过量预留会在 topology mutation 前拒绝 CPU down |
 | active mm | `exit_mm()`、`context_switch()`、`enter_lazy_tlb()`、`finish_task_switch()` | task-mm 所有权在 zombie 前解除；lazy CPU carrier 与页表根存储保留到最后 CPU lease | move-only token + task detach + per-CPU active lease 已实现 |
 | 用户 TLB 回收 | `mmu_gather`、`mm_cpumask()`、各架构 `flush_tlb_mm_range()` | 先改 PTE，再同步 active-mm CPU，最后释放物理所有权 | 共享 mm CPU tracker + typed gather 已实现；调度 token 不再各自维护错误的 CPU footprint |
 | task deadline | `hrtimer`、`sched/deadline.c` | IRQ 只处理 generation-bearing 值记录；CBS 状态机是唯一期限真值 | Deadline 已改为 class-owned 有序 AVL rq，并在节点内增广最早 CBS 事件；pick/dequeue/rekey 为 O(log n)；CBS 记账与物理入队同属目标 rq 事务；CBS 生命周期改为互斥状态，删除 `base_deadline` 镜像 |
-| clockevent/nohz | `clockevents_program_event()`、`clockevents_shutdown()`、`hrtimer_interrupt()`、`tick_nohz_idle_enter()`、`tick_nohz_stop_tick()`、`tick_nohz_idle_exit()` | 每 CPU 单一物理 owner；CPU 生命周期与 firing 带 epoch；早到/陈旧边不得进入 scheduler；idle 无调度事件时停止 tick；无期限用 `Option` | scheduler tick 建模为 `Running/Stopped`；online/offline 推进 CPU epoch；IRQ 只有在当前 arm 已到期时才能取得 move-only firing token，旧 pending edge 只重编程当前 arm；idle IRQ-off 提交时撤销 tick，只保留 task deadline |
-| switch tail | `finish_task_switch()` | 清 outgoing `on_cpu` 后才能回收；已提交的 raw switch 不可重试 | `on_switch_in` 已移到 current publication、runtime tail、handoff consumption 之后的 move-only completion，并在释放 `CpuLocal` borrow 后执行；task placement 仍镜像 switch-tail 暂态，待收敛到 CPU handoff |
+| clockevent/nohz | `clockevents_program_event()`、`clockevents_shutdown()`、`hrtimer_interrupt()`、`tick_nohz_idle_enter()`、`tick_nohz_stop_tick()`、`tick_nohz_idle_exit()` | 每 CPU 单一物理 owner；CPU 生命周期与 firing 带 epoch；任何已投递的硬件边必须先失效旧 arm，再由逻辑时钟判断是否到期；idle 无调度事件时停止 tick；无期限用 `Option` | scheduler tick 建模为 `Running/Stopped`；online/offline 推进 CPU epoch；有效 `Armed` edge 都取得 move-only firing token，先失效旧 arm，再有界运行 hard queue/发布 soft work，早到或旧 pending edge 在 finish 时只按当前最早期限重编程一次；idle IRQ-off 提交时撤销 tick，只保留 task deadline |
+| switch tail | `finish_task_switch()` | 清 outgoing `on_cpu` 后才能回收；已提交的 raw switch 不可重试 | `on_switch_in` 位于 current publication、runtime tail、`on_cpu` 清除与 handoff consumption 之后；task placement 不保存 switch-tail 暂态，唯一未完成事务是 per-CPU move-only `SwitchHandoff` |
 | 架构 current/preempt | `current.h`、`preempt.h`、`cpu_switch_to`、`finish_task_switch()` | current 与普通 preempt 状态必须由架构唯一来源取得；TLS 只在物理寄存器确实重叠时改变 current 读取路径；裸切换尾不可失败 | AArch64 始终以 `SP_EL0` 为 current、`TPIDR_EL0` 为 TLS；x86 以 GS/FS 分离；RISC-V/LoongArch TLS 模式才从 CPU anchor 取得 current；删除全局 TLS current 模式选择 |
 | PI/锁 | `rtmutex`、`spinlock_rt.c`、`wake_q` | raw rq/IRQ gate、sleeping PI、task-local pin 四层分离；每把锁拥有有序 waiter tree，owner 只接收各锁 top waiter；解锁核心在同一 preempt-disabled 事务内选择 waiter、deboost、发布 ownerless 状态并加入 wake_q，释放元数据锁后由核心完成 wake | `PiMutexCore` 唯一拥有 generation-bearing owner word 与 allocation-free AVL waiter tree；线程预备 lock/owner 两套 linkage，owner donor tree 只保存每把已持有锁的 top waiter；ax-sync 不再保存第二份 owner、selected、waiter 容器或可丢弃 wake handle；registration、release、claim 与 release 后 wake 均由 ax-task 持有完整事务，外层不能遗漏 handoff wake |
 | 阻塞等待 | `do_lock_file_wait()`、`wait_event_interruptible()`、`locks_delete_block()` | wake 只是重试提示；条件与临时阻塞关系由领域层拥有，返回前必须先注销 | scheduler notification 与 nofault access retry 已类型化分离，fcntl/futex 外层负责重试 |
@@ -292,8 +292,8 @@ v7.1 PREEMPT_RT。此次不再把“已有枚举/guard/缓存”当作完成标�
    work 时保持 stopped，idle exit/过期恢复只重算一次。无 work 时不得保留永久 periodic
    source，也不得用调用栈外的第二份布尔状态镜像 NOHZ 生命周期。online/offline 都推进
    epoch；`Firing` 必须持有 move-only epoch token，旧 CPU 周期的 completion 不能提交到
-   新周期。timer edge 只有在当前 `Armed` deadline 已到期时才进入 scheduler，早到或
-   offline 前遗留的 pending edge 只重编程当前 arm。
+   新周期。任何有效 `Armed` edge 都先失效旧 arm 并进入一次有界 scheduler pass；早到或
+   旧 pending edge 不产生逻辑 expiry，finish 只按当前 source state 重编程一次。
 8. **scheduler entry、active-mm 与 switch plan 一次提交**。typed entry token 独占
    scheduler baton；next active-mm lease/root/current publication 在 raw switch 前准备，
    previous lease 与资源仅在 switch tail 释放。四架构只允许汇编 idle/switch 细节不同，
@@ -355,17 +355,17 @@ v7.1 PREEMPT_RT。此次不再把“已有枚举/guard/缓存”当作完成标�
 新 DL Ready 实体选择最晚 deadline CPU；低优先级 wake 即使不触发当前任务抢占，也会为已
 overloaded 的 RT rq 发布一次 owner balance doorbell。旧实现三条均稳定失败。
 
-当前 DL CBS/GRUB bandwidth 和 zero-lag timer 仍归原 per-rq owner。已有 bandwidth owner 的
-阻塞 DL 线程不能仅凭 cpudl hint 直接换 rq，否则目标 rq 会激活属于旧 CPU 的 CBS 事实，且
-旧 CPU 的 zero-lag timer 生命周期尚未撤销。因此这类 wake 暂时固定到 bandwidth owner；
-后续必须先建立独立 root-domain bandwidth owner，再开放 blocked DL 的直接跨 CPU wake。
-这不是兼容路径，而是 B1 所要求的所有权前置条件。
+DL CBS/GRUB bandwidth 和 zero-lag timer 仍归精确 per-rq owner，但 blocked DL wake 与 CPU
+offline 已建立 Linux `TASK_WAKING/task_rq_lock` 式迁移事务：先在源 rq 删除 CBS/zero-lag
+registration、`this_bw/running_bw/member`，提交源派生索引，再在目标 rq 安装相同 generation
+的带宽/activity 并发布目标 scheduler deadline。cpudl 只负责选核提示，不能单独迁移这些事实。
 
 RT bandwidth 仍按 Linux `struct rt_rq` 保持 per-CPU 事实源；Linux 的共享
 `rt_bandwidth` 负责 period timer 和 runtime balancing，并不意味着所有 CPU 共用一份
-`rt_time`。因此本轮没有把 per-CPU consumed runtime 错误合并成全局计数。后续若实现
-runtime borrowing，应增加独立 root-domain bandwidth owner，而不是让迁移线程携带源 CPU
-的 `rt_time`。
+`rt_time`。当前 `RootRtBandwidth` 独占 monotonic period timer、base runtime 和
+`rt_runtime_lock`，per-rq `RtRunQueueBandwidth` 独占 `rt_time/runtime/throttled`；quota 边缘
+按 Linux `do_balance_runtime()` 在 root lock 下从 span 内 donor 借取 1/N spare，CPU offline
+按 `__disable_runtime()` 贪婪收回 loan。迁移线程不携带源 CPU 的 `rt_time`。
 
 旧实现对 128 个 Deadline runnable thread 的一次 EDF pick 稳定访问 128 个实体；确定性
 红测要求访问数不随 runnable 数线性增长，新实现只访问有序树头。另一个既有迁移回滚测试
@@ -411,13 +411,24 @@ migration、switch-tail 和回收只能通过 rq 事务与 handoff 方法。bloc
 - remotely lockable `RunQueue`：Fair/RT/Deadline 队列、runnable load、调度策略时钟、
   Deadline member 与 GRUB/CBS bandwidth 记账；使用 IRQ-safe raw rq lock，四架构共享同一
   事务模型；
-- owner-only `OwnerDispatchState`：current/idle、current dispatch、switch handoff；
-- owner-only `LocalTaskDeadlineState`：deadline heap、expired buffer、物理 deadline 发布；
+- rq-owned current/idle/current dispatch：和各 class queue、`nr_running`、clock、pushable、
+  PI/RT/DL bandwidth 一起由同一个 `CpuRunQueueState` raw rq lock 保护；
+- IRQ-safe `CpuRemote::CpuDeadlineState`：deadline heap、expired buffer、scheduler deadline
+  publication，允许 timer IRQ/soft worker 与持有 task-rq 事务的远程迁移安全交接；
+- owner-only `OwnerDispatchState`：只保留 switch handoff 与调度 continuation scratch；
 - `OwnerDrainScratch`：只保留 migration/control 等必须由 switch-tail owner 完成的控制消息。
 
 公开 owner-only 操作必须证明持有 runtime IRQ pin 或 scheduler baton。runqueue
 操作改为持有目标 rq raw lock；仅有一个嵌套的 `NoPreempt`/锁 guard 既不构成
 owner ownership，也不能替代 rq lock。rq lock 内禁止 callback、资源释放和任意 wake。
+
+所有生产 rq 写入都通过 `OwnerRqTxn`：构造时关闭本地 IRQ、取得目标 rq lock 并只采样一次
+`rq_clock_sample`；事务内完成 common accounting、class hook、current/placement 变化与
+RT/DL bandwidth；显式 `commit` 一次发布 current、load、cpupri、cpudl、rto/dlo，再释放 rq。
+scheduler request 的 generation 只能在 commit 和 current publication 之后 acknowledge。
+事务没有析构提交或错误兜底；未显式 commit 即触发 fatal invariant，从而禁止半事务悄悄
+解锁。`sched_class` 是静态闭集，统一提供 enqueue/dequeue/check_preempt/put_prev/set_next/
+task_tick/migrate hook；`RunQueue` 只负责 Linux common rq accounting 和 membership。
 
 远程 wake 的状态事务固定为：
 
@@ -625,7 +636,7 @@ root。Starry 的 `SchedulerAddressSpaceLease` 因此把“scheduler slot 已解
 时间值分为两个不能直接比较的域：
 
 - scheduler `rq_clock` 使用无符号回绕时间戳，所有相对参数必须小于半区间，先用有符号差
-  判断先后；Deadline、RT period、Fair request 只能保存这个域的值；
+  判断先后；Deadline CBS、RR/Fair request 与运行时间记账保存这个域的值；
 - 物理 timer 使用 Linux `ktime_t` 的有限有符号域。`MonotonicInstant` 与
   `MonotonicDeadline` 只在 runtime/clockevent 边界出现，`KTIME_MAX` 仍是有限时间，
   只有 `Option::None` 表示没有期限。
@@ -637,15 +648,17 @@ root。Starry 的 `SchedulerAddressSpaceLease` 因此把“scheduler slot 已解
 映射到 `ktime_get()`，而不是假定两者绝对纪元相同。
 
 `CpuRunQueueState` 现在像 Linux `struct rq` 一样独占 `RunQueueClock`。它只在目标 rq 的
-IRQ-safe lock 内调用 `TaskRuntime::scheduler_clock_source(RuntimeCpuId)` 接受一个 source
-样本：首样本建立基线，负向 delta 被拒绝，counter wrap 按 signed-delta 顺序前进。远程
+IRQ-safe lock 内调用 `TaskRuntime::rq_clock_sample(RuntimeCpuId)` 接受一个已校正 clock 和
+累计 hardirq 时间样本：首样本建立基线，负向 delta 被拒绝，counter wrap 按 signed-delta
+顺序前进。远程
 wake 必须锁定目标 rq 并读取目标 CPU source，不能把 waker CPU 的时间带入目标实体。
 一次 owner rq 事务只允许更新一次；后续 dispatch settle、switch plan 和 timer programming
 读取同一个 `RunQueueClockSnapshot`，对应 Linux 的 `RQCF_UPDATED` 与 `rq_clock()` accessor，
-不得通过第二次 source 读取制造微小双重记账。当前没有独立 IRQ/steal-time authority，因而
-不虚构 `clock_task`；将来只有建立对应来源后才能按 Linux 模型扣除。
+不得通过第二次 source 读取制造微小双重记账。common IRQ entry/exit 是 hardirq 累计时间的
+唯一 authority，rq 以 `prev_irq_time` 增量构造 `clock_task`；当前没有独立 steal-time
+authority，因此不虚构 steal-time。
 
-`TaskRuntime` 因而分别提供按 CPU 取样的 `scheduler_clock_source(cpu)` 与
+`TaskRuntime` 因而分别提供按 CPU 取样的 `rq_clock_sample(cpu)` 与
 `monotonic_now()` 两个 capability。平台当前可以让两者读取同一个硬件 counter，但调用方
 不能据此合并接口或依赖相同 epoch。
 timer IRQ 使用入口的 monotonic 样本提升物理 task deadline，另取 scheduler 样本完成
@@ -686,8 +699,8 @@ timer IRQ 顺序：
 
 1. platform claim/ACK；
 2. 对照当前 epoch 与 arm：`Idle/Offline/Firing` 的 stale edge 不进入 ax-task，但必须先
-   stop/mask 物理 clockevent；未到期的旧 pending/early edge 只重新写入当前 arm；只有
-   已到期的 `Armed -> Firing(token)` 才失效旧 arm；
+   stop/mask 物理 clockevent；任何有效 `Armed` edge 都进入 `Firing(token)` 并失效旧 arm，
+   early edge 的有界扫描不产生 due work，finish 再统一重编程一次；
 3. 非 idle CPU 更新 scheduler tick；idle/nohz 状态不生成 periodic source；
 4. 调用有界 `on_clock_event(now, budget)`；
 5. 发布 sticky deadline work / need-resched；
@@ -700,7 +713,7 @@ level/pending source，EOI 后会立即重入并形成 IRQ storm。RISC-V net-lo
 固定要求 `Ignored -> ClockEventAction::Stop`。四架构后端分别负责 mask/disable/compare
 更新，trap/IRQ 入口继续独立完成控制器 claim/ACK/EOI。
 
-`finish/recover` 必须消费同一 move-only firing token。token 的 epoch 已过期时不能发布
+`finish` 必须消费同一 move-only firing token。token 的 epoch 已过期时不能发布
 task deadline、periodic advance 或硬件动作。这样 offline 前已经 pending 的 IRQ 即使在
 re-online 后才交付，也不能把新 CPU 周期提前推进到 `Firing`。
 
@@ -2039,10 +2052,10 @@ reservation 在 1 CPU、2 CPU、再次 1 CPU 时的 per-rq `extra_bw` 分别为 
 `saturating_sub()` 会返回成功，新实现明确返回 `InvalidConfiguration`，root-domain owner
 把这种情况视为内部账本不变量破坏。
 
-这一阶段补齐 A4 与 Deadline CPU-down admission，但尚未把 blocked Deadline reservation
-从原 rq 的 zero-lag/CBS 生命周期中拆出；跨 CPU runtime borrowing 仍需单独建立
-root-domain bandwidth owner/baton 协议。running-in-rq 已由下一节完成，不能再把它列为
-未实现前置项。
+这一阶段补齐 A4 与 Deadline CPU-down admission。后续 owner-rq 事务已经实现 blocked
+Deadline reservation 与 zero-lag/CBS registration 的源 rq detach、目标 rq attach；
+`reservation_owner` 是带宽账本 owner，`SchedulerPlacement::control_owner()` 是物理 placement
+owner，二者不再互作 fallback。running-in-rq 已由下一节完成。
 
 ### 2026-08-05 RT/DL running-in-rq 与独立 pushable 所有权
 
@@ -2057,11 +2070,11 @@ review 提出的 A5 方向有效，但不能把“running 留队”机械套到�
 - RT/DL 的 generation-bearing intrusive node 在 dispatch 期间继续属于 active 结构；pick 只
   把它标记为 `linked_current`，不再归还 node storage、注销 membership、重新分配 sequence；
 - `len`、placement demand 与 remote runnable summary 表示 queued work，不把 physically-linked
-  current 重复计数；current 的优先级仍由同一 rq 锁内的 `CurrentSchedule` 发布；
-- migration eligibility 由独立、预分配的 generation-bearing `PushableIndex` 拥有。它使用固定
-  二叉堆和 slot-to-index 反向表，线程创建阶段准备容量，rq 热路径 O(log n) 且零分配；
-  `set_next` 只删除 pushable key，`put_prev` 只恢复 key。active ownership 与可迁移性不再共用
-  一次全量 class scan；
+  current 重复计数；current 的优先级仍由同一 rq 锁内的 `CurrentClassState` 发布；
+- migration eligibility 由独立、预分配的 generation-bearing `PushableIndex` membership
+  拥有，只记录 slot generation、class count 与 RT quota-exempt count；候选顺序唯一归 DL tree、
+  RT priority queue 和 Fair EEVDF tree，不再另建跨 class priority heap。`set_next` 只删除
+  pushable membership，`put_prev` 只恢复 membership；active ownership 与可迁移性不再共用；
 - Deadline current 的 CBS accounting 在一个 dispatch interval 内保持 queue key 稳定，只在
   rq 锁内替换 active node 的 augmented payload，不执行 remove/insert；absolute deadline
   的变化由 `put_prev` 在 current 离开 dispatch 时统一 remove/reinsert 并 rekey；
@@ -2069,7 +2082,7 @@ review 提出的 A5 方向有效，但不能把“running 留队”机械套到�
   preemption 保持原位置；Fair 继续沿用原 EEVDF remove/insert 语义。
 
 两项最低层红测在旧实现稳定证明 RT 与 Deadline pick 后 membership 已消失；新实现要求
-active membership 保留、queued count 为零、pushable key 为空。确定性 reference model 也改为
+active membership 保留、queued count 为零、pushable membership 不包含 current。确定性 reference model 也改为
 Linux 语义：未耗尽 RT/DL 的 scheduler entry 不产生新 arrival sequence，耗尽 CBS 才退出 active
 集合。不是放宽输出断言。当前检查点执行 `cargo test -p ax-task --quiet`，313 个 unit、
 21 个 loom 以及全部 integration/doctest 通过。后续仍需拆分 `CurrentDispatch`
@@ -2124,13 +2137,14 @@ RT/DL 任务只能等待下一次偶然 enqueue、tick 或 idle pull。
 - owner selection 同时保存 previous/next 的 `SchedulingUrgency`，只比较 class 与 class-local
   priority/deadline，不把 ThreadId、arrival sequence 等队列 tie-break 误判成优先级下降；
 - 真正发生 RT/DL priority drop 时只增加 root-domain `requested_generation`。一个
-  `Idle / Published(cpu) / Claimed(cpu)` iterator 保存 `scan_generation` 与 cursor，同一时刻只给
-  一个 overload owner 发布 scheduler doorbell；owner claim 后在自己的 rq/safe point 内 push，
+  RT 和 DL 各有一个 `Idle / Published(cpu) / Claimed(cpu)` iterator，分别保存
+  `scan_generation` 与 cursor；每一类同一时刻只给一个对应 overload owner 发布 scheduler
+  doorbell；owner claim 后在自己的 rq/safe point 内只 push 同类候选，
   完成再交给下一 owner。扫描期间的新请求只推进 generation，本轮结束后重扫，等价于 Linux
   `rto_loop_next/rto_loop/rto_cpu`，不会形成逐 CPU IPI storm；
-- ax-task 的迁移事务要求源 rq owner 独占 intrusive node 与 publication lease，所以 RT 和 DL
-  共用这条 root-domain owner iterator。它对应 Linux RT 的 irq-work 扫描所有权，并保留 Linux
-  DL 的独立 `dlo` membership；没有退回 target CPU 同步锁多个 rq 的第二迁移协议；
+- ax-task 的迁移事务要求源 rq owner 独占 intrusive node 与 publication lease。RT 与 DL 共享
+  迁移 carrier 协议，但不共享 overload iterator 或候选选择；它们分别对应 Linux `rto_mask`
+  与 `dlo_mask`，没有退回 target CPU 同步锁多个 rq 的第二迁移协议；
 - 每个 safe point 最多提交一次跨 rq 迁移。若迁移成功且源仍 overload，iterator 保留该 source
   并重新发布本地 owner work；若没有可迁移目标则交给下一 source。这样保持 owner callback 有界，
   同时具备 Linux `push_rt_tasks()/push_dl_tasks()` 的“只要持续取得进展就继续”语义。
@@ -2264,10 +2278,125 @@ copy 事务同步更新 mask 与 cardinality；`is_migration_capable()` 不再�
 语义和确定性红绿测试证明正确的 affinity 边界；后续继续从新的 PI handoff、guard 和 current
 identity 热点收敛固定成本。
 
+### 2026-08-06 rq、选核与 runtime 能力边界最终收敛
+
+最后一轮逐调用链复审删除了三类会让后续修错重新产生双轨的结构：
+
+- `CpuLoadSummary` 只发布 Fair/sched-domain 所需的 demand 与 `fair_pushable`。RT/DL 的
+  current priority、pushable priority 和 overloaded 不再出现在 load snapshot；唯一远程
+  authority 是 rq 事务发布的 cpupri/cpudl 与 `rto/dlo` mask/count。RT/DL push 和 idle pull
+  直接遍历 class mask，balance request 显式携带 class；失败后的 visited CPU set 使下一次
+  owner pass 前进到下一 source，不自旋重试同一 rq。Fair snapshot 的 seqlock reader 等待
+  owner 在不可睡眠的 rq publication 临界区写完匹配的偶数 generation；删除固定八次读取后
+  返回 `None` 的自创恢复，否则 writer timing 会静默把合法 CPU 从 placement/balance 中删除；
+- wake、首次 Ready、普通 affinity、current affinity、owner reconciliation 与 switch-out
+  forced migration 都先读取有效 class/entity：RT 使用 `find_lowest_rq()` 等价 cpupri，DL
+  使用 `find_later_rq()` 等价 cpudl，Fair 才读取 demand。只有 Linux `select_fallback_rq()`
+  对应的拓扑恢复路径可以选择第一个 allowed/active CPU，不得用 queued-count 代替优先级；
+- 旧 `PushableIndex` 跨 class 二叉堆没有生产消费者，而且复制了 DL tree、RT priority array
+  与 Fair EEVDF tree 的排序，因此已整体删除。DL 自己维护 generation-bearing pushable
+  索引，RT 自己维护按优先级位图；Fair 不伪装成 Linux `pushable_tasks`，只由 EEVDF tree
+  保存迁移资格并向 sched-domain 发布派生的 `fair_pushable`。三个 class queue 各自是候选
+  顺序的唯一 owner；
+- `DeadlineBandwidthState::reservation_owner` 只表示 `this_bw/running_bw/zero-lag` 账本所在
+  rq；`SchedulerPlacement::control_owner()` 只表示 queued/running/switch-tail 的物理 owner。
+  policy replacement 可显式选择 reservation owner 执行带宽事务，但 affinity 和 wake 禁止
+  把 reservation owner 当作 placement fallback；
+- Linux v7.1 的 root `sched_rt_period_timer()` 明确使用 `HRTIMER_MODE_REL_HARD`，并在
+  `do_sched_rt_period_timer()` 中扫描 online span。ax-task 因而保留同一 hard scheduler timer：
+  每个 rq 先以 `rt_time==0 && !rt_nr_running` 快速跳过，必要时才取得 rq/runtime lock、补充
+  quota 并发布 reschedule；不能误改成通用 task soft timer。sleep/park/wait timeout 仍只由
+  soft-timer worker 唤醒。`rt_rq` runtime ledger 继续使用独立 raw `rt_runtime_lock`，而不是
+  错误并入 rq 主锁：这与 Linux `rt_rq->rt_runtime_lock` 及 root
+  `rt_bandwidth.rt_runtime_lock` 的 runtime sharing/period 扫描锁域一致；ledger 仍只属于对应
+  rq，不是第二份带宽状态；
+- ax-runtime 的 current-thread 读取不再把寄存器/anchor mismatch 转成空指针或 NONE。
+  NONE 只表示永久 early bootstrap header 尚未绑定 scheduler cookie；已绑定 runtime context
+  的 cookie/publication 不一致是致命架构不变量。IRQ guard 与 scheduler-tail 查询失败同样
+  fatal，不得静默当作 `need_resched=false`。
+
+`TaskRuntime` 保留一张 trait-FFI capability 表，因为它是 ax-task 到 OS 的链接边界，不保存
+调度状态；文件按资源/context ABI、clock ABI、provider interface 拆分。`CpuLocal` 则按
+dispatch/switch handoff、scheduler deadline/soft timer、idle polling facade 拆分。拆分没有
+引入 supertrait、兼容转发或第二 owner。
+
+### 2026-08-06 PREEMPT_RT PI 有效实体与 Deadline CBS 所有权
+
+修改前重新核对 Linux v7.1 `init/Kconfig::SCHED_PROXY_EXEC`、
+`kernel/sched/core.c::rt_mutex_setprio()`、`kernel/sched/deadline.c::pi_of()`、
+`replenish_dl_entity()` 和 `update_curr_dl()`。`SCHED_PROXY_EXEC` 明确依赖
+`!PREEMPT_RT`，因此 RT 配置不能采用 `rq->donor` 的 proxy-execution 记账，也不能把 donor
+的可变 CBS runtime 当作 mutex owner 的执行预算。PREEMPT_RT 的实际模型是：
+
+- FIFO/RR 的 `policy` 与嵌入 task 的 RT entity 不因 PI 改变；`rt_mutex_setprio()` 只改变
+  effective priority。RR 的剩余 quantum 在 boost、抢占和 deboost 之间连续累计，FIFO 始终
+  不产生 timeslice；
+- 每个 task 都嵌入自己的 `sched_dl_entity` 可变执行账本。`p->dl.pi_se` 只把
+  `dl_runtime/dl_period/dl_deadline` 参数解析到 donor；runtime、absolute deadline、throttled、
+  overrun 和 timer lifetime 仍属于 owner 本地 entity；
+- mutex owner 运行时只扣一次自己的本地 runtime，donor runtime 不变。boosted entity 预算
+  耗尽后走 `ENQUEUE_REPLENISH` 等价路径，用 donor 参数立即补充 owner 本地账本并更新 EDF key，
+  不等待普通 Deadline timer，也不把 overrun callback 重定向到 donor；
+- deboost 只清除 effective donor/`pi_se`，恢复同一个 base entity，不能从 task-side overlay
+  复制一份旧 accounting 覆盖 rq 已经累计的 runtime。
+
+ax-task 因此把 policy state 收敛为一个可移动的 `ActiveSchedulingState`：base entity、可选的
+cross-class inherited entity 与 effective policy 始终作为一个值在 task control 和 owner rq
+之间转移，任一时刻只有一个物理 owner。RT 同类 PI 直接复用 base entity；Deadline inherited
+entity 由 owner-local `DeadlineServer` 和 donor-parameter `DeadlineServer` 组成。旧
+`pi_overlay/pi_saved_active`、task/rq 双份 active state、donor 双重扣费和 donor overrun 路径均已
+删除。这个边界是 PREEMPT_RT 的正式实现，不得在后续适配中恢复 proxy accounting 或兼容镜像。
+
+### 2026-08-06 最终反向审计与架构冻结
+
+在进入统一修错前，按 Linux v7.1 `__schedule()`、`enqueue/dequeue_task_{rt,dl}()`、
+`sched_rt_period_timer()`、`start_dl_timer()`、`update_rq_clock_task()`、`hrtimer_interrupt()`、
+`irq_work_claim()` 和 `finish_task_switch()` 再次反向核验完整调用链。当前架构冻结为：
+
+- `RunQueue::current` 是唯一 `rq->curr`。RT/DL current 保留在 active list/tree，Fair/stop
+  current 离开 class tree 但仍计入 `nr_running`，dedicated idle 永不进入 Fair class 或
+  `nr_running`。旧 `CpuRunQueueState::current`、`linked_current` 字段和独立 `nr_queued`
+  计数均已删除；`linked_current`/`nr_queued` 只能由 `rq->curr` 与 `nr_running` 派生；
+- class 生命周期只经过 `enqueue/dequeue/check_preempt/put_prev/pick/set_next/task_tick`。
+  common rq 统一提交 current、membership、placement、runtime accounting 和 root-domain
+  publication；class 后端不得再发布另一份 running/current 状态；
+- Deadline active tree、throttled membership、timer lifetime anchor、`this_bw/running_bw`
+  账本和 class-local pushable index 全部位于同一个 `DeadlineRunQueue`。root-domain
+  `total_bw/admission`、每 rq `this_bw/running_bw`、每 rq `extra_bw` 仍是 Linux 定义的三个
+  不同语义，不能误合并为一项；拓扑/admission 写事务统一更新 `extra_bw` 镜像；
+- task 的 base/effective scheduling state 作为一个值在 task control 与 rq 之间移动。FIFO/RR
+  PI 只改 effective priority 并保留原 entity；Deadline PI 只借用 donor 参数，owner-local CBS
+  账本单次扣费并在 boosted exhaustion 时立即 replenish。不存在 task-side overlay、donor
+  runtime 扣费或第二份 rq accounting；
+- RT bandwidth 保留 Linux 的两级 owner：root `rt_bandwidth` 独占 period hard timer 与
+  runtime-sharing 总锁，每个 `rt_rq` 独占 `rt_time/rt_runtime/throttled`。hotplug 的
+  loan reclaim、period scan 和 strict `rt_time > rt_runtime` 都经过这两个正式锁域，不存在
+  task-owned quota 副本或周期轮询恢复；
+- scheduler request 的 generation word 是逻辑 request/ack 唯一 authority；runtime IPI
+  doorbell 只运输该 generation 的物理边。task-work 的 work queues 是 payload authority，
+  doorbell epoch 只表示 worker 尚未承认的通知，`IrqWaitCell` 只负责可合并的物理 wake；
+  三者不复制 payload 或完成状态；
+- `LocalClockEvent` 是物理 oneshot 唯一 owner，只有 `Offline/Idle/Armed/Firing`。scheduler
+  deadline、periodic tick 与 task soft deadline 只作为逻辑 source 输入最近期限选择；hard
+  IRQ budget 耗尽后由 sticky scheduler request 在 owner safe point 继续，不重新 arm 已过期
+  边，不提供 `claim_due/recover_overdue` 或偶然 tick 扫描；
+- runtime 当前 CPU 的 local/remote handle、current-thread publication、rq clock sample 和
+  hardirq 累计值都来自对应 CPU 的已初始化 per-CPU/cpu-local owner。只有显式的 early
+  bootstrap/query API 可以返回 `NONE/NotInitialized`；online scheduler fast path 的缺失、
+  CPU 错配或 clock source 错配均为致命生命周期违例。
+
+这次冻结只表明状态所有权和接口边界已统一，不代表测试、QEMU、CI 或性能已经通过。后续失败
+先判断是否违反上述不变量；若不违反，才作为统一适配/实现错误修复，禁止恢复已删除字段、旧
+API、超时重试、轮询推进或 silent fallback。
+
 ## 模块化结果
 
 - `TaskSystem` orchestration 只负责编排，registry/reap、placement、owner scheduling、deadline、PI、balance、deferred work 分模块；
-- `CpuLocal` 按 dispatch、deadline、inbox、switch-tail、snapshot 划分；
+- `CpuRunQueueState` 按 current/class queue、deadline/RT bandwidth、clock 与派生 publication
+  划分；`CpuLocal` 只保留 switch-tail、drain scratch 和 owner continuation，facade 实现按
+  owner dispatch、deadline/soft timer、idle polling 分文件；
+- `TaskRuntime` 按 move-only resource/context ABI、scheduler/monotonic clock ABI 与 provider
+  interface 分文件，仍保持单一 trait-FFI 边界；
 - `ThreadSchedState` 按 lifecycle、policy、placement、deadline、PI、runtime binding 划分；
 - ax-runtime task 按 bootstrap、thread resources、context/switch、executor、IPI、clockevent、guard-state 划分；
 - Starry perf、process identity、lifecycle/wait、sampling registry 分模块；

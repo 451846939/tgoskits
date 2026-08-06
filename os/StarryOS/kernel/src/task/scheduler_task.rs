@@ -190,10 +190,10 @@ impl UserTaskRef {
     }
 
     /// Returns the last CPU selected for this task, if placement is known.
-    pub fn cpu_id(&self) -> usize {
+    pub fn assigned_cpu(&self) -> Option<usize> {
         self.scheduler
             .assigned_cpu()
-            .map_or(0, |cpu| cpu.as_u32() as usize)
+            .map(|cpu| cpu.as_u32() as usize)
     }
 
     /// Returns the base scheduling policy.

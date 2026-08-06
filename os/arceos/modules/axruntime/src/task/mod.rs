@@ -25,8 +25,7 @@ pub use ax_task::{
     runtime::{MonotonicDeadline, MonotonicInstant, SchedSwitchRecord},
     schedule_current_cpu, set_current_thread_affinity, set_thread_affinity,
     set_thread_affinity_and_wait, set_thread_policy, sleep, sleep_until, thread_affinity,
-    thread_handle, thread_policy, thread_round_robin_interval_ns, thread_runtime,
-    validate_blocking_context, yield_current_cpu,
+    thread_handle, thread_policy, thread_runtime, validate_blocking_context, yield_current_cpu,
 };
 use ax_task::{
     CpuLocal, CpuRemote, TaskSystem, TaskSystemConfig, ThreadResources, ThreadSpec,

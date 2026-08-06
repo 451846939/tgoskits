@@ -22,16 +22,13 @@ impl TaskSystem {
             if sched.placement.queued_cpu().is_some() || sched.placement.execution_cpu().is_some() {
                 return Err(TaskError::AlreadyQueued);
             }
-            if sched.placement.on_cpu().is_some() || sched.pi.deadline_cbs_borrower.is_some() {
+            if sched.placement.on_cpu().is_some() {
                 return Err(TaskError::ThreadBusy);
             }
-            if record.blocked_on.is_some()
-                || !record.pi_donors.is_empty()
-                || sched.pi.donating_locks != 0
-            {
+            if sched.pi.blocked_on.is_some() || !sched.pi.donors.is_empty() {
                 return Err(TaskError::InvalidPiState);
             }
-            if sched.deadline.bandwidth_cpu.is_some() {
+            if sched.deadline.bandwidth.reservation_owner().is_some() {
                 sched.deadline.cleanup_pending = true;
                 drop(sched);
                 drop(state);

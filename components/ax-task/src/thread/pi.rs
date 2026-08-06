@@ -327,6 +327,12 @@ impl PiMutexRaw {
         unsafe { self.core.as_ref() }.state.lock()
     }
 
+    pub(crate) unsafe fn try_lock_state(self) -> Option<RawTicketGuard<'static, PiMutexWaiters>> {
+        // SAFETY: identical lifetime contract to `lock_state`; failure does
+        // not expose the protected waiter tree.
+        unsafe { self.core.as_ref() }.state.try_lock()
+    }
+
     pub(crate) unsafe fn core(self) -> &'static PiMutexCore {
         // SAFETY: the raw capability is lifetime-bound by a wait token or
         // mutex transaction, both of which borrow the physical mutex core.
@@ -338,6 +344,18 @@ impl PiMutexRaw {
 // identity alive. The embedded raw ticket lock serializes mutable state.
 unsafe impl Send for PiMutexRaw {}
 unsafe impl Sync for PiMutexRaw {}
+
+/// One generation-checked edge from a blocked task to a physical PI mutex.
+///
+/// The edge is protected by the blocked task's scheduler lock, the equivalent
+/// of Linux `task_struct::pi_lock`. The referenced mutex waiter node remains
+/// protected by that mutex's wait lock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PiWaitRegistration {
+    pub(crate) lock: PiMutexRaw,
+    pub(crate) key: crate::PiWaitKey,
+    pub(crate) generation: u64,
+}
 
 #[derive(Debug)]
 pub(crate) struct PiMutexWaiters {
@@ -414,19 +432,15 @@ impl PiWaitToken<'_> {
         self.core.pi_wait_state().is_granted(self.generation)
     }
 
-    /// Returns whether an ownerless PI mutex selected this waiter to claim.
+    /// Returns whether this waiter is currently eligible to acquire an
+    /// ownerless mutex.
     ///
-    /// Selection is only a wake-before-block handshake. The waiter does not
-    /// own the mutex until its local owner-word claim and scheduler claim
-    /// transaction both complete.
-    pub fn is_selected(&self) -> bool {
-        self.core.pi_wait_state().is_selected(self.generation)
-    }
-
-    /// Returns whether the scheduler selection and ownerless handoff are both
-    /// published, so this waiter may enter the serialized claim transaction.
+    /// Linux leaves the woken waiter in the lock tree and authorizes whichever
+    /// waiter is first when `try_to_take_rt_mutex()` serializes on wait_lock.
+    /// Deriving eligibility from the live top node lets a newly arrived, more
+    /// urgent waiter take the lock without a second selected-owner state.
     pub fn can_claim(&self) -> bool {
-        self.is_selected()
+        self.is_top_waiter()
             && unsafe {
                 // SAFETY: this token retains the physical mutex-core borrow.
                 self.lock.core()
@@ -466,7 +480,6 @@ impl PiWaitToken<'_> {
 pub(crate) struct PiWaitState {
     generation: AtomicU64,
     top_generation: AtomicU64,
-    selected_generation: AtomicU64,
     granted_generation: AtomicU64,
 }
 
@@ -475,13 +488,11 @@ impl PiWaitState {
         Self {
             generation: AtomicU64::new(0),
             top_generation: AtomicU64::new(0),
-            selected_generation: AtomicU64::new(0),
             granted_generation: AtomicU64::new(0),
         }
     }
 
     pub(crate) fn begin(&self) -> Result<u64, TaskError> {
-        self.selected_generation.store(0, Ordering::Relaxed);
         self.top_generation.store(0, Ordering::Relaxed);
         self.granted_generation.store(0, Ordering::Relaxed);
         self.generation
@@ -490,26 +501,6 @@ impl PiWaitState {
             })
             .map(|generation| generation + 1)
             .map_err(|_| TaskError::InvalidPiState)
-    }
-
-    pub(crate) fn select(&self, generation: u64) -> Result<(), TaskError> {
-        if self.generation.load(Ordering::Acquire) != generation
-            || self.granted_generation.load(Ordering::Acquire) == generation
-        {
-            return Err(TaskError::InvalidPiState);
-        }
-        self.selected_generation
-            .store(generation, Ordering::Release);
-        Ok(())
-    }
-
-    pub(crate) fn clear_selection(&self, generation: u64) {
-        let _ = self.selected_generation.compare_exchange(
-            generation,
-            0,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
     }
 
     pub(crate) fn mark_top(&self, generation: u64) -> Result<(), TaskError> {
@@ -535,7 +526,6 @@ impl PiWaitState {
         if self.generation.load(Ordering::Acquire) != generation {
             return Err(TaskError::InvalidPiState);
         }
-        self.clear_selection(generation);
         self.clear_top(generation);
         self.granted_generation.store(generation, Ordering::Release);
         Ok(())
@@ -546,16 +536,8 @@ impl PiWaitState {
             && self.granted_generation.load(Ordering::Acquire) != generation
     }
 
-    pub(crate) fn can_select(&self, generation: u64) -> bool {
-        self.can_grant(generation) && self.selected_generation.load(Ordering::Acquire) != generation
-    }
-
     fn is_granted(&self, generation: u64) -> bool {
         self.granted_generation.load(Ordering::Acquire) == generation
-    }
-
-    fn is_selected(&self, generation: u64) -> bool {
-        self.selected_generation.load(Ordering::Acquire) == generation
     }
 
     fn is_top(&self, generation: u64) -> bool {

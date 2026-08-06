@@ -329,8 +329,8 @@ fn repeated_smp_wake_distributes_rt_threads_without_duplicate_entries() {
     system.complete_context_switch(cpu1.as_mut()).unwrap();
     assert_eq!(first.state(), ThreadState::Ready);
     assert_eq!(second.state(), ThreadState::Ready);
-    assert_eq!(cpu0.try_runnable_summary(), Some(1));
-    assert_eq!(cpu1.try_runnable_summary(), Some(1));
+    assert_eq!(cpu0.queued_summary(), Some(1));
+    assert_eq!(cpu1.queued_summary(), Some(1));
     support::clear_handles();
 }
 

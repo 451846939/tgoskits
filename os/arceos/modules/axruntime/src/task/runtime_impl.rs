@@ -53,10 +53,7 @@ impl_task_runtime! {
             // SAFETY: the ax-task caller keeps the scheduler-owned current
             // thread fixed. Bootstrap cached this CPU's Arc-backed endpoint
             // before online publication and retains its TaskSystem owner.
-            let raw = unsafe { scheduler_current_cpu_remote_handle() };
-            // SAFETY: zero denotes pre-initialization; every nonzero value is
-            // the shutdown-lifetime current-CPU endpoint cached above.
-            unsafe { CpuRemoteHandle::from_raw(raw) }
+            unsafe { scheduler_current_cpu_remote_handle() }
         }
 
         unsafe fn current_thread_publication() -> CurrentThreadPublication {
@@ -79,12 +76,6 @@ impl_task_runtime! {
             let cpu = u32::try_from(unsafe { ax_hal::percpu::scheduler_current_cpu_id() })
                 .expect("logical CPU ID must fit the TaskRuntime ABI");
             RuntimeCpuId::new(cpu)
-        }
-
-        fn online_cpu_count() -> u32 {
-            task_system()
-                .and_then(|system| u32::try_from(system.online_cpu_count()).ok())
-                .unwrap_or(0)
         }
 
         fn prepare_cpu_online(cpu: RuntimeCpuId) -> RuntimeStatus {

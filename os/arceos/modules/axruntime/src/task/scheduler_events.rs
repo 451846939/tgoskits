@@ -2,12 +2,8 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-#[cfg(feature = "irq")]
-use ax_task::TaskError;
 #[cfg(any(feature = "ipi", feature = "wake-ipi", test))]
 use ax_task::runtime::RuntimeStatus;
-#[cfg(feature = "irq")]
-use ax_task::runtime::SchedulerDeadlineUpdate;
 
 #[cfg(any(feature = "ipi", feature = "wake-ipi"))]
 use super::with_current_cpu_pin;
@@ -161,7 +157,7 @@ pub(super) fn record_scheduler_ipi_send() {
 pub(crate) fn on_clock_event(
     now: ax_task::runtime::MonotonicInstant,
     scheduler_tick: bool,
-) -> Option<SchedulerDeadlineUpdate> {
+) -> ax_task::TaskClockEventOutcome {
     TASK_TIMER_IRQ_COUNT.fetch_add(1, Ordering::Relaxed);
     account_clock_event(now, scheduler_tick)
 }
@@ -170,14 +166,13 @@ pub(crate) fn on_clock_event(
 fn account_clock_event(
     now: ax_task::runtime::MonotonicInstant,
     scheduler_tick: bool,
-) -> Option<SchedulerDeadlineUpdate> {
+) -> ax_task::TaskClockEventOutcome {
     match ax_task::on_clock_event_with_scheduler_tick(
         now,
         TASK_CLOCK_EVENT_IRQ_BUDGET,
         scheduler_tick,
     ) {
-        Ok(outcome) => Some(outcome.update()),
-        Err(TaskError::NotInitialized | TaskError::CpuOffline(_)) => None,
+        Ok(outcome) => outcome,
         Err(error) => panic!("task clockevent accounting failed: {error}"),
     }
 }

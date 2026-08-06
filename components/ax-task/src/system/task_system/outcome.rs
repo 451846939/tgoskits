@@ -139,13 +139,16 @@ pub(crate) struct SwitchEndpoint {
 }
 
 impl SwitchEndpoint {
-    pub(super) fn from_core(core: &ThreadCore) -> Self {
-        let sched = core.sched().lock();
+    pub(crate) const fn new(
+        thread: ThreadId,
+        binding: crate::runtime::ThreadRuntimeBinding,
+        extension: Option<ThreadExtensionView>,
+    ) -> Self {
         Self {
-            thread: core.id(),
-            context: sched.runtime.context,
-            address_space: sched.runtime.address_space,
-            extension: core.extension_view(),
+            thread,
+            context: binding.context(),
+            address_space: binding.address_space(),
+            extension,
         }
     }
 
@@ -179,7 +182,7 @@ pub struct DeadlineRuntimeSnapshot {
     pub(super) remaining_runtime_ns: u64,
     pub(super) misses: u64,
     pub(super) overruns: u64,
-    pub(super) pi_critical_rescue: bool,
+    pub(super) pi_boosted: bool,
     pub(super) donor: Option<ThreadId>,
 }
 
@@ -224,9 +227,10 @@ impl DeadlineRuntimeSnapshot {
         self.overruns
     }
 
-    /// Reports whether execution is in the explicit PI-critical rescue path.
-    pub const fn pi_critical_rescue(self) -> bool {
-        self.pi_critical_rescue
+    /// Reports whether the task currently executes with a donated Deadline
+    /// reservation, equivalent to Linux `is_dl_boosted()`.
+    pub const fn pi_boosted(self) -> bool {
+        self.pi_boosted
     }
 
     /// Returns the original Deadline reservation currently donated to the thread.

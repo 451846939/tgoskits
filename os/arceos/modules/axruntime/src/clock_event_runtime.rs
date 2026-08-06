@@ -135,36 +135,24 @@ struct ClockEventFiringTransaction {
 }
 
 #[cfg(feature = "irq")]
-fn unclaimed_irq_action(
-    claim: &crate::clock_event::ClockEventIrqClaim,
-) -> Option<crate::clock_event::ClockEventAction> {
-    match claim {
-        crate::clock_event::ClockEventIrqClaim::Ignored => {
-            Some(crate::clock_event::ClockEventAction::Stop)
-        }
-        crate::clock_event::ClockEventIrqClaim::Rearm(deadline) => {
-            Some(crate::clock_event::ClockEventAction::Program(*deadline))
-        }
-        crate::clock_event::ClockEventIrqClaim::Firing(_) => None,
-    }
-}
-
-#[cfg(feature = "irq")]
 impl ClockEventFiringTransaction {
-    fn begin(now: ax_task::runtime::MonotonicInstant) -> Option<Self> {
+    fn begin(
+        now: ax_task::runtime::MonotonicInstant,
+    ) -> Result<Self, crate::clock_event::ClockEventAction> {
         let claim = with_local_clock_event_mut(|clockevent| clockevent.claim_irq(now));
-        if let Some(action) = unclaimed_irq_action(&claim) {
-            apply_clock_event_action(action);
-        }
         let token = match claim {
-            crate::clock_event::ClockEventIrqClaim::Ignored => return None,
-            crate::clock_event::ClockEventIrqClaim::Rearm(_) => return None,
+            // No logical owner may leave a level/pending clockevent source
+            // armed across EOI. This is the clockevent-device shutdown step,
+            // independent of the interrupt controller acknowledgement.
+            crate::clock_event::ClockEventIrqClaim::Ignored => {
+                return Err(crate::clock_event::ClockEventAction::Stop);
+            }
             crate::clock_event::ClockEventIrqClaim::Firing(token) => token,
         };
         let _scheduler_tick = with_local_clock_event_mut(|clockevent| {
             clockevent.advance_periodic(now, periodic_interval_nanos())
         });
-        Some(Self {
+        Ok(Self {
             token,
             #[cfg(feature = "multitask")]
             scheduler_tick: _scheduler_tick,
@@ -173,17 +161,19 @@ impl ClockEventFiringTransaction {
 
     fn finish(
         self,
-        #[cfg(feature = "multitask")] scheduler_update: Option<
-            ax_task::runtime::SchedulerDeadlineUpdate,
-        >,
+        now: ax_task::runtime::MonotonicInstant,
+        #[cfg(feature = "multitask")] outcome: ax_task::TaskClockEventOutcome,
     ) {
         let token = self.token;
         let action = with_local_clock_event_mut(|clockevent| {
             #[cfg(feature = "multitask")]
-            if let Some(update) = scheduler_update {
-                let _ = clockevent.publish_scheduler(update.generation(), update.deadline());
-            }
-            clockevent.finish_firing(token)
+            let _ = clockevent
+                .publish_scheduler(outcome.update().generation(), outcome.update().deadline());
+            #[cfg(feature = "multitask")]
+            let defer_due_work = outcome.pending();
+            #[cfg(not(feature = "multitask"))]
+            let defer_due_work = false;
+            clockevent.finish_firing(token, now, defer_due_work)
         });
         apply_clock_event_action(action);
     }
@@ -249,17 +239,17 @@ pub(crate) fn init_timer() {
 pub(crate) fn initial_periodic_deadline(
     now: ax_task::runtime::MonotonicInstant,
     interval_ns: u64,
-) -> Option<crate::clock_event::ClockDeadline> {
+) -> crate::clock_event::ClockDeadline {
     assert_ne!(
         interval_ns, 0,
         "periodic clockevent interval must be non-zero"
     );
     let deadline = now.deadline_after(core::time::Duration::from_nanos(interval_ns));
-    if now.reached(deadline) {
-        None
-    } else {
-        Some(crate::clock_event::ClockDeadline::from_monotonic(deadline))
-    }
+    assert!(
+        !now.reached(deadline),
+        "periodic scheduler tick exceeded the finite monotonic clock domain"
+    );
+    crate::clock_event::ClockDeadline::from_monotonic(deadline)
 }
 
 #[cfg(any(feature = "irq", test))]
@@ -267,13 +257,13 @@ pub(crate) fn next_periodic_deadline(
     deadline: crate::clock_event::ClockDeadline,
     now: ax_task::runtime::MonotonicInstant,
     interval_ns: u64,
-) -> Option<crate::clock_event::ClockDeadline> {
+) -> crate::clock_event::ClockDeadline {
     assert_ne!(
         interval_ns, 0,
         "periodic clockevent interval must be non-zero"
     );
     if !now.reached(deadline.as_monotonic()) {
-        return Some(deadline);
+        return deadline;
     }
 
     let deadline_ns = deadline.as_nanos();
@@ -282,27 +272,42 @@ pub(crate) fn next_periodic_deadline(
     let interval_ns = interval_ns as u128;
     let periods = elapsed_ns / interval_ns + 1;
     let next = deadline_ns as u128 + periods * interval_ns;
-    let next = u64::try_from(next).ok()?;
-    crate::clock_event::ClockDeadline::from_nanos(next)
+    let next =
+        u64::try_from(next).expect("periodic scheduler tick exceeded the physical clock domain");
+    let next = crate::clock_event::ClockDeadline::from_nanos(next)
+        .expect("periodic scheduler tick exceeded the finite monotonic clock domain");
+    assert!(
+        !now.reached(next.as_monotonic()),
+        "periodic scheduler tick must advance beyond the current instant"
+    );
+    next
 }
 
 #[cfg(feature = "irq")]
 pub(crate) fn timer_irq_handler(ctx: ax_hal::irq::IrqContext) -> ax_hal::irq::IrqReturn {
     run_clock_event_irq_scope(ax_kernel_guard::IrqSave::new, || {
         let _ = ctx;
-        // SAFETY: the local timer IRQ scope excludes migration and nested
-        // scheduler-clock publication for this complete stamp.
+        // Claiming first invalidates the armed device state, matching Linux
+        // `hrtimer_interrupt()` setting `expires_next = KTIME_MAX` before it
+        // advances scheduler time or runs any hard timer.
+        let firing = match ClockEventFiringTransaction::begin(monotonic_now()) {
+            Ok(firing) => firing,
+            Err(action) => {
+                apply_clock_event_action(action);
+                return ax_hal::irq::IrqReturn::Handled;
+            }
+        };
+        // SAFETY: the claimed local firing transaction excludes migration and
+        // nested scheduler-clock publication for this complete stamp.
         unsafe { ax_hal::time::scheduler_clock_tick() }
             .expect("current CPU scheduler clock must be online before timer IRQs");
         let now = monotonic_now();
-        let Some(firing) = ClockEventFiringTransaction::begin(now) else {
-            return ax_hal::irq::IrqReturn::Handled;
-        };
         #[cfg(feature = "multitask")]
-        let scheduler_update = crate::task::on_clock_event(now, firing.scheduler_tick());
+        let outcome = crate::task::on_clock_event(now, firing.scheduler_tick());
         firing.finish(
+            now,
             #[cfg(feature = "multitask")]
-            scheduler_update,
+            outcome,
         );
         ax_hal::irq::IrqReturn::Handled
     })
@@ -408,10 +413,11 @@ mod tests {
 
     #[cfg(feature = "irq")]
     #[test]
-    fn stale_edge_without_a_logical_owner_stops_the_physical_clockevent() {
+    fn stale_edge_without_a_logical_owner_does_not_guess_hardware_state() {
+        let mut clockevent = crate::clock_event::LocalClockEvent::offline();
         assert_eq!(
-            super::unclaimed_irq_action(&crate::clock_event::ClockEventIrqClaim::Ignored),
-            Some(crate::clock_event::ClockEventAction::Stop)
+            clockevent.claim_irq(instant(1)),
+            crate::clock_event::ClockEventIrqClaim::Ignored
         );
     }
 

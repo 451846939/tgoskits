@@ -130,17 +130,27 @@ pub enum SwitchReason {
 /// CPU affinity expressed against one [`crate::TaskSystem`] topology.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CpuSet {
-    allowed: Vec<bool>,
+    words: Vec<usize>,
+    topology_len: usize,
     // Mirrors Linux task_struct::nr_cpus_allowed so scheduler class decisions
     // do not repeatedly derive affinity cardinality from the mask.
     allowed_count: usize,
 }
 
 impl CpuSet {
+    const BITS_PER_WORD: usize = usize::BITS as usize;
+
     /// Creates a set that permits every CPU in a topology.
     pub fn all(cpu_count: usize) -> Self {
+        let mut words = vec![usize::MAX; cpu_count.div_ceil(Self::BITS_PER_WORD)];
+        if let Some(last) = words.last_mut()
+            && !cpu_count.is_multiple_of(Self::BITS_PER_WORD)
+        {
+            *last = (1usize << (cpu_count % Self::BITS_PER_WORD)) - 1;
+        }
         Self {
-            allowed: vec![true; cpu_count],
+            words,
+            topology_len: cpu_count,
             allowed_count: cpu_count,
         }
     }
@@ -148,49 +158,60 @@ impl CpuSet {
     /// Creates an empty CPU set for a topology.
     pub fn empty(cpu_count: usize) -> Self {
         Self {
-            allowed: vec![false; cpu_count],
+            words: vec![0; cpu_count.div_ceil(Self::BITS_PER_WORD)],
+            topology_len: cpu_count,
             allowed_count: 0,
         }
     }
 
     /// Enables one CPU if it is represented by this set.
     pub fn insert(&mut self, cpu: CpuId) -> bool {
-        match self.allowed.get_mut(cpu.as_usize()) {
-            Some(allowed) => {
-                let changed = !*allowed;
-                *allowed = true;
-                if changed {
-                    self.allowed_count += 1;
-                }
-                changed
-            }
-            None => false,
+        let index = cpu.as_usize();
+        if index >= self.topology_len {
+            return false;
         }
+        let mask = 1usize << (index % Self::BITS_PER_WORD);
+        let word = &mut self.words[index / Self::BITS_PER_WORD];
+        let changed = *word & mask == 0;
+        *word |= mask;
+        if changed {
+            self.allowed_count += 1;
+        }
+        changed
     }
 
     /// Disables one CPU if it is represented by this set.
     pub fn remove(&mut self, cpu: CpuId) -> bool {
-        match self.allowed.get_mut(cpu.as_usize()) {
-            Some(allowed) => {
-                let changed = *allowed;
-                *allowed = false;
-                if changed {
-                    self.allowed_count -= 1;
-                }
-                changed
-            }
-            None => false,
+        let index = cpu.as_usize();
+        if index >= self.topology_len {
+            return false;
         }
+        let mask = 1usize << (index % Self::BITS_PER_WORD);
+        let word = &mut self.words[index / Self::BITS_PER_WORD];
+        let changed = *word & mask != 0;
+        *word &= !mask;
+        if changed {
+            self.allowed_count -= 1;
+        }
+        changed
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.words.fill(0);
+        self.allowed_count = 0;
     }
 
     /// Tests whether a CPU is allowed.
     pub fn contains(&self, cpu: CpuId) -> bool {
-        self.allowed.get(cpu.as_usize()).copied().unwrap_or(false)
+        let index = cpu.as_usize();
+        index < self.topology_len
+            && self.words[index / Self::BITS_PER_WORD] & (1usize << (index % Self::BITS_PER_WORD))
+                != 0
     }
 
     /// Returns the number of CPUs represented by the set.
     pub fn topology_len(&self) -> usize {
-        self.allowed.len()
+        self.topology_len
     }
 
     /// Returns the number of CPUs selected by this set.
@@ -203,10 +224,14 @@ impl CpuSet {
         if self.allowed_count != 1 {
             return None;
         }
-        self.allowed
+        let (word_index, word) = self
+            .words
             .iter()
-            .position(|allowed| *allowed)
-            .map(|index| CpuId::new(index as u32))
+            .copied()
+            .enumerate()
+            .find(|(_, word)| *word != 0)?;
+        let index = word_index * Self::BITS_PER_WORD + word.trailing_zeros() as usize;
+        (index < self.topology_len).then_some(CpuId::new(index as u32))
     }
 
     /// Returns whether a runnable thread can leave its current allowed CPU.
@@ -216,21 +241,56 @@ impl CpuSet {
 
     /// Returns whether this set permits every CPU selected by `required`.
     pub fn covers(&self, required: &Self) -> bool {
-        self.allowed.len() == required.allowed.len()
+        self.topology_len == required.topology_len
             && self
-                .allowed
+                .words
                 .iter()
-                .zip(&required.allowed)
-                .all(|(allowed, is_required)| !is_required || *allowed)
+                .zip(&required.words)
+                .all(|(allowed, is_required)| allowed & is_required == *is_required)
     }
 
     pub(crate) fn copy_from_set(&mut self, source: &Self) -> Result<(), TaskError> {
-        if self.allowed.len() != source.allowed.len() {
+        if self.topology_len != source.topology_len {
             return Err(TaskError::InvalidConfiguration);
         }
-        self.allowed.copy_from_slice(&source.allowed);
+        self.words.copy_from_slice(&source.words);
         self.allowed_count = source.allowed_count;
         Ok(())
+    }
+
+    /// Returns the first CPU in the intersection that satisfies `accepts`.
+    ///
+    /// This is the `cpumask_any_and()` primitive used by cpupri/cpudl: the
+    /// intersection is formed a machine word at a time rather than scanning
+    /// every logical CPU.
+    pub(crate) fn first_intersection(
+        &self,
+        other: &Self,
+        mut accepts: impl FnMut(CpuId) -> bool,
+    ) -> Option<CpuId> {
+        if self.topology_len != other.topology_len {
+            return None;
+        }
+        for (word_index, (left, right)) in self.words.iter().zip(&other.words).enumerate() {
+            let mut candidates = left & right;
+            while candidates != 0 {
+                let bit = candidates.trailing_zeros() as usize;
+                candidates &= candidates - 1;
+                let index = word_index * Self::BITS_PER_WORD + bit;
+                if index >= self.topology_len {
+                    break;
+                }
+                let cpu = CpuId::new(index as u32);
+                if accepts(cpu) {
+                    return Some(cpu);
+                }
+            }
+        }
+        None
+    }
+
+    pub(crate) fn word(&self, word_index: usize) -> usize {
+        self.words.get(word_index).copied().unwrap_or(0)
     }
 }
 

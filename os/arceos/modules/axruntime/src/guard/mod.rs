@@ -112,7 +112,9 @@ pub(crate) fn exit_irq(owner: &'static str) {
         let needs_reschedule = state.irq.depth == 1 && {
             // SAFETY: raw IRQ exclusion retains the same CPU while this
             // query observes the current CpuRemote's sticky request.
-            unsafe { ax_task::current_needs_reschedule_pinned() }.unwrap_or(false)
+            unsafe { ax_task::current_needs_reschedule_pinned() }.unwrap_or_else(|error| {
+                panic!("IRQ guard exit lost the current scheduler owner: {error:?}")
+            })
         };
         if needs_reschedule {
             ax_hal::percpu::scheduler_set_preempt_need_resched()
@@ -378,7 +380,9 @@ fn exit_scheduler_frame_guard_inner(
     let needs_reschedule = {
         // SAFETY: the scheduler baton and raw IRQ exclusion retain this CPU
         // through the current endpoint observation.
-        unsafe { ax_task::current_needs_reschedule_pinned() }.unwrap_or(false)
+        unsafe { ax_task::current_needs_reschedule_pinned() }.unwrap_or_else(|error| {
+            panic!("scheduler tail lost the current scheduler owner: {error:?}")
+        })
     };
     let publication = if needs_reschedule {
         ax_hal::percpu::scheduler_set_preempt_need_resched()

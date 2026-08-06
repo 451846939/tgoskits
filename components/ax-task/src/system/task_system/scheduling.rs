@@ -8,84 +8,75 @@ impl TaskSystem {
     /// The target never locks or mutates the source runqueue. Its pinned request
     /// node is published to the source owner-control inbox and the source owner
     /// selects and hands off one affinity-compatible thread at a safe point.
-    pub fn request_idle_pull(&self, cpu: Pin<&CpuLocal>) -> Result<bool, TaskError> {
+    pub fn request_idle_pull(&self, mut cpu: Pin<&mut CpuLocal>) -> Result<bool, TaskError> {
         self.ensure_owner_cpu_context(&cpu)?;
         if task_runtime::in_hard_irq() {
             return Ok(false);
         }
         self.ensure_owner_cpu_online(&cpu)?;
-        if cpu.current() != cpu.idle()
-            || cpu.has_remote_work()
-            || cpu.try_runnable_summary() != Some(0)
-        {
+        if cpu.current() != cpu.idle() || cpu.has_remote_work() || cpu.queued_summary() != 0 {
+            cpu.as_mut().reset_idle_pull_scan();
             return Ok(false);
         }
-        let target_remote = cpu.remote();
+        let target_remote = Arc::clone(cpu.remote());
         let reservation = match target_remote.begin_idle_pull() {
             IdlePullReservation::Started(reservation) => reservation,
             IdlePullReservation::AlreadyPending => return Ok(true),
             IdlePullReservation::Busy => return Ok(false),
         };
-        if cpu.current() != cpu.idle()
-            || cpu.has_remote_work()
-            || cpu.try_runnable_summary() != Some(0)
-        {
+        if cpu.current() != cpu.idle() || cpu.has_remote_work() || cpu.queued_summary() != 0 {
             target_remote.cancel_idle_pull(reservation);
+            cpu.as_mut().reset_idle_pull_scan();
             return Ok(false);
         }
         let target = cpu.owner();
         let source = self
-            .cpu_remotes
-            .iter()
-            .enumerate()
-            .filter(|(index, remote)| {
-                remote.accepts_placement() && CpuId::new(*index as u32) != target
-            })
-            .filter_map(|(index, local)| {
-                let source = CpuId::new(index as u32);
-                let summary = local.try_load_summary()?;
-                let key = summary.pushable_key()?;
-                let class = summary.pushable_class()?;
-                if !summary.is_overloaded() {
-                    return None;
-                }
-                let load = if class == SchedulingClass::Fair {
-                    summary.workload_demand()
-                } else {
-                    summary.runnable_count() as u64
-                };
-                Some((class, key, load, source))
-            })
-            .min_by_key(|(class, key, load, source)| {
-                let cross_cpu_urgency =
-                    matches!(class, SchedulingClass::Deadline | SchedulingClass::Realtime)
-                        .then_some(*key);
-                (
-                    *class as u8,
-                    cross_cpu_urgency,
-                    core::cmp::Reverse(*load),
-                    source.as_u32(),
-                )
+            .root_domain
+            .find_idle_pull_source(target, cpu.idle_pull_visited())
+            .or_else(|| {
+                self.cpu_remotes
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, remote)| {
+                        let source = CpuId::new(*index as u32);
+                        remote.accepts_placement()
+                            && source != target
+                            && !cpu.idle_pull_visited().contains(source)
+                    })
+                    .filter_map(|(index, local)| {
+                        let source = CpuId::new(index as u32);
+                        let summary = local.load_summary();
+                        summary
+                            .has_pushable_fair()
+                            .then_some((summary.fair_demand(), source))
+                    })
+                    .max_by_key(|(demand, source)| (*demand, core::cmp::Reverse(source.as_u32())))
+                    .map(|(_, source)| (source, SchedulingClass::Fair))
             });
-        let Some((_, _, _, source)) = source else {
+        let Some((source, class)) = source else {
             target_remote.cancel_idle_pull(reservation);
+            cpu.as_mut().reset_idle_pull_scan();
             return Ok(false);
         };
+        cpu.as_mut().mark_idle_pull_source(source);
         let Some(source_local) = self.cpu_remote(source) else {
             target_remote.cancel_idle_pull(reservation);
-            return Err(TaskError::CpuOffline(source.as_u32()));
+            cpu.request_scheduler_work();
+            return Ok(true);
         };
-        let message = InboxMessage::balance_request(source, target, reservation);
+        let message = InboxMessage::balance_request(source, target, reservation, class);
         let result = source_local.publish_owner_control(cpu.balance_request_node(), message);
         match result {
             PublishResult::Published => Ok(true),
             PublishResult::AlreadyPending => {
                 target_remote.cancel_idle_pull(reservation);
+                cpu.request_scheduler_work();
                 Ok(true)
             }
             PublishResult::WrongKind => {
                 target_remote.cancel_idle_pull(reservation);
-                Ok(false)
+                cpu.request_scheduler_work();
+                Ok(true)
             }
         }
     }
@@ -94,17 +85,13 @@ impl TaskSystem {
     ///
     /// Selection and dequeue happen only on `cpu`; the target receives an
     /// intrusive handoff and enqueues it in its own safe-point drain.
-    pub fn push_overloaded(
-        &self,
-        mut cpu: Pin<&mut CpuLocal>,
-    ) -> Result<Option<ThreadId>, TaskError> {
+    pub fn push_rt_deadline(&self, cpu: Pin<&mut CpuLocal>) -> Result<Option<ThreadId>, TaskError> {
         self.ensure_owner_cpu_context(&cpu)?;
         if task_runtime::in_hard_irq() {
             return Ok(None);
         }
         self.ensure_owner_cpu_online(&cpu)?;
-        self.publish_owner_cpu_load_summary(cpu.as_mut());
-        self.push_overloaded_from_published_summary(cpu)
+        self.push_rt_deadline_from_root_domain(cpu, None)
     }
 
     /// Pushes from the coherent owner snapshot published by the immediately
@@ -114,25 +101,20 @@ impl TaskSystem {
     /// its common tail can reuse that snapshot just as Linux keeps balancing
     /// decisions under one owner-rq transaction. Callers must not mutate the
     /// local runqueue or current dispatch between publication and this call.
-    pub(super) fn push_overloaded_from_published_summary(
+    pub(super) fn push_rt_deadline_from_root_domain(
         &self,
         mut cpu: Pin<&mut CpuLocal>,
+        class: Option<SchedulingClass>,
     ) -> Result<Option<ThreadId>, TaskError> {
-        let Some(source_summary) = cpu.try_load_summary() else {
-            return Ok(None);
-        };
-        if !source_summary.is_overloaded()
-            || !matches!(
-                source_summary.pushable_class(),
-                Some(SchedulingClass::Deadline | SchedulingClass::Realtime)
-            )
-        {
+        if !class.map_or_else(
+            || self.root_domain.cpu_has_rt_deadline_overload(cpu.owner()),
+            |class| self.root_domain.cpu_has_overload(cpu.owner(), class),
+        ) {
             return Ok(None);
         }
-        let Some(selection) = self.select_rt_deadline_balance_transfer(
-            cpu.as_ref().get_ref(),
-            source_summary.runnable_count(),
-        ) else {
+        let Some(selection) =
+            self.select_rt_deadline_balance_transfer(cpu.as_ref().get_ref(), class)
+        else {
             return Ok(None);
         };
         let target = selection.target();
@@ -148,52 +130,10 @@ impl TaskSystem {
         Ok(outcome.migrated())
     }
 
-    /// Replenishes a throttled Deadline job and enqueues it on an owner CPU.
-    pub fn replenish_deadline(
-        &self,
-        mut cpu: Pin<&mut CpuLocal>,
-        thread: ThreadId,
-    ) -> Result<(), TaskError> {
-        self.ensure_owner_cpu_context(&cpu)?;
-        let now_ns = cpu.update_rq_clock().wall_nanos();
-        let core = {
-            let state = self.state.lock();
-            Arc::clone(&state.thread_record(thread)?.core)
-        };
-        {
-            let mut sched = core.sched().lock();
-            let mut deadline = sched
-                .policy
-                .base_entity
-                .deadline()
-                .ok_or(TaskError::NotReady)?;
-            deadline.replenish(now_ns);
-            if deadline.is_throttled() {
-                return Err(TaskError::NotReady);
-            }
-            match sched.lifecycle.state() {
-                ThreadState::Blocked => {
-                    sched.transition(&core, ThreadState::Waking)?;
-                    sched.transition(&core, ThreadState::Ready)?;
-                }
-                ThreadState::Waking => sched.transition(&core, ThreadState::Ready)?,
-                ThreadState::Ready => {}
-                _ => return Err(TaskError::NotReady),
-            }
-            sched.policy.base_entity = SchedulingEntity::Deadline(deadline);
-            if !sched.is_pi_boosted() {
-                sched.policy.effective_entity = sched.policy.base_entity;
-            }
-            sched.deadline.replenish_pending = false;
-        }
-        self.enqueue_owner_thread(cpu.as_mut(), core, EnqueueReason::Replenished)?;
-        Self::program_local_timer(cpu.as_mut())
-    }
-
     /// Charges the current dispatch and reports class budget expiration.
     pub fn charge_current(
         &self,
-        mut cpu: Pin<&mut CpuLocal>,
+        cpu: Pin<&mut CpuLocal>,
         runtime_ns: u64,
         reclaimed_ns: u64,
     ) -> Result<ChargeOutcome, TaskError> {
@@ -201,9 +141,14 @@ impl TaskSystem {
         if !cpu.is_online() {
             return Err(TaskError::CpuOffline(cpu.owner().as_u32()));
         }
-        let charge = cpu
-            .as_mut()
-            .charge_current_dispatch(runtime_ns, reclaimed_ns)?;
+        let remote = Arc::clone(cpu.remote());
+        let mut transaction = OwnerRqTxn::begin(self, &remote);
+        if transaction.current().is_none() {
+            transaction.commit();
+            return Err(TaskError::NoRunnableThread);
+        }
+        let charge = transaction.charge_current(runtime_ns, reclaimed_ns);
+        transaction.commit();
         Ok(ChargeOutcome {
             slice_expired: charge.slice_expired,
             deadline_overrun: charge.deadline_overrun,
@@ -223,16 +168,22 @@ impl TaskSystem {
 
     pub(crate) fn charge_current_until_with_clock(
         &self,
-        mut cpu: Pin<&mut CpuLocal>,
+        cpu: Pin<&mut CpuLocal>,
         reclaimed_ns: u64,
     ) -> Result<(ChargeOutcome, RunQueueClockSnapshot), TaskError> {
         self.ensure_owner_cpu_context(&cpu)?;
         if !cpu.is_online() {
             return Err(TaskError::CpuOffline(cpu.owner().as_u32()));
         }
-        let (charge, clock) = cpu
-            .as_mut()
-            .settle_current_dispatch_with_clock(reclaimed_ns)?;
+        let remote = Arc::clone(cpu.remote());
+        let mut transaction = OwnerRqTxn::begin(self, &remote);
+        let clock = transaction.clock();
+        if transaction.current().is_none() {
+            transaction.commit();
+            return Err(TaskError::NoRunnableThread);
+        }
+        let charge = transaction.settle_current(reclaimed_ns);
+        transaction.commit();
         Ok((
             ChargeOutcome {
                 slice_expired: charge.slice_expired,
@@ -242,53 +193,66 @@ impl TaskSystem {
         ))
     }
 
-    /// Tests RT bandwidth, allowing a PI-boosted owner to run to unlock.
-    pub fn rt_may_run(
-        &self,
-        cpu: Pin<&mut CpuLocal>,
-        pi_boosted_owner: bool,
-    ) -> Result<bool, TaskError> {
+    /// Reports Linux `!rt_rq_throttled(rq)` for the owner runqueue.
+    pub fn rt_run_queue_may_run(&self, cpu: Pin<&mut CpuLocal>) -> Result<bool, TaskError> {
         self.ensure_owner_cpu_context(&cpu)?;
         self.ensure_owner_cpu_online(&cpu)?;
-        let _clock = cpu.update_rq_clock();
-        Ok(cpu.lock_run_queue().rt_may_run(pi_boosted_owner))
+        let has_boosted = cpu.remote().lock_run_queue().has_exempt_rt();
+        Ok(!self.rt_is_effectively_throttled(cpu.owner(), has_boosted))
     }
 
     /// Selects the next thread according to strict class precedence.
     pub fn schedule(&self, cpu: Pin<&mut CpuLocal>) -> Result<ScheduleDecision, TaskError> {
-        let now_ns = cpu.update_rq_clock().wall_nanos();
-        self.schedule_owner(cpu, now_ns)
+        self.schedule_owner(cpu, OwnerRqEntry::IrqSave)
     }
 
     fn schedule_owner(
         &self,
         mut cpu: Pin<&mut CpuLocal>,
-        now_ns: u64,
+        rq_entry: OwnerRqEntry,
     ) -> Result<ScheduleDecision, TaskError> {
         self.ensure_owner_cpu_context(&cpu)?;
+        let remote = Arc::clone(cpu.remote());
+        let initial_request = remote.claim_scheduler_request();
         self.complete_context_switch(cpu.as_mut())?;
-        self.drain_owner_work(cpu.as_mut(), now_ns)?;
+        self.drain_owner_work(cpu.as_mut())?;
+        self.service_soft_timer_work(cpu.as_mut())?;
         self.ensure_owner_cpu_online(&cpu)?;
-        let mut request = cpu.as_mut().claim_scheduler_request();
-        self.commit_owner_current_dispatch(cpu.as_mut())?;
-        self.service_soft_timer_work(cpu.as_mut(), now_ns)?;
-        request = request.merge(cpu.as_mut().claim_scheduler_request());
-        let previous = cpu.current();
-        let previous_core = cpu.current_core().cloned();
+        let previous_core_hint = cpu.current_core();
+        let mut previous_sched = previous_core_hint.as_ref().map(|core| core.sched().lock());
+        // SAFETY: the public task entry chooses irqsave; the scheduler-frame
+        // entry is exposed only by its unsafe wrapper below.
+        let mut transaction = unsafe { rq_entry.begin(self, &remote) };
+        let clock = transaction.clock();
+        let now_ns = clock.wall().as_nanos();
+        transaction.adopt_scheduler_request(initial_request);
+        transaction.merge_scheduler_request();
+        let dispatch_commit = self.commit_owner_current_dispatch_in_rq(&mut transaction);
+        let previous = transaction.current_thread();
+        let previous_core = transaction.current_core();
+        let previous_endpoint = transaction.current_switch_endpoint();
+        if previous_core.as_ref().map(Arc::as_ptr) != previous_core_hint.as_ref().map(Arc::as_ptr) {
+            task_runtime::fatal_invariant(0x5343_1201, cpu.owner().as_u32() as usize);
+        }
         let mut migration = None;
         if let Some(core) = previous_core.as_ref() {
-            migration = self.schedule_out_owner_running(
+            let schedule_out = self.schedule_out_owner_running_in_rq(
                 cpu.as_mut(),
+                &mut transaction,
                 Arc::clone(core),
+                previous_sched.as_deref_mut().unwrap_or_else(|| {
+                    task_runtime::fatal_invariant(0x5343_1202, core.id().as_u64() as usize)
+                }),
                 now_ns,
                 EnqueueReason::Preempted,
-            )?;
+            );
+            migration = schedule_out.migration;
         }
-        let next = self.pick_owner_next(cpu.as_mut(), now_ns, previous)?;
-        if next.outgoing_migration.is_some() {
-            migration = next.outgoing_migration;
-        }
+        let next = self.pick_owner_next_in_rq(cpu.as_mut(), &mut transaction, previous);
         let next_core = next.core;
+        let next_endpoint = transaction.current_switch_endpoint().unwrap_or_else(|| {
+            task_runtime::fatal_invariant(0x5343_1203, next_core.id().as_u64() as usize)
+        });
         let migrated = migration.is_some();
         Self::stage_switch_handoff(
             cpu.as_mut(),
@@ -296,15 +260,24 @@ impl TaskSystem {
             previous_core.as_ref().map(Arc::clone),
             next_core.id(),
             migration,
-        )?;
+        );
         let reason = if migrated {
             SwitchReason::Migrated
         } else {
             SwitchReason::Preempted
         };
-        let decision = Self::owner_switch_plan(previous_core.as_ref(), &next_core, reason, now_ns);
+        transaction.commit_and_acknowledge_scheduler_request();
+        drop(previous_sched);
+        let decision = Self::owner_switch_plan(
+            previous_core.as_ref(),
+            previous_endpoint,
+            &next_core,
+            next_endpoint,
+            reason,
+            now_ns,
+        );
+        self.finish_owner_dispatch_commit(cpu.as_mut(), dispatch_commit, clock.wall().as_nanos());
         let decision = self.finish_owner_selection(cpu.as_mut(), decision);
-        cpu.acknowledge_scheduler_request(request);
         Ok(decision)
     }
 
@@ -313,68 +286,103 @@ impl TaskSystem {
         &self,
         cpu: Pin<&mut CpuLocal>,
     ) -> Result<SchedulerOutcome, TaskError> {
-        let now_ns = cpu.update_rq_clock().wall_nanos();
-        self.schedule_if_requested_owner(cpu, now_ns)
+        self.schedule_if_requested_owner(cpu, OwnerRqEntry::IrqSave)
+    }
+
+    /// Services scheduler work while the runtime owns the IRQ-off baton.
+    ///
+    /// # Safety
+    ///
+    /// The scheduler frame must remain active until this function returns.
+    pub(crate) unsafe fn schedule_if_requested_in_scheduler_frame(
+        &self,
+        cpu: Pin<&mut CpuLocal>,
+    ) -> Result<SchedulerOutcome, TaskError> {
+        self.schedule_if_requested_owner(cpu, OwnerRqEntry::SchedulerFrame)
     }
 
     fn schedule_if_requested_owner(
         &self,
         mut cpu: Pin<&mut CpuLocal>,
-        now_ns: u64,
+        rq_entry: OwnerRqEntry,
     ) -> Result<SchedulerOutcome, TaskError> {
         self.ensure_owner_cpu_context(&cpu)?;
+        let remote = Arc::clone(cpu.remote());
+        let initial_request = remote.claim_scheduler_request();
         self.complete_context_switch(cpu.as_mut())?;
-        self.drain_owner_work(cpu.as_mut(), now_ns)?;
+        self.drain_owner_work(cpu.as_mut())?;
+        self.service_soft_timer_work(cpu.as_mut())?;
         self.ensure_owner_cpu_online(&cpu)?;
-        let mut request = cpu.as_mut().claim_scheduler_request();
-        if cpu.dispatch_state().current_dispatch.is_some() {
-            let _settled = cpu.as_mut().settle_current_dispatch(0)?;
+        let previous_core_hint = cpu.current_core();
+        let mut previous_sched = previous_core_hint.as_ref().map(|core| core.sched().lock());
+        // SAFETY: propagated from the selected entry contract.
+        let mut transaction = unsafe { rq_entry.begin(self, &remote) };
+        let clock = transaction.clock();
+        let now_ns = clock.wall().as_nanos();
+        transaction.adopt_scheduler_request(initial_request);
+        let request = transaction.merge_scheduler_request();
+        if transaction.current().is_some() {
+            let _settled = transaction.settle_current(0);
         }
-        self.service_soft_timer_work(cpu.as_mut(), now_ns)?;
-        request = request.merge(cpu.as_mut().claim_scheduler_request());
-        if cpu.current_lifecycle_state() == Some(ThreadState::Parking) {
+        if transaction
+            .current()
+            .map(|dispatch| dispatch.runtime_core_arc().state())
+            == Some(ThreadState::Parking)
+        {
             // The interrupted owner still holds a generation-checked park
             // token and remains `current` / `on_cpu`. Consume this safe-point
             // doorbell so an IRQ-return `while need_resched` loop can return to
             // `commit_park`. A real preemption request is kept separately and
             // restored only if the park is cancelled.
             cpu.defer_park_preemption(request.preempt_requested());
-            cpu.acknowledge_scheduler_request(request);
+            transaction.commit_and_acknowledge_scheduler_request();
             return Ok(SchedulerOutcome::ParkingDeferred);
         }
         let switch_requested = request.preempt_requested();
-        let previous = cpu.current();
-        let previous_core = cpu.current_core().cloned();
+        let previous = transaction.current_thread();
+        let previous_core = transaction.current_core();
+        let previous_endpoint = transaction.current_switch_endpoint();
+        if previous_core.as_ref().map(Arc::as_ptr) != previous_core_hint.as_ref().map(Arc::as_ptr) {
+            task_runtime::fatal_invariant(0x5343_1204, cpu.owner().as_u32() as usize);
+        }
         if previous_core.is_some() && !switch_requested {
-            self.sync_owner_current_dispatch(cpu.as_mut())?;
-            self.publish_owner_cpu_load_summary(cpu.as_mut());
+            let runtime_overrun_work = self.sync_owner_current_dispatch_in_rq(&mut transaction);
+            transaction.commit_and_acknowledge_scheduler_request();
+            drop(previous_sched);
+            if let Some(core) = runtime_overrun_work {
+                self.publish_deadline_overrun_work(core);
+            }
             let current = previous.expect("a current core must retain its thread identity");
             if self.owner_balance_work_pending(cpu.as_ref().get_ref(), current) {
                 self.service_owner_balance(cpu.as_mut(), current)?;
             }
-            Self::program_local_timer(cpu.as_mut())?;
-            cpu.acknowledge_scheduler_request(request);
+            self.program_local_timer(cpu.as_mut())?;
             return Ok(if cpu.needs_reschedule() || cpu.has_remote_work() {
                 SchedulerOutcome::OwnerWorkPending
             } else {
                 SchedulerOutcome::Quiescent
             });
         }
-        self.commit_owner_current_dispatch(cpu.as_mut())?;
+        let dispatch_commit = self.commit_owner_current_dispatch_in_rq(&mut transaction);
         let mut migration = None;
         if let Some(core) = previous_core.as_ref() {
-            migration = self.schedule_out_owner_running(
+            let schedule_out = self.schedule_out_owner_running_in_rq(
                 cpu.as_mut(),
+                &mut transaction,
                 Arc::clone(core),
+                previous_sched.as_deref_mut().unwrap_or_else(|| {
+                    task_runtime::fatal_invariant(0x5343_1205, core.id().as_u64() as usize)
+                }),
                 now_ns,
                 EnqueueReason::Preempted,
-            )?;
+            );
+            migration = schedule_out.migration;
         }
-        let next = self.pick_owner_next(cpu.as_mut(), now_ns, previous)?;
-        if next.outgoing_migration.is_some() {
-            migration = next.outgoing_migration;
-        }
+        let next = self.pick_owner_next_in_rq(cpu.as_mut(), &mut transaction, previous);
         let next_core = next.core;
+        let next_endpoint = transaction.current_switch_endpoint().unwrap_or_else(|| {
+            task_runtime::fatal_invariant(0x5343_1206, next_core.id().as_u64() as usize)
+        });
         let migrated = migration.is_some();
         Self::stage_switch_handoff(
             cpu.as_mut(),
@@ -382,111 +390,185 @@ impl TaskSystem {
             previous_core.as_ref().map(Arc::clone),
             next_core.id(),
             migration,
-        )?;
+        );
         let reason = if migrated {
             SwitchReason::Migrated
         } else {
             SwitchReason::Preempted
         };
-        let decision = Self::owner_switch_plan(previous_core.as_ref(), &next_core, reason, now_ns);
+        transaction.commit_and_acknowledge_scheduler_request();
+        drop(previous_sched);
+        let decision = Self::owner_switch_plan(
+            previous_core.as_ref(),
+            previous_endpoint,
+            &next_core,
+            next_endpoint,
+            reason,
+            now_ns,
+        );
+        self.finish_owner_dispatch_commit(cpu.as_mut(), dispatch_commit, clock.wall().as_nanos());
         let decision = self.finish_owner_selection(cpu.as_mut(), decision);
-        cpu.acknowledge_scheduler_request(request);
         Ok(SchedulerOutcome::Decision(decision))
     }
 
     /// Moves the current thread to its class tail and selects another thread.
-    pub fn yield_current(
+    pub fn yield_current(&self, cpu: Pin<&mut CpuLocal>) -> Result<ScheduleDecision, TaskError> {
+        self.yield_current_owner(cpu, OwnerRqEntry::IrqSave)
+    }
+
+    /// Yields while the runtime owns the IRQ-off scheduler baton.
+    ///
+    /// # Safety
+    ///
+    /// The scheduler frame must remain active until this function returns.
+    pub(crate) unsafe fn yield_current_in_scheduler_frame(
+        &self,
+        cpu: Pin<&mut CpuLocal>,
+    ) -> Result<ScheduleDecision, TaskError> {
+        self.yield_current_owner(cpu, OwnerRqEntry::SchedulerFrame)
+    }
+
+    fn yield_current_owner(
         &self,
         mut cpu: Pin<&mut CpuLocal>,
+        rq_entry: OwnerRqEntry,
     ) -> Result<ScheduleDecision, TaskError> {
         self.ensure_owner_cpu_context(&cpu)?;
+        let remote = Arc::clone(cpu.remote());
+        let initial_request = remote.claim_scheduler_request();
         self.complete_context_switch(cpu.as_mut())?;
+        self.drain_owner_work(cpu.as_mut())?;
+        self.service_soft_timer_work(cpu.as_mut())?;
         self.ensure_owner_cpu_online(&cpu)?;
-        let now_ns = cpu.update_rq_clock().wall_nanos();
-        self.commit_owner_current_dispatch(cpu.as_mut())?;
-        let request = cpu.as_mut().claim_scheduler_request();
-        let previous = cpu.current();
-        let previous_core = cpu.current_core().cloned();
+        let previous_core_hint = cpu.current_core();
+        let mut previous_sched = previous_core_hint.as_ref().map(|core| core.sched().lock());
+        // SAFETY: propagated from the selected entry contract.
+        let mut transaction = unsafe { rq_entry.begin(self, &remote) };
+        let clock = transaction.clock();
+        let now_ns = clock.wall().as_nanos();
+        transaction.adopt_scheduler_request(initial_request);
+        transaction.merge_scheduler_request();
+        let dispatch_commit = self.commit_owner_current_dispatch_in_rq(&mut transaction);
+        let previous = transaction.current_thread();
+        let previous_core = transaction.current_core();
+        let previous_endpoint = transaction.current_switch_endpoint();
+        if previous_core.as_ref().map(Arc::as_ptr) != previous_core_hint.as_ref().map(Arc::as_ptr) {
+            task_runtime::fatal_invariant(0x5343_1207, cpu.owner().as_u32() as usize);
+        }
         if let Some(core) = previous_core.as_ref() {
             let owner = cpu.owner();
             let continuing_dispatch = {
-                let sched = core.sched().lock();
-                (matches!(sched.policy.effective_entity, SchedulingEntity::Fair(_))
-                    && sched.placement.can_continue_running_on(owner)
-                    && cpu.lock_run_queue().len() == 0)
-                    .then(|| Self::owner_dispatch(core, &sched, now_ns))
-                    .transpose()?
+                let sched = previous_sched.as_deref().unwrap_or_else(|| {
+                    task_runtime::fatal_invariant(0x5343_1208, core.id().as_u64() as usize)
+                });
+                matches!(
+                    transaction.current_scheduling_entity(),
+                    Some(SchedulingEntity::Fair(_))
+                ) && core.sched().placement().can_continue_running_on(owner)
+                    && sched.affinity.affinity.contains(owner)
+                    && transaction.nr_queued() == 0
             };
-            if let Some(dispatch) = continuing_dispatch {
+            if continuing_dispatch {
                 // Linux `yield_task_fair()` returns before changing the active
                 // EEVDF request when this is the only runnable entity. Moving
                 // the owner through Ready and the runqueue here would
                 // forfeit its request even though no peer could consume the
                 // yielded service.
-                cpu.as_mut().install_dispatch(dispatch);
-                self.publish_owner_cpu_load_summary(cpu.as_mut());
-                let decision =
-                    Self::owner_switch_plan(Some(core), core, SwitchReason::Yield, now_ns);
+                transaction.commit_and_acknowledge_scheduler_request();
+                drop(previous_sched);
+                let endpoint = previous_endpoint.unwrap_or_else(|| {
+                    task_runtime::fatal_invariant(0x5343_1209, core.id().as_u64() as usize)
+                });
+                let decision = Self::owner_switch_plan(
+                    Some(core),
+                    Some(endpoint),
+                    core,
+                    endpoint,
+                    SwitchReason::Yield,
+                    now_ns,
+                );
+                self.finish_owner_dispatch_commit(
+                    cpu.as_mut(),
+                    dispatch_commit,
+                    clock.wall().as_nanos(),
+                );
                 let decision = self.finish_owner_selection(cpu.as_mut(), decision);
-                cpu.acknowledge_scheduler_request(request);
                 return Ok(decision);
             }
         }
         let mut migration = None;
         if let Some(core) = previous_core.as_ref() {
             let deadline_job_ended = {
-                let mut sched = core.sched().lock();
-                if matches!(sched.policy.applied, SchedulePolicy::Deadline(_))
+                let placement = core.sched().placement();
+                let sched = previous_sched.as_deref_mut().unwrap_or_else(|| {
+                    task_runtime::fatal_invariant(0x5343_120a, core.id().as_u64() as usize)
+                });
+                if matches!(sched.policy.base, SchedulePolicy::Deadline(_))
                     && !sched.is_pi_boosted()
                 {
                     if sched.lifecycle.state() != ThreadState::Running
-                        || sched.placement.execution_cpu() != Some(cpu.owner())
-                        || sched.placement.on_cpu() != Some(cpu.owner())
+                        || placement.execution_cpu() != Some(cpu.owner())
+                        || placement.on_cpu() != Some(cpu.owner())
                     {
-                        return Err(TaskError::InvalidConfiguration);
+                        task_runtime::fatal_invariant(0x5343_120b, core.id().as_u64() as usize);
                     }
-                    if !sched.policy.effective_entity.yield_deadline_job() {
-                        return Err(TaskError::InvalidConfiguration);
+                    let current_entity = transaction
+                        .current_scheduling_entity_mut()
+                        .unwrap_or_else(|| {
+                            task_runtime::fatal_invariant(0x5343_120c, core.id().as_u64() as usize)
+                        });
+                    if !current_entity.yield_deadline_job() {
+                        task_runtime::fatal_invariant(0x5343_120d, core.id().as_u64() as usize);
                     }
-                    if let SchedulingEntity::Deadline(_) = sched.policy.effective_entity {
-                        sched.policy.base_entity = sched.policy.effective_entity;
+                    sched
+                        .transition(core, ThreadState::Ready)
+                        .unwrap_or_else(|_| {
+                            task_runtime::fatal_invariant(0x5343_120e, core.id().as_u64() as usize)
+                        });
+                    transaction
+                        .throttle_current_deadline(core.id())
+                        .unwrap_or_else(|_| {
+                            task_runtime::fatal_invariant(0x5343_120e, core.id().as_u64() as usize)
+                        });
+                    placement.put_prev(cpu.owner());
+                    if self
+                        .refresh_owner_deadline_timers_in_rq(
+                            core,
+                            sched,
+                            cpu.as_mut(),
+                            now_ns,
+                            &mut transaction,
+                        )
+                        .is_some()
+                    {
+                        cpu.request_scheduler_work();
                     }
-                    sched.deadline.replenish_pending = true;
-                    self.mark_owner_deadline_non_contending_locked(
-                        core,
-                        &mut sched,
-                        cpu.as_mut(),
-                        now_ns,
-                    )?;
-                    sched.transition(core, ThreadState::Blocked)?;
-                    let mut run_queue = cpu.lock_run_queue();
-                    if run_queue.is_linked_current(core.id()) {
-                        run_queue
-                            .dequeue(core.id())
-                            .expect("validated retained current must remain linked");
-                    }
-                    sched.placement.block_current(cpu.owner());
                     true
                 } else {
                     false
                 }
             };
             if deadline_job_ended {
-                cpu.as_mut().clear_current();
+                transaction.take_current();
             } else {
-                migration = self.schedule_out_owner_running(
+                let schedule_out = self.schedule_out_owner_running_in_rq(
                     cpu.as_mut(),
+                    &mut transaction,
                     Arc::clone(core),
+                    previous_sched.as_deref_mut().unwrap_or_else(|| {
+                        task_runtime::fatal_invariant(0x5343_120f, core.id().as_u64() as usize)
+                    }),
                     now_ns,
                     EnqueueReason::Yield,
-                )?;
+                );
+                migration = schedule_out.migration;
             }
         }
-        let next = self.pick_owner_next(cpu.as_mut(), now_ns, previous)?;
-        if next.outgoing_migration.is_some() {
-            migration = next.outgoing_migration;
-        }
+        let next = self.pick_owner_next_in_rq(cpu.as_mut(), &mut transaction, previous);
         let next_core = next.core;
+        let next_endpoint = transaction.current_switch_endpoint().unwrap_or_else(|| {
+            task_runtime::fatal_invariant(0x5343_1210, next_core.id().as_u64() as usize)
+        });
         let migrated = migration.is_some();
         Self::stage_switch_handoff(
             cpu.as_mut(),
@@ -494,15 +576,24 @@ impl TaskSystem {
             previous_core.as_ref().map(Arc::clone),
             next_core.id(),
             migration,
-        )?;
+        );
         let reason = if migrated {
             SwitchReason::Migrated
         } else {
             SwitchReason::Yield
         };
-        let decision = Self::owner_switch_plan(previous_core.as_ref(), &next_core, reason, now_ns);
+        transaction.commit_and_acknowledge_scheduler_request();
+        drop(previous_sched);
+        let decision = Self::owner_switch_plan(
+            previous_core.as_ref(),
+            previous_endpoint,
+            &next_core,
+            next_endpoint,
+            reason,
+            now_ns,
+        );
+        self.finish_owner_dispatch_commit(cpu.as_mut(), dispatch_commit, clock.wall().as_nanos());
         let decision = self.finish_owner_selection(cpu.as_mut(), decision);
-        cpu.acknowledge_scheduler_request(request);
         Ok(decision)
     }
 }

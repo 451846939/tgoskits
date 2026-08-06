@@ -49,21 +49,35 @@ impl RootDomainPriorityIndex {
         }
     }
 
-    pub(super) fn publish_run_queue(&self, cpu: CpuId, run_queue: &CpuRunQueueState, online: bool) {
+    pub(super) fn publish_run_queue(
+        &self,
+        cpu: CpuId,
+        highest_rt_priority: Option<u8>,
+        earliest_deadline: Option<u64>,
+        online: bool,
+    ) {
         self.rt.publish(
             cpu,
             online,
-            run_queue.highest_rt_priority_including_current(),
-            run_queue.earliest_deadline_including_current().is_some(),
+            highest_rt_priority,
+            earliest_deadline.is_some(),
         );
-        self.deadline
-            .lock()
-            .publish(cpu, online, run_queue.earliest_deadline_including_current());
+        self.deadline.lock().publish(cpu, online, earliest_deadline);
     }
 
     pub(super) fn publish_offline(&self, cpu: CpuId) {
         self.rt.publish(cpu, false, None, false);
         self.deadline.lock().publish(cpu, false, None);
+    }
+
+    pub(super) fn has_multiple_online_cpus(&self) -> bool {
+        self.rt
+            .levels
+            .iter()
+            .filter(|level| level.load(Ordering::Acquire) != RT_OFFLINE_LEVEL)
+            .take(2)
+            .count()
+            > 1
     }
 
     pub(super) fn find_lowest_rt_cpu(
@@ -167,7 +181,8 @@ impl RtCpuPriorityIndex {
                 return Some(preferred);
             }
             for word_index in 0..self.words_per_level {
-                let mut candidates = self.bucket(level, word_index).load(Ordering::Acquire);
+                let mut candidates = self.bucket(level, word_index).load(Ordering::Acquire)
+                    & affinity.word(word_index);
                 while candidates != 0 {
                     let bit = candidates.trailing_zeros() as usize;
                     candidates &= candidates - 1;
@@ -180,7 +195,6 @@ impl RtCpuPriorityIndex {
                     let cpu = CpuId::new(index as u32);
                     if cpu_level.load(Ordering::Acquire) == level
                         && Some(cpu) != preferred
-                        && affinity.contains(cpu)
                         && accepts(cpu)
                     {
                         return Some(cpu);
@@ -281,9 +295,9 @@ impl DeadlineCpuHeap {
         {
             return Some(preferred);
         }
-        if let Some(cpu) = (0..self.indices.len())
-            .map(|index| CpuId::new(index as u32))
-            .find(|cpu| self.free.contains(*cpu) && affinity.contains(*cpu) && accepts(*cpu))
+        if let Some(cpu) = self
+            .free
+            .first_intersection(affinity, |cpu| Some(cpu) != preferred && accepts(cpu))
         {
             return Some(cpu);
         }

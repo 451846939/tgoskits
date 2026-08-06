@@ -1,6 +1,6 @@
 //! Copy-only scheduler messages crossing CPU ownership boundaries.
 
-use crate::{CpuId, ThreadId};
+use crate::{CpuId, SchedulingClass, ThreadId};
 
 /// Class of owner-CPU work carried by one intrusive inbox.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -47,6 +47,7 @@ pub struct InboxMessage {
     target_cpu: u32,
     generation: u64,
     placement_demand: u64,
+    balance_class: Option<SchedulingClass>,
     payload: usize,
 }
 
@@ -62,10 +63,12 @@ impl InboxMessage {
         target_cpu: Self::NO_CPU,
         generation: 0,
         placement_demand: 0,
+        balance_class: None,
         payload: 0,
     };
 
-    /// Creates an owner-to-owner migration transfer.
+    /// Creates an owner-to-owner migration transfer for deterministic fixtures.
+    #[cfg(test)]
     pub const fn migration(
         thread_id: ThreadId,
         source_cpu: CpuId,
@@ -100,6 +103,7 @@ impl InboxMessage {
             target_cpu: target_cpu.as_u32(),
             generation,
             placement_demand,
+            balance_class: None,
             payload,
         }
     }
@@ -119,6 +123,7 @@ impl InboxMessage {
             target_cpu: owner.as_u32(),
             generation,
             placement_demand: 0,
+            balance_class: None,
             payload,
         }
     }
@@ -138,6 +143,7 @@ impl InboxMessage {
             target_cpu: target_cpu.as_u32(),
             generation: thread_id.generation() as u64,
             placement_demand: 0,
+            balance_class: None,
             payload,
         }
     }
@@ -161,12 +167,18 @@ impl InboxMessage {
             target_cpu: owner.as_u32(),
             generation,
             placement_demand: 0,
+            balance_class: None,
             payload,
         }
     }
 
     /// Creates an idle-pull request sent to a remote runqueue owner.
-    pub const fn balance_request(source_cpu: CpuId, target_cpu: CpuId, reservation: u64) -> Self {
+    pub const fn balance_request(
+        source_cpu: CpuId,
+        target_cpu: CpuId,
+        reservation: u64,
+        class: SchedulingClass,
+    ) -> Self {
         Self {
             kind: InboxKind::OwnerControl,
             operation: InboxOperation::BalanceRequest,
@@ -175,6 +187,7 @@ impl InboxMessage {
             target_cpu: target_cpu.as_u32(),
             generation: reservation,
             placement_demand: 0,
+            balance_class: Some(class),
             payload: 0,
         }
     }
@@ -193,6 +206,15 @@ impl InboxMessage {
         }
     }
 
+    /// Returns the scheduler class whose overload mask selected the source.
+    pub const fn balance_class(self) -> Option<SchedulingClass> {
+        if self.is_balance_request() {
+            self.balance_class
+        } else {
+            None
+        }
+    }
+
     /// Creates a deferred resource-reclaim request.
     pub const fn reclaim(thread_id: ThreadId, generation: u64, payload: usize) -> Self {
         Self {
@@ -203,6 +225,7 @@ impl InboxMessage {
             target_cpu: Self::NO_CPU,
             generation,
             placement_demand: 0,
+            balance_class: None,
             payload,
         }
     }
@@ -217,6 +240,7 @@ impl InboxMessage {
             target_cpu: Self::NO_CPU,
             generation: thread_id.generation() as u64,
             placement_demand: 0,
+            balance_class: None,
             payload,
         }
     }
@@ -231,6 +255,7 @@ impl InboxMessage {
             target_cpu: Self::NO_CPU,
             generation: thread_id.generation() as u64,
             placement_demand: 0,
+            balance_class: None,
             payload,
         }
     }

@@ -39,7 +39,6 @@ impl<T> RawTicketLock<T> {
     }
 
     /// Attempts immediate acquisition without waiting.
-    #[cfg(test)]
     pub(crate) fn try_lock(&self) -> Option<RawTicketGuard<'_, T>> {
         let owner = self.owner.load(Ordering::Acquire);
         self.next

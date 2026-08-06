@@ -55,7 +55,8 @@ fn schedule_current_cpu_with_entry(
     let system = runtime_task_system()?;
     let outcome = {
         let mut cpu = runtime_current_cpu_mut(&mut scheduler_frame)?;
-        let current_state = cpu.current_lifecycle_state();
+        // SAFETY: RuntimeSchedulerFrameGuard owns the IRQ-off scheduler baton.
+        let current_state = unsafe { cpu.scheduler_current_lifecycle_state() };
         if !cpu.needs_reschedule() && !cpu.has_remote_work() {
             if current_state == Some(ThreadState::Parking) {
                 SchedulerOutcome::ParkingDeferred
@@ -63,7 +64,8 @@ fn schedule_current_cpu_with_entry(
                 SchedulerOutcome::Quiescent
             }
         } else {
-            system.schedule_if_requested(cpu.as_mut())?
+            // SAFETY: `scheduler_frame` owns the IRQ-off scheduler baton.
+            unsafe { system.schedule_if_requested_in_scheduler_frame(cpu.as_mut())? }
         }
     };
     if let Some(decision) = outcome.decision() {
@@ -82,7 +84,8 @@ pub fn yield_current_cpu() -> Result<ScheduleDecision, TaskError> {
     let system = runtime_task_system()?;
     let decision = {
         let mut cpu = runtime_current_cpu_mut(&mut scheduler_frame)?;
-        system.yield_current(cpu.as_mut())?
+        // SAFETY: `scheduler_frame` owns the IRQ-off scheduler baton.
+        unsafe { system.yield_current_in_scheduler_frame(cpu.as_mut())? }
     };
     execute_switch_plan(&mut scheduler_frame, decision);
     Ok(decision)
@@ -131,8 +134,8 @@ pub fn commit_current_exit(permit: ExitPermit) -> ! {
         if cpu.current() != Some(thread) {
             task_runtime::fatal_invariant(0x4558_0014, thread.as_u64() as _);
         }
-        system
-            .commit_prepared_current_exit(cpu.as_mut(), permit.system)
+        // SAFETY: `scheduler_frame` owns the IRQ-off scheduler baton.
+        unsafe { system.commit_prepared_current_exit(cpu.as_mut(), permit.system) }
             .unwrap_or_else(|_| task_runtime::fatal_invariant(0x4558_0015, thread.as_u64() as _))
     };
     execute_switch_plan(&mut scheduler_frame, decision);

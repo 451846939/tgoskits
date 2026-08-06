@@ -44,7 +44,7 @@ impl TimerEntry {
         self.kind
     }
 
-    fn precedes(self, other: Self) -> bool {
+    pub(super) fn precedes(self, other: Self) -> bool {
         self.deadline < other.deadline
             || (self.deadline == other.deadline
                 && (self.thread.as_u64() < other.thread.as_u64()

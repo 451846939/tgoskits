@@ -1,9 +1,51 @@
 //! Allocation-free ordered PI waiter linkage.
 
-use alloc::boxed::Box;
+use alloc::{
+    boxed::Box,
+    sync::{Arc, Weak},
+};
 use core::{cell::UnsafeCell, cmp::Ordering, fmt, ptr::NonNull};
 
-use crate::{SchedulingUrgency, ThreadId};
+use crate::{SchedulePolicy, SchedulingUrgency, ThreadCore, ThreadId};
+
+/// Effective donation cloned into an rtmutex waiter node.
+///
+/// Linux stores cloned priority/deadline ordering in `rt_mutex_waiter` and
+/// retains the donating task identity through `pi_top_task`. Keeping the same
+/// facts in the preallocated node lets the owner consume one coherent snapshot
+/// under its PI lock without taking another task lock or consulting the global
+/// registry.
+#[derive(Clone, Debug)]
+pub(crate) struct PiDonation {
+    pub(crate) policy: SchedulePolicy,
+    pub(crate) root: ThreadId,
+    waiter_core: Weak<ThreadCore>,
+    pub(crate) root_core: Weak<ThreadCore>,
+}
+
+impl PiDonation {
+    pub(crate) fn new(
+        policy: SchedulePolicy,
+        root: ThreadId,
+        waiter_core: &Arc<ThreadCore>,
+        root_core: &Arc<ThreadCore>,
+    ) -> Self {
+        Self {
+            policy,
+            root,
+            waiter_core: Arc::downgrade(waiter_core),
+            root_core: Arc::downgrade(root_core),
+        }
+    }
+
+    pub(crate) fn same_source(&self, other: &Self) -> bool {
+        self.policy == other.policy && self.root == other.root
+    }
+
+    pub(crate) fn waiter_core(&self) -> Option<Arc<ThreadCore>> {
+        self.waiter_core.upgrade()
+    }
+}
 
 /// Stable ordering copied into both the lock waiter tree and owner donor tree.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43,6 +85,7 @@ type PiWaitLink = Option<Box<PiWaitNode>>;
 /// One preallocated AVL linkage owned by a blocked thread.
 pub(crate) struct PiWaitNode {
     key: PiWaitKey,
+    donation: Option<PiDonation>,
     left: PiWaitLink,
     right: PiWaitLink,
     height: usize,
@@ -56,14 +99,16 @@ impl PiWaitNode {
                 u64::MAX,
                 ThreadId::from_parts(0, 0),
             ),
+            donation: None,
             left: None,
             right: None,
             height: 1,
         })
     }
 
-    fn reset(&mut self, key: PiWaitKey) {
+    fn reset(&mut self, key: PiWaitKey, donation: PiDonation) {
         self.key = key;
+        self.donation = Some(donation);
         self.left = None;
         self.right = None;
         self.height = 1;
@@ -81,6 +126,7 @@ impl fmt::Debug for PiWaitNode {
         formatter
             .debug_struct("PiWaitNode")
             .field("key", &self.key)
+            .field("donation", &self.donation)
             .field("height", &self.height)
             .finish_non_exhaustive()
     }
@@ -167,10 +213,6 @@ impl PiWaitTree {
         self.len == 0
     }
 
-    pub(crate) const fn len(&self) -> usize {
-        self.len
-    }
-
     pub(crate) fn first(&self) -> Option<PiWaitKey> {
         self.first.map(|first| {
             // SAFETY: `first` points into one of the boxes owned by `root`.
@@ -180,12 +222,41 @@ impl PiWaitTree {
         })
     }
 
+    pub(crate) fn first_entry(&self) -> Option<(PiWaitKey, PiDonation)> {
+        self.first.map(|first| {
+            // SAFETY: identical ownership contract to `first()`.
+            let first = unsafe { first.as_ref() };
+            (
+                first.key,
+                first
+                    .donation
+                    .as_ref()
+                    .expect("linked PI waiter must retain its donation")
+                    .clone(),
+            )
+        })
+    }
+
+    pub(crate) fn donation(&self, key: PiWaitKey) -> Option<PiDonation> {
+        find_node(self.root.as_deref(), key).map(|node| {
+            node.donation
+                .as_ref()
+                .expect("linked PI waiter must retain its donation")
+                .clone()
+        })
+    }
+
     pub(crate) fn contains(&self, key: PiWaitKey) -> bool {
         find_node(self.root.as_deref(), key).is_some()
     }
 
-    pub(crate) fn insert(&mut self, key: PiWaitKey, mut node: Box<PiWaitNode>) {
-        node.reset(key);
+    pub(crate) fn insert(
+        &mut self,
+        key: PiWaitKey,
+        donation: PiDonation,
+        mut node: Box<PiWaitNode>,
+    ) {
+        node.reset(key, donation);
         let node_pointer = NonNull::from(node.as_mut());
         self.root = insert_node(self.root.take(), node);
         if self.first().is_none_or(|first| key < first) {
@@ -373,6 +444,7 @@ fn validate_node(node: Option<&PiWaitNode>, previous: &mut Option<PiWaitKey>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{TaskSystem, TaskSystemConfig, ThreadSpec};
 
     fn key(primary: u64) -> PiWaitKey {
         PiWaitKey::new(
@@ -382,11 +454,28 @@ mod tests {
         )
     }
 
+    fn donation(primary: u64, core: &Arc<ThreadCore>) -> PiDonation {
+        PiDonation::new(
+            SchedulePolicy::default(),
+            ThreadId::from_parts(primary as u32 + 1, 1),
+            core,
+            core,
+        )
+    }
+
     #[test]
     fn cached_first_and_avl_links_survive_reordering_removals() {
+        let system = TaskSystem::new(TaskSystemConfig::new(1)).unwrap();
+        let thread = system
+            .create_thread(ThreadSpec::new(SchedulePolicy::default()))
+            .unwrap();
         let mut tree = PiWaitTree::new();
         for primary in [30, 10, 50, 20, 40, 60] {
-            tree.insert(key(primary), PiWaitNode::empty());
+            tree.insert(
+                key(primary),
+                donation(primary, &thread.core),
+                PiWaitNode::empty(),
+            );
             tree.assert_invariants();
         }
         assert_eq!(tree.first(), Some(key(10)));
