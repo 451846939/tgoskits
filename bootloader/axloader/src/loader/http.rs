@@ -4,7 +4,8 @@ use alloc::{vec, vec::Vec};
 use core::time::Duration;
 
 use uefi::{
-    boot::{self, OpenProtocolAttributes, OpenProtocolParams},
+    Status,
+    boot::{self, OpenProtocolAttributes, OpenProtocolParams, SearchType},
     proto::network::{
         http::{HttpBinding, HttpHelper},
         ip4config2::Ip4Config2,
@@ -119,6 +120,8 @@ fn append_download_chunk(
 }
 
 fn prepare_network() {
+    connect_boot_controllers();
+
     let handles = match boot::find_handles::<Ip4Config2>() {
         Ok(handles) => handles,
         Err(err) => {
@@ -156,6 +159,36 @@ fn prepare_network() {
         crate::logln!("network_ifup_failed: {status:?}");
     } else {
         crate::logln!("network_ifup_failed: no IPv4 config handle");
+    }
+}
+
+fn connect_boot_controllers() {
+    let handles = match boot::locate_handle_buffer(SearchType::AllHandles) {
+        Ok(handles) => handles,
+        Err(err) => {
+            crate::logln!("network_connect_controllers_failed: {:?}", err.status());
+            return;
+        }
+    };
+
+    let mut connected = 0usize;
+    let mut ignored = 0usize;
+    let mut last_error = None;
+    for handle in handles.iter().copied() {
+        match boot::connect_controller(handle, None, None, true) {
+            Ok(()) => connected += 1,
+            Err(err) if err.status() == Status::NOT_FOUND => ignored += 1,
+            Err(err) => last_error = Some(err.status()),
+        }
+    }
+
+    if connected > 0 || last_error.is_some() {
+        crate::logln!(
+            "network_connect_controllers: connected={} ignored={} last_error={:?}",
+            connected,
+            ignored,
+            last_error
+        );
     }
 }
 
