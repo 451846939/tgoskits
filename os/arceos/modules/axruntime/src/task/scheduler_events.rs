@@ -7,7 +7,7 @@ use ax_task::TaskError;
 #[cfg(any(feature = "ipi", feature = "wake-ipi", test))]
 use ax_task::runtime::RuntimeStatus;
 #[cfg(feature = "irq")]
-use ax_task::runtime::TaskDeadlineUpdate;
+use ax_task::runtime::SchedulerDeadlineUpdate;
 
 #[cfg(any(feature = "ipi", feature = "wake-ipi"))]
 use super::with_current_cpu_pin;
@@ -34,8 +34,8 @@ pub struct QperfRuntimeSchedulerMetricsSnapshot {
 #[cfg(any(feature = "ipi", feature = "wake-ipi", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SchedulerIpiPublication {
-    Notify { epoch: u64 },
-    Coalesced { epoch: u64 },
+    Notify { generation: u64 },
+    Coalesced { generation: u64 },
 }
 
 #[cfg(any(feature = "ipi", feature = "wake-ipi", test))]
@@ -44,9 +44,9 @@ impl SchedulerIpiPublication {
         matches!(self, Self::Notify { .. })
     }
 
-    const fn epoch(self) -> u64 {
+    const fn generation(self) -> u64 {
         match self {
-            Self::Notify { epoch } | Self::Coalesced { epoch } => epoch,
+            Self::Notify { generation } | Self::Coalesced { generation } => generation,
         }
     }
 }
@@ -55,28 +55,27 @@ impl SchedulerIpiPublication {
 #[cfg(any(feature = "ipi", feature = "wake-ipi"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SchedulerIpiClaim {
-    epoch: u64,
+    generation: u64,
 }
 
 #[cfg(any(feature = "ipi", feature = "wake-ipi"))]
 impl SchedulerIpiClaim {
-    pub(crate) const fn epoch(self) -> u64 {
-        self.epoch
+    pub(crate) const fn generation(self) -> u64 {
+        self.generation
     }
 }
 
 /// Allocation-free generation transport for the shared physical IPI vector.
 ///
-/// `published_epoch` is the logical work generation, `claimed_epoch` records
-/// the generation observed at IPI entry, and `edge_armed` owns the one physical
-/// notification that covers the interval between them. Clearing the edge
-/// before reading the published generation lets a concurrent producer arm a
-/// fresh edge while the current handler drains work, matching Linux irq_work's
-/// PENDING-before-callback rule.
+/// `delivered_generation` is copied from ax-task's authoritative scheduler
+/// request state; this transport never creates or acknowledges logical work.
+/// `edge_armed` owns the one physical notification covering the latest
+/// delivered generation. Clearing the edge before reading the generation lets
+/// a concurrent producer arm a fresh edge while the current handler drains
+/// work, matching Linux irq_work's PENDING-before-callback rule.
 #[cfg(any(feature = "ipi", feature = "wake-ipi"))]
 pub(super) struct SchedulerIpiDoorbell {
-    published_epoch: AtomicU64,
-    claimed_epoch: AtomicU64,
+    delivered_generation: AtomicU64,
     edge_armed: core::sync::atomic::AtomicBool,
 }
 
@@ -84,28 +83,30 @@ pub(super) struct SchedulerIpiDoorbell {
 impl SchedulerIpiDoorbell {
     pub(super) const fn new() -> Self {
         Self {
-            published_epoch: AtomicU64::new(0),
-            claimed_epoch: AtomicU64::new(0),
+            delivered_generation: AtomicU64::new(0),
             edge_armed: core::sync::atomic::AtomicBool::new(false),
         }
     }
 
-    pub(super) fn publish(&self) -> SchedulerIpiPublication {
-        let epoch = self
-            .published_epoch
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |epoch| {
-                epoch.checked_add(1)
-            })
-            .unwrap_or_else(|_| panic!("scheduler IPI epoch exhausted"))
-            + 1;
+    pub(super) fn publish(&self, generation: u64) -> SchedulerIpiPublication {
+        assert_ne!(
+            generation, 0,
+            "scheduler request generation must be nonzero"
+        );
+        let previous = self
+            .delivered_generation
+            .fetch_max(generation, Ordering::AcqRel);
+        if generation <= previous {
+            return SchedulerIpiPublication::Coalesced { generation };
+        }
         if self
             .edge_armed
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            SchedulerIpiPublication::Notify { epoch }
+            SchedulerIpiPublication::Notify { generation }
         } else {
-            SchedulerIpiPublication::Coalesced { epoch }
+            SchedulerIpiPublication::Coalesced { generation }
         }
     }
 
@@ -113,15 +114,20 @@ impl SchedulerIpiDoorbell {
         if !self.edge_armed.swap(false, Ordering::AcqRel) {
             return None;
         }
-        let epoch = self.published_epoch.load(Ordering::Acquire);
-        self.claimed_epoch.store(epoch, Ordering::Release);
-        Some(SchedulerIpiClaim { epoch })
+        let generation = self.delivered_generation.load(Ordering::Acquire);
+        Some(SchedulerIpiClaim { generation })
     }
 
     pub(super) fn is_pending(&self) -> bool {
         self.edge_armed.load(Ordering::Acquire)
-            || self.published_epoch.load(Ordering::Acquire)
-                != self.claimed_epoch.load(Ordering::Acquire)
+    }
+
+    pub(super) fn reset_for_offline(&self) {
+        assert!(
+            !self.edge_armed.load(Ordering::Acquire),
+            "scheduler IPI edge must quiesce before CPU offline"
+        );
+        self.delivered_generation.store(0, Ordering::Release);
     }
 }
 
@@ -155,20 +161,8 @@ pub(super) fn record_scheduler_ipi_send() {
 pub(crate) fn on_clock_event(
     now: ax_task::runtime::MonotonicInstant,
     scheduler_tick: bool,
-) -> Option<TaskDeadlineUpdate> {
+) -> Option<SchedulerDeadlineUpdate> {
     TASK_TIMER_IRQ_COUNT.fetch_add(1, Ordering::Relaxed);
-    account_clock_event(now, scheduler_tick)
-}
-
-/// Performs the same bounded accounting when idle recovers a missed edge.
-///
-/// This is not a physical interrupt and therefore must not inflate the IRQ
-/// counter used by timer diagnostics.
-#[cfg(feature = "irq")]
-pub(crate) fn recover_clock_event(
-    now: ax_task::runtime::MonotonicInstant,
-    scheduler_tick: bool,
-) -> Option<TaskDeadlineUpdate> {
     account_clock_event(now, scheduler_tick)
 }
 
@@ -176,7 +170,7 @@ pub(crate) fn recover_clock_event(
 fn account_clock_event(
     now: ax_task::runtime::MonotonicInstant,
     scheduler_tick: bool,
-) -> Option<TaskDeadlineUpdate> {
+) -> Option<SchedulerDeadlineUpdate> {
     match ax_task::on_clock_event_with_scheduler_tick(
         now,
         TASK_CLOCK_EVENT_IRQ_BUDGET,
@@ -215,9 +209,24 @@ pub(crate) fn current_scheduler_ipi_doorbell_pending() -> bool {
 }
 
 #[cfg(any(feature = "ipi", feature = "wake-ipi"))]
+pub(crate) fn reset_current_scheduler_ipi_doorbell_for_offline() {
+    // SAFETY: CPU-offline preparation owns the IRQ-excluded current CPU after
+    // remote scheduler admission and every physical edge have quiesced.
+    unsafe {
+        with_current_cpu_pin(|pin| {
+            SCHEDULER_IPI_DOORBELL.with_current(pin, SchedulerIpiDoorbell::reset_for_offline)
+        })
+    }
+}
+
+#[cfg(any(feature = "ipi", feature = "wake-ipi"))]
 pub(super) fn publish_scheduler_ipi_doorbell(
     cpu_id: usize,
+    generation: u64,
 ) -> Result<SchedulerIpiPublication, RuntimeStatus> {
+    if generation == 0 {
+        return Err(RuntimeStatus::InvalidArgument);
+    }
     let Ok(cpu_index) = ax_percpu::CpuIndex::try_from(cpu_id) else {
         return Err(RuntimeStatus::InvalidArgument);
     };
@@ -226,7 +235,7 @@ pub(super) fn publish_scheduler_ipi_doorbell(
     };
     // SAFETY: runtime per-CPU areas are permanent after publication, and the
     // doorbell is an atomic object explicitly designed for remote publication.
-    Ok(unsafe { SCHEDULER_IPI_DOORBELL.remote_ptr(area).as_ref() }.publish())
+    Ok(unsafe { SCHEDULER_IPI_DOORBELL.remote_ptr(area).as_ref() }.publish(generation))
 }
 
 #[cfg(any(feature = "ipi", feature = "wake-ipi", test))]
@@ -238,7 +247,7 @@ pub(super) fn publish_then_notify_scheduler_ipi(
         Ok(publication) => publication,
         Err(status) => return status,
     };
-    debug_assert_ne!(publication.epoch(), 0);
+    debug_assert_ne!(publication.generation(), 0);
     if publication.needs_notification() {
         notify();
     }

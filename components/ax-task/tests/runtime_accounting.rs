@@ -13,6 +13,41 @@ use support::TaskSystemClockTestExt;
 static RESOURCE_RELEASE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]
+fn runqueue_task_clock_excludes_target_cpu_hardirq_time() {
+    support::clear_handles();
+    support::set_online_cpu_count(1);
+    support::set_hard_irq(false);
+    support::set_scheduler_ns_for_cpu(0, 100);
+    support::set_hardirq_ns_for_cpu(0, 5);
+
+    let system = TaskSystem::new(TaskSystemConfig::new(1)).unwrap();
+    let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
+    let running = system
+        .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
+        .unwrap();
+    system
+        .register_idle_thread(
+            cpu.as_mut(),
+            ThreadSpec::new(SchedulePolicy::fair(Nice::ZERO, FairMode::Idle)),
+        )
+        .unwrap();
+    system.bring_cpu_online(cpu.as_mut()).unwrap();
+
+    support::set_scheduler_ns_for_cpu(0, 160);
+    support::set_hardirq_ns_for_cpu(0, 25);
+    system.charge_current_until(cpu.as_mut(), 0).unwrap();
+
+    assert_eq!(
+        system
+            .thread_runtime(running.id())
+            .unwrap()
+            .charged_runtime_ns(),
+        40
+    );
+    support::clear_handles();
+}
+
+#[test]
 fn runtime_snapshot_includes_the_running_residual_before_switch_commit() {
     support::clear_handles();
     support::set_online_cpu_count(1);

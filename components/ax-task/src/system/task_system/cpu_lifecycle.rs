@@ -9,7 +9,12 @@ impl TaskSystem {
         cpu: CpuId,
     ) -> Result<Pin<alloc::boxed::Box<CpuLocal>>, TaskError> {
         let remote = Arc::clone(&self.state.lock().cpu_registration(cpu)?.remote);
-        Ok(CpuLocal::create(cpu, self.config, remote))
+        Ok(CpuLocal::create(
+            cpu,
+            self.config,
+            remote,
+            Arc::clone(self.root_domain.rt_bandwidth()),
+        ))
     }
 
     /// Returns the stable remote-publication endpoint of a placement-active CPU.
@@ -146,6 +151,9 @@ impl TaskSystem {
             cpu.as_ref().get_ref().remote().mark_online(),
             "validated offline CPU must accept final publication"
         );
+        if cpu.lock_run_queue().has_runnable_rt() {
+            self.root_domain.activate_rt_period(id, monotonic_now);
+        }
         self.topology_sequence.write_end();
         Ok(())
     }
@@ -185,6 +193,10 @@ impl TaskSystem {
             .checked_sub(1)
             .ok_or(TaskError::InvalidConfiguration)?;
         let deadline_rebuild = state.deadline_bandwidth_rebuild(remaining_online)?;
+        let rt_period_replacement = (0..root_domain.online.topology_len())
+            .map(|index| CpuId::new(index as u32))
+            .find(|candidate| *candidate != id && root_domain.online.contains(*candidate))
+            .ok_or(TaskError::LastOnlineCpu(id.as_u32()))?;
 
         self.topology_sequence.write_begin();
         let result = if !remote.try_deactivate() {
@@ -212,6 +224,13 @@ impl TaskSystem {
             self.online_count.store(online_count, Ordering::Release);
             remote.finish_offline();
             self.root_domain.publish_offline(id);
+            if self
+                .root_domain
+                .rt_bandwidth()
+                .migrate_owner(id, rt_period_replacement)
+            {
+                self.cpu_remotes[rt_period_replacement.as_usize()].kick_scheduler_work();
+            }
             Ok(())
         };
         self.topology_sequence.write_end();

@@ -12,7 +12,7 @@ use ax_task::{
         CurrentCpuLocalHandle, CurrentCpuOwnerHandles, ExecutionContextHandle, IrqGuardToken,
         KernelContextRequest, PreemptGuardToken, RuntimeCpuId, RuntimeHandleResult,
         RuntimeScheduleOrigin, RuntimeSchedulerEntry, RuntimeSchedulerReturn, RuntimeStatus,
-        SchedSwitchRecord, StackHandle, StackRequest, TaskDeadlineUpdate, TaskRuntime,
+        SchedSwitchRecord, SchedulerDeadlineUpdate, StackHandle, StackRequest, TaskRuntime,
         TaskSystemHandle, TlsHandle, TlsRequest, UserContextRequest,
     },
 };
@@ -39,6 +39,10 @@ std::thread_local! {
 
 #[ax_crate_interface::impl_interface]
 impl ax_kernel_guard::KernelGuardIf for UnitTestKernelGuard {
+    fn hardirq_enter() {}
+
+    fn hardirq_exit() {}
+
     fn disable_preempt() {
         PREEMPT_DEPTH.with(|depth| {
             depth.set(
@@ -179,11 +183,11 @@ impl_task_runtime! {
         fn monotonic_now() -> ax_task::runtime::MonotonicInstant {
             ax_task::runtime::MonotonicInstant::from_nanos(0).unwrap()
         }
-        fn scheduler_clock_source(_cpu: RuntimeCpuId) -> ax_task::SchedulerTimestamp {
-            ax_task::SchedulerTimestamp::from_nanos(0)
+        fn rq_clock_sample(_cpu: RuntimeCpuId) -> RqClockSample {
+            RqClockSample::new(ax_task::SchedulerTimestamp::from_nanos(0), 0)
         }
-        fn publish_task_deadline(_update: TaskDeadlineUpdate) {}
-        fn send_scheduler_ipi(_cpu: RuntimeCpuId) -> RuntimeStatus {
+        fn publish_scheduler_deadline(_update: SchedulerDeadlineUpdate) {}
+        fn send_scheduler_ipi(_cpu: RuntimeCpuId, _generation: u64) -> RuntimeStatus {
             RuntimeStatus::Success
         }
         fn wait_for_interrupt() {}

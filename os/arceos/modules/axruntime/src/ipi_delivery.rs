@@ -28,7 +28,7 @@ fn claim_local_scheduler_delivery() -> bool {
     let Some(claim) = crate::task::claim_scheduler_ipi_doorbell() else {
         return false;
     };
-    debug_assert_ne!(claim.epoch(), 0);
+    debug_assert_ne!(claim.generation(), 0);
     true
 }
 

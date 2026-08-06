@@ -178,19 +178,12 @@ mod tests {
         arm_current_park_deadline(&running, &mut ticket, deadline(0)).unwrap();
 
         assert_eq!(on_clock_event(instant(0), 64).unwrap().expired(), 1);
-        let mut irq = RuntimeIrqGuard::enter();
-        assert_eq!(
-            drain_current_expired_timers(system.as_ref().get_ref(), &mut irq).unwrap(),
-            1
-        );
-        drop(irq);
         assert_eq!(
             system.thread_state(running.id()).unwrap(),
             crate::ThreadState::Parking,
-            "timer wake must leave the owner thread to finish its PARKING handshake"
+            "hard IRQ only publishes soft-timer work"
         );
         assert_eq!(owner_snapshot(&system, cpu.as_ref()).runnable(), 0);
-        cpu.request_reschedule();
         let mut irq_return_passes = 0;
         while current_cpu_needs_resched().unwrap() {
             assert!(
@@ -247,14 +240,7 @@ mod tests {
         system.bring_cpu_online(cpu.as_mut()).unwrap();
         let _runtime_handles = InstalledTaskHandles::new(system.as_ref(), cpu.as_mut());
 
-        {
-            let mut irq = RuntimeIrqGuard::enter();
-            assert_eq!(
-                service_scheduler_safe_point_deadlines(system.as_ref().get_ref(), &mut irq)
-                    .unwrap(),
-                0
-            );
-        }
+        system.service_soft_timer_work(cpu.as_mut(), 0).unwrap();
         assert_eq!(
             cpu.deadline_expire_passes_for_test(),
             0,
@@ -298,16 +284,16 @@ mod tests {
             let _irq = RuntimeIrqGuard::enter();
             let clock = cpu.update_rq_clock();
             cpu.as_mut()
-                .next_task_deadline_update(clock, instant(0))
+                .next_scheduler_deadline_update(clock, instant(0))
                 .unwrap()
         };
-        task_runtime::publish_task_deadline(initial);
-        assert!(test_runtime::take_task_deadline_update().is_some());
+        task_runtime::publish_scheduler_deadline(initial);
+        assert!(test_runtime::take_scheduler_deadline_update().is_some());
 
         yield_current_cpu().unwrap();
 
         assert!(
-            test_runtime::take_task_deadline_update().is_none(),
+            test_runtime::take_scheduler_deadline_update().is_none(),
             "sched_yield must not republish an unchanged logical clockevent"
         );
     }
@@ -383,7 +369,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_safe_point_recovers_overdue_deadline_without_clock_irq() {
+    fn scheduler_safe_point_only_services_deadlines_claimed_by_clock_irq() {
         let system = Box::pin(TaskSystem::new(crate::TaskSystemConfig::new(1)).unwrap());
         let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
         let running = system
@@ -401,16 +387,22 @@ mod tests {
         test_runtime::set_monotonic_ns(10);
         assert!(
             schedule_current_cpu().unwrap().parking_deferred(),
-            "the owner must retain its PARKING handshake at the recovery safe point"
+            "an unclaimed soft timer must not change the PARKING handshake"
         );
         assert!(
+            !running.core.take_park_notification(),
+            "scheduler entry must not poll an unclaimed timer heap"
+        );
+
+        assert_eq!(on_clock_event(instant(10), 64).unwrap().expired(), 1);
+        assert!(schedule_current_cpu().unwrap().parking_deferred());
+        assert!(
             running.core.take_park_notification(),
-            "a scheduler safe point must recover a due task deadline even when no physical \
-             clockevent IRQ was observed"
+            "the soft-timer owner must complete the IRQ-claimed expiration"
         );
         assert!(
             !cancel_current_park_deadline(&running, &mut ticket).unwrap(),
-            "safe-point recovery must physically consume the expired deadline entry"
+            "the claimed timer must be physically consumed exactly once"
         );
         cancel_current_park(&mut ticket).unwrap();
     }
@@ -501,7 +493,6 @@ mod tests {
 
         assert_eq!(outcome.expired(), 1);
         assert!(outcome.pending());
-        assert!(outcome.update().deferred_work());
         assert!(
             outcome
                 .update()
@@ -615,11 +606,18 @@ mod tests {
         let irq = on_clock_event(instant(10), 1).unwrap();
         assert_eq!(irq.expired(), 1);
         assert!(irq.pending());
-        assert!(schedule_current_cpu().is_ok());
-        assert!(current_cpu_needs_resched().unwrap());
-        assert!(schedule_current_cpu().is_ok());
+        let mut passes = 0;
+        while current_cpu_needs_resched().unwrap() {
+            assert!(schedule_current_cpu().is_ok());
+            passes += 1;
+            assert!(
+                passes <= 3,
+                "bounded soft-timer work must make progress: {:?}",
+                cpu.remote().scheduler_request_state_for_test()
+            );
+        }
+        assert_eq!(passes, 3);
         assert!(cpu.as_mut().task_deadlines().is_empty());
-        assert!(!current_cpu_needs_resched().unwrap());
     }
 
     #[test]
@@ -724,7 +722,7 @@ mod tests {
             panic!("fresh park must publish PARKING");
         };
         let _ = permit;
-        cpu.as_mut().set_task_deadline_generation_for_test(u64::MAX);
+        cpu.as_mut().set_scheduler_deadline_generation_for_test(u64::MAX);
 
         assert_eq!(
             arm_current_park_deadline(&running, &mut ticket, deadline(10)),
@@ -752,7 +750,7 @@ mod tests {
         };
         let _ = permit;
         arm_current_park_deadline(&running, &mut ticket, deadline(10)).unwrap();
-        cpu.as_mut().set_task_deadline_generation_for_test(u64::MAX);
+        cpu.as_mut().set_scheduler_deadline_generation_for_test(u64::MAX);
 
         assert_eq!(
             cancel_current_park_deadline(&running, &mut ticket),
@@ -768,7 +766,7 @@ mod tests {
             Some(deadline(10))
         );
 
-        cpu.as_mut().set_task_deadline_generation_for_test(1);
+        cpu.as_mut().set_scheduler_deadline_generation_for_test(1);
         assert!(cancel_current_park_deadline(&running, &mut ticket).unwrap());
         cancel_current_park(&mut ticket).unwrap();
     }
@@ -984,7 +982,7 @@ mod tests {
         // Forced schedule paths used to consume the sticky bit without first
         // draining owner work. Claiming scheduler entry must re-observe the
         // published inbox and preserve a doorbell for the next bounded drain.
-        cpu.as_mut().scheduler_enter();
+        let _ = cpu.remote().take_preempt_requested();
         assert!(cpu.needs_reschedule());
 
         let _outcome = schedule_current_cpu().unwrap();
@@ -1610,13 +1608,12 @@ mod tests {
         );
 
         test_runtime::reenter_needs_reschedule_from_next_hook();
-        let update = crate::runtime::TaskDeadlineUpdate::try_new(
+        let update = crate::runtime::SchedulerDeadlineUpdate::try_new(
             1,
             crate::runtime::MonotonicDeadline::from_nanos(1),
-            false,
         )
         .unwrap();
-        task_runtime::publish_task_deadline(update);
+        task_runtime::publish_scheduler_deadline(update);
         assert_eq!(
             test_runtime::take_hook_reentry_error(),
             None,
@@ -1624,7 +1621,7 @@ mod tests {
         );
 
         test_runtime::reenter_current_thread_from_next_hook();
-        let _status = task_runtime::send_scheduler_ipi(RuntimeCpuId::new(0));
+        let _status = task_runtime::send_scheduler_ipi(RuntimeCpuId::new(0), 1);
         assert_eq!(
             test_runtime::take_hook_reentry_error(),
             None,

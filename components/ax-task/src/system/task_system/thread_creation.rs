@@ -179,7 +179,7 @@ impl TaskSystem {
 
         let thread = self.create_thread(unpublished.into_spec())?;
         let setup = (|| {
-            let now_ns = cpu.update_rq_clock().as_nanos();
+            let now_ns = cpu.update_rq_clock().task_nanos();
             let state = self.state.lock();
             let record = state.thread_record(thread.id())?;
             let core = Arc::clone(&record.core);

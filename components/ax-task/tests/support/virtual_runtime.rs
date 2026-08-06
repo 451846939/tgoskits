@@ -52,8 +52,7 @@ pub(super) enum VirtualIdleState {
 #[derive(Clone, Copy)]
 pub(super) struct VirtualCpuState {
     pub(super) online: bool,
-    pub(super) ipi_published_epoch: u64,
-    pub(super) ipi_claimed_epoch: u64,
+    pub(super) ipi_delivered_generation: u64,
     pub(super) ipi_edge_pending: bool,
     pub(super) ipi_send_count: usize,
     pub(super) scheduler_work_generation: u64,
@@ -69,8 +68,7 @@ impl VirtualCpuState {
     const fn new() -> Self {
         Self {
             online: false,
-            ipi_published_epoch: 0,
-            ipi_claimed_epoch: 0,
+            ipi_delivered_generation: 0,
             ipi_edge_pending: false,
             ipi_send_count: 0,
             scheduler_work_generation: 0,
@@ -160,15 +158,24 @@ impl VirtualRuntimeState {
         Ok(generation)
     }
 
-    pub(super) fn publish_ipi(&mut self, cpu: u32) -> RuntimeStatus {
+    pub(super) fn publish_ipi(&mut self, cpu: u32, generation: u64) -> RuntimeStatus {
+        if generation == 0 {
+            return RuntimeStatus::InvalidArgument;
+        }
         let Some(state) = self.cpu_mut(cpu) else {
             return RuntimeStatus::InvalidArgument;
         };
-        state.ipi_published_epoch = state
-            .ipi_published_epoch
-            .checked_add(1)
-            .expect("virtual scheduler IPI epoch exhausted");
-        let epoch = state.ipi_published_epoch;
+        if generation <= state.ipi_delivered_generation {
+            self.record(
+                cpu,
+                VirtualRuntimeEventKind::IpiEdgeCoalesced,
+                generation,
+                0,
+                0,
+            );
+            return RuntimeStatus::Success;
+        }
+        state.ipi_delivered_generation = generation;
         let kind = if state.ipi_edge_pending {
             VirtualRuntimeEventKind::IpiEdgeCoalesced
         } else {
@@ -179,7 +186,7 @@ impl VirtualRuntimeState {
                 .expect("virtual scheduler IPI count exhausted");
             VirtualRuntimeEventKind::IpiEdgePublished
         };
-        self.record(cpu, kind, epoch, 0, 0);
+        self.record(cpu, kind, generation, 0, 0);
         RuntimeStatus::Success
     }
 
@@ -188,11 +195,10 @@ impl VirtualRuntimeState {
         if !core::mem::replace(&mut state.ipi_edge_pending, false) {
             return None;
         }
-        let epoch = state.ipi_published_epoch;
-        state.ipi_claimed_epoch = epoch;
+        let generation = state.ipi_delivered_generation;
         state.idle_state = VirtualIdleState::Running;
-        self.record(cpu, VirtualRuntimeEventKind::IpiClaimed, epoch, 0, 0);
-        Some(epoch)
+        self.record(cpu, VirtualRuntimeEventKind::IpiClaimed, generation, 0, 0);
+        Some(generation)
     }
 
     pub(super) fn events(&self) -> Vec<VirtualRuntimeEvent> {

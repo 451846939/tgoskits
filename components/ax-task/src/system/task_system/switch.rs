@@ -307,8 +307,7 @@ impl TaskSystem {
         let mut reconciled = 0;
         let core = loop {
             let queued = {
-                let dispatch = cpu.as_mut().dispatch_state_mut();
-                let rt_eligibility = if dispatch.rt_bandwidth.may_run(now_ns, false) {
+                let rt_eligibility = if !cpu.lock_run_queue().rt_is_effectively_throttled() {
                     RtEligibility::Ordinary
                 } else {
                     RtEligibility::PiOwnerOnly

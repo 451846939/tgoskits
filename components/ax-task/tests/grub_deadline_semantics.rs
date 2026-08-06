@@ -157,6 +157,16 @@ fn reclaim_starts_only_after_the_blocked_reservation_zero_lag_time() {
     assert_eq!(cpu.deadline_bandwidth().this_bw_scaled(), 750_000_000);
     assert_eq!(cpu.deadline_bandwidth().running_bw_scaled(), 750_000_000);
     support::set_monotonic_ns(4);
+    let irq_budget = cpu.batch_limit();
+    assert_eq!(
+        cpu.as_mut()
+            .on_task_clock_event(
+                ax_task::runtime::MonotonicInstant::from_nanos(4).unwrap(),
+                irq_budget,
+            )
+            .expired(),
+        1
+    );
     assert!(
         system
             .schedule_if_requested_at(cpu.as_mut(), 4)
@@ -343,6 +353,16 @@ fn throttled_wake_cannot_restore_cbs_budget_before_replenishment() {
     }
     assert_eq!(thread.state(), ThreadState::Blocked);
     support::set_monotonic_ns(20);
+    let irq_budget = cpu.batch_limit();
+    assert_eq!(
+        cpu.as_mut()
+            .on_task_clock_event(
+                ax_task::runtime::MonotonicInstant::from_nanos(20).unwrap(),
+                irq_budget,
+            )
+            .expired(),
+        1
+    );
     let decision = system.schedule_at(cpu.as_mut(), 20).unwrap();
     assert_eq!(decision.next(), thread.id());
     assert_eq!(

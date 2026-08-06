@@ -16,6 +16,10 @@ struct KernelGuardIfImpl;
 
 #[ax_crate_interface::impl_interface]
 impl ax_kernel_guard::KernelGuardIf for KernelGuardIfImpl {
+    fn hardirq_enter() {}
+
+    fn hardirq_exit() {}
+
     fn enable_preempt() {
         PREEMPT_DEPTH.fetch_sub(1, Ordering::AcqRel);
     }

@@ -36,6 +36,8 @@
 //!
 //! #[ax_crate_interface::impl_interface]
 //! impl KernelGuardIf for KernelGuardIfImpl {
+//!     fn hardirq_enter() {}
+//!     fn hardirq_exit() {}
 //!     fn enable_preempt() {
 //!         // Your implementation here
 //!     }
@@ -67,6 +69,19 @@ mod arch;
 /// Low-level interfaces that must be implemented by the crate user.
 #[ax_crate_interface::def_interface]
 pub trait KernelGuardIf {
+    /// Accounts entry into a hard-interrupt context.
+    ///
+    /// The common IRQ entry invokes this after disabling preemption and local
+    /// interrupts. A preemptive runtime must override this method and publish
+    /// the elapsed hard-IRQ time before IRQ-return scheduling is allowed.
+    fn hardirq_enter();
+
+    /// Accounts exit from a hard-interrupt context.
+    ///
+    /// The common IRQ exit invokes this before releasing the IRQ-return
+    /// preemption guard, matching Linux's `account_hardirq_exit()` ordering.
+    fn hardirq_exit();
+
     /// Enables kernel preemption from ordinary task context.
     ///
     /// If local IRQs are disabled, this path must defer scheduling. It must not
@@ -82,6 +97,20 @@ pub trait KernelGuardIf {
 
     /// How to disable kernel preemption.
     fn disable_preempt();
+}
+
+/// Publishes entry into the common hard-interrupt lifecycle.
+#[inline]
+pub fn hardirq_enter() {
+    #[cfg(feature = "preempt")]
+    ax_crate_interface::call_interface!(KernelGuardIf::hardirq_enter);
+}
+
+/// Publishes exit from the common hard-interrupt lifecycle.
+#[inline]
+pub fn hardirq_exit() {
+    #[cfg(feature = "preempt")]
+    ax_crate_interface::call_interface!(KernelGuardIf::hardirq_exit);
 }
 
 /// A base trait that all guards implement.

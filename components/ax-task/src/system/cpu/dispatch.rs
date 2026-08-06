@@ -1,7 +1,7 @@
 //! Owner-local dispatch accounting and switch-tail handoff.
 
 use super::*;
-use crate::{DeadlineEntity, scheduler_time_advance};
+use crate::{DeadlineEntity, SchedulerTimestamp, scheduler_time_advance};
 
 /// State committed before an architecture switch and consumed by switch tail.
 #[derive(Debug)]
@@ -304,7 +304,7 @@ impl CurrentDispatch {
     }
 
     pub(super) fn unaccounted_runtime(&self, now_ns: u64) -> u64 {
-        now_ns.saturating_sub(self.accounted_until_ns)
+        dispatch_runtime_delta(now_ns, self.accounted_until_ns)
     }
 
     pub(super) fn runtime_core(&self) -> &ThreadCore {
@@ -393,6 +393,10 @@ impl CurrentDispatch {
     }
 }
 
+fn dispatch_runtime_delta(now_ns: u64, accounted_until_ns: u64) -> u64 {
+    SchedulerTimestamp::from_nanos(now_ns).since(SchedulerTimestamp::from_nanos(accounted_until_ns))
+}
+
 fn grub_charge_ns(
     runtime_ns: u64,
     own_bw_scaled: u64,
@@ -431,7 +435,12 @@ pub(crate) struct DispatchCharge {
 
 #[cfg(test)]
 mod tests {
-    use super::grub_charge_ns;
+    use super::{dispatch_runtime_delta, grub_charge_ns};
+
+    #[test]
+    fn dispatch_runtime_survives_scheduler_clock_wrap() {
+        assert_eq!(dispatch_runtime_delta(2, u64::MAX - 2), 5);
+    }
 
     #[test]
     fn grub_charge_uses_linux_fixed_point_truncation() {

@@ -53,153 +53,23 @@ fn schedule_current_cpu_with_entry(
     let mut scheduler_frame =
         RuntimeSchedulerFrameGuard::enter(RuntimeScheduleOrigin::Preempt, entry)?;
     let system = runtime_task_system()?;
-    let (fast_outcome, deadline_service_now) = {
+    let outcome = {
         let mut cpu = runtime_current_cpu_mut(&mut scheduler_frame)?;
-        let deadline_work_pending = cpu.deadline_work_pending();
-        let monotonic_now =
-            (deadline_work_pending || cpu.has_task_deadlines()).then(task_runtime::monotonic_now);
-        if deadline_work_pending
-            || monotonic_now.is_some_and(|now| cpu.task_deadline_expiry_due(now))
-        {
-            (None, monotonic_now)
+        let current_state = cpu.current_lifecycle_state();
+        if !cpu.needs_reschedule() && !cpu.has_remote_work() {
+            if current_state == Some(ThreadState::Parking) {
+                SchedulerOutcome::ParkingDeferred
+            } else {
+                SchedulerOutcome::Quiescent
+            }
         } else {
-            (
-                Some(schedule_cpu_after_deadline_service(system, cpu.as_mut())?),
-                None,
-            )
+            system.schedule_if_requested(cpu.as_mut())?
         }
-    };
-    let outcome = if let Some(outcome) = fast_outcome {
-        outcome
-    } else {
-        service_scheduler_safe_point_deadlines_at(
-            system,
-            &mut scheduler_frame,
-            deadline_service_now.expect("deadline slow path must retain its physical clock sample"),
-        )?;
-        let mut cpu = runtime_current_cpu_mut(&mut scheduler_frame)?;
-        schedule_cpu_after_deadline_service(system, cpu.as_mut())?
     };
     if let Some(decision) = outcome.decision() {
         execute_switch_plan(&mut scheduler_frame, decision);
     }
     Ok(outcome)
-}
-
-fn schedule_cpu_after_deadline_service(
-    system: &TaskSystem,
-    mut cpu: Pin<&mut CpuLocal>,
-) -> Result<SchedulerOutcome, TaskError> {
-    let current_state = cpu.current_lifecycle_state();
-    if !cpu.needs_reschedule() && !cpu.has_remote_work() {
-        Ok(if current_state == Some(ThreadState::Parking) {
-            SchedulerOutcome::ParkingDeferred
-        } else {
-            SchedulerOutcome::Quiescent
-        })
-    } else {
-        system.schedule_if_requested_after_deadline_service(cpu.as_mut())
-    }
-}
-
-pub(super) fn drain_current_expired_timers(
-    system: &TaskSystem,
-    pin: &mut impl RuntimeCpuPin,
-) -> Result<usize, TaskError> {
-    let mut drained = 0;
-    loop {
-        let event = {
-            let mut cpu = runtime_current_cpu_mut(pin)?;
-            cpu.as_mut().take_expired_park_deadline()
-        };
-        let Some(event) = event else {
-            break;
-        };
-        let Some(thread) = event.thread() else {
-            continue;
-        };
-        match system.thread_handle(thread) {
-            Ok(handle) => {
-                let completed = handle.core.complete_sleep_timer(event.token().generation());
-                let park_matches = event.kind().is_some_and(|kind| {
-                    kind.park_generation() == Some(handle.core.park_generation())
-                });
-                if completed && park_matches {
-                    let _wake_result = handle.wake_handle().wake();
-                }
-            }
-            Err(TaskError::StaleThreadId) => {}
-            Err(error) => return Err(error),
-        }
-        drained += 1;
-    }
-    Ok(drained)
-}
-
-#[cfg(test)]
-pub(super) fn service_scheduler_safe_point_deadlines(
-    system: &TaskSystem,
-    pin: &mut impl RuntimeCpuPin,
-) -> Result<u64, TaskError> {
-    service_scheduler_safe_point_deadlines_at(system, pin, task_runtime::monotonic_now()).map(
-        |()| {
-            let mut cpu = runtime_current_cpu_mut(pin)
-                .expect("test scheduler pin must retain its current CPU");
-            cpu.as_mut().update_rq_clock().as_nanos()
-        },
-    )
-}
-
-fn service_scheduler_safe_point_deadlines_at(
-    system: &TaskSystem,
-    pin: &mut impl RuntimeCpuPin,
-    now: MonotonicInstant,
-) -> Result<(), TaskError> {
-    let should_run = {
-        let mut cpu = runtime_current_cpu_mut(pin)?;
-        let expiry_due = cpu.task_deadline_expiry_due(now);
-        if !cpu.deadline_work_pending() && !expiry_due {
-            return Ok(());
-        }
-        cpu.as_mut().begin_deadline_work() || expiry_due
-    };
-    if !should_run {
-        return Ok(());
-    }
-
-    let result = (|| {
-        // Empty the bounded IRQ buffer before promoting another batch. This
-        // guarantees progress even when the clockevent filled every slot,
-        // while still entering the heap expiry engine at most once per safe
-        // point.
-        let mut drained = drain_current_expired_timers(system, pin)?;
-        let batch_pending = {
-            let mut cpu = runtime_current_cpu_mut(pin)?;
-            if cpu.task_deadline_expiry_due(now) {
-                let budget = cpu.batch_limit();
-                cpu.as_mut().expire_task_deadlines(now, budget).pending()
-            } else {
-                false
-            }
-        };
-        drained += drain_current_expired_timers(system, pin)?;
-        let mut cpu = runtime_current_cpu_mut(pin)?;
-        let pending =
-            batch_pending || cpu.has_expired_task_deadlines() || cpu.task_deadline_expiry_due(now);
-        cpu.as_mut().finish_deadline_work(pending);
-        Ok(drained)
-    })();
-    if result.is_err() {
-        let mut cpu = runtime_current_cpu_mut(pin)?;
-        cpu.as_mut().finish_deadline_work(true);
-    }
-    let _drained = result?;
-    let _scheduler_events = {
-        let mut cpu = runtime_current_cpu_mut(pin)?;
-        let scheduler_now_ns = cpu.as_mut().update_rq_clock().as_nanos();
-        system.service_pending_deadline_timers(cpu.as_mut(), scheduler_now_ns, now)?
-    };
-    Ok(())
 }
 
 /// Yields the calling thread and executes the resulting context switch.

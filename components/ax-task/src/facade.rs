@@ -48,17 +48,14 @@ pub(crate) use runtime_cpu::{
     RuntimeIrqGuard, current_cpu_remote, runtime_current_cpu_mut, runtime_task_system,
     wake_thread_direct,
 };
+#[cfg(test)]
+use scheduling::prepare_next_address_space;
 pub use scheduling::{
     ExitPermit, commit_current_exit, exit_current_thread, prepare_current_exit,
     schedule_current_cpu, schedule_current_cpu_from_irq_guard_exit,
     schedule_current_cpu_from_preempt_exit, yield_current_cpu,
 };
 use scheduling::{complete_current_context_switch_tail, execute_switch_plan};
-#[cfg(test)]
-use scheduling::{
-    drain_current_expired_timers, prepare_next_address_space,
-    service_scheduler_safe_point_deadlines,
-};
 pub(crate) use task_work::publish_deferred_coroutine_reclaim;
 #[cfg(test)]
 use task_work::{TaskWorkServiceAction, service_task_work_pass, task_work_service_action};

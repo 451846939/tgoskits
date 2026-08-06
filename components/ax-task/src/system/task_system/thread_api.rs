@@ -35,7 +35,7 @@ impl TaskSystem {
                 self.cpu_remotes
                     .get(cpu.as_usize())
                     .ok_or(TaskError::InvalidCpu(cpu.as_u32()))
-                    .map(|remote| remote.lock_run_queue().update_clock().as_nanos())
+                    .map(|remote| remote.lock_run_queue().update_clock().task_nanos())
             })
             .transpose()?;
         let snapshot = core.runtime_snapshot(running_now_ns);

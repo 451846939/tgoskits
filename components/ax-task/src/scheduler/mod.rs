@@ -13,4 +13,4 @@ pub use clock::*;
 pub use entity::*;
 pub use fair::*;
 pub(crate) use queue::*;
-pub use rt::*;
+pub(crate) use rt::*;

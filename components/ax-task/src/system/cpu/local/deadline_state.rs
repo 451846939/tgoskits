@@ -1,9 +1,8 @@
 use super::*;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct TaskDeadlinePublicationState {
+pub(super) struct SchedulerDeadlinePublicationState {
     pub(super) deadline: Option<MonotonicDeadline>,
-    pub(super) deferred_work: bool,
 }
 
 #[derive(Debug)]
@@ -12,7 +11,7 @@ pub(crate) struct LocalTaskDeadlineState {
     pub(crate) expired_buffer: Vec<ExpiredTaskDeadline>,
     pub(crate) expired_count: usize,
     pub(super) generation: u64,
-    pub(super) publication: Option<TaskDeadlinePublicationState>,
+    pub(super) publication: Option<SchedulerDeadlinePublicationState>,
     #[cfg(test)]
     pub(super) expire_passes: usize,
 }

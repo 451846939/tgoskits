@@ -16,6 +16,7 @@ pub use owner::CpuLocalOwnerBorrow;
 pub(crate) use run_queue::CpuRunQueueState;
 #[cfg(feature = "qperf-metrics")]
 pub(crate) use run_queue::WakePreemptionDecision;
+pub(crate) use scheduler::SchedulerRequestClaim;
 
 /// Stable cross-CPU publication endpoint for one scheduler owner.
 ///

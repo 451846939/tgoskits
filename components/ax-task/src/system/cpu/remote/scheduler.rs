@@ -1,29 +1,62 @@
 use super::*;
 
-const SCHEDULER_WORK_PENDING: u8 = 1 << 0;
-const SCHEDULER_IDLE_POLLING: u8 = 1 << 1;
+const REQUEST_PREEMPT: u64 = 1 << 0;
+const REQUEST_OWNER_WORK: u64 = 1 << 1;
+const REQUEST_SOFT_TIMER: u64 = 1 << 2;
+const REQUEST_REASON_MASK: u64 = REQUEST_PREEMPT | REQUEST_OWNER_WORK | REQUEST_SOFT_TIMER;
+const REQUEST_ENTRY_MASK: u64 = REQUEST_PREEMPT | REQUEST_OWNER_WORK;
+const REQUEST_IDLE_POLLING: u64 = 1 << 3;
+const REQUEST_GENERATION_SHIFT: u32 = 8;
+const REQUEST_FLAGS_MASK: u64 = (1 << REQUEST_GENERATION_SHIFT) - 1;
+const REQUEST_GENERATION_MAX: u64 = u64::MAX >> REQUEST_GENERATION_SHIFT;
 const DEFERRED_SCHEDULER_WORK_OFFLINE_INVARIANT: u32 = 0x4453_574f;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum SchedulerWorkPublication {
+pub(super) enum SchedulerRequestDelivery {
     /// The owner is in the IRQ-disabled idle polling region and will observe
     /// the sticky work bit before committing to sleep.
     PollingOwner,
     /// The runtime must publish a physical-delivery generation.
     ///
-    /// This is deliberately independent of `SCHEDULER_WORK_PENDING`: that bit
-    /// is the logical scheduling fact and may have been set by owner-local
-    /// work which never armed a remote doorbell. Physical edge coalescing is
-    /// owned by the runtime's per-CPU generation transport.
+    /// The logical request generation is already committed in ax-task; the
+    /// runtime transports that exact generation without inventing another.
     DoorbellRequired,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SchedulerRequestPublication {
+    generation: u64,
+    delivery: SchedulerRequestDelivery,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct SchedulerRequestClaim {
+    generation: u64,
+    preempt: bool,
+}
+
+impl SchedulerRequestClaim {
+    pub(crate) const fn preempt_requested(self) -> bool {
+        self.preempt
+    }
+
+    pub(crate) const fn merge(self, other: Self) -> Self {
+        Self {
+            generation: if self.generation > other.generation {
+                self.generation
+            } else {
+                other.generation
+            },
+            preempt: self.preempt || other.preempt,
+        }
+    }
 }
 
 #[derive(Debug)]
 pub(super) struct SchedulerDoorbellState {
     ready: AtomicBool,
-    flags: AtomicU8,
-    deadline_work_pending: AtomicBool,
-    preempt_requested: AtomicBool,
+    request: AtomicU64,
+    acknowledged_generation: AtomicU64,
     park_preempt_deferred: AtomicBool,
 }
 
@@ -31,12 +64,15 @@ impl SchedulerDoorbellState {
     pub(super) const fn new() -> Self {
         Self {
             ready: AtomicBool::new(false),
-            flags: AtomicU8::new(0),
-            deadline_work_pending: AtomicBool::new(false),
-            preempt_requested: AtomicBool::new(false),
+            request: AtomicU64::new(0),
+            acknowledged_generation: AtomicU64::new(0),
             park_preempt_deferred: AtomicBool::new(false),
         }
     }
+}
+
+const fn request_generation(word: u64) -> u64 {
+    word >> REQUEST_GENERATION_SHIFT
 }
 
 impl CpuRemote {
@@ -56,11 +92,8 @@ impl CpuRemote {
         self.request_reschedule_owned();
     }
 
-    fn request_reschedule_owned(&self) -> SchedulerWorkPublication {
-        self.scheduler
-            .preempt_requested
-            .store(true, Ordering::Release);
-        self.request_scheduler_work_owned()
+    fn request_reschedule_owned(&self) -> SchedulerRequestPublication {
+        self.publish_scheduler_request_owned(REQUEST_PREEMPT)
     }
 
     /// Publishes a remote preemption and rings the target doorbell only after
@@ -81,45 +114,60 @@ impl CpuRemote {
         self.request_scheduler_work_owned();
     }
 
-    pub(super) fn request_scheduler_work_owned(&self) -> SchedulerWorkPublication {
+    pub(super) fn request_scheduler_work_owned(&self) -> SchedulerRequestPublication {
+        self.publish_scheduler_request_owned(REQUEST_OWNER_WORK)
+    }
+
+    fn publish_scheduler_request_owned(&self, reason: u64) -> SchedulerRequestPublication {
+        debug_assert_ne!(reason & REQUEST_REASON_MASK, 0);
         let previous = self
             .scheduler
-            .flags
-            .fetch_or(SCHEDULER_WORK_PENDING, Ordering::AcqRel);
-        if previous & SCHEDULER_IDLE_POLLING != 0 {
-            SchedulerWorkPublication::PollingOwner
+            .request
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |word| {
+                let generation = request_generation(word).checked_add(1)?;
+                if generation > REQUEST_GENERATION_MAX {
+                    return None;
+                }
+                Some(
+                    (generation << REQUEST_GENERATION_SHIFT) | (word & REQUEST_FLAGS_MASK) | reason,
+                )
+            })
+            .unwrap_or_else(|_| panic!("scheduler request generation exhausted"));
+        let generation = request_generation(previous) + 1;
+        let delivery = if previous & REQUEST_IDLE_POLLING != 0 {
+            SchedulerRequestDelivery::PollingOwner
         } else {
-            SchedulerWorkPublication::DoorbellRequired
+            SchedulerRequestDelivery::DoorbellRequired
+        };
+        SchedulerRequestPublication {
+            generation,
+            delivery,
         }
     }
 
-    pub(in crate::system::cpu) fn publish_deadline_work(&self) {
+    pub(in crate::system::cpu) fn publish_soft_timer_work(&self) {
+        let _ = self.publish_scheduler_request_owned(REQUEST_SOFT_TIMER);
+    }
+
+    pub(crate) fn soft_timer_work_pending(&self) -> bool {
+        self.scheduler.request.load(Ordering::Acquire) & REQUEST_SOFT_TIMER != 0
+    }
+
+    pub(in crate::system::cpu) fn begin_soft_timer_work(&self) -> bool {
         self.scheduler
-            .deadline_work_pending
-            .store(true, Ordering::Release);
-        let _ = self.request_scheduler_work_owned();
+            .request
+            .fetch_and(!REQUEST_SOFT_TIMER, Ordering::AcqRel)
+            & REQUEST_SOFT_TIMER
+            != 0
     }
 
-    pub(crate) fn deadline_work_pending(&self) -> bool {
-        self.scheduler.deadline_work_pending.load(Ordering::Acquire)
-    }
-
-    pub(in crate::system::cpu) fn begin_deadline_work(&self) -> bool {
-        self.scheduler
-            .deadline_work_pending
-            .swap(false, Ordering::AcqRel)
-    }
-
-    pub(in crate::system::cpu) fn finish_deadline_work(&self, pending: bool) {
+    pub(in crate::system::cpu) fn finish_soft_timer_work(&self, pending: bool) {
         // Only the owner CPU publishes deadline work, and both timer IRQ and
         // scheduler safe-point paths hold local IRQ exclusion while mutating
         // CpuLocal. The completed pass therefore owns the full publication
         // interval and may replace the sticky bit with its actual remainder.
-        self.scheduler
-            .deadline_work_pending
-            .store(pending, Ordering::Release);
         if pending {
-            let _ = self.request_scheduler_work_owned();
+            let _ = self.publish_scheduler_request_owned(REQUEST_SOFT_TIMER);
         }
     }
 
@@ -150,24 +198,24 @@ impl CpuRemote {
             );
         };
         let _irq = IrqScope::enter();
-        self.request_scheduler_work_owned();
-        self.ring_scheduler_doorbell();
+        let publication = self.request_scheduler_work_owned();
+        self.ring_scheduler_doorbell(publication.generation);
     }
 
     pub(super) fn deliver_scheduler_work_owned(
         &self,
-        publication: SchedulerWorkPublication,
+        publication: SchedulerRequestPublication,
     ) -> bool {
-        if publication == SchedulerWorkPublication::PollingOwner
+        if publication.delivery == SchedulerRequestDelivery::PollingOwner
             || self.current_cpu_will_service_local_work()
         {
             return true;
         }
-        self.ring_scheduler_doorbell()
+        self.ring_scheduler_doorbell(publication.generation)
     }
 
-    fn ring_scheduler_doorbell(&self) -> bool {
-        match task_runtime::send_scheduler_ipi(RuntimeCpuId::new(self.owner.as_u32())) {
+    fn ring_scheduler_doorbell(&self, generation: u64) -> bool {
+        match task_runtime::send_scheduler_ipi(RuntimeCpuId::new(self.owner.as_u32()), generation) {
             RuntimeStatus::Success => true,
             status => task_runtime::fatal_invariant(
                 0x4950_4900 | status as u32,
@@ -192,28 +240,53 @@ impl CpuRemote {
 
     /// Tests the sticky reschedule request without consuming it.
     pub fn needs_reschedule(&self) -> bool {
-        self.scheduler.flags.load(Ordering::Acquire) & SCHEDULER_WORK_PENDING != 0
+        let request = self.scheduler.request.load(Ordering::Acquire);
+        request & REQUEST_REASON_MASK != 0
+            || request_generation(request)
+                != self
+                    .scheduler
+                    .acknowledged_generation
+                    .load(Ordering::Acquire)
     }
 
-    pub(crate) fn scheduler_enter(&self) -> bool {
-        self.scheduler
-            .flags
-            .fetch_and(!SCHEDULER_WORK_PENDING, Ordering::AcqRel);
-        let preempt_requested = self
+    pub(crate) fn claim_scheduler_request(&self) -> SchedulerRequestClaim {
+        let request = self
             .scheduler
-            .preempt_requested
-            .swap(false, Ordering::AcqRel);
-        if self.deadline_work_pending() || self.has_remote_work() {
+            .request
+            .fetch_and(!REQUEST_ENTRY_MASK, Ordering::AcqRel);
+        SchedulerRequestClaim {
+            generation: request_generation(request),
+            preempt: request & REQUEST_PREEMPT != 0,
+        }
+    }
+
+    pub(crate) fn acknowledge_scheduler_request(&self, claim: SchedulerRequestClaim) {
+        self.scheduler
+            .acknowledged_generation
+            .store(claim.generation, Ordering::Release);
+        let request = self.scheduler.request.load(Ordering::Acquire);
+        if self.has_remote_work() && request & REQUEST_ENTRY_MASK == 0 {
             self.request_scheduler_work();
         }
-        preempt_requested
     }
 
     #[cfg(test)]
     pub(crate) fn take_preempt_requested(&self) -> bool {
-        self.scheduler
-            .preempt_requested
-            .swap(false, Ordering::AcqRel)
+        let claim = self.claim_scheduler_request();
+        self.acknowledge_scheduler_request(claim);
+        claim.preempt_requested()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scheduler_request_state_for_test(&self) -> (u64, u64, u64) {
+        let request = self.scheduler.request.load(Ordering::Acquire);
+        (
+            request_generation(request),
+            self.scheduler
+                .acknowledged_generation
+                .load(Ordering::Acquire),
+            request & REQUEST_REASON_MASK,
+        )
     }
 
     pub(crate) fn defer_park_preemption(&self, requested: bool) {
@@ -237,11 +310,10 @@ impl CpuRemote {
     pub(crate) fn prepare_idle_wait(&self) -> bool {
         let previous = self
             .scheduler
-            .flags
-            .fetch_or(SCHEDULER_IDLE_POLLING, Ordering::AcqRel);
-        let may_wait = previous & SCHEDULER_WORK_PENDING == 0
+            .request
+            .fetch_or(REQUEST_IDLE_POLLING, Ordering::AcqRel);
+        let may_wait = previous & REQUEST_REASON_MASK == 0
             && !self.needs_reschedule()
-            && !self.deadline_work_pending()
             && !self.has_remote_work()
             && self.try_runnable_summary() == Some(0);
         if !may_wait {
@@ -252,22 +324,19 @@ impl CpuRemote {
 
     pub(crate) fn finish_idle_wait(&self) {
         self.scheduler
-            .flags
-            .fetch_and(!SCHEDULER_IDLE_POLLING, Ordering::Release);
+            .request
+            .fetch_and(!REQUEST_IDLE_POLLING, Ordering::Release);
     }
 
     pub(crate) fn is_idle_polling(&self) -> bool {
-        self.scheduler.flags.load(Ordering::Acquire) & SCHEDULER_IDLE_POLLING != 0
+        self.scheduler.request.load(Ordering::Acquire) & REQUEST_IDLE_POLLING != 0
     }
 
     pub(super) fn reset_scheduler_for_offline(&self) {
-        self.scheduler.flags.store(0, Ordering::Relaxed);
+        self.scheduler.request.store(0, Ordering::Relaxed);
         self.scheduler
-            .deadline_work_pending
-            .store(false, Ordering::Relaxed);
-        self.scheduler
-            .preempt_requested
-            .store(false, Ordering::Relaxed);
+            .acknowledged_generation
+            .store(0, Ordering::Relaxed);
         self.scheduler
             .park_preempt_deferred
             .store(false, Ordering::Relaxed);

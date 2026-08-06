@@ -50,9 +50,12 @@ std::thread_local! {
     static SCHEDULER_NS: RefCell<[u64; MAX_TEST_CPUS]> = const {
         RefCell::new([0; MAX_TEST_CPUS])
     };
+    static HARDIRQ_NS: RefCell<[u64; MAX_TEST_CPUS]> = const {
+        RefCell::new([0; MAX_TEST_CPUS])
+    };
     static MONOTONIC_READS: Cell<usize> = const { Cell::new(0) };
     static SCHEDULER_READS: Cell<usize> = const { Cell::new(0) };
-    static LAST_TASK_DEADLINE_UPDATE: Cell<Option<TaskDeadlineUpdate>> = const { Cell::new(None) };
+    static LAST_SCHEDULER_DEADLINE_UPDATE: Cell<Option<SchedulerDeadlineUpdate>> = const { Cell::new(None) };
     static CPU_ONLINE_STATUS: Cell<RuntimeStatus> = const { Cell::new(RuntimeStatus::Success) };
     static CPU_OFFLINE_STATUS: Cell<RuntimeStatus> = const { Cell::new(RuntimeStatus::Success) };
     static CPU_LIFECYCLE_EVENTS: RefCell<std::vec::Vec<CpuLifecycleEvent>> =
@@ -355,23 +358,34 @@ impl TaskRuntime for UnitTestRuntime {
         crate::runtime::MonotonicInstant::from_nanos(MONOTONIC_NS.with(Cell::get))
             .expect("test monotonic clock must remain in the ktime domain")
     }
-    fn scheduler_clock_source(cpu: RuntimeCpuId) -> crate::SchedulerTimestamp {
+    fn rq_clock_sample(cpu: RuntimeCpuId) -> RqClockSample {
         run_hook_reentry_query();
         SCHEDULER_READS.with(|reads| reads.set(reads.get() + 1));
+        let index = cpu.as_u32() as usize;
         let now_ns = SCHEDULER_NS.with(|clocks| {
             clocks
                 .borrow()
-                .get(cpu.as_u32() as usize)
+                .get(index)
                 .copied()
                 .expect("test scheduler CPU must fit the fake clock table")
         });
-        crate::SchedulerTimestamp::from_nanos(now_ns)
+        let hardirq_time_ns = HARDIRQ_NS.with(|clocks| {
+            clocks
+                .borrow()
+                .get(index)
+                .copied()
+                .expect("test scheduler CPU must fit the fake IRQ clock table")
+        });
+        RqClockSample::new(
+            crate::SchedulerTimestamp::from_nanos(now_ns),
+            hardirq_time_ns,
+        )
     }
-    fn publish_task_deadline(update: TaskDeadlineUpdate) {
+    fn publish_scheduler_deadline(update: SchedulerDeadlineUpdate) {
         run_hook_reentry_query();
-        LAST_TASK_DEADLINE_UPDATE.with(|observed| observed.set(Some(update)));
+        LAST_SCHEDULER_DEADLINE_UPDATE.with(|observed| observed.set(Some(update)));
     }
-    fn send_scheduler_ipi(_cpu: RuntimeCpuId) -> RuntimeStatus {
+    fn send_scheduler_ipi(_cpu: RuntimeCpuId, _generation: u64) -> RuntimeStatus {
         run_hook_reentry_query();
         SCHEDULER_IPI_SEND_COUNT.with(|count| count.set(count.get() + 1));
         let irq_guards = ACTIVE_IRQ_TOKENS.with(|tokens| tokens.borrow().len());
@@ -733,9 +747,10 @@ pub(crate) fn clear_task_handles() {
     reset_cpu_handle_reads();
     MONOTONIC_NS.with(|now| now.set(0));
     SCHEDULER_NS.with(|clocks| clocks.borrow_mut().fill(0));
+    HARDIRQ_NS.with(|clocks| clocks.borrow_mut().fill(0));
     MONOTONIC_READS.with(|reads| reads.set(0));
     SCHEDULER_READS.with(|reads| reads.set(0));
-    LAST_TASK_DEADLINE_UPDATE.with(|observed| observed.set(None));
+    LAST_SCHEDULER_DEADLINE_UPDATE.with(|observed| observed.set(None));
     CPU_LIFECYCLE_EVENTS.with(|events| events.borrow_mut().clear());
     configure_cpu_lifecycle(RuntimeStatus::Success, RuntimeStatus::Success);
 }
@@ -773,8 +788,8 @@ pub(crate) fn scheduler_reads() -> usize {
     SCHEDULER_READS.with(Cell::get)
 }
 
-pub(crate) fn take_task_deadline_update() -> Option<TaskDeadlineUpdate> {
-    LAST_TASK_DEADLINE_UPDATE.with(Cell::take)
+pub(crate) fn take_scheduler_deadline_update() -> Option<SchedulerDeadlineUpdate> {
+    LAST_SCHEDULER_DEADLINE_UPDATE.with(Cell::take)
 }
 
 pub(crate) fn take_cpu_lifecycle_events() -> std::vec::Vec<CpuLifecycleEvent> {

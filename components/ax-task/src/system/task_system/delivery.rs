@@ -261,7 +261,7 @@ impl TaskSystem {
         &self,
         cpu: Pin<&mut CpuLocal>,
     ) -> Result<OwnerControlDrain, TaskError> {
-        let now_ns = cpu.update_rq_clock().as_nanos();
+        let now_ns = cpu.update_rq_clock().wall_nanos();
         self.drain_policy_updates_with_clock(cpu, now_ns)
     }
 

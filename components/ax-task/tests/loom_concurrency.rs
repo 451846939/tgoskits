@@ -843,13 +843,12 @@ fn new_generation_publishers_do_not_delay_retired_head_grace() {
 }
 
 #[test]
-fn stale_task_deadline_publication_cannot_replace_a_newer_generation() {
+fn stale_scheduler_deadline_publication_cannot_replace_a_newer_generation() {
     loom::model(|| {
         #[derive(Clone, Copy)]
         struct DeadlineState {
             generation: usize,
             deadline: usize,
-            deferred_work: bool,
         }
 
         fn publish(state: &Mutex<DeadlineState>, update: DeadlineState) {
@@ -862,7 +861,6 @@ fn stale_task_deadline_publication_cannot_replace_a_newer_generation() {
         let state = Arc::new(Mutex::new(DeadlineState {
             generation: 0,
             deadline: 0,
-            deferred_work: false,
         }));
         let older = {
             let state = Arc::clone(&state);
@@ -872,7 +870,6 @@ fn stale_task_deadline_publication_cannot_replace_a_newer_generation() {
                     DeadlineState {
                         generation: 1,
                         deadline: 100,
-                        deferred_work: true,
                     },
                 );
             })
@@ -885,7 +882,6 @@ fn stale_task_deadline_publication_cannot_replace_a_newer_generation() {
                     DeadlineState {
                         generation: 2,
                         deadline: 200,
-                        deferred_work: false,
                     },
                 );
             })
@@ -896,7 +892,6 @@ fn stale_task_deadline_publication_cannot_replace_a_newer_generation() {
         let state = state.lock().unwrap();
         assert_eq!(state.generation, 2);
         assert_eq!(state.deadline, 200);
-        assert!(!state.deferred_work);
     });
 }
 

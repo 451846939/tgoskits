@@ -2,12 +2,6 @@
 
 use super::*;
 
-#[derive(Clone, Copy)]
-enum DeadlineEntry {
-    Service,
-    AlreadyServiced,
-}
-
 impl TaskSystem {
     /// Requests one owner-mediated pull from the busiest remote CPU.
     ///
@@ -161,7 +155,7 @@ impl TaskSystem {
         thread: ThreadId,
     ) -> Result<(), TaskError> {
         self.ensure_owner_cpu_context(&cpu)?;
-        let now_ns = cpu.update_rq_clock().as_nanos();
+        let now_ns = cpu.update_rq_clock().wall_nanos();
         let core = {
             let state = self.state.lock();
             Arc::clone(&state.thread_record(thread)?.core)
@@ -251,43 +245,34 @@ impl TaskSystem {
     /// Tests RT bandwidth, allowing a PI-boosted owner to run to unlock.
     pub fn rt_may_run(
         &self,
-        mut cpu: Pin<&mut CpuLocal>,
+        cpu: Pin<&mut CpuLocal>,
         pi_boosted_owner: bool,
     ) -> Result<bool, TaskError> {
         self.ensure_owner_cpu_context(&cpu)?;
         self.ensure_owner_cpu_online(&cpu)?;
-        let now_ns = cpu.update_rq_clock().as_nanos();
-        Ok(cpu
-            .as_mut()
-            .dispatch_state_mut()
-            .rt_bandwidth
-            .may_run(now_ns, pi_boosted_owner))
+        let _clock = cpu.update_rq_clock();
+        Ok(cpu.lock_run_queue().rt_may_run(pi_boosted_owner))
     }
 
     /// Selects the next thread according to strict class precedence.
     pub fn schedule(&self, cpu: Pin<&mut CpuLocal>) -> Result<ScheduleDecision, TaskError> {
-        let now_ns = cpu.update_rq_clock().as_nanos();
-        self.schedule_with_deadline_entry(cpu, now_ns, DeadlineEntry::Service)
+        let now_ns = cpu.update_rq_clock().wall_nanos();
+        self.schedule_owner(cpu, now_ns)
     }
 
-    fn schedule_with_deadline_entry(
+    fn schedule_owner(
         &self,
         mut cpu: Pin<&mut CpuLocal>,
         now_ns: u64,
-        deadline_entry: DeadlineEntry,
     ) -> Result<ScheduleDecision, TaskError> {
         self.ensure_owner_cpu_context(&cpu)?;
         self.complete_context_switch(cpu.as_mut())?;
         self.drain_owner_work(cpu.as_mut(), now_ns)?;
         self.ensure_owner_cpu_online(&cpu)?;
-        cpu.as_mut().scheduler_enter();
+        let mut request = cpu.as_mut().claim_scheduler_request();
         self.commit_owner_current_dispatch(cpu.as_mut())?;
-        if matches!(deadline_entry, DeadlineEntry::Service) {
-            self.service_deadline_timers(cpu.as_mut(), now_ns)?;
-        }
-        // Close the publication window after owner work and accounting. The
-        // Acquire recheck keeps concurrently published inbox work sticky.
-        cpu.as_mut().scheduler_enter();
+        self.service_soft_timer_work(cpu.as_mut(), now_ns)?;
+        request = request.merge(cpu.as_mut().claim_scheduler_request());
         let previous = cpu.current();
         let previous_core = cpu.current_core().cloned();
         let mut migration = None;
@@ -318,7 +303,9 @@ impl TaskSystem {
             SwitchReason::Preempted
         };
         let decision = Self::owner_switch_plan(previous_core.as_ref(), &next_core, reason, now_ns);
-        Ok(self.finish_owner_selection(cpu, decision))
+        let decision = self.finish_owner_selection(cpu.as_mut(), decision);
+        cpu.acknowledge_scheduler_request(request);
+        Ok(decision)
     }
 
     /// Services sticky scheduler work and switches only for a real preemption.
@@ -326,50 +313,36 @@ impl TaskSystem {
         &self,
         cpu: Pin<&mut CpuLocal>,
     ) -> Result<SchedulerOutcome, TaskError> {
-        let now_ns = cpu.update_rq_clock().as_nanos();
-        self.schedule_if_requested_with_deadline_entry(cpu, now_ns, DeadlineEntry::Service)
+        let now_ns = cpu.update_rq_clock().wall_nanos();
+        self.schedule_if_requested_owner(cpu, now_ns)
     }
 
-    pub(crate) fn schedule_if_requested_after_deadline_service(
-        &self,
-        cpu: Pin<&mut CpuLocal>,
-    ) -> Result<SchedulerOutcome, TaskError> {
-        let now_ns = cpu.update_rq_clock().as_nanos();
-        self.schedule_if_requested_with_deadline_entry(cpu, now_ns, DeadlineEntry::AlreadyServiced)
-    }
-
-    fn schedule_if_requested_with_deadline_entry(
+    fn schedule_if_requested_owner(
         &self,
         mut cpu: Pin<&mut CpuLocal>,
         now_ns: u64,
-        deadline_entry: DeadlineEntry,
     ) -> Result<SchedulerOutcome, TaskError> {
         self.ensure_owner_cpu_context(&cpu)?;
         self.complete_context_switch(cpu.as_mut())?;
         self.drain_owner_work(cpu.as_mut(), now_ns)?;
         self.ensure_owner_cpu_online(&cpu)?;
+        let mut request = cpu.as_mut().claim_scheduler_request();
+        if cpu.dispatch_state().current_dispatch.is_some() {
+            let _settled = cpu.as_mut().settle_current_dispatch(0)?;
+        }
+        self.service_soft_timer_work(cpu.as_mut(), now_ns)?;
+        request = request.merge(cpu.as_mut().claim_scheduler_request());
         if cpu.current_lifecycle_state() == Some(ThreadState::Parking) {
             // The interrupted owner still holds a generation-checked park
             // token and remains `current` / `on_cpu`. Consume this safe-point
             // doorbell so an IRQ-return `while need_resched` loop can return to
             // `commit_park`. A real preemption request is kept separately and
             // restored only if the park is cancelled.
-            let preempt_requested = cpu.as_mut().scheduler_enter();
-            cpu.defer_park_preemption(preempt_requested);
+            cpu.defer_park_preemption(request.preempt_requested());
+            cpu.acknowledge_scheduler_request(request);
             return Ok(SchedulerOutcome::ParkingDeferred);
         }
-        let mut switch_requested = cpu.as_mut().scheduler_enter();
-        if cpu.dispatch_state().current_dispatch.is_some() {
-            let _settled = cpu.as_mut().settle_current_dispatch(0)?;
-        }
-        if matches!(deadline_entry, DeadlineEntry::Service) {
-            self.service_deadline_timers(cpu.as_mut(), now_ns)?;
-        }
-        // Work published while this bounded safe point is running must affect
-        // this decision. `scheduler_enter` consumes only the request observed
-        // on entry; the second exchange closes the publication window without
-        // losing a request that races after it.
-        switch_requested |= cpu.as_mut().scheduler_enter();
+        let switch_requested = request.preempt_requested();
         let previous = cpu.current();
         let previous_core = cpu.current_core().cloned();
         if previous_core.is_some() && !switch_requested {
@@ -379,14 +352,8 @@ impl TaskSystem {
             if self.owner_balance_work_pending(cpu.as_ref().get_ref(), current) {
                 self.service_owner_balance(cpu.as_mut(), current)?;
             }
-            // `scheduler_enter` consumed the sticky entry request, but a
-            // bounded inbox drain may have left another batch behind. Preserve
-            // that work (and any request produced by Deadline servicing) for
-            // the next scheduler safe point.
-            if cpu.has_remote_work() {
-                cpu.request_scheduler_work();
-            }
             Self::program_local_timer(cpu.as_mut())?;
+            cpu.acknowledge_scheduler_request(request);
             return Ok(if cpu.needs_reschedule() || cpu.has_remote_work() {
                 SchedulerOutcome::OwnerWorkPending
             } else {
@@ -422,9 +389,9 @@ impl TaskSystem {
             SwitchReason::Preempted
         };
         let decision = Self::owner_switch_plan(previous_core.as_ref(), &next_core, reason, now_ns);
-        Ok(SchedulerOutcome::Decision(
-            self.finish_owner_selection(cpu, decision),
-        ))
+        let decision = self.finish_owner_selection(cpu.as_mut(), decision);
+        cpu.acknowledge_scheduler_request(request);
+        Ok(SchedulerOutcome::Decision(decision))
     }
 
     /// Moves the current thread to its class tail and selects another thread.
@@ -435,13 +402,9 @@ impl TaskSystem {
         self.ensure_owner_cpu_context(&cpu)?;
         self.complete_context_switch(cpu.as_mut())?;
         self.ensure_owner_cpu_online(&cpu)?;
-        let now_ns = cpu.update_rq_clock().as_nanos();
+        let now_ns = cpu.update_rq_clock().wall_nanos();
         self.commit_owner_current_dispatch(cpu.as_mut())?;
-        // Forced yield owns the current entity's class transition, not the
-        // general scheduler safe point. Consume the preemption request covered
-        // by this selection while preserving sticky remote/deadline work for
-        // its already-armed delivery.
-        cpu.as_mut().scheduler_enter();
+        let request = cpu.as_mut().claim_scheduler_request();
         let previous = cpu.current();
         let previous_core = cpu.current_core().cloned();
         if let Some(core) = previous_core.as_ref() {
@@ -464,7 +427,9 @@ impl TaskSystem {
                 self.publish_owner_cpu_load_summary(cpu.as_mut());
                 let decision =
                     Self::owner_switch_plan(Some(core), core, SwitchReason::Yield, now_ns);
-                return Ok(self.finish_owner_selection(cpu, decision));
+                let decision = self.finish_owner_selection(cpu.as_mut(), decision);
+                cpu.acknowledge_scheduler_request(request);
+                return Ok(decision);
             }
         }
         let mut migration = None;
@@ -536,6 +501,8 @@ impl TaskSystem {
             SwitchReason::Yield
         };
         let decision = Self::owner_switch_plan(previous_core.as_ref(), &next_core, reason, now_ns);
-        Ok(self.finish_owner_selection(cpu, decision))
+        let decision = self.finish_owner_selection(cpu.as_mut(), decision);
+        cpu.acknowledge_scheduler_request(request);
+        Ok(decision)
     }
 }

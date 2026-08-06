@@ -1,12 +1,14 @@
 //! Root-domain topology, priority indexes, and Deadline bandwidth ownership.
 
+mod rt_bandwidth;
+
 use core::{
     ops::Deref,
     sync::atomic::{AtomicUsize, Ordering},
 };
 
 use super::*;
-use crate::{DEADLINE_UTILIZATION_SCALE, RtPriority, lock::PreemptTicketGuard};
+use crate::{DEADLINE_UTILIZATION_SCALE, RootRtBandwidth, RtPriority, lock::PreemptTicketGuard};
 
 /// The scheduler-wide owner corresponding to Linux `struct root_domain`.
 ///
@@ -23,6 +25,7 @@ pub(super) struct RootDomain {
     overload: RootDomainOverloadIndex,
     push: RootDomainPushIterator,
     runqueues: Vec<Arc<CpuRemote>>,
+    rt_bandwidth: Arc<RootRtBandwidth>,
     deadline_max_bw_scaled: u64,
 }
 
@@ -109,8 +112,13 @@ impl RootDomain {
             overload: RootDomainOverloadIndex::new(config.cpu_count()),
             push: RootDomainPushIterator::new(),
             runqueues,
+            rt_bandwidth: Arc::new(RootRtBandwidth::new(config)),
             deadline_max_bw_scaled,
         }
+    }
+
+    pub(super) fn rt_bandwidth(&self) -> &Arc<RootRtBandwidth> {
+        &self.rt_bandwidth
     }
 
     pub(super) fn lock(&self) -> RootDomainGuard<'_> {

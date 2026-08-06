@@ -108,6 +108,8 @@ impl_task_runtime! {
             if current_scheduler_ipi_doorbell_pending() {
                 return RuntimeStatus::Busy;
             }
+            #[cfg(any(feature = "ipi", feature = "wake-ipi"))]
+            reset_current_scheduler_ipi_doorbell_for_offline();
             #[cfg(feature = "irq")]
             crate::clock_event_runtime::take_current_clock_event_offline();
             release_current_active_address_space();
@@ -223,15 +225,25 @@ impl_task_runtime! {
             .expect("platform monotonic clock exceeded the signed ktime domain")
         }
 
-        fn scheduler_clock_source(_cpu: RuntimeCpuId) -> ax_task::SchedulerTimestamp {
-            ax_task::SchedulerTimestamp::from_nanos(ax_hal::time::monotonic_time_nanos())
+        fn rq_clock_sample(cpu: RuntimeCpuId) -> ax_task::runtime::RqClockSample {
+            let cpu_id = cpu.as_u32() as usize;
+            // SAFETY: ax-task holds the target runqueue IRQ-save lock, which
+            // pins the calling CPU for this complete remote-clock coupling.
+            let clock_ns = unsafe { ax_hal::time::scheduler_clock_source(cpu_id) }
+                .unwrap_or_else(|error| {
+                    panic!("scheduler clock source for CPU {cpu_id} is unavailable: {error}")
+                });
+            ax_task::runtime::RqClockSample::new(
+                ax_task::SchedulerTimestamp::from_nanos(clock_ns),
+                crate::irq_time::total_for_cpu(cpu_id),
+            )
         }
 
-        fn publish_task_deadline(update: ax_task::runtime::TaskDeadlineUpdate) {
-            crate::clock_event_runtime::publish_local_task_deadline(update);
+        fn publish_scheduler_deadline(update: ax_task::runtime::SchedulerDeadlineUpdate) {
+            crate::clock_event_runtime::publish_local_scheduler_deadline(update);
         }
 
-        fn send_scheduler_ipi(cpu: RuntimeCpuId) -> RuntimeStatus {
+        fn send_scheduler_ipi(cpu: RuntimeCpuId, generation: u64) -> RuntimeStatus {
             #[cfg(any(feature = "ipi", feature = "wake-ipi"))]
             {
                 let cpu_id = cpu.as_u32() as usize;
@@ -239,7 +251,7 @@ impl_task_runtime! {
                     return RuntimeStatus::InvalidArgument;
                 }
                 publish_then_notify_scheduler_ipi(
-                    || publish_scheduler_ipi_doorbell(cpu_id),
+                    || publish_scheduler_ipi_doorbell(cpu_id, generation),
                     || {
                         #[cfg(feature = "qperf-metrics")]
                         record_scheduler_ipi_send();
@@ -252,7 +264,7 @@ impl_task_runtime! {
             }
             #[cfg(not(any(feature = "ipi", feature = "wake-ipi")))]
             {
-                let _ = cpu;
+                let _ = (cpu, generation);
                 RuntimeStatus::Unsupported
             }
         }
@@ -260,7 +272,6 @@ impl_task_runtime! {
         fn wait_for_interrupt() {
             ax_hal::asm::disable_irqs();
             let mut now = crate::clock_event_runtime::monotonic_now();
-            let _ = crate::clock_event_runtime::recover_overdue_local_clock_event(now);
             let mut needs_reschedule = ax_task::current_cpu_needs_resched()
                 .expect("idle handoff requires an initialized current CPU");
             if needs_reschedule

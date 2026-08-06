@@ -714,6 +714,40 @@ impl MonotonicDeadline {
     }
 }
 
+/// One Linux-style runqueue-clock observation for a target CPU.
+///
+/// `clock` is the corrected `sched_clock_cpu()` value. `hardirq_time_ns` is
+/// the cumulative hard-interrupt time published by that CPU. The runqueue
+/// owner consumes both values in one locked `update_rq_clock()` transaction so
+/// task execution time can exclude interrupt service without comparing either
+/// value with the monotonic clockevent domain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C)]
+pub struct RqClockSample {
+    clock: crate::SchedulerTimestamp,
+    hardirq_time_ns: u64,
+}
+
+impl RqClockSample {
+    /// Creates one coherent runqueue-clock observation.
+    pub const fn new(clock: crate::SchedulerTimestamp, hardirq_time_ns: u64) -> Self {
+        Self {
+            clock,
+            hardirq_time_ns,
+        }
+    }
+
+    /// Returns the corrected scheduler-clock value.
+    pub const fn clock(self) -> crate::SchedulerTimestamp {
+        self.clock
+    }
+
+    /// Returns cumulative hard-interrupt time for the target CPU.
+    pub const fn hardirq_time_ns(self) -> u64 {
+        self.hardirq_time_ns
+    }
+}
+
 #[cfg(test)]
 mod monotonic_time_tests {
     use super::*;
@@ -757,30 +791,24 @@ mod monotonic_time_tests {
     }
 }
 
-/// One generation-ordered publication from a CPU's task-deadline owner.
+/// One generation-ordered publication from a CPU's scheduler owner.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TaskDeadlineUpdate {
+pub struct SchedulerDeadlineUpdate {
     generation: u64,
     deadline: Option<MonotonicDeadline>,
-    deferred_work: bool,
 }
 
-impl TaskDeadlineUpdate {
+impl SchedulerDeadlineUpdate {
     /// Creates one publication after the owner has committed its local state.
     ///
     /// Generation zero is reserved for an uninitialized consumer.
-    pub const fn try_new(
-        generation: u64,
-        deadline: Option<MonotonicDeadline>,
-        deferred_work: bool,
-    ) -> Option<Self> {
+    pub const fn try_new(generation: u64, deadline: Option<MonotonicDeadline>) -> Option<Self> {
         if generation == 0 {
             None
         } else {
             Some(Self {
                 generation,
                 deadline,
-                deferred_work,
             })
         }
     }
@@ -790,14 +818,9 @@ impl TaskDeadlineUpdate {
         self.generation
     }
 
-    /// Returns the next task-owned deadline, if one exists.
+    /// Returns the next scheduler-owned physical deadline, if one exists.
     pub const fn deadline(self) -> Option<MonotonicDeadline> {
         self.deadline
-    }
-
-    /// Reports work that must be completed at a scheduler safe point.
-    pub const fn deferred_work(self) -> bool {
-        self.deferred_work
     }
 }
 
@@ -1022,7 +1045,7 @@ pub trait TaskRuntime {
     /// Returns one sample from the finite monotonic `ktime` domain.
     fn monotonic_now() -> MonotonicInstant;
 
-    /// Returns one source sample for `cpu`'s wrapping scheduler clock.
+    /// Returns one coherent source sample for `cpu`'s runqueue clocks.
     ///
     /// Linux calls `sched_clock_cpu(cpu_of(rq))` while holding the target
     /// runqueue lock, including direct remote wakeups. The runtime may derive
@@ -1030,13 +1053,13 @@ pub trait TaskRuntime {
     /// silently substitute the calling CPU when per-CPU sources differ.
     /// Scheduler absolute values must never be compared directly with
     /// monotonic deadlines.
-    fn scheduler_clock_source(cpu: RuntimeCpuId) -> crate::SchedulerTimestamp;
+    fn rq_clock_sample(cpu: RuntimeCpuId) -> RqClockSample;
 
-    /// Commits the current CPU's complete task-deadline state.
+    /// Commits the current CPU's complete scheduler-deadline state.
     ///
     /// The runtime owns the physical clockevent. It must ignore generations
     /// older than the most recently accepted update and merge the accepted
-    /// task deadline with non-task sources before programming hardware. This
+    /// scheduler deadline with non-scheduler sources before programming hardware. This
     /// hook is callable from ordinary task context, so the runtime must hold
     /// local IRQ exclusion across both state publication and hardware
     /// programming instead of relying on an implicit caller-side guard.
@@ -1047,7 +1070,7 @@ pub trait TaskRuntime {
     /// retain a wakeup source as a runtime-fatal invariant. Returning a
     /// recoverable error here would leave the scheduler queue and physical
     /// clockevent in an unknowable half-committed state.
-    fn publish_task_deadline(update: TaskDeadlineUpdate);
+    fn publish_scheduler_deadline(update: SchedulerDeadlineUpdate);
 
     /// Sends a coalescible scheduler IPI directly to `cpu`.
     ///
@@ -1056,7 +1079,7 @@ pub trait TaskRuntime {
     /// flight. Coalescing is therefore never reported as transport
     /// backpressure. Every other status is an unrecoverable violation of the
     /// scheduler delivery contract.
-    fn send_scheduler_ipi(cpu: RuntimeCpuId) -> RuntimeStatus;
+    fn send_scheduler_ipi(cpu: RuntimeCpuId, generation: u64) -> RuntimeStatus;
 
     /// Commits one local interrupt wait after the scheduler clears polling.
     ///

@@ -171,16 +171,16 @@ fn uncontended_rt_lock_owner_does_not_bypass_exhausted_rt_bandwidth() {
     system.enqueue_at(cpu.as_mut(), fair.id(), 0).unwrap();
     assert_eq!(system.schedule_at(cpu.as_mut(), 0).unwrap().next(), rt.id());
     system
-        .charge_current_at(cpu.as_mut(), 950_000_000, 950_000_000, 0)
+        .charge_current_at(cpu.as_mut(), 950_000_001, 950_000_001, 0)
         .unwrap();
     assert!(
         cpu.needs_reschedule(),
-        "exact RT quota exhaustion must publish need_resched immediately"
+        "Linux RT throttles only after runtime strictly exceeds quota"
     );
 
     assert_eq!(
         system
-            .schedule_at(cpu.as_mut(), 950_000_000)
+            .schedule_at(cpu.as_mut(), 950_000_001)
             .unwrap()
             .next(),
         fair.id()

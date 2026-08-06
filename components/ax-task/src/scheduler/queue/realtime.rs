@@ -177,6 +177,10 @@ impl RealtimeRunQueue {
         self.active_bitmap & RT_PRIORITY_BITMAP != 0
     }
 
+    pub(super) const fn has_exempt_rt(&self) -> bool {
+        self.exempt_bitmap & RT_PRIORITY_BITMAP != 0
+    }
+
     pub(super) fn highest_rt_priority(&self) -> Option<u8> {
         bitmap_highest_priority(self.active_bitmap & RT_PRIORITY_BITMAP)
     }

@@ -186,7 +186,7 @@ impl TaskSystem {
         let remote = &self.cpu_remotes[target.as_usize()];
         remote.cancel_idle_pull_if_uncommitted();
         let mut run_queue = remote.lock_run_queue();
-        let now_ns = run_queue.update_clock().as_nanos();
+        let now_ns = run_queue.update_clock().wall_nanos();
         let policy = sched.policy.effective;
         let mut queued_entity = sched.policy.effective_entity;
         let deadline_wake = matches!(policy, SchedulePolicy::Deadline(_)) && !sched.is_pi_boosted();
@@ -256,6 +256,10 @@ impl TaskSystem {
         let deadline_generation = sched.pi.deadline_cbs_generation;
         drop(run_queue);
         drop(sched);
+        let rt_period_started = policy.rt_priority().is_some()
+            && self
+                .root_domain
+                .activate_rt_period(target, task_runtime::monotonic_now());
 
         #[cfg(feature = "qperf-metrics")]
         crate::metrics::record_direct_wake_enqueue();
@@ -293,6 +297,9 @@ impl TaskSystem {
             // Linux queues the RT/DL push balance callback in the enqueue
             // transaction. The target owner performs migration after dropping
             // the wakee's rq lock and revalidates the pushable candidate.
+            remote.kick_scheduler_work();
+        }
+        if rt_period_started {
             remote.kick_scheduler_work();
         }
         WakeResult::Notified
@@ -367,7 +374,7 @@ impl TaskSystem {
             .remote()
             .cancel_idle_pull_if_uncommitted();
         let mut run_queue = cpu.lock_run_queue();
-        let now_ns = run_queue.update_clock().as_nanos();
+        let now_ns = run_queue.update_clock().wall_nanos();
         let policy = sched.policy.effective;
         let mut queued_entity = sched.policy.effective_entity;
         let mut deadline_wake_throttled = false;
@@ -469,6 +476,10 @@ impl TaskSystem {
         ) && preempts_current
         {
             cpu.request_reschedule();
+        }
+        if cpu.lock_run_queue().has_runnable_rt() {
+            self.root_domain
+                .activate_rt_period(cpu.owner(), task_runtime::monotonic_now());
         }
         self.publish_owner_cpu_load_summary(cpu.as_mut());
         if !preempts_current && self.rt_deadline_push_pending(cpu.remote()) {
@@ -728,7 +739,7 @@ impl TaskSystem {
             return Ok(());
         }
         let (_charge, clock) = cpu.as_mut().settle_current_dispatch(0)?;
-        let now_ns = clock.as_nanos();
+        let now_ns = clock.task_nanos();
         let Some(mut dispatch) = cpu.as_mut().take_dispatch() else {
             return Ok(());
         };

@@ -13,7 +13,7 @@ use core::{
     ops::Deref,
     pin::Pin,
     ptr::NonNull,
-    sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering},
 };
 
 pub(crate) use clock::{RunQueueClock, RunQueueClockSnapshot};
@@ -34,16 +34,18 @@ pub(crate) use remote::WakePreemptionDecision;
 pub use remote::{CpuLifecycleState, CpuLocalOwnerBorrow, CpuRemote};
 pub(crate) use remote::{
     CpuRemotePublication, CpuRunQueueState, IdlePullReservation, PreparedMigrationDelivery,
+    SchedulerRequestClaim,
 };
 pub use snapshot::CpuSnapshot;
 
 use crate::{
-    CpuId, DeadlineAdmission, FairMode, RtBandwidth, RunQueue, SchedulePolicy, SchedulingEntity,
-    SchedulingKey, TaskError, TaskSystemConfig, ThreadHandle, ThreadId, ThreadState,
+    CpuId, DeadlineAdmission, FairMode, RootRtBandwidth, RtRunQueueBandwidth, RunQueue,
+    SchedulePolicy, SchedulingEntity, SchedulingKey, TaskError, TaskSystemConfig, ThreadHandle,
+    ThreadId, ThreadState,
     inbox::{InboxKind, InboxMessage, InboxNode, PublishResult, SchedulerInbox},
     lock::{IrqScope, IrqTicketGuard, IrqTicketLock},
     runtime::{
-        MonotonicDeadline, MonotonicInstant, RuntimeCpuId, RuntimeStatus, TaskDeadlineUpdate,
+        MonotonicDeadline, MonotonicInstant, RuntimeCpuId, RuntimeStatus, SchedulerDeadlineUpdate,
         task_runtime,
     },
     thread::ThreadCore,

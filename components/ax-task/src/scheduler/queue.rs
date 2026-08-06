@@ -501,6 +501,10 @@ impl RunQueue {
         self.rt.has_any_rt()
     }
 
+    pub(crate) fn has_exempt_rt(&self) -> bool {
+        self.rt.has_exempt_rt()
+    }
+
     pub(crate) fn highest_rt_priority(&self) -> Option<u8> {
         self.rt.highest_rt_priority()
     }

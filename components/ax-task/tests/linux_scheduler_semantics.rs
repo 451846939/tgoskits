@@ -40,20 +40,38 @@ fn need_resched_remains_sticky_until_scheduler_entry() {
 fn rt_bandwidth_throttles_at_quota_but_pi_owner_may_unlock() {
     let (system, mut cpu) = online_system(TaskSystemConfig::new(1));
     let thread = ready_thread(&system, SchedulePolicy::fifo(RtPriority::new(80).unwrap()));
+    let fair = ready_thread(&system, SchedulePolicy::default());
     system.enqueue_at(cpu.as_mut(), thread.id(), 0).unwrap();
+    system.enqueue_at(cpu.as_mut(), fair.id(), 0).unwrap();
     system.schedule_at(cpu.as_mut(), 0).unwrap();
 
     system
-        .charge_current_at(cpu.as_mut(), 0, 950_000_000, 0)
+        .charge_current_at(cpu.as_mut(), 0, 950_000_001, 0)
         .unwrap();
 
     assert!(!system.rt_may_run_at(cpu.as_mut(), 0, false).unwrap());
     assert!(system.rt_may_run_at(cpu.as_mut(), 0, true).unwrap());
+    assert_eq!(
+        system.schedule_at(cpu.as_mut(), 0).unwrap().next(),
+        fair.id()
+    );
+    support::install_handles(
+        (&system as *const TaskSystem).expose_provenance(),
+        cpu.as_mut(),
+    );
+    support::set_monotonic_ns(1_000_000_000);
+    support::set_scheduler_ns(1_000_000_000);
+    ax_task::on_clock_event(
+        ax_task::runtime::MonotonicInstant::from_nanos(1_000_000_000).unwrap(),
+        64,
+    )
+    .unwrap();
     assert!(
         system
             .rt_may_run_at(cpu.as_mut(), 1_000_000_000, false)
             .unwrap()
     );
+    support::clear_handles();
 }
 
 #[test]
@@ -66,15 +84,26 @@ fn exhausted_rt_bandwidth_skips_ordinary_rt_until_the_next_period() {
     assert_eq!(system.schedule_at(cpu.as_mut(), 0).unwrap().next(), rt.id());
 
     system
-        .charge_current_at(cpu.as_mut(), 950_000_000, 950_000_000, 0)
+        .charge_current_at(cpu.as_mut(), 950_000_001, 950_000_001, 0)
         .unwrap();
     assert_eq!(
         system
-            .schedule_at(cpu.as_mut(), 950_000_000)
+            .schedule_at(cpu.as_mut(), 950_000_001)
             .unwrap()
             .next(),
         fair.id()
     );
+    support::install_handles(
+        (&system as *const TaskSystem).expose_provenance(),
+        cpu.as_mut(),
+    );
+    support::set_monotonic_ns(1_000_000_000);
+    support::set_scheduler_ns(1_000_000_000);
+    ax_task::on_clock_event(
+        ax_task::runtime::MonotonicInstant::from_nanos(1_000_000_000).unwrap(),
+        64,
+    )
+    .unwrap();
     assert_eq!(
         system
             .schedule_at(cpu.as_mut(), 1_000_000_000)
@@ -82,6 +111,7 @@ fn exhausted_rt_bandwidth_skips_ordinary_rt_until_the_next_period() {
             .next(),
         rt.id()
     );
+    support::clear_handles();
 }
 
 #[test]
@@ -250,6 +280,7 @@ fn throttled_deadline_job_is_replenished_and_becomes_runnable() {
     );
 
     support::set_monotonic_ns(20);
+    assert_ne!(expire_deadline_irq(cpu.as_mut(), 20), 0);
     assert_eq!(
         system.schedule_at(cpu.as_mut(), 20).unwrap().next(),
         deadline.id()
@@ -301,6 +332,7 @@ fn early_deadline_replenishment_keeps_the_throttled_job_blocked() {
     );
     assert_eq!(deadline.state(), ThreadState::Blocked);
     support::set_monotonic_ns(20);
+    assert_ne!(expire_deadline_irq(cpu.as_mut(), 20), 0);
     assert_eq!(
         system.schedule_at(cpu.as_mut(), 20).unwrap().next(),
         deadline.id()
@@ -325,6 +357,7 @@ fn constrained_deadline_wake_after_deadline_waits_for_next_release() {
     system.enqueue_at(cpu.as_mut(), deadline.id(), 0).unwrap();
     system.dequeue(cpu.as_mut(), deadline.id()).unwrap();
 
+    support::set_monotonic_ns(9);
     system.enqueue_at(cpu.as_mut(), deadline.id(), 9).unwrap();
 
     assert_eq!(deadline.state(), ThreadState::Blocked);
@@ -334,6 +367,7 @@ fn constrained_deadline_wake_after_deadline_waits_for_next_release() {
         idle.id()
     );
     support::set_monotonic_ns(10);
+    assert_ne!(expire_deadline_irq(cpu.as_mut(), 10), 0);
     assert_eq!(
         system.schedule_at(cpu.as_mut(), 10).unwrap().next(),
         deadline.id()
@@ -381,6 +415,7 @@ fn deadline_yield_ends_the_current_job_until_replenishment() {
         0
     );
     support::set_monotonic_ns(20);
+    assert_ne!(expire_deadline_irq(cpu.as_mut(), 20), 0);
     assert_eq!(
         system.schedule_at(cpu.as_mut(), 20).unwrap().next(),
         deadline.id()
@@ -411,6 +446,7 @@ fn active_deadline_job_records_one_miss_at_its_absolute_deadline() {
     );
 
     support::set_monotonic_ns(10);
+    assert_ne!(expire_deadline_irq(cpu.as_mut(), 10), 0);
     system.schedule_at(cpu.as_mut(), 10).unwrap();
     assert_eq!(system.deadline_runtime(deadline.id()).unwrap().misses(), 1);
     support::set_monotonic_ns(11);
@@ -525,6 +561,15 @@ fn ready_thread(system: &TaskSystem, policy: SchedulePolicy) -> ax_task::ThreadH
     let thread = system.create_thread(ThreadSpec::new(policy)).unwrap();
     system.make_ready(thread.id()).unwrap();
     thread
+}
+
+fn expire_deadline_irq(cpu: core::pin::Pin<&mut ax_task::CpuLocal>, now_ns: u64) -> usize {
+    let budget = cpu.batch_limit();
+    cpu.on_task_clock_event(
+        ax_task::runtime::MonotonicInstant::from_nanos(now_ns).unwrap(),
+        budget,
+    )
+    .expired()
 }
 
 fn deadline_policy(

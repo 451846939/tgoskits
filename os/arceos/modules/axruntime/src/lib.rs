@@ -53,6 +53,8 @@ mod mp;
 mod boot_memory;
 mod bootstrap;
 mod guard;
+#[cfg(feature = "multitask")]
+mod irq_time;
 #[cfg(feature = "paging")]
 mod kernel_mapping;
 mod klib;

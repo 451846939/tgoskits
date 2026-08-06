@@ -300,9 +300,11 @@ std::thread_local! {
     static IN_HARD_IRQ: Cell<bool> = const { Cell::new(false) };
     static LAST_ONESHOT_NS: Cell<u64> = const { Cell::new(0) };
     static LAST_DEADLINE_GENERATION: Cell<u64> = const { Cell::new(0) };
-    static LAST_DEFERRED_WORK: Cell<bool> = const { Cell::new(false) };
     static MONOTONIC_NS: Cell<u64> = const { Cell::new(0) };
     static SCHEDULER_NS: RefCell<[u64; MAX_TEST_CPUS]> = const {
+        RefCell::new([0; MAX_TEST_CPUS])
+    };
+    static HARDIRQ_NS: RefCell<[u64; MAX_TEST_CPUS]> = const {
         RefCell::new([0; MAX_TEST_CPUS])
     };
 }
@@ -570,25 +572,37 @@ impl_trait! {
             MonotonicInstant::from_nanos(MONOTONIC_NS.with(Cell::get))
                 .expect("test monotonic clock must remain in the ktime domain")
         }
-        fn scheduler_clock_source(cpu: RuntimeCpuId) -> ax_task::SchedulerTimestamp {
+        fn rq_clock_sample(cpu: RuntimeCpuId) -> RqClockSample {
+            let index = cpu.as_u32() as usize;
             let now_ns = SCHEDULER_NS.with(|clocks| {
                 clocks
                     .borrow()
-                    .get(cpu.as_u32() as usize)
+                    .get(index)
                     .copied()
                     .expect("virtual CPU must fit the fake scheduler clock table")
             });
-            ax_task::SchedulerTimestamp::from_nanos(now_ns)
+            let hardirq_time_ns = HARDIRQ_NS.with(|clocks| {
+                clocks
+                    .borrow()
+                    .get(index)
+                    .copied()
+                    .expect("virtual CPU must fit the fake IRQ clock table")
+            });
+            RqClockSample::new(
+                ax_task::SchedulerTimestamp::from_nanos(now_ns),
+                hardirq_time_ns,
+            )
         }
-        fn publish_task_deadline(update: TaskDeadlineUpdate) {
+        fn publish_scheduler_deadline(update: SchedulerDeadlineUpdate) {
             LAST_ONESHOT_NS.with(|deadline| {
                 deadline.set(update.deadline().map_or(0, MonotonicDeadline::as_nanos))
             });
             LAST_DEADLINE_GENERATION.with(|generation| generation.set(update.generation()));
-            LAST_DEFERRED_WORK.with(|pending| pending.set(update.deferred_work()));
         }
-        fn send_scheduler_ipi(cpu: RuntimeCpuId) -> RuntimeStatus {
-            VIRTUAL_RUNTIME.with(|runtime| runtime.borrow_mut().publish_ipi(cpu.as_u32()))
+        fn send_scheduler_ipi(cpu: RuntimeCpuId, generation: u64) -> RuntimeStatus {
+            VIRTUAL_RUNTIME.with(|runtime| {
+                runtime.borrow_mut().publish_ipi(cpu.as_u32(), generation)
+            })
         }
         fn wait_for_interrupt() {
             let cpu = CURRENT_CPU.with(Cell::get);
@@ -613,12 +627,17 @@ impl_trait! {
                     if remote_has_work
                         || state.scheduler_work_pending
                         || state.ipi_edge_pending
-                        || state.ipi_published_epoch != state.ipi_claimed_epoch
                     {
-                        (VirtualRuntimeEventKind::IdleCommitAborted, state.ipi_published_epoch)
+                        (
+                            VirtualRuntimeEventKind::IdleCommitAborted,
+                            state.ipi_delivered_generation,
+                        )
                     } else {
                         state.idle_state = VirtualIdleState::Sleeping;
-                        (VirtualRuntimeEventKind::IdleCommitted, state.ipi_published_epoch)
+                        (
+                            VirtualRuntimeEventKind::IdleCommitted,
+                            state.ipi_delivered_generation,
+                        )
                     }
                 };
                 runtime.record(cpu, kind, generation, 0, 0);
@@ -737,7 +756,7 @@ pub fn install_cpu(cpu: u32, cpu_local: Pin<&mut CpuLocal>) {
 // even when a particular test exercises only the global facade.
 const _: fn(usize, Pin<&mut CpuLocal>) = install_handles;
 const _: fn(u32, Pin<&mut CpuLocal>) = install_cpu;
-const _: fn() -> (u64, u64, bool) = last_task_deadline_update;
+const _: fn() -> (u64, u64) = last_scheduler_deadline_update;
 const _: fn(u32) -> usize = ipi_count;
 const _: fn(u32) -> bool = consume_ipi;
 const _: fn(u32) -> bool = dispatch_scheduler_ipi;
@@ -861,11 +880,10 @@ pub fn last_oneshot_ns() -> u64 {
     LAST_ONESHOT_NS.with(Cell::get)
 }
 
-pub fn last_task_deadline_update() -> (u64, u64, bool) {
+pub fn last_scheduler_deadline_update() -> (u64, u64) {
     (
         LAST_DEADLINE_GENERATION.with(Cell::get),
         LAST_ONESHOT_NS.with(Cell::get),
-        LAST_DEFERRED_WORK.with(Cell::get),
     )
 }
 
@@ -884,6 +902,15 @@ pub fn set_scheduler_ns_for_cpu(cpu: u32, now_ns: u64) {
             .borrow_mut()
             .get_mut(cpu as usize)
             .expect("virtual CPU must fit the fake scheduler clock table") = now_ns;
+    });
+}
+
+pub fn set_hardirq_ns_for_cpu(cpu: u32, hardirq_time_ns: u64) {
+    HARDIRQ_NS.with(|clocks| {
+        *clocks
+            .borrow_mut()
+            .get_mut(cpu as usize)
+            .expect("virtual CPU must fit the fake IRQ clock table") = hardirq_time_ns;
     });
 }
 
@@ -911,9 +938,9 @@ pub fn clear_handles() {
     reset_resource_release_counts();
     LAST_ONESHOT_NS.with(|deadline| deadline.set(0));
     LAST_DEADLINE_GENERATION.with(|generation| generation.set(0));
-    LAST_DEFERRED_WORK.with(|pending| pending.set(false));
     let _cleared_oneshot = last_oneshot_ns();
     set_monotonic_ns(0);
     SCHEDULER_NS.with(|clocks| clocks.borrow_mut().fill(0));
+    HARDIRQ_NS.with(|clocks| clocks.borrow_mut().fill(0));
     let _reset_counts = resource_release_counts();
 }

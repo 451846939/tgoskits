@@ -137,13 +137,47 @@ mod scheduler_ipi_tests {
             "ax-task must forward every non-polling remote publication so the runtime doorbell can own physical-edge coalescing"
         );
 
-        remote.scheduler_enter();
+        let _ = remote.take_preempt_requested();
         assert!(remote.kick_scheduler_work());
         assert_eq!(
             crate::test_runtime::scheduler_ipi_send_count(),
             3,
             "claiming logical scheduler work must remain independent of physical delivery state"
         );
+    }
+
+    #[test]
+    fn request_published_between_claim_and_ack_remains_pending() {
+        let remote = CpuRemote::create(CpuId::new(0), TaskSystemConfig::new(1));
+        assert!(remote.mark_online());
+
+        remote.request_reschedule();
+        let first = remote.claim_scheduler_request();
+        assert!(first.preempt_requested());
+
+        remote.request_reschedule();
+        remote.acknowledge_scheduler_request(first);
+        assert!(
+            remote.needs_reschedule(),
+            "acknowledging an older rq transaction must not consume a concurrent publication"
+        );
+
+        let second = remote.claim_scheduler_request();
+        assert!(second.preempt_requested());
+        remote.acknowledge_scheduler_request(second);
+        assert!(!remote.needs_reschedule());
+    }
+
+    #[test]
+    fn owner_work_claim_does_not_manufacture_a_preemption_request() {
+        let remote = CpuRemote::create(CpuId::new(0), TaskSystemConfig::new(1));
+        assert!(remote.mark_online());
+
+        remote.request_scheduler_work();
+        let request = remote.claim_scheduler_request();
+        assert!(!request.preempt_requested());
+        remote.acknowledge_scheduler_request(request);
+        assert!(!remote.needs_reschedule());
     }
 
     #[test]

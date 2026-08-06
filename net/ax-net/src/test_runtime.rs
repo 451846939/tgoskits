@@ -130,11 +130,16 @@ impl_task_runtime! {
             )
             .expect("platform monotonic clock exceeded the ktime domain")
         }
-        fn scheduler_clock_source(_cpu: RuntimeCpuId) -> ax_task::SchedulerTimestamp {
-            ax_task::SchedulerTimestamp::from_nanos(ax_hal::time::monotonic_time_nanos())
+        fn rq_clock_sample(_cpu: RuntimeCpuId) -> RqClockSample {
+            RqClockSample::new(
+                ax_task::SchedulerTimestamp::from_nanos(ax_hal::time::monotonic_time_nanos()),
+                0,
+            )
         }
-        fn publish_task_deadline(_update: TaskDeadlineUpdate) {}
-        fn send_scheduler_ipi(_cpu: RuntimeCpuId) -> RuntimeStatus { RuntimeStatus::Success }
+        fn publish_scheduler_deadline(_update: SchedulerDeadlineUpdate) {}
+        fn send_scheduler_ipi(_cpu: RuntimeCpuId, _generation: u64) -> RuntimeStatus {
+            RuntimeStatus::Success
+        }
         fn wait_for_interrupt() {}
         fn allocate_stack(_request: StackRequest) -> RuntimeHandleResult {
             RuntimeHandleResult::failure(RuntimeStatus::Unsupported)
@@ -253,6 +258,10 @@ struct NetTestKernelGuard;
 
 #[ax_crate_interface::impl_interface]
 impl ax_kernel_guard::KernelGuardIf for NetTestKernelGuard {
+    fn hardirq_enter() {}
+
+    fn hardirq_exit() {}
+
     fn disable_preempt() {
         ACTIVE_PREEMPT_GUARDS.with(|depth| depth.set(depth.get() + 1));
     }

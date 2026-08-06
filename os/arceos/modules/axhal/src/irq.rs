@@ -56,7 +56,9 @@ pub fn handle_acknowledged_irq(irq: IrqId) -> IrqOutcome {
 fn with_irq_entry<R>(dispatch: impl FnOnce() -> R) -> R {
     let mut irq_guard = ax_kernel_guard::IrqSave::new();
     let preempt_guard = irq_guard.disable_preempt_for_irq_return();
+    ax_kernel_guard::hardirq_enter();
     let result = dispatch();
+    ax_kernel_guard::hardirq_exit();
 
     drop(preempt_guard); // Explicit IRQ-return scheduling keeps local IRQs disabled.
     drop(irq_guard);

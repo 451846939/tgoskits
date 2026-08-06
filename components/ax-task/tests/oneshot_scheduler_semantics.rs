@@ -18,10 +18,9 @@ fn sole_fair_dispatch_does_not_program_a_service_request() {
         fair.id()
     );
     assert_eq!(support::last_oneshot_ns(), 0);
-    let (generation, deadline_ns, deferred_work) = support::last_task_deadline_update();
+    let (generation, deadline_ns) = support::last_scheduler_deadline_update();
     assert_ne!(generation, 0);
     assert_eq!(deadline_ns, 0);
-    assert!(!deferred_work);
 }
 
 #[test]
@@ -37,10 +36,9 @@ fn contended_fair_dispatch_programs_its_remaining_service_request() {
     assert!(selected == first.id() || selected == second.id());
     let initial_deadline = 100 + NORMALIZED_FAIR_SLICE_NS / 2;
     assert_eq!(support::last_oneshot_ns(), initial_deadline);
-    let (generation, deadline_ns, deferred_work) = support::last_task_deadline_update();
+    let (generation, deadline_ns) = support::last_scheduler_deadline_update();
     assert_ne!(generation, 0);
     assert_eq!(deadline_ns, initial_deadline);
-    assert!(!deferred_work);
 }
 
 #[test]
@@ -67,8 +65,8 @@ fn deadline_dispatch_programs_budget_before_its_absolute_deadline() {
         &system,
         SchedulePolicy::deadline(DeadlinePolicy::new(2, 10, 100, DeadlineFlags::NONE).unwrap()),
     );
-    system.enqueue_at(cpu.as_mut(), deadline.id(), 100).unwrap();
     support::set_monotonic_ns(100);
+    system.enqueue_at(cpu.as_mut(), deadline.id(), 100).unwrap();
 
     assert_eq!(
         system.schedule_at(cpu.as_mut(), 100).unwrap().next(),
@@ -84,8 +82,8 @@ fn scheduler_boundary_is_translated_by_delta_into_the_monotonic_clock_domain() {
         &system,
         SchedulePolicy::deadline(DeadlinePolicy::new(2, 10, 100, DeadlineFlags::NONE).unwrap()),
     );
-    system.enqueue_at(cpu.as_mut(), deadline.id(), 100).unwrap();
     support::set_monotonic_ns(10);
+    system.enqueue_at(cpu.as_mut(), deadline.id(), 100).unwrap();
 
     assert_eq!(
         system.schedule_at(cpu.as_mut(), 100).unwrap().next(),
@@ -109,7 +107,70 @@ fn fifo_dispatch_programs_the_rt_quota_exhaustion_boundary() {
         system.schedule_at(cpu.as_mut(), 100).unwrap().next(),
         fifo.id()
     );
-    assert_eq!(support::last_oneshot_ns(), 950_000_100);
+    assert_eq!(support::last_oneshot_ns(), 950_000_101);
+}
+
+#[test]
+fn rt_period_expiry_reschedules_throttled_fifo_from_dedicated_idle() {
+    let (system, mut cpu) = online_system();
+    let fifo = ready_thread(&system, SchedulePolicy::fifo(RtPriority::new(40).unwrap()));
+    system.enqueue_at(cpu.as_mut(), fifo.id(), 0).unwrap();
+    support::set_monotonic_ns(0);
+
+    assert_eq!(
+        system.schedule_at(cpu.as_mut(), 0).unwrap().next(),
+        fifo.id()
+    );
+    support::install_handles(
+        (&system as *const TaskSystem).expose_provenance(),
+        cpu.as_mut(),
+    );
+
+    support::set_monotonic_ns(950_000_001);
+    support::set_scheduler_ns(950_000_001);
+    let exhausted = ax_task::on_clock_event(
+        ax_task::runtime::MonotonicInstant::from_nanos(950_000_001).unwrap(),
+        64,
+    )
+    .unwrap();
+    assert_eq!(
+        exhausted
+            .next_deadline()
+            .map(|deadline| deadline.as_nanos()),
+        Some(1_000_000_000),
+        "RT exhaustion must arm the bandwidth period timer",
+    );
+    assert_ne!(
+        system
+            .schedule_if_requested_at(cpu.as_mut(), 950_000_001)
+            .unwrap()
+            .decision()
+            .expect("quota exhaustion must switch away from FIFO")
+            .next(),
+        fifo.id(),
+    );
+
+    support::set_monotonic_ns(1_000_000_000);
+    support::set_scheduler_ns(1_000_000_000);
+    let replenished = ax_task::on_clock_event(
+        ax_task::runtime::MonotonicInstant::from_nanos(1_000_000_000).unwrap(),
+        64,
+    )
+    .unwrap();
+    assert!(
+        replenished.pending(),
+        "the RT period owner must publish reschedule work when it unthrottles a runnable FIFO task",
+    );
+    assert_eq!(
+        system
+            .schedule_if_requested_at(cpu.as_mut(), 1_000_000_000)
+            .unwrap()
+            .decision()
+            .expect("period replenishment must leave dedicated idle")
+            .next(),
+        fifo.id(),
+    );
+    support::clear_handles();
 }
 
 #[test]
@@ -226,13 +287,26 @@ fn constrained_deadline_replenishment_preemption_is_seen_in_the_same_safe_point(
         "budget depletion must arm the next release rather than the earlier relative deadline",
     );
 
+    support::install_handles(
+        (&system as *const TaskSystem).expose_provenance(),
+        cpu.as_mut(),
+    );
     support::set_monotonic_ns(100);
+    support::set_scheduler_ns(100);
+    let event = ax_task::on_clock_event(
+        ax_task::runtime::MonotonicInstant::from_nanos(100).unwrap(),
+        64,
+    )
+    .unwrap();
+    assert_eq!(event.expired(), 1);
+    ax_task::runtime::task_runtime::publish_scheduler_deadline(event.update());
     let decision = system
         .schedule_if_requested_at(cpu.as_mut(), 100)
         .unwrap()
         .decision()
         .expect("replenishment must be reconsidered before leaving this safe point");
     assert_eq!(decision.next(), deadline.id());
+    support::clear_handles();
 }
 
 #[test]
@@ -272,6 +346,7 @@ fn yielded_deadline_rearms_replenishment_after_earlier_zero_lag_event() {
         !event.pending(),
         "no second immediately due event remains after the bounded IRQ pass"
     );
+    ax_task::runtime::task_runtime::publish_scheduler_deadline(event.update());
     system.schedule_at(cpu.as_mut(), 10).unwrap();
     assert_eq!(
         support::last_oneshot_ns(),
@@ -279,8 +354,21 @@ fn yielded_deadline_rearms_replenishment_after_earlier_zero_lag_event() {
         "zero-lag servicing must preserve the later CBS replenishment",
     );
     support::set_monotonic_ns(100);
+    support::set_scheduler_ns(100);
+    let event = ax_task::on_clock_event(
+        ax_task::runtime::MonotonicInstant::from_nanos(100).unwrap(),
+        64,
+    )
+    .unwrap();
+    assert_eq!(event.expired(), 1);
+    ax_task::runtime::task_runtime::publish_scheduler_deadline(event.update());
     assert_eq!(
-        system.schedule_at(cpu.as_mut(), 100).unwrap().next(),
+        system
+            .schedule_if_requested_at(cpu.as_mut(), 100)
+            .unwrap()
+            .decision()
+            .expect("CBS replenishment must preempt idle")
+            .next(),
         deadline.id()
     );
     support::clear_handles();

@@ -4,6 +4,10 @@ struct FsTestKernelGuard;
 
 #[ax_crate_interface::impl_interface]
 impl ax_kernel_guard::KernelGuardIf for FsTestKernelGuard {
+    fn hardirq_enter() {}
+
+    fn hardirq_exit() {}
+
     fn disable_preempt() {}
 
     fn enable_preempt() {}

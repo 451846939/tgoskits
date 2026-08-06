@@ -123,17 +123,29 @@ fn scheduler_ipi_doorbell_coalesces_and_consumes_publication() {
     assert!(!doorbell.is_pending());
     assert!(doorbell.claim().is_none());
     assert_eq!(
-        doorbell.publish(),
-        SchedulerIpiPublication::Notify { epoch: 1 }
+        doorbell.publish(1),
+        SchedulerIpiPublication::Notify { generation: 1 }
     );
     assert!(doorbell.is_pending());
     assert_eq!(
-        doorbell.publish(),
-        SchedulerIpiPublication::Coalesced { epoch: 2 }
+        doorbell.publish(2),
+        SchedulerIpiPublication::Coalesced { generation: 2 }
     );
-    assert_eq!(doorbell.claim().unwrap().epoch(), 2);
+    assert_eq!(doorbell.claim().unwrap().generation(), 2);
     assert!(!doorbell.is_pending());
     assert!(doorbell.claim().is_none());
+    assert_eq!(
+        doorbell.publish(1),
+        SchedulerIpiPublication::Coalesced { generation: 1 },
+        "a stale transport call must not recreate an edge for acknowledged logical work"
+    );
+    assert!(!doorbell.is_pending());
+    doorbell.reset_for_offline();
+    assert_eq!(
+        doorbell.publish(1),
+        SchedulerIpiPublication::Notify { generation: 1 },
+        "CPU re-online starts a fresh scheduler-request generation domain"
+    );
 }
 
 #[test]
@@ -144,7 +156,7 @@ fn scheduler_ipi_notification_follows_successful_publication() {
         publish_then_notify_scheduler_ipi(
             || {
                 events.borrow_mut().push("publish");
-                Ok(SchedulerIpiPublication::Notify { epoch: 1 })
+                Ok(SchedulerIpiPublication::Notify { generation: 1 })
             },
             || events.borrow_mut().push("notify"),
         ),
@@ -172,23 +184,28 @@ fn failed_scheduler_ipi_publication_suppresses_notification() {
 fn coalesced_scheduler_ipi_publication_suppresses_a_duplicate_notification() {
     let doorbell = SchedulerIpiDoorbell::new();
     let notifications = AtomicUsize::new(0);
-    let publish = || Ok(doorbell.publish());
 
     assert_eq!(
-        publish_then_notify_scheduler_ipi(publish, || {
-            notifications.fetch_add(1, Ordering::Relaxed);
-        }),
+        publish_then_notify_scheduler_ipi(
+            || Ok(doorbell.publish(1)),
+            || {
+                notifications.fetch_add(1, Ordering::Relaxed);
+            }
+        ),
         RuntimeStatus::Success
     );
     assert_eq!(
-        publish_then_notify_scheduler_ipi(publish, || {
-            notifications.fetch_add(1, Ordering::Relaxed);
-        }),
+        publish_then_notify_scheduler_ipi(
+            || Ok(doorbell.publish(2)),
+            || {
+                notifications.fetch_add(1, Ordering::Relaxed);
+            }
+        ),
         RuntimeStatus::Success,
         "coalescing is a successful delivery guarantee, not transport backpressure"
     );
     assert_eq!(notifications.load(Ordering::Relaxed), 1);
-    assert_eq!(doorbell.claim().unwrap().epoch(), 2);
+    assert_eq!(doorbell.claim().unwrap().generation(), 2);
 }
 
 #[test]

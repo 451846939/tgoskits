@@ -121,6 +121,7 @@ pub(crate) struct CpuRunQueueState {
     clock: RunQueueClock,
     queue: RunQueue,
     current: Option<CurrentSchedule>,
+    rt_bandwidth: RtRunQueueBandwidth,
     /// Deadline bandwidth and membership belong to the same transaction as
     /// physical runqueue membership. Remote wakeups therefore cannot expose a
     /// runnable Deadline entity before its CBS reservation is accounted.
@@ -135,6 +136,7 @@ impl CpuRunQueueState {
             clock: RunQueueClock::new(),
             queue: RunQueue::new(),
             current: None,
+            rt_bandwidth: RtRunQueueBandwidth::new(config.rt_period_ns(), config.rt_runtime_ns()),
             deadline_members: Vec::with_capacity(config.thread_capacity()),
             deadline_bandwidth: DeadlineRunQueueBandwidth::new(
                 u64::from(config.deadline_cap_percent()) * 10_000_000,
@@ -144,8 +146,8 @@ impl CpuRunQueueState {
 
     /// Updates and snapshots Linux-style `rq->clock` under this runqueue lock.
     pub(crate) fn update_clock(&mut self) -> RunQueueClockSnapshot {
-        let source = task_runtime::scheduler_clock_source(RuntimeCpuId::new(self.owner.as_u32()));
-        self.clock.update(source)
+        let sample = task_runtime::rq_clock_sample(RuntimeCpuId::new(self.owner.as_u32()));
+        self.clock.update(sample)
     }
 
     /// Reads the last owner-accepted runqueue clock without sampling hardware.
@@ -168,6 +170,37 @@ impl CpuRunQueueState {
                 .expect("running RT/DL linkage must match the dispatch snapshot");
         }
         self.current = current;
+    }
+
+    pub(crate) fn charge_rt_runtime(&mut self, runtime_ns: u64) -> bool {
+        self.rt_bandwidth.charge(runtime_ns)
+    }
+
+    pub(crate) fn rt_may_run(&self, boosted: bool) -> bool {
+        self.rt_bandwidth.may_run(boosted)
+    }
+
+    pub(crate) fn rt_runtime_until_throttle(&self) -> Option<u64> {
+        self.rt_bandwidth.runtime_until_throttle()
+    }
+
+    pub(crate) fn rt_is_effectively_throttled(&self) -> bool {
+        self.rt_bandwidth.is_throttled() && !self.queue.has_exempt_rt()
+    }
+
+    pub(crate) fn replenish_rt_runtime(&mut self, overruns: u64) -> bool {
+        self.rt_bandwidth.replenish(overruns)
+    }
+
+    pub(crate) fn has_rt_activity(&self) -> bool {
+        self.rt_bandwidth.time_ns() != 0 || self.has_runnable_rt()
+    }
+
+    pub(crate) fn has_runnable_rt(&self) -> bool {
+        self.queue.has_rt()
+            || self
+                .current
+                .is_some_and(|current| current.schedule_policy().rt_priority().is_some())
     }
 
     pub(crate) fn highest_rt_priority_including_current(&self) -> Option<u8> {

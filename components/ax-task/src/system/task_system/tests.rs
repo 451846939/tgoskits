@@ -1252,7 +1252,7 @@ fn nonpreempting_rt_wake_kicks_overloaded_owner_balance() {
         .unwrap();
     system.make_ready(pushable.id()).unwrap();
     system.enqueue_at(cpu0.as_mut(), pushable.id(), 4).unwrap();
-    cpu0.remote().scheduler_enter();
+    let _ = cpu0.remote().take_preempt_requested();
 
     let _runtime_handles = InstalledTaskHandles::new(system.as_ref(), cpu1.as_mut());
     crate::test_runtime::configure_scheduler_ipi(RuntimeStatus::Success);
@@ -1294,7 +1294,7 @@ fn lowering_rt_priority_notifies_overloaded_root_domain_owner() {
         .unwrap();
     system.make_ready(pushable.id()).unwrap();
     system.enqueue_at(cpu0.as_mut(), pushable.id(), 2).unwrap();
-    cpu0.remote().scheduler_enter();
+    let _ = cpu0.remote().take_preempt_requested();
 
     let cpu1_current = install_running_fifo(&system, cpu1.as_mut(), 50, 3);
     assert_eq!(
@@ -1302,7 +1302,7 @@ fn lowering_rt_priority_notifies_overloaded_root_domain_owner() {
         cpu1_current.id()
     );
     system.complete_context_switch(cpu1.as_mut()).unwrap();
-    cpu1.remote().scheduler_enter();
+    let _ = cpu1.remote().take_preempt_requested();
 
     let runtime_handles = InstalledTaskHandles::new(system.as_ref(), cpu1.as_mut());
     crate::test_runtime::configure_scheduler_ipi(RuntimeStatus::Success);
@@ -1372,7 +1372,7 @@ fn priority_drop_serializes_root_domain_push_delivery() {
         system
             .enqueue_at(cpus[source].as_mut(), pushable.id(), now + 1)
             .unwrap();
-        cpus[source].remote().scheduler_enter();
+        let _ = cpus[source].remote().take_preempt_requested();
     }
 
     let lowering = install_running_fifo(&system, cpus[1].as_mut(), 50, 5);
@@ -1381,7 +1381,7 @@ fn priority_drop_serializes_root_domain_push_delivery() {
         lowering.id()
     );
     system.complete_context_switch(cpus[1].as_mut()).unwrap();
-    cpus[1].remote().scheduler_enter();
+    let _ = cpus[1].remote().take_preempt_requested();
 
     let lowering_handles = InstalledTaskHandles::new(system.as_ref(), cpus[1].as_mut());
     crate::test_runtime::configure_scheduler_ipi(RuntimeStatus::Success);
@@ -1456,7 +1456,7 @@ fn pinned_rt_work_does_not_kick_owner_push() {
         .unwrap();
     system.make_ready(pinned.id()).unwrap();
     system.enqueue_at(cpu0.as_mut(), pinned.id(), 4).unwrap();
-    cpu0.remote().scheduler_enter();
+    let _ = cpu0.remote().take_preempt_requested();
 
     let _runtime_handles = InstalledTaskHandles::new(system.as_ref(), cpu1.as_mut());
     crate::test_runtime::configure_scheduler_ipi(RuntimeStatus::Success);
@@ -2328,7 +2328,7 @@ fn local_timer_is_programmed_from_scheduler_completion_time() {
     crate::test_runtime::set_monotonic_ns(COMPLETION_NOW_NS);
     crate::test_runtime::set_scheduler_ns(ENTRY_NOW_NS);
     TaskSystem::program_local_timer(cpu.as_mut()).unwrap();
-    let update = crate::test_runtime::take_task_deadline_update()
+    let update = crate::test_runtime::take_scheduler_deadline_update()
         .expect("local timer programming must publish one complete update");
     let deadline_ns = update
         .deadline()
@@ -3964,21 +3964,28 @@ fn bounded_deadline_expiration_retains_only_due_work() {
         system.enqueue_at(cpu.as_mut(), thread.id(), 0).unwrap();
     }
     // Discard the preemption requested by initial Deadline placement. Both CBS
-    // events are due at 10, but the safe point may consume only one per batch.
-    assert!(cpu.as_mut().scheduler_enter());
+    // events are due at 10, but hard IRQ may publish only one per batch.
+    assert!(cpu.remote().take_preempt_requested());
     crate::test_runtime::set_monotonic_ns(10);
-    system.service_deadline_timers(cpu.as_mut(), 10).unwrap();
+    let irq_budget = cpu.batch_limit();
+    let irq_batch = cpu
+        .as_mut()
+        .on_task_clock_event(MonotonicInstant::from_nanos(10).unwrap(), irq_budget);
+    assert_eq!(irq_batch.expired(), 1);
+    assert!(irq_batch.pending());
+    system.service_soft_timer_work(cpu.as_mut(), 10).unwrap();
     assert!(
         cpu.needs_reschedule(),
         "the first bounded batch must retain the second expired event"
     );
 
-    cpu.as_mut().scheduler_enter();
-    system.service_deadline_timers(cpu.as_mut(), 10).unwrap();
-    cpu.as_mut().scheduler_enter();
+    let _ = cpu.remote().take_preempt_requested();
+    system.service_soft_timer_work(cpu.as_mut(), 10).unwrap();
+    let _ = cpu.remote().take_preempt_requested();
     assert!(
         !cpu.needs_reschedule(),
-        "draining the second expired event must finish bounded owner work"
+        "draining the second expired event must finish bounded owner work: {:?}",
+        cpu.remote().scheduler_request_state_for_test()
     );
 }
 
@@ -4002,7 +4009,7 @@ fn future_deadline_members_do_not_create_scheduler_work() {
     // Consume the one-time preemption request created by initial placement.
     // Neither future CBS deadline is due, so an ordinary safe point must not
     // manufacture more scheduler work merely to scan the reservation set.
-    assert!(cpu.as_mut().scheduler_enter());
+    assert!(cpu.remote().take_preempt_requested());
     let outcome = system.schedule_if_requested_at(cpu.as_mut(), 0).unwrap();
     assert!(matches!(outcome, SchedulerOutcome::Quiescent));
 }
@@ -5451,7 +5458,12 @@ fn remote_pi_owner_exclusively_borrows_the_donor_cbs_entity() {
         )
     };
     crate::test_runtime::set_monotonic_ns(20);
-    system.service_deadline_timers(cpu0.as_mut(), 20).unwrap();
+    let irq_budget = cpu0.batch_limit();
+    let irq_batch = cpu0
+        .as_mut()
+        .on_task_clock_event(MonotonicInstant::from_nanos(20).unwrap(), irq_budget);
+    assert_eq!(irq_batch.expired(), 1);
+    system.service_soft_timer_work(cpu0.as_mut(), 20).unwrap();
     {
         let state = system.state.lock();
         let sched = state.thread_record(donor.id()).unwrap().sched.lock();
@@ -5466,7 +5478,7 @@ fn remote_pi_owner_exclusively_borrows_the_donor_cbs_entity() {
             "the expired donor CBS event must stay detached while the borrower owns the baton"
         );
     }
-    cpu0.as_mut().scheduler_enter();
+    let _ = cpu0.remote().take_preempt_requested();
     assert!(
         !cpu0.needs_reschedule(),
         "the donor CPU must start the baton-return check without stale work"
@@ -5495,7 +5507,7 @@ fn remote_pi_owner_exclusively_borrows_the_donor_cbs_entity() {
         );
     }
     system.drain_policy_updates_at(cpu0.as_mut(), 20).unwrap();
-    system.service_deadline_timers(cpu0.as_mut(), 20).unwrap();
+    system.service_soft_timer_work(cpu0.as_mut(), 20).unwrap();
     assert_eq!(system.deadline_runtime(donor.id()).unwrap().misses(), 1);
     system.pi_wait_cancel(wait).unwrap();
 }

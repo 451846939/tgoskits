@@ -7,7 +7,7 @@ mod deadline_state;
 mod dispatch_state;
 mod drain_state;
 
-use deadline_state::TaskDeadlinePublicationState;
+use deadline_state::SchedulerDeadlinePublicationState;
 
 /// Scheduler state that is created explicitly and mutated only by its owner CPU.
 ///
@@ -17,6 +17,7 @@ use deadline_state::TaskDeadlinePublicationState;
 pub struct CpuLocal {
     owner: CpuId,
     remote: Arc<CpuRemote>,
+    rt_bandwidth: Arc<RootRtBandwidth>,
     dispatch: dispatch_state::OwnerDispatchState,
     task_deadlines: deadline_state::LocalTaskDeadlineState,
     drain: drain_state::OwnerDrainScratch,
@@ -28,11 +29,13 @@ impl CpuLocal {
         owner: CpuId,
         config: TaskSystemConfig,
         remote: Arc<CpuRemote>,
+        rt_bandwidth: Arc<RootRtBandwidth>,
     ) -> Pin<Box<Self>> {
         debug_assert_eq!(owner, remote.owner());
         Box::pin(Self {
             owner,
             remote,
+            rt_bandwidth,
             dispatch: dispatch_state::OwnerDispatchState::new(config),
             task_deadlines: deadline_state::LocalTaskDeadlineState::new(config),
             drain: drain_state::OwnerDrainScratch::new(config),
@@ -192,7 +195,7 @@ impl CpuLocal {
         let remote = &this.remote;
         let dispatch = &mut this.dispatch;
         let mut run_queue = remote.lock_run_queue();
-        let now_ns = run_queue.update_clock().as_nanos();
+        let now_ns = run_queue.update_clock().task_nanos();
         Self::charge_current_dispatch_locked(
             remote,
             dispatch,
@@ -249,7 +252,7 @@ impl CpuLocal {
             current_policy,
             SchedulePolicy::Fifo { .. } | SchedulePolicy::RoundRobin { .. }
         ) {
-            dispatch_state.rt_bandwidth.charge(now_ns, runtime_ns)
+            run_queue.charge_rt_runtime(runtime_ns)
         } else {
             false
         };
@@ -297,7 +300,7 @@ impl CpuLocal {
         clock: RunQueueClockSnapshot,
         reclaimed_ns: u64,
     ) -> Result<(DispatchCharge, RunQueueClockSnapshot), TaskError> {
-        let now_ns = clock.as_nanos();
+        let now_ns = clock.task_nanos();
         let runtime_ns = dispatch
             .current_dispatch
             .as_ref()
@@ -369,13 +372,12 @@ impl CpuLocal {
         self.dispatch.switch_handoff.as_ref()
     }
 
-    pub(crate) fn scheduler_enter(self: Pin<&mut Self>) -> bool {
-        // `need_resched` is cleared only after entering the scheduler, never by
-        // wake, timer, IPI, or preemption-disable paths. The AcqRel claim pairs
-        // with producer Release stores after inbox publication. Rechecking the
-        // inbox after the claim closes the race where a forced scheduling path
-        // otherwise overwrote a remote producer's doorbell.
-        self.remote.scheduler_enter()
+    pub(crate) fn claim_scheduler_request(self: Pin<&mut Self>) -> SchedulerRequestClaim {
+        self.remote.claim_scheduler_request()
+    }
+
+    pub(crate) fn acknowledge_scheduler_request(&self, claim: SchedulerRequestClaim) {
+        self.remote.acknowledge_scheduler_request(claim);
     }
 
     pub(crate) fn defer_park_preemption(&self, requested: bool) {
@@ -458,13 +460,16 @@ impl CpuLocal {
         clock: RunQueueClockSnapshot,
         monotonic_now: MonotonicInstant,
     ) -> bool {
-        let now_ns = clock.as_nanos();
+        let now_ns = clock.task_nanos();
         // SAFETY: the scheduler owns this pinned runqueue while refreshing RT
         // bandwidth periods and querying its next local event.
         let this = unsafe { self.get_unchecked_mut() };
         let scheduler_due = this
             .scheduler_deadline_ns(now_ns)
             .is_some_and(|deadline| scheduler_time_reached(now_ns, deadline));
+        if scheduler_due {
+            this.remote.request_reschedule();
+        }
         scheduler_due || this.publish_fair_balance_due(monotonic_now)
     }
 
@@ -473,22 +478,20 @@ impl CpuLocal {
         clock: RunQueueClockSnapshot,
         monotonic_now: MonotonicInstant,
     ) -> Option<MonotonicDeadline> {
-        let scheduler_now_ns = clock.as_nanos();
+        let scheduler_now_ns = clock.task_nanos();
         // SAFETY: clockevent selection is an owner-only transition. The
         // mutable queue/scheduler projections cannot move CpuLocal.
         let this = unsafe { self.get_unchecked_mut() };
-        let deferred_timer_backlog = this.remote.deadline_work_pending()
+        let deferred_timer_backlog = this.remote.soft_timer_work_pending()
             && this
                 .task_deadlines
                 .queue
                 .has_immediately_actionable_entry(monotonic_now);
         let timer = if deferred_timer_backlog {
-            // A bounded hard-IRQ pass already published sticky owner work and
-            // need_resched. Re-arming the overdue heap head at the hardware
-            // resolution would create an interrupt storm that can prevent the
-            // scheduler safe point from draining that work. Keep future
-            // scheduler deadlines visible and let the runtime's periodic
-            // source remain the failsafe clockevent.
+            // A bounded hard-IRQ pass transferred ownership of the overdue
+            // heap head to sticky soft-timer work. Re-arming that same head
+            // would create an interrupt storm; the claimed scheduler work is
+            // now the sole progress mechanism until the queue is drained.
             None
         } else {
             this.task_deadlines.queue.next_deadline()
@@ -510,98 +513,94 @@ impl CpuLocal {
             None => None,
         };
         let fair_balance = this.fair_balance_clockevent_deadline(monotonic_now);
-        [timer, scheduler, fair_balance].into_iter().flatten().min()
+        let rt_period = this.rt_bandwidth.deadline_for(this.owner);
+        [timer, scheduler, fair_balance, rt_period]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
-    pub(crate) fn next_task_deadline_update(
+    pub(crate) fn next_scheduler_deadline_update(
         mut self: Pin<&mut Self>,
         clock: RunQueueClockSnapshot,
         monotonic_now: MonotonicInstant,
-    ) -> Result<TaskDeadlineUpdate, TaskError> {
+    ) -> Result<SchedulerDeadlineUpdate, TaskError> {
         let publication = self
             .as_mut()
-            .task_deadline_publication(clock, monotonic_now);
+            .scheduler_deadline_publication(clock, monotonic_now);
         let task_deadlines = self.task_deadline_state_mut();
         if task_deadlines.publication == Some(publication) {
-            return TaskDeadlineUpdate::try_new(
+            return SchedulerDeadlineUpdate::try_new(
                 task_deadlines.generation,
                 publication.deadline,
-                publication.deferred_work,
             )
             .ok_or(TaskError::InvalidConfiguration);
         }
-        Self::commit_task_deadline_publication(task_deadlines, publication)
+        Self::commit_scheduler_deadline_publication(task_deadlines, publication)
     }
 
-    pub(crate) fn next_task_deadline_update_if_changed(
+    pub(crate) fn next_scheduler_deadline_update_if_changed(
         mut self: Pin<&mut Self>,
         clock: RunQueueClockSnapshot,
         monotonic_now: MonotonicInstant,
-    ) -> Result<Option<TaskDeadlineUpdate>, TaskError> {
+    ) -> Result<Option<SchedulerDeadlineUpdate>, TaskError> {
         let publication = self
             .as_mut()
-            .task_deadline_publication(clock, monotonic_now);
+            .scheduler_deadline_publication(clock, monotonic_now);
         let task_deadlines = self.task_deadline_state_mut();
         if task_deadlines.publication == Some(publication) {
             return Ok(None);
         }
-        Self::commit_task_deadline_publication(task_deadlines, publication).map(Some)
+        Self::commit_scheduler_deadline_publication(task_deadlines, publication).map(Some)
     }
 
-    fn task_deadline_publication(
+    fn scheduler_deadline_publication(
         mut self: Pin<&mut Self>,
         clock: RunQueueClockSnapshot,
         monotonic_now: MonotonicInstant,
-    ) -> TaskDeadlinePublicationState {
+    ) -> SchedulerDeadlinePublicationState {
         let deadline = self.as_mut().next_oneshot_deadline(clock, monotonic_now);
-        TaskDeadlinePublicationState {
-            deadline,
-            deferred_work: self.remote.deadline_work_pending(),
-        }
+        SchedulerDeadlinePublicationState { deadline }
     }
 
-    fn commit_task_deadline_publication(
+    fn commit_scheduler_deadline_publication(
         task_deadlines: &mut deadline_state::LocalTaskDeadlineState,
-        publication: TaskDeadlinePublicationState,
-    ) -> Result<TaskDeadlineUpdate, TaskError> {
+        publication: SchedulerDeadlinePublicationState,
+    ) -> Result<SchedulerDeadlineUpdate, TaskError> {
         task_deadlines.generation = task_deadlines
             .generation
             .checked_add(1)
             .ok_or(TaskError::InvalidConfiguration)?;
-        let update = TaskDeadlineUpdate::try_new(
-            task_deadlines.generation,
-            publication.deadline,
-            publication.deferred_work,
-        )
-        .ok_or(TaskError::InvalidConfiguration)?;
+        let update =
+            SchedulerDeadlineUpdate::try_new(task_deadlines.generation, publication.deadline)
+                .ok_or(TaskError::InvalidConfiguration)?;
         task_deadlines.publication = Some(publication);
         Ok(update)
     }
 
-    pub(crate) fn invalidate_task_deadline_publication(self: Pin<&mut Self>) {
+    pub(crate) fn invalidate_scheduler_deadline_publication(self: Pin<&mut Self>) {
         self.task_deadline_state_mut().publication = None;
     }
 
-    pub(crate) fn deadline_work_pending(&self) -> bool {
-        self.remote.deadline_work_pending()
+    pub(crate) fn soft_timer_work_pending(&self) -> bool {
+        self.remote.soft_timer_work_pending()
     }
 
     pub(crate) fn run_queue_clock(&self) -> Option<RunQueueClockSnapshot> {
         self.remote.lock_run_queue().clock_snapshot()
     }
 
-    pub(crate) fn has_task_deadlines(&self) -> bool {
-        !self.task_deadlines.queue.is_empty()
-    }
-
-    pub(crate) fn task_deadline_expiry_due(&self, now: MonotonicInstant) -> bool {
+    pub(crate) fn has_due_task_deadline(&self, now: MonotonicInstant) -> bool {
         self.task_deadlines
             .queue
             .has_immediately_actionable_entry(now)
     }
 
     #[cfg(test)]
-    pub(crate) fn set_task_deadline_generation_for_test(self: Pin<&mut Self>, generation: u64) {
+    pub(crate) fn set_scheduler_deadline_generation_for_test(
+        self: Pin<&mut Self>,
+        generation: u64,
+    ) {
         self.task_deadline_state_mut().generation = generation;
     }
 
@@ -626,19 +625,13 @@ impl CpuLocal {
             {
                 next_deadline_ns = earliest(next_deadline_ns, deadline);
             }
-            if dispatch.is_rt() && !dispatch.rt_quota_exempt {
-                let remaining = self.dispatch.rt_bandwidth.remaining_runtime_ns(now_ns);
-                let deadline = if remaining == 0 {
-                    self.dispatch.rt_bandwidth.next_period_ns(now_ns)
-                } else {
-                    scheduler_time_advance(now_ns, remaining)
-                };
-                next_deadline_ns = earliest(next_deadline_ns, deadline);
+            if dispatch.is_rt()
+                && !dispatch.rt_quota_exempt
+                && let Some(remaining) = run_queue.rt_runtime_until_throttle()
+            {
+                next_deadline_ns =
+                    earliest(next_deadline_ns, scheduler_time_advance(now_ns, remaining));
             }
-        }
-        if run_queue.has_rt() && self.dispatch.rt_bandwidth.is_throttled(now_ns) {
-            let deadline = self.dispatch.rt_bandwidth.next_period_ns(now_ns);
-            next_deadline_ns = earliest(next_deadline_ns, deadline);
         }
         next_deadline_ns
     }
@@ -725,8 +718,24 @@ impl CpuLocal {
         &mut unsafe { self.get_unchecked_mut() }.task_deadlines.queue
     }
 
-    /// Expires one bounded timer batch without allocation or callbacks.
-    pub fn expire_task_deadlines(
+    /// Expires one bounded hard-IRQ timer batch and publishes soft-timer work.
+    pub fn on_task_clock_event(
+        self: Pin<&mut Self>,
+        now: MonotonicInstant,
+        budget: usize,
+    ) -> TaskDeadlineExpireBatch {
+        let mut this = self;
+        let batch = this.as_mut().promote_due_task_deadlines(now, budget);
+        if batch.pending() || batch.expired() != 0 {
+            this.remote.publish_soft_timer_work();
+        }
+        batch
+    }
+
+    /// Moves one bounded batch into task-context storage without publishing a
+    /// second scheduler request. The soft-timer worker owns publication for
+    /// the complete begin/drain/finish transaction.
+    pub(crate) fn promote_due_task_deadlines(
         self: Pin<&mut Self>,
         now: MonotonicInstant,
         budget: usize,
@@ -748,9 +757,6 @@ impl CpuLocal {
         let output = &mut task_deadlines.expired_buffer[task_deadlines.expired_count..];
         let batch = task_deadlines.queue.expire(request, output);
         task_deadlines.expired_count += batch.expired();
-        if batch.pending() || batch.expired() != 0 {
-            this.remote.publish_deadline_work();
-        }
         batch
     }
 
@@ -759,12 +765,12 @@ impl CpuLocal {
         self.task_deadlines.expire_passes
     }
 
-    pub(crate) fn begin_deadline_work(self: Pin<&mut Self>) -> bool {
-        self.remote.begin_deadline_work()
+    pub(crate) fn begin_soft_timer_work(self: Pin<&mut Self>) -> bool {
+        self.remote.begin_soft_timer_work()
     }
 
-    pub(crate) fn finish_deadline_work(self: Pin<&mut Self>, pending: bool) {
-        self.remote.finish_deadline_work(pending);
+    pub(crate) fn finish_soft_timer_work(self: Pin<&mut Self>, pending: bool) {
+        self.remote.finish_soft_timer_work(pending);
     }
 
     /// Copies expired timer events to task-context storage.
@@ -788,22 +794,11 @@ impl CpuLocal {
         count
     }
 
-    pub(crate) fn take_expired_park_deadline(self: Pin<&mut Self>) -> Option<ExpiredTaskDeadline> {
-        self.take_expired_task_deadline_matching(|event| {
-            event
-                .kind()
-                .is_some_and(|kind| kind.park_generation().is_some())
-        })
-    }
-
-    pub(crate) fn take_expired_scheduler_deadline(
-        self: Pin<&mut Self>,
+    pub(crate) fn take_one_expired_task_deadline(
+        mut self: Pin<&mut Self>,
     ) -> Option<ExpiredTaskDeadline> {
-        self.take_expired_task_deadline_matching(|event| {
-            event
-                .kind()
-                .is_some_and(|kind| kind.park_generation().is_none())
-        })
+        let mut event = [ExpiredTaskDeadline::EMPTY; 1];
+        (self.as_mut().take_expired_task_deadlines(&mut event) == 1).then_some(event[0])
     }
 
     pub(crate) const fn has_expired_task_deadlines(&self) -> bool {
@@ -820,23 +815,6 @@ impl CpuLocal {
                     && event.deadline() == Some(registration.deadline())
                     && event.kind() == Some(registration.kind())
             })
-    }
-
-    fn take_expired_task_deadline_matching(
-        self: Pin<&mut Self>,
-        matches: impl Fn(ExpiredTaskDeadline) -> bool,
-    ) -> Option<ExpiredTaskDeadline> {
-        let task_deadlines = self.task_deadline_state_mut();
-        let index = task_deadlines.expired_buffer[..task_deadlines.expired_count]
-            .iter()
-            .rposition(|event| event.thread().is_some() && matches(*event))?;
-        task_deadlines.expired_count -= 1;
-        let last = task_deadlines.expired_count;
-        task_deadlines.expired_buffer.swap(index, last);
-        Some(core::mem::replace(
-            &mut task_deadlines.expired_buffer[last],
-            ExpiredTaskDeadline::EMPTY,
-        ))
     }
 
     /// Returns the owner-control publication endpoint for remote CPUs.

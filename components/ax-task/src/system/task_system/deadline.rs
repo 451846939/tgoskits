@@ -446,54 +446,74 @@ impl TaskSystem {
         Ok((batch.drained(), dispatched))
     }
 
-    pub(super) fn service_deadline_timers(
+    pub(crate) fn service_soft_timer_work(
         &self,
         mut cpu: Pin<&mut CpuLocal>,
         scheduler_now_ns: u64,
     ) -> Result<(), TaskError> {
-        let monotonic_now = task_runtime::monotonic_now();
-        let _processed =
-            self.service_pending_deadline_timers(cpu.as_mut(), scheduler_now_ns, monotonic_now)?;
-        if cpu.task_deadline_expiry_due(monotonic_now) {
-            // Direct TaskSystem users retain the facade's lost-clockevent
-            // recovery. Runtime scheduling enters through the facade and does
-            // not call this promotion path a second time.
-            let budget = cpu.batch_limit();
-            cpu.as_mut().expire_task_deadlines(monotonic_now, budget);
+        if !cpu.soft_timer_work_pending() {
+            return Ok(());
         }
-        let _processed =
-            self.service_pending_deadline_timers(cpu, scheduler_now_ns, monotonic_now)?;
-        Ok(())
+        let monotonic_now = task_runtime::monotonic_now();
+        if !cpu.as_mut().begin_soft_timer_work() {
+            return Ok(());
+        }
+        let budget = cpu.batch_limit();
+        let service = (|| {
+            let mut processed = 0;
+            while processed < budget {
+                if !cpu.has_expired_task_deadlines() && cpu.has_due_task_deadline(monotonic_now) {
+                    let remaining = budget - processed;
+                    cpu.as_mut()
+                        .promote_due_task_deadlines(monotonic_now, remaining);
+                }
+                let Some(event) = cpu.as_mut().take_one_expired_task_deadline() else {
+                    break;
+                };
+                self.service_expired_deadline(cpu.as_mut(), event, scheduler_now_ns)?;
+                processed += 1;
+            }
+            Ok(())
+        })();
+        let pending = service.is_err()
+            || cpu.has_expired_task_deadlines()
+            || cpu.has_due_task_deadline(monotonic_now);
+        cpu.as_mut().finish_soft_timer_work(pending);
+        service
     }
 
-    pub(crate) fn service_pending_deadline_timers(
+    fn service_expired_deadline(
         &self,
-        mut cpu: Pin<&mut CpuLocal>,
+        cpu: Pin<&mut CpuLocal>,
+        event: ExpiredTaskDeadline,
         scheduler_now_ns: u64,
-        monotonic_now: MonotonicInstant,
-    ) -> Result<usize, TaskError> {
-        let mut processed = 0;
-        if cpu.as_mut().begin_deadline_work() {
-            let budget = cpu.batch_limit();
-            let service = (|| {
-                while processed < budget {
-                    let Some(event) = cpu.as_mut().take_expired_scheduler_deadline() else {
-                        break;
-                    };
-                    self.service_expired_scheduler_deadline(cpu.as_mut(), event, scheduler_now_ns)?;
-                    processed += 1;
-                }
-                Ok(())
-            })();
-            if let Err(error) = service {
-                cpu.as_mut().finish_deadline_work(true);
-                return Err(error);
+    ) -> Result<(), TaskError> {
+        match event.kind() {
+            Some(TaskDeadlineKind::ParkTimeout { .. }) => self.service_expired_park_deadline(event),
+            Some(TaskDeadlineKind::DeadlineCbs | TaskDeadlineKind::DeadlineZeroLag) => {
+                self.service_expired_scheduler_deadline(cpu, event, scheduler_now_ns)
             }
-            let pending =
-                cpu.has_expired_task_deadlines() || cpu.task_deadline_expiry_due(monotonic_now);
-            cpu.as_mut().finish_deadline_work(pending);
+            None => Ok(()),
         }
-        Ok(processed)
+    }
+
+    fn service_expired_park_deadline(&self, event: ExpiredTaskDeadline) -> Result<(), TaskError> {
+        let Some(thread) = event.thread() else {
+            return Ok(());
+        };
+        let handle = match self.thread_handle(thread) {
+            Ok(handle) => handle,
+            Err(TaskError::StaleThreadId) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let completed = handle.core.complete_sleep_timer(event.token().generation());
+        let park_matches = event
+            .kind()
+            .is_some_and(|kind| kind.park_generation() == Some(handle.core.park_generation()));
+        if completed && park_matches {
+            let _wake_result = handle.wake_handle().wake();
+        }
+        Ok(())
     }
 
     fn service_expired_scheduler_deadline(
@@ -573,11 +593,11 @@ impl TaskSystem {
         let monotonic_now = task_runtime::monotonic_now();
         let Some(update) = cpu
             .as_mut()
-            .next_task_deadline_update_if_changed(clock, monotonic_now)?
+            .next_scheduler_deadline_update_if_changed(clock, monotonic_now)?
         else {
             return Ok(());
         };
-        task_runtime::publish_task_deadline(update);
+        task_runtime::publish_scheduler_deadline(update);
         Ok(())
     }
 }

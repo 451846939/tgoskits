@@ -100,7 +100,7 @@ impl TaskSystem {
         token: &mut ParkTicket,
     ) -> Result<ParkCommit, TaskError> {
         self.ensure_owner_cpu_context(&cpu)?;
-        let now_ns = cpu.update_rq_clock().as_nanos();
+        let now_ns = cpu.update_rq_clock().wall_nanos();
         self.commit_park_at(cpu, token, now_ns)
     }
 
@@ -136,8 +136,8 @@ impl TaskSystem {
             token.mark_resolved();
             return Ok(ParkCommit::Notified);
         }
-        let scheduler_requested = cpu.as_mut().scheduler_enter();
-        cpu.defer_park_preemption(scheduler_requested);
+        let scheduler_request = cpu.as_mut().claim_scheduler_request();
+        cpu.defer_park_preemption(scheduler_request.preempt_requested());
         self.commit_owner_current_dispatch(cpu.as_mut())?;
         #[cfg(test)]
         park_commit_wake_race_hook(self, previous_core.id());
@@ -200,6 +200,7 @@ impl TaskSystem {
             cpu.as_mut().install_dispatch(dispatch);
             cpu.finish_park_preemption(true);
             self.publish_owner_cpu_load_summary(cpu.as_mut());
+            cpu.acknowledge_scheduler_request(scheduler_request);
             token.mark_resolved();
             return Ok(ParkCommit::Notified);
         }
@@ -223,7 +224,8 @@ impl TaskSystem {
             SwitchReason::Blocked,
             now_ns,
         );
-        let decision = self.finish_owner_selection(cpu, decision);
+        let decision = self.finish_owner_selection(cpu.as_mut(), decision);
+        cpu.acknowledge_scheduler_request(scheduler_request);
         token.mark_resolved();
         Ok(ParkCommit::Blocked(decision))
     }
@@ -258,7 +260,7 @@ impl TaskSystem {
         mut cpu: Pin<&mut CpuLocal>,
     ) -> Result<ScheduleDecision, TaskError> {
         self.ensure_owner_cpu_context(&cpu)?;
-        let now_ns = cpu.update_rq_clock().as_nanos();
+        let now_ns = cpu.update_rq_clock().wall_nanos();
         match self.prepare_park(cpu.as_mut())? {
             ParkPrepare::Prepared(mut ticket) => {
                 match self.commit_park_at(cpu.as_mut(), &mut ticket, now_ns)? {
@@ -292,7 +294,7 @@ impl TaskSystem {
         &self,
         cpu: Pin<&mut CpuLocal>,
     ) -> Result<CurrentExitPermit, TaskError> {
-        let now_ns = cpu.update_rq_clock().as_nanos();
+        let now_ns = cpu.update_rq_clock().wall_nanos();
         self.prepare_current_exit_inner(cpu, now_ns, true)
     }
 
@@ -363,7 +365,7 @@ impl TaskSystem {
         // Pure scheduler users may model a transition without installing an
         // architecture context. The runtime facade uses the stricter prepared
         // form before publishing OS-visible completion.
-        let now_ns = cpu.update_rq_clock().as_nanos();
+        let now_ns = cpu.update_rq_clock().wall_nanos();
         let permit = self.prepare_current_exit_inner(cpu.as_mut(), now_ns, false)?;
         self.commit_current_exit_after_owner_drain(cpu, permit, now_ns)
     }
@@ -375,7 +377,7 @@ impl TaskSystem {
         permit: CurrentExitPermit,
     ) -> Result<ScheduleDecision, TaskError> {
         self.ensure_owner_cpu_context(&cpu)?;
-        let now_ns = cpu.update_rq_clock().as_nanos();
+        let now_ns = cpu.update_rq_clock().wall_nanos();
         self.complete_context_switch(cpu.as_mut())?;
         self.drain_owner_work(cpu.as_mut(), now_ns)?;
         self.commit_current_exit_after_owner_drain(cpu, permit, now_ns)
@@ -394,7 +396,7 @@ impl TaskSystem {
         now_ns: u64,
     ) -> Result<ScheduleDecision, TaskError> {
         let exiting = permit.thread();
-        let (decision, exited_core) = {
+        let (decision, exited_core, scheduler_request) = {
             let mut state = self.state.lock();
             state.ensure_cpu_online(&cpu)?;
             let previous = cpu.current().ok_or(TaskError::NoRunnableThread)?;
@@ -407,7 +409,7 @@ impl TaskSystem {
                 return Err(TaskError::InvalidPiState);
             }
             record.callbacks.validate_prepare_exit()?;
-            cpu.as_mut().scheduler_enter();
+            let scheduler_request = cpu.as_mut().claim_scheduler_request();
             self.commit_owner_current_dispatch(cpu.as_mut())?;
             let previous_core = previous_core.ok_or(TaskError::NoRunnableThread)?;
             Self::detach_owner_deadline_bandwidth(&previous_core, cpu.as_mut());
@@ -486,11 +488,14 @@ impl TaskSystem {
                     now_ns,
                 ),
                 Arc::clone(&previous_core),
+                scheduler_request,
             )
         };
         exited_core.notify_affinity_waiters();
         drop(permit);
-        Ok(self.finish_owner_selection(cpu, decision))
+        let decision = self.finish_owner_selection(cpu.as_mut(), decision);
+        cpu.acknowledge_scheduler_request(scheduler_request);
+        Ok(decision)
     }
 
     /// Completes the physical switch-out handoff in the newly active context.
