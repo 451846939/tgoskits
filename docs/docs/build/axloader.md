@@ -34,7 +34,7 @@ flowchart TB
     ESP["3. 组装 ESP<br/>esp/EFI/BOOT/BOOTX64.EFI"]
     KERNEL["4. minimal_x86_64_kernel_elf<br/>手工拼装的 2 字节 jmp . 内核"]
     HTTP["5. SmokeHttpServer::start<br/>监听 0.0.0.0:0 提供 /kernel.elf"]
-    QEMU["6. spawn_axloader_qemu<br/>q35 + KVM + pflash(OVMF) + user net(e1000)"]
+    QEMU["6. spawn_axloader_qemu<br/>q35 + KVM + pflash(OVMF) + user net(virtio-net)"]
     SERIAL["7. 监听 QEMU stdio<br/>等待 'AXLOADER READY'"]
     BOOT["8. 写入 AXLOADER BOOT JSON 行<br/>含 kernel_url=http://10.0.2.2:<port>/kernel.elf"]
     FETCH["9. QEMU user-net 访问 host<br/>10.0.2.2 (QEMU_HOST_GATEWAY)"]
@@ -71,7 +71,7 @@ qemu-system-x86_64 \
   -m 256M -smp 1 -machine q35 \
   -accel kvm \
   -display none -monitor none -serial stdio \
-  -netdev user,id=net0 -device e1000,netdev=net0 \
+  -netdev user,id=net0 -device virtio-net-pci,netdev=net0 \
   -drive if=pflash,format=raw,readonly=on,file=<OVMF> \
   -drive format=raw,if=ide,file=fat:rw:<esp_dir>
 ```

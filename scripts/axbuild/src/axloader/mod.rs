@@ -370,7 +370,7 @@ fn x86_64_qemu_args(firmware: &Path, esp_dir: &Path) -> Vec<String> {
         "-netdev".into(),
         "user,id=net0".into(),
         "-device".into(),
-        "e1000,netdev=net0".into(),
+        "virtio-net-pci,netdev=net0".into(),
         "-drive".into(),
         format!(
             "if=pflash,format=raw,readonly=on,file={}",
@@ -684,6 +684,21 @@ mod tests {
             args.windows(2)
                 .any(|pair| pair == ["-accel".to_string(), "kvm".to_string()]),
             "axloader HTTP smoke runs on KVM-labelled CI and must not silently fall back to TCG"
+        );
+    }
+
+    #[test]
+    fn x86_64_smoke_qemu_uses_uefi_virtio_network() {
+        let args = x86_64_qemu_args(Path::new("/ovmf.fd"), Path::new("/esp"));
+
+        assert!(
+            args.windows(2).any(|pair| {
+                pair == [
+                    "-device".to_string(),
+                    "virtio-net-pci,netdev=net0".to_string(),
+                ]
+            }),
+            "axloader HTTP smoke should use the same stable virtio-net model as other QEMU tests"
         );
     }
 
