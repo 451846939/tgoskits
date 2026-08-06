@@ -3,7 +3,7 @@ use super::*;
 pub(super) struct ControllerPort {
     pub(super) commands: BoundedChannel<ControllerCommand>,
     pub(super) notification: Arc<dyn BlockNotification>,
-    pub(super) irq_latches: IrqMutex<Vec<Arc<ControllerIrqLatch>>>,
+    pub(super) irq_latches: PiMutex<Vec<Arc<ControllerIrqLatch>>>,
 }
 
 pub(super) struct ControllerCommand {
@@ -12,7 +12,7 @@ pub(super) struct ControllerCommand {
 }
 
 struct ControllerReply {
-    result: IrqMutex<Option<Result<ControllerState, BlkError>>>,
+    result: PiMutex<Option<Result<ControllerState, BlkError>>>,
     notification: Arc<dyn BlockNotification>,
 }
 
@@ -33,7 +33,7 @@ impl ControllerPort {
             .map_err(|_| BlkError::Other("block runtime adapter is not installed"))?
             .notification();
         let reply = Arc::new(ControllerReply {
-            result: IrqMutex::new(None),
+            result: PiMutex::new(None),
             notification,
         });
         let command = ControllerCommand {
@@ -62,8 +62,16 @@ impl ControllerPort {
     }
 
     pub(super) fn irq_target(&self, source_id: usize) -> ControllerIrqTarget {
-        let latch = Arc::new(ControllerIrqLatch::new(source_id));
-        self.irq_latches.lock().push(Arc::clone(&latch));
+        let mut latches = self.irq_latches.lock();
+        let latch = latches
+            .iter()
+            .find(|latch| latch.source_id() == source_id)
+            .cloned()
+            .unwrap_or_else(|| {
+                let latch = Arc::new(ControllerIrqLatch::new(source_id));
+                latches.push(Arc::clone(&latch));
+                latch
+            });
         ControllerIrqTarget::new(latch, Arc::clone(&self.notification))
     }
 }

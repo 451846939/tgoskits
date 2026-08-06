@@ -34,14 +34,14 @@ use super::{
     completion::{CompletionGroup, CompletionSubscription},
     hctx::{ControllerEventPort, Hctx, HctxObserver, Submission, request_is_nowait},
     irq::{
-        BlockIrqAction, ControllerIrqLatch, ControllerIrqTarget, GroupIrqMemberTarget, IrqTarget,
-        LatchedControllerIrq,
+        BlockIrqAction, ControllerIrqLatch, ControllerIrqTarget, GroupIrqMemberTarget,
+        IrqRearmEpisode, IrqTarget, LatchedControllerIrq,
     },
     waiters::TaskWaiters,
 };
 use crate::os::{
     BlockIrqRegistration, BlockNotification, BlockThread, register_block_irq, runtime_ops,
-    sync::IrqMutex, wall_time,
+    sync::PiMutex, wall_time,
 };
 
 const CONTROLLER_CHANNEL_DEPTH: usize = 64;
@@ -202,8 +202,8 @@ impl BlockRuntime {
 
 struct BlockGroupHandle {
     name: String,
-    controller: IrqMutex<Option<Box<dyn BlockControllerGroup>>>,
-    registrations: IrqMutex<Vec<Box<dyn BlockIrqRegistration>>>,
+    controller: PiMutex<Option<Box<dyn BlockControllerGroup>>>,
+    registrations: PiMutex<Vec<Box<dyn BlockIrqRegistration>>>,
     members: Vec<Arc<BlockDeviceHandle>>,
     stopped: AtomicBool,
 }
@@ -329,8 +329,8 @@ impl BlockGroupHandle {
         }
         Ok(Self {
             name,
-            controller: IrqMutex::new(Some(controller)),
-            registrations: IrqMutex::new(registrations),
+            controller: PiMutex::new(Some(controller)),
+            registrations: PiMutex::new(registrations),
             members: ready,
             stopped: AtomicBool::new(false),
         })
@@ -499,15 +499,16 @@ impl Drop for BlockDeviceHandle {
 
 struct DeviceInner {
     name: String,
-    info: IrqMutex<DeviceInfo>,
+    info: PiMutex<DeviceInfo>,
     max_io_queues: usize,
+    irq_ownership: IrqOwnership,
     irq_sources: Vec<BlockIrqSource>,
-    hctxs: IrqMutex<Vec<Arc<Hctx>>>,
-    detached_queues: IrqMutex<Vec<Box<dyn HardwareQueue>>>,
-    cpu_channels: IrqMutex<Vec<CpuSubmissionChannel>>,
-    irq_registrations: IrqMutex<Vec<Box<dyn BlockIrqRegistration>>>,
+    hctxs: PiMutex<Vec<Arc<Hctx>>>,
+    detached_queues: PiMutex<Vec<Box<dyn HardwareQueue>>>,
+    cpu_channels: PiMutex<Vec<CpuSubmissionChannel>>,
+    irq_registrations: PiMutex<Vec<InstalledIrqSource>>,
     controller: Arc<ControllerPort>,
-    controller_thread: IrqMutex<Option<Box<dyn BlockThread>>>,
+    controller_thread: PiMutex<Option<Box<dyn BlockThread>>>,
     state: AtomicU8,
     accepting: AtomicBool,
     active_data: AtomicUsize,
@@ -516,6 +517,18 @@ struct DeviceInner {
     flush_gate_waiters: TaskWaiters,
     data_drain_waiters: TaskWaiters,
     state_notification: Arc<dyn BlockNotification>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IrqOwnership {
+    Device,
+    SharedGroup,
+}
+
+struct InstalledIrqSource {
+    source_id: usize,
+    queue_bits: u64,
+    registration: Box<dyn BlockIrqRegistration>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -541,7 +554,7 @@ impl BlockDeviceHandle {
             irqs,
             controller,
         } = device;
-        let handle = Self::bootstrap(name, irqs, controller)?;
+        let handle = Self::bootstrap(name, irqs, controller, IrqOwnership::Device)?;
         handle.finish_group_start()?;
         Ok(handle)
     }
@@ -550,13 +563,14 @@ impl BlockDeviceHandle {
         name: String,
         controller: Box<dyn BlockController>,
     ) -> Result<Arc<Self>, BlkError> {
-        Self::bootstrap(name, Vec::new(), controller)
+        Self::bootstrap(name, Vec::new(), controller, IrqOwnership::SharedGroup)
     }
 
     fn bootstrap(
         name: String,
         irqs: Vec<BlockIrqSource>,
         controller: Box<dyn BlockController>,
+        irq_ownership: IrqOwnership,
     ) -> Result<Arc<Self>, BlkError> {
         let info = controller.device_info();
         let max_io_queues = controller.max_io_queues().min(MAX_RUNTIME_HCTX);
@@ -573,19 +587,20 @@ impl BlockDeviceHandle {
             )
             .map_err(|_| BlkError::NoMemory)?,
             notification: controller_notification,
-            irq_latches: IrqMutex::new(Vec::new()),
+            irq_latches: PiMutex::new(Vec::new()),
         });
         let inner = Arc::new(DeviceInner {
             name,
-            info: IrqMutex::new(info),
+            info: PiMutex::new(info),
             max_io_queues,
+            irq_ownership,
             irq_sources: irqs,
-            hctxs: IrqMutex::new(Vec::new()),
-            detached_queues: IrqMutex::new(Vec::new()),
-            cpu_channels: IrqMutex::new(Vec::new()),
-            irq_registrations: IrqMutex::new(Vec::new()),
+            hctxs: PiMutex::new(Vec::new()),
+            detached_queues: PiMutex::new(Vec::new()),
+            cpu_channels: PiMutex::new(Vec::new()),
+            irq_registrations: PiMutex::new(Vec::new()),
             controller: Arc::clone(&controller_port),
-            controller_thread: IrqMutex::new(None),
+            controller_thread: PiMutex::new(None),
             state: AtomicU8::new(DEVICE_STARTING),
             accepting: AtomicBool::new(false),
             active_data: AtomicUsize::new(0),
@@ -840,6 +855,12 @@ fn quiesce_hctxs(hctxs: &[Arc<Hctx>]) {
 fn disable_registrations(registrations: &[Box<dyn BlockIrqRegistration>]) {
     for registration in registrations {
         let _ = registration.disable_and_synchronize();
+    }
+}
+
+fn disable_installed_sources(sources: &[InstalledIrqSource]) {
+    for source in sources {
+        let _ = source.registration.disable_and_synchronize();
     }
 }
 

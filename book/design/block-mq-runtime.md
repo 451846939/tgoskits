@@ -254,6 +254,50 @@ Each endpoint owns:
 The acknowledgement also carries a queue bitmap and an opaque controller event.
 It never carries borrowed memory or invokes a completion callback.
 
+### 物理 IRQ source 与 deferred owner
+
+本轮以本地 Linux v7.1（`8cd9520d35a6`）的 PREEMPT_RT 路径重新核对了
+block IRQ 生命周期。对应关系是：
+
+- `kernel/irq/chip.c::handle_level_irq` 在执行 action 前 mask/ack，只有不存在
+  oneshot worker 时才 unmask；
+- `kernel/irq/handle.c::__irq_wake_thread` 用 `IRQTF_RUNTHREAD` 合并重复投递，
+  并把 action 的 `thread_mask` 计入 `threads_oneshot`；
+- `kernel/irq/manage.c::irq_finalize_oneshot` 在 `IRQS_INPROGRESS`、新的
+  `IRQTF_RUNTHREAD` 和全部 `threads_oneshot` 都清除后才允许 unmask；
+- `drivers/nvme/host/pci.c::nvme_irq` 由 queue owner 排空 CQ；当多个 queue
+  共享一个 vector 时，解除物理 source 屏蔽仍由 IRQ descriptor 汇总，而不是
+  由任意一个 queue 提前执行。
+
+TGOSKits 不复制 Linux 的 IRQ thread 基础设施，但采用相同的所有权模型：
+
+1. 一个 `source_id` 在运行时只能有一个已安装 registration。`IrqEndpoint`
+   是该 source 的完整 queue-routing 快照，而不是可以累加的局部 queue
+   handler。同一 source 再次出现表示替换；driver 必须先保持 source masked，
+   runtime 执行 `disable + synchronize`、安装完整新快照，最后才通过
+   `ControllerEvent::Rearm` 解除屏蔽。
+2. rearm domain 的 `IN_PROGRESS`、`REARM_PENDING`、`REARM_CANCELLED` 和 active
+   deferred-owner 数量放在同一个原子状态字中。最后一个 owner 只能用比较交换领取
+   唯一 rearm；并发的 hard IRQ publication、新 owner 或 drain failure 会修改同一个
+   状态字，因此不存在“读到旧计数后提前 unmask”的窗口。即使失败发生在 top half
+   退出之前，后续 `finish_irq` 也不能重新生成已取消的 rearm。
+3. 每个 queue latch 单独维护 `ACTIVE/PENDING`，等价于 Linux action 的
+   `RUNTHREAD` 生命周期。hard IRQ 先发布 queue/control 数据，再设置 pending 并
+   通知 hctx；hctx claim 后排空 CQ。排空期间的新 IRQ 会重新设置 pending，使完成
+   CAS 失败并保留 active owner，下一轮继续 drain，不会丢事件，也不会提前 rearm。
+4. queue-coupled control 和 rearm 都在 hctx 完成 drain 后发布。source 自身持有固定的
+   controller publisher，任务态完成路径不再查 controller latch registry，也不再获取
+   IRQ-aware registry lock。control-only source 没有 queue owner，由 controller worker
+   作为唯一 deferred owner。
+5. shared controller 的物理 IRQ source 与 member-local mask domain 分开建模。例如
+   AHCI HBA IRQ 可以保持 acknowledged/cleared，而被 mask 的 PxIE 属于各 port member；
+   每个 member 的 queue owners 只汇总并 rearm 自己的 port，不能替其他 member 或
+   HBA source 做解除屏蔽。
+
+这个模型没有 polling、超时重试、重复 registration 或 controller 提前 rearm 的兼容
+路径。数据 I/O 只能由 hard IRQ publication 推进到唯一 queue owner，再由最后 owner
+完成 source rearm。
+
 ### Hardware queue
 
 `HardwareQueue` is move-only and is owned by one maintenance task. Its data path
