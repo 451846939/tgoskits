@@ -18,8 +18,8 @@ const ARCEOS_IVC_GUEST_PACKAGES: &[&str] = &["arceos-ivc-publisher", "arceos-ivc
 const AXVISOR_IVC_LINUX_PUBLISHER_GUEST_PATH: &str = "/root/ivc-publish";
 const AXVISOR_IVC_LINUX_SUBSCRIBER_GUEST_PATH: &str = "/root/ivc-subscribe";
 const AXVISOR_IVC_ZEPHYR_PUBLISHER_GUEST_PATH: &str = "/guest/zephyr/zephyr-ivc-publisher.bin";
-const AXVISOR_VPCI_BAR2_SMOKE_GUEST_PATH: &str = "/root/vpci-bar2-smoke";
-const AXVISOR_VPCI_BAR2_INITRAMFS_GUEST_PATH: &str = "/guest/linux/vpci-bar2-initramfs.cpio";
+const AXVISOR_IVSHMEM_BAR2_SMOKE_GUEST_PATH: &str = "/root/ivshmem-bar2-smoke";
+const AXVISOR_IVSHMEM_BAR2_INITRAMFS_GUEST_PATH: &str = "/guest/linux/ivshmem-bar2-initramfs.cpio";
 
 #[derive(Clone, Copy)]
 struct ArceosIvcGuestProfile {
@@ -217,35 +217,35 @@ pub(super) fn inject_zephyr_ivc_guest_images(
     result
 }
 
-pub(super) fn inject_linux_vpci_assets(
+pub(super) fn inject_linux_ivshmem_assets(
     workspace_root: &Path,
     request: &ResolvedAxvisorRequest,
     case: &PreparedAxvisorQemuCase,
     prepared_assets: &mut test_case::PreparedCaseAssets,
 ) -> anyhow::Result<()> {
-    if !case_needs_linux_vpci_assets(request, case) {
+    if !case_needs_linux_ivshmem_assets(request, case) {
         return Ok(());
     }
 
-    let out_dir = build_linux_vpci_assets(workspace_root, &request.arch)?;
-    let smoke = out_dir.join("vpci-bar2-smoke");
-    let initramfs = out_dir.join("vpci-bar2-initramfs.cpio");
-    ensure_file_exists(&smoke, "Linux vPCI BAR2 smoke test")?;
-    ensure_file_exists(&initramfs, "Linux vPCI BAR2 initramfs")?;
+    let out_dir = build_linux_ivshmem_assets(workspace_root, &request.arch)?;
+    let smoke = out_dir.join("ivshmem-bar2-smoke");
+    let initramfs = out_dir.join("ivshmem-bar2-initramfs.cpio");
+    ensure_file_exists(&smoke, "Linux ivshmem BAR2 smoke test")?;
+    ensure_file_exists(&initramfs, "Linux ivshmem BAR2 initramfs")?;
 
     let (overlay_dir, temporary_overlay_run_dir) =
         direct_overlay_dir(workspace_root, request, case)?;
     copy_guest_overlay_file(
         &smoke,
         &overlay_dir,
-        AXVISOR_VPCI_BAR2_SMOKE_GUEST_PATH,
-        "Linux vPCI BAR2 smoke test",
+        AXVISOR_IVSHMEM_BAR2_SMOKE_GUEST_PATH,
+        "Linux ivshmem BAR2 smoke test",
     )?;
     copy_guest_overlay_file(
         &initramfs,
         &overlay_dir,
-        AXVISOR_VPCI_BAR2_INITRAMFS_GUEST_PATH,
-        "Linux vPCI BAR2 initramfs",
+        AXVISOR_IVSHMEM_BAR2_INITRAMFS_GUEST_PATH,
+        "Linux ivshmem BAR2 initramfs",
     )?;
     let result = crate::rootfs::inject::inject_overlay(&prepared_assets.rootfs_path, &overlay_dir);
     test_case::remove_case_run_dir(temporary_overlay_run_dir.as_deref());
@@ -327,15 +327,15 @@ fn case_needs_zephyr_ivc_assets(
         })
 }
 
-fn case_needs_linux_vpci_assets(
+fn case_needs_linux_ivshmem_assets(
     request: &ResolvedAxvisorRequest,
     case: &PreparedAxvisorQemuCase,
 ) -> bool {
-    case.case.case.name.contains("vpci")
+    case.case.case.name.contains("ivshmem")
         && request.vmconfigs.iter().any(|path| {
             path.file_stem()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.contains("linux-vpci"))
+                .is_some_and(|name| name.contains("linux-ivshmem"))
         })
 }
 
@@ -380,32 +380,32 @@ fn build_zephyr_ivc_publisher(workspace_root: &Path) -> anyhow::Result<PathBuf> 
     Ok(out_dir.join("zephyr-ivc-publisher.bin"))
 }
 
-fn build_linux_vpci_assets(workspace_root: &Path, arch: &str) -> anyhow::Result<PathBuf> {
-    let source_dir = workspace_root.join("apps/linux/vpci");
+fn build_linux_ivshmem_assets(workspace_root: &Path, arch: &str) -> anyhow::Result<PathBuf> {
+    let source_dir = workspace_root.join("apps/linux/ivshmem");
     let build_script = source_dir.join("build.sh");
-    ensure_file_exists(&build_script, "Linux vPCI build script")?;
+    ensure_file_exists(&build_script, "Linux ivshmem build script")?;
 
-    let out_dir = workspace_root.join("tmp/axbuild/vpci").join(arch);
+    let out_dir = workspace_root.join("tmp/axbuild/ivshmem").join(arch);
     let mut command = Command::new(&build_script);
     command
         .current_dir(&source_dir)
-        .env("AXVISOR_VPCI_ARCH", arch)
-        .env("AXVISOR_VPCI_OUT_DIR", &out_dir);
+        .env("AXVISOR_IVSHMEM_ARCH", arch)
+        .env("AXVISOR_IVSHMEM_OUT_DIR", &out_dir);
 
     let status = command
         .status()
         .with_context(|| format!("failed to run {}", build_script.display()))?;
     if !status.success() {
-        anyhow::bail!("Linux vPCI asset build failed with status {status}");
+        anyhow::bail!("Linux ivshmem asset build failed with status {status}");
     }
-    write_vpci_bar2_initramfs(
-        &out_dir.join("vpci-bar2-initramfs.cpio"),
-        &out_dir.join("vpci-bar2-smoke"),
+    write_ivshmem_bar2_initramfs(
+        &out_dir.join("ivshmem-bar2-initramfs.cpio"),
+        &out_dir.join("ivshmem-bar2-smoke"),
     )?;
     Ok(out_dir)
 }
 
-fn write_vpci_bar2_initramfs(output: &Path, init_binary: &Path) -> anyhow::Result<()> {
+fn write_ivshmem_bar2_initramfs(output: &Path, init_binary: &Path) -> anyhow::Result<()> {
     let init = fs::read(init_binary)
         .with_context(|| format!("failed to read {}", init_binary.display()))?;
     let mut archive = Vec::new();

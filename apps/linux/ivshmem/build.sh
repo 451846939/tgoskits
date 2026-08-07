@@ -2,8 +2,8 @@
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-arch="${AXVISOR_VPCI_ARCH:-aarch64}"
-out_dir="${AXVISOR_VPCI_OUT_DIR:-${script_dir}/build/out-${arch}}"
+arch="${AXVISOR_IVSHMEM_ARCH:-aarch64}"
+out_dir="${AXVISOR_IVSHMEM_OUT_DIR:-${script_dir}/build/out-${arch}}"
 
 pick_cross_prefix() {
     local preferred="$1"
@@ -30,15 +30,15 @@ case "${arch}" in
         cross="$(pick_cross_prefix "${X86_64_MUSL_CROSS:-x86_64-linux-musl-}" "${X86_64_GNU_CROSS:-x86_64-linux-gnu-}" "")"
         ;;
     *)
-        echo "unsupported AXVISOR_VPCI_ARCH: ${arch}" >&2
+        echo "unsupported AXVISOR_IVSHMEM_ARCH: ${arch}" >&2
         exit 2
         ;;
 esac
 
 mkdir -p "${out_dir}"
 "${cross}gcc" \
-    -Wall -Wextra -Os -s -Wl,--gc-sections -static \
-    -o "${out_dir}/vpci-bar2-smoke" \
+    -Wall -Wextra -Os -s -Wl,--gc-sections -static -no-pie \
+    -o "${out_dir}/ivshmem-bar2-smoke" \
     "${script_dir}/bar2_smoke/main.c"
 
-echo "AXVISOR_VPCI_OUT_DIR=${out_dir}"
+echo "AXVISOR_IVSHMEM_OUT_DIR=${out_dir}"

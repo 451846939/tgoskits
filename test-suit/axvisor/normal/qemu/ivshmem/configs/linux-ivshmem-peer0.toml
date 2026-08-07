@@ -4,7 +4,7 @@
 # Guest vm id.
 id = 1
 # Guest vm name.
-name = "linux-vpci-peer0"
+name = "linux-ivshmem-peer0"
 # Virtualization type.
 vm_type = 1
 # The number of virtual CPUs.
@@ -27,7 +27,7 @@ kernel_load_addr = 0x8020_0000
 # The load address of the device tree blob (DTB).
 dtb_load_addr = 0x8000_0000
 # The file path of the initramfs image.
-ramdisk_path = "/guest/linux/vpci-bar2-initramfs.cpio"
+ramdisk_path = "/guest/linux/ivshmem-bar2-initramfs.cpio"
 # The load address of the initramfs image.
 ramdisk_load_addr = 0x8800_0000
 
@@ -46,7 +46,12 @@ interrupt_mode = "passthrough"
 
 # Pass-through devices.
 passthrough_devices = [
-    ["/"],
+    ["/chosen"],
+    ["/aliases"],
+    ["/psci"],
+    ["/timer"],
+    ["/intc@8000000"],
+    ["/pl011@9000000"],
 ]
 
 # Passthrough addresses.
@@ -54,41 +59,7 @@ passthrough_devices = [
 passthrough_addresses = []
 
 # Devices that are not desired to be passed through to the guest.
-excluded_devices = [
-    ["/pcie@10000000"],
-    ["/virtio_mmio@a000000"],
-    ["/virtio_mmio@a000200"],
-    ["/virtio_mmio@a000400"],
-    ["/virtio_mmio@a000600"],
-    ["/virtio_mmio@a000800"],
-    ["/virtio_mmio@a000a00"],
-    ["/virtio_mmio@a000c00"],
-    ["/virtio_mmio@a000e00"],
-    ["/virtio_mmio@a001000"],
-    ["/virtio_mmio@a001200"],
-    ["/virtio_mmio@a001400"],
-    ["/virtio_mmio@a001600"],
-    ["/virtio_mmio@a001800"],
-    ["/virtio_mmio@a001a00"],
-    ["/virtio_mmio@a001c00"],
-    ["/virtio_mmio@a001e00"],
-    ["/virtio_mmio@a002000"],
-    ["/virtio_mmio@a002200"],
-    ["/virtio_mmio@a002400"],
-    ["/virtio_mmio@a002600"],
-    ["/virtio_mmio@a002800"],
-    ["/virtio_mmio@a002a00"],
-    ["/virtio_mmio@a002c00"],
-    ["/virtio_mmio@a002e00"],
-    ["/virtio_mmio@a003000"],
-    ["/virtio_mmio@a003200"],
-    ["/virtio_mmio@a003400"],
-    ["/virtio_mmio@a003600"],
-    ["/virtio_mmio@a003800"],
-    ["/virtio_mmio@a003a00"],
-    ["/virtio_mmio@a003c00"],
-    ["/virtio_mmio@a003e00"],
-]
+excluded_devices = []
 
 # Emu_devices.
 # Name Base-Ipa Ipa_len Alloc-Irq Emu-Type EmuConfig.
@@ -97,5 +68,5 @@ excluded_devices = [
 #  bar0_base, bar0_size, link_id, peer_id, peers, feature_flags,
 #  bar2_base, bar2_size, bar2_host_backing].
 emu_devices = [
-    ["ivshmem-pci", 0x5000_0000, 0x10_0000, 60, 0x81, [0, 5, 0, 0xaaaa, 0x0002, 0x5010_0000, 0x30_0000, 0x5010_0000, 0x1000, 1, 0, 2, 0, 0x5020_0000, 0x20_0000, 0]],
+    ["ivshmem-pci", 0x5000_0000, 0x10_0000, 60, 0x81, [0, 5, 0, 0x1af4, 0x1110, 0x5010_0000, 0x30_0000, 0x5010_0000, 0x1000, 1, 0, 2, 0, 0x5020_0000, 0x20_0000, 0]],
 ]

@@ -17,27 +17,36 @@ const DEFAULT_DEVICE: u8 = 5;
 const DEFAULT_FUNCTION: u8 = 0;
 const DEFAULT_VENDOR_ID: u16 = 0xaaaa;
 const DEFAULT_DEVICE_ID: u16 = 0x0001;
-const IVSHMEM_VENDOR_ID: u16 = 0xaaaa;
-const IVSHMEM_DEVICE_ID: u16 = 0x0002;
+const IVSHMEM_VENDOR_ID: u16 = 0x1af4;
+const IVSHMEM_DEVICE_ID: u16 = 0x1110;
 const DEFAULT_BAR0_SIZE: usize = 0x1000;
 
 const PCI_COMMAND_OFFSET: usize = 0x04;
+const PCI_STATUS_OFFSET: usize = 0x06;
 const PCI_BAR0_OFFSET: usize = 0x10;
 const PCI_BAR2_OFFSET: usize = 0x18;
+const PCI_INTERRUPT_LINE_OFFSET: usize = 0x3c;
+const PCI_INTERRUPT_PIN_OFFSET: usize = 0x3d;
 const PCI_BAR_SIZE_PROBE: u32 = u32::MAX;
 const PCI_BAR_MEM_SPACE: u32 = 0x0;
 const PCI_BAR_MEM32_MASK: u32 = 0xffff_fff0;
 const PCI_COMMAND_MEMORY_SPACE: u16 = 1 << 1;
+const PCI_COMMAND_INTX_DISABLE: u16 = 1 << 10;
+const PCI_COMMAND_WRITABLE_BITS: u16 = PCI_COMMAND_MEMORY_SPACE | PCI_COMMAND_INTX_DISABLE;
+const PCI_STATUS_INTERRUPT: u16 = 1 << 3;
+const PCI_INTERRUPT_LINE_NONE: u8 = 0xff;
+const PCI_INTERRUPT_PIN_NONE: u8 = 0;
+const PCI_INTERRUPT_PIN_INTA: u8 = 1;
 
 const BAR0_ID_OFFSET: usize = 0x00;
 const BAR0_SCRATCH_OFFSET: usize = 0x08;
 const BAR0_ID: u32 = 0x4158_5043; // "AXPC"
 
-const IVSHMEM_BAR0_ID_OFFSET: usize = 0x00;
-const IVSHMEM_BAR0_MAX_PEERS_OFFSET: usize = 0x04;
-const IVSHMEM_BAR0_INT_CONTROL_OFFSET: usize = 0x08;
-const IVSHMEM_BAR0_INT_STATUS_OFFSET: usize = 0x0c;
-const IVSHMEM_BAR0_DOORBELL_OFFSET: usize = 0x10;
+const IVSHMEM_BAR0_INT_CONTROL_OFFSET: usize = 0x00;
+const IVSHMEM_BAR0_INT_STATUS_OFFSET: usize = 0x04;
+const IVSHMEM_BAR0_ID_OFFSET: usize = 0x08;
+const IVSHMEM_BAR0_DOORBELL_OFFSET: usize = 0x0c;
+const IVSHMEM_BAR0_MAX_PEERS_OFFSET: usize = 0x10;
 const IVSHMEM_BAR0_STATE_OFFSET: usize = 0x14;
 const IVSHMEM_BAR0_LINK_STATUS_OFFSET: usize = 0x18;
 const IVSHMEM_BAR0_FEATURE_FLAGS_OFFSET: usize = 0x1c;
@@ -107,6 +116,10 @@ pub struct VirtualPciEndpointConfig {
     pub bar2_base: u64,
     /// BAR2 size in bytes.
     pub bar2_size: u64,
+    /// Legacy PCI interrupt line exposed in configuration space.
+    pub interrupt_line: u8,
+    /// Legacy PCI interrupt pin exposed in configuration space.
+    pub interrupt_pin: u8,
     /// Endpoint-specific behavior.
     pub kind: VirtualPciEndpointKind,
 }
@@ -123,6 +136,8 @@ impl Default for VirtualPciEndpointConfig {
             bar0_size: DEFAULT_BAR0_SIZE as u64,
             bar2_base: 0,
             bar2_size: 0,
+            interrupt_line: PCI_INTERRUPT_LINE_NONE,
+            interrupt_pin: PCI_INTERRUPT_PIN_NONE,
             kind: VirtualPciEndpointKind::Dummy,
         }
     }
@@ -137,8 +152,10 @@ impl VirtualPciEndpointConfig {
         cfg_list: &[usize],
         kind: VirtualPciEndpointKind,
     ) -> DeviceManagerResult<Self> {
-        let mut config = Self::default();
-        config.kind = kind;
+        let mut config = Self {
+            kind,
+            ..Self::default()
+        };
         if let Some(value) = cfg_list.first().copied() {
             config.bus = checked_u8(value, "PCI bus")?;
         }
@@ -242,6 +259,7 @@ pub struct VirtualPciHost {
     resources: Box<[Resource]>,
     config_space: [u8; PCI_CONFIG_SPACE_SIZE],
     state: Arc<SpinNoIrq<VirtualPciState>>,
+    irq: Option<IrqLine>,
 }
 
 impl VirtualPciHost {
@@ -274,6 +292,8 @@ impl VirtualPciHost {
             }
         }
         config_space[0x0e] = 0x00; // endpoint header
+        config_space[PCI_INTERRUPT_LINE_OFFSET] = endpoint.interrupt_line;
+        config_space[PCI_INTERRUPT_PIN_OFFSET] = endpoint.interrupt_pin;
         config_space[PCI_BAR0_OFFSET..PCI_BAR0_OFFSET + 4]
             .copy_from_slice(&(endpoint.bar0_base as u32 | PCI_BAR_MEM_SPACE).to_le_bytes());
         if endpoint.bar2_size != 0 {
@@ -306,7 +326,12 @@ impl VirtualPciHost {
         }));
 
         if let VirtualPciEndpointKind::Ivshmem(config) = endpoint.kind {
-            register_ivshmem_doorbell_endpoint(config.link_id, config.peer_id, state.clone(), irq);
+            register_ivshmem_doorbell_endpoint(
+                config.link_id,
+                config.peer_id,
+                state.clone(),
+                irq.clone(),
+            );
         }
 
         Ok(Self {
@@ -317,6 +342,7 @@ impl VirtualPciHost {
             resources,
             config_space,
             state,
+            irq,
         })
     }
 
@@ -374,13 +400,22 @@ impl VirtualPciHost {
             return Ok(Self::absent_value(width));
         };
 
-        if register_access_touches(register, width, PCI_COMMAND_OFFSET, 2) {
+        if register_access_touches(register, width, PCI_COMMAND_OFFSET, 4) {
+            let state = self.state.lock();
+            let command = state.command;
+            let mut status = read_le_u16(&self.config_space, PCI_STATUS_OFFSET);
+            if matches!(self.endpoint.kind, VirtualPciEndpointKind::Ivshmem(_))
+                && state.int_status & state.int_control != 0
+            {
+                status |= PCI_STATUS_INTERRUPT;
+            }
+            let command_status = command as u32 | ((status as u32) << 16);
             return Ok(read_window(
-                self.state.lock().command as u64,
+                command_status as u64,
                 register,
                 width,
                 PCI_COMMAND_OFFSET,
-                2,
+                4,
             ));
         }
         if register_access_touches(register, width, PCI_BAR0_OFFSET, 4) {
@@ -451,7 +486,10 @@ impl VirtualPciHost {
                 PCI_COMMAND_OFFSET,
                 2,
             );
-            state.command = (merged as u16) & PCI_COMMAND_MEMORY_SPACE;
+            state.command = (merged as u16) & PCI_COMMAND_WRITABLE_BITS;
+            let irq_asserted = ivshmem_interrupt_asserted(&self.endpoint.kind, &state);
+            drop(state);
+            self.set_ivshmem_irq_level(irq_asserted)?;
             return Ok(());
         }
         if register_access_touches(register, width, PCI_BAR0_OFFSET, 4) {
@@ -501,27 +539,37 @@ impl VirtualPciHost {
                 addr: addr.as_usize() as u64,
             });
         };
-        let state = self.state.lock();
-        let value = match offset {
-            _ => match self.endpoint.kind {
-                VirtualPciEndpointKind::Dummy => match offset {
-                    BAR0_ID_OFFSET => BAR0_ID,
-                    BAR0_SCRATCH_OFFSET => state.scratch,
-                    _ => 0,
-                },
-                VirtualPciEndpointKind::Ivshmem(config) => match offset {
-                    IVSHMEM_BAR0_ID_OFFSET => config.peer_id,
-                    IVSHMEM_BAR0_MAX_PEERS_OFFSET => config.peers,
-                    IVSHMEM_BAR0_INT_CONTROL_OFFSET => state.int_control,
-                    IVSHMEM_BAR0_INT_STATUS_OFFSET => state.int_status,
-                    IVSHMEM_BAR0_DOORBELL_OFFSET => state.last_doorbell,
-                    IVSHMEM_BAR0_STATE_OFFSET => state.ivshmem_state,
-                    IVSHMEM_BAR0_LINK_STATUS_OFFSET => IVSHMEM_LINK_READY,
-                    IVSHMEM_BAR0_FEATURE_FLAGS_OFFSET => config.feature_flags,
-                    _ => 0,
-                },
+        let mut state = self.state.lock();
+        let mut update_irq = false;
+        let value = match self.endpoint.kind {
+            VirtualPciEndpointKind::Dummy => match offset {
+                BAR0_ID_OFFSET => BAR0_ID,
+                BAR0_SCRATCH_OFFSET => state.scratch,
+                _ => 0,
+            },
+            VirtualPciEndpointKind::Ivshmem(config) => match offset {
+                IVSHMEM_BAR0_ID_OFFSET => config.peer_id,
+                IVSHMEM_BAR0_MAX_PEERS_OFFSET => config.peers,
+                IVSHMEM_BAR0_INT_CONTROL_OFFSET => state.int_control,
+                IVSHMEM_BAR0_INT_STATUS_OFFSET => {
+                    let status = state.int_status;
+                    state.int_status = 0;
+                    update_irq = true;
+                    status
+                }
+                IVSHMEM_BAR0_DOORBELL_OFFSET => state.last_doorbell,
+                IVSHMEM_BAR0_STATE_OFFSET => state.ivshmem_state,
+                IVSHMEM_BAR0_LINK_STATUS_OFFSET => IVSHMEM_LINK_READY,
+                IVSHMEM_BAR0_FEATURE_FLAGS_OFFSET => config.feature_flags,
+                _ => 0,
             },
         };
+        let irq_asserted =
+            update_irq.then(|| ivshmem_interrupt_asserted(&self.endpoint.kind, &state));
+        drop(state);
+        if let Some(asserted) = irq_asserted {
+            self.set_ivshmem_irq_level(asserted)?;
+        }
         Ok(width_mask(value as u64, width))
     }
 
@@ -533,6 +581,7 @@ impl VirtualPciHost {
         };
         let mut doorbell = None;
         let mut state = self.state.lock();
+        let mut update_irq = false;
         match self.endpoint.kind {
             VirtualPciEndpointKind::Dummy => {
                 if offset == BAR0_SCRATCH_OFFSET {
@@ -544,10 +593,12 @@ impl VirtualPciHost {
                 IVSHMEM_BAR0_INT_CONTROL_OFFSET => {
                     let old = state.int_control as u64;
                     state.int_control = merge_value(old, value, width) as u32;
+                    update_irq = true;
                 }
                 IVSHMEM_BAR0_INT_STATUS_OFFSET => {
                     let clear_mask = width_mask(value, width) as u32;
                     state.int_status &= !clear_mask;
+                    update_irq = true;
                 }
                 IVSHMEM_BAR0_DOORBELL_OFFSET => {
                     let value = merge_value(state.last_doorbell as u64, value, width) as u32;
@@ -561,14 +612,33 @@ impl VirtualPciHost {
                 _ => {}
             },
         }
+        let irq_asserted =
+            update_irq.then(|| ivshmem_interrupt_asserted(&self.endpoint.kind, &state));
         drop(state);
 
+        if let Some(asserted) = irq_asserted {
+            self.set_ivshmem_irq_level(asserted)?;
+        }
         if let (VirtualPciEndpointKind::Ivshmem(config), Some(value)) =
             (self.endpoint.kind, doorbell)
         {
             pulse_ivshmem_doorbell(config, value)?;
         }
         Ok(())
+    }
+
+    fn set_ivshmem_irq_level(&self, asserted: bool) -> DeviceResult {
+        if !matches!(self.endpoint.kind, VirtualPciEndpointKind::Ivshmem(_)) {
+            return Ok(());
+        }
+        let Some(irq) = &self.irq else {
+            return Ok(());
+        };
+        let result = if asserted { irq.raise() } else { irq.lower() };
+        result.map_err(|error| DeviceError::Unsupported {
+            operation: "set ivshmem interrupt level",
+            detail: format!("{error}"),
+        })
     }
 }
 
@@ -654,10 +724,13 @@ impl DeviceFactory for IvshmemPciFactory {
         context: &DeviceBuildContext<'_>,
     ) -> DeviceManagerResult<DeviceBundle> {
         let endpoint = VirtualPciEndpointConfig::ivshmem_from_cfg_list(&config.cfg_list)?;
+        let mut endpoint = endpoint;
         let irq = if config.irq_id == 0 {
             None
         } else {
-            Some(context.resolve_irq(config.irq_id, InterruptTriggerMode::EdgeTriggered)?)
+            endpoint.interrupt_line = checked_u8(config.irq_id, "ivshmem interrupt line")?;
+            endpoint.interrupt_pin = PCI_INTERRUPT_PIN_INTA;
+            Some(context.resolve_irq(config.irq_id, InterruptTriggerMode::LevelTriggered)?)
         };
         let device = VirtualPciHost::new(
             config.name.clone(),
@@ -708,20 +781,27 @@ fn pulse_ivshmem_doorbell(config: IvshmemPciConfig, value: u32) -> DeviceResult 
             ),
         })?;
 
-    {
+    let pulse_irq = {
         let mut state = target.state.lock();
         state.int_status |= IVSHMEM_INT_STATUS_DOORBELL;
         state.last_doorbell = ((config.peer_id & 0xffff) << 16) | (vector & 0xffff);
-    }
+        ivshmem_interrupt_asserted(&VirtualPciEndpointKind::Ivshmem(config), &state)
+    };
 
-    if let Some(irq) = target.irq {
-        irq.pulse().map_err(|error| DeviceError::Unsupported {
+    if pulse_irq && let Some(irq) = target.irq {
+        irq.raise().map_err(|error| DeviceError::Unsupported {
             operation: "pulse ivshmem doorbell interrupt",
             detail: format!("{error}"),
         })?;
     }
 
     Ok(())
+}
+
+fn ivshmem_interrupt_asserted(kind: &VirtualPciEndpointKind, state: &VirtualPciState) -> bool {
+    matches!(kind, VirtualPciEndpointKind::Ivshmem(_))
+        && state.int_status & state.int_control != 0
+        && state.command & PCI_COMMAND_INTX_DISABLE == 0
 }
 
 fn checked_u8(value: usize, field: &'static str) -> DeviceManagerResult<u8> {
@@ -837,6 +917,10 @@ fn width_mask(value: u64, width: AccessWidth) -> u64 {
     }
 }
 
+fn read_le_u16(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
+}
+
 #[cfg(test)]
 mod tests {
     use axdevice_base::{DeviceId, NoopDeviceAccess};
@@ -862,6 +946,8 @@ mod tests {
                 bar0_size: 0x1000,
                 bar2_base: 0,
                 bar2_size: 0,
+                interrupt_line: PCI_INTERRUPT_LINE_NONE,
+                interrupt_pin: PCI_INTERRUPT_PIN_NONE,
                 kind: VirtualPciEndpointKind::Dummy,
             },
             None,
@@ -888,6 +974,8 @@ mod tests {
                 bar0_size: 0x1000,
                 bar2_base: BAR2_BASE as u64,
                 bar2_size: 0x20_0000,
+                interrupt_line: 60,
+                interrupt_pin: PCI_INTERRUPT_PIN_INTA,
                 kind: VirtualPciEndpointKind::Ivshmem(IvshmemPciConfig {
                     link_id,
                     peer_id,
@@ -901,6 +989,10 @@ mod tests {
     }
 
     fn read(device: &VirtualPciHost, addr: usize) -> u64 {
+        read_with_width(device, addr, AccessWidth::Dword)
+    }
+
+    fn read_with_width(device: &VirtualPciHost, addr: usize, width: AccessWidth) -> u64 {
         let mut access = NoopDeviceAccess::new(DeviceId::new(0));
         match device
             .access(
@@ -908,7 +1000,7 @@ mod tests {
                     kind: BusKind::Mmio,
                     is_read: true,
                     addr: addr as u64,
-                    width: AccessWidth::Dword,
+                    width,
                     data: 0,
                 },
                 &mut access,
@@ -998,6 +1090,22 @@ mod tests {
     }
 
     #[test]
+    fn ivshmem_config_space_exposes_legacy_intx_line_and_pin() {
+        let device = test_ivshmem_device();
+        let interrupt_line_addr = ECAM_BASE + (5 << 15) + PCI_INTERRUPT_LINE_OFFSET;
+        let interrupt_pin_addr = ECAM_BASE + (5 << 15) + PCI_INTERRUPT_PIN_OFFSET;
+
+        assert_eq!(
+            read_with_width(&device, interrupt_line_addr, AccessWidth::Byte),
+            60
+        );
+        assert_eq!(
+            read_with_width(&device, interrupt_pin_addr, AccessWidth::Byte),
+            PCI_INTERRUPT_PIN_INTA as u64
+        );
+    }
+
+    #[test]
     fn ivshmem_doorbell_sets_target_status_only() {
         let peer0 = test_ivshmem_device_with_peer(11, 0, 3);
         let peer1 = test_ivshmem_device_with_peer(11, 1, 3);
@@ -1013,7 +1121,56 @@ mod tests {
             read(&peer1, BAR0_BASE + IVSHMEM_BAR0_INT_STATUS_OFFSET),
             IVSHMEM_INT_STATUS_DOORBELL as u64
         );
+        assert_eq!(read(&peer1, BAR0_BASE + IVSHMEM_BAR0_INT_STATUS_OFFSET), 0);
         assert_eq!(read(&peer2, BAR0_BASE + IVSHMEM_BAR0_INT_STATUS_OFFSET), 0);
         assert_eq!(read(&peer1, BAR0_BASE + IVSHMEM_BAR0_DOORBELL_OFFSET), 7);
+    }
+
+    #[test]
+    fn ivshmem_pending_doorbell_sets_pci_status_interrupt_bit() {
+        let peer0 = test_ivshmem_device_with_peer(12, 0, 2);
+        let peer1 = test_ivshmem_device_with_peer(12, 1, 2);
+        let status_addr = ECAM_BASE + (5 << 15) + PCI_STATUS_OFFSET;
+
+        assert_eq!(
+            read_with_width(&peer1, status_addr, AccessWidth::Word) & PCI_STATUS_INTERRUPT as u64,
+            0
+        );
+        write(&peer1, BAR0_BASE + IVSHMEM_BAR0_INT_CONTROL_OFFSET, 1);
+        write(
+            &peer0,
+            BAR0_BASE + IVSHMEM_BAR0_DOORBELL_OFFSET,
+            (1u64 << 16) | 3,
+        );
+
+        assert_eq!(
+            read_with_width(&peer1, status_addr, AccessWidth::Word) & PCI_STATUS_INTERRUPT as u64,
+            PCI_STATUS_INTERRUPT as u64
+        );
+        write(&peer1, BAR0_BASE + IVSHMEM_BAR0_INT_STATUS_OFFSET, 1);
+        assert_eq!(
+            read_with_width(&peer1, status_addr, AccessWidth::Word) & PCI_STATUS_INTERRUPT as u64,
+            0
+        );
+    }
+
+    #[test]
+    fn ivshmem_command_dword_read_includes_dynamic_status_interrupt_bit() {
+        let peer0 = test_ivshmem_device_with_peer(13, 0, 2);
+        let peer1 = test_ivshmem_device_with_peer(13, 1, 2);
+        let command_addr = ECAM_BASE + (5 << 15) + PCI_COMMAND_OFFSET;
+
+        write(&peer1, BAR0_BASE + IVSHMEM_BAR0_INT_CONTROL_OFFSET, 1);
+        write(
+            &peer0,
+            BAR0_BASE + IVSHMEM_BAR0_DOORBELL_OFFSET,
+            (1u64 << 16) | 3,
+        );
+
+        let command_status = read(&peer1, command_addr);
+        assert_eq!(
+            (command_status >> 16) & PCI_STATUS_INTERRUPT as u64,
+            PCI_STATUS_INTERRUPT as u64
+        );
     }
 }

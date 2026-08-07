@@ -20,11 +20,10 @@ fail_regex = [
     "(?i)kernel panic",
     "(?i)unhandled page fault",
     "(?i)page fault",
-    "(?m)^vpci smoke failed\\s*$",
-    "(?m)^vpci bar2 smoke failed:",
+    "(?m)^ivshmem bar2 smoke failed:",
 ]
 success_regex = [
-    "(?s)VM A writes BAR2.*VM A writes doorbell\\(target=B\\).*VM B observes doorbell event.*VM B reads same data.*VM B writes BAR2.*VM B writes doorbell\\(target=A\\).*VM A reads same data.*VM A observes doorbell event.*vpci bar2 shared memory pass",
+    "(?s)ivshmem-pci vendor=0x1af4 device=0x1110.*ivshmem irq=[1-9][0-9]*.*ivshmem uio device=/dev/uio[0-9]+.*ivshmem uio event count=[0-9]+.*ivshmem uio event count=[0-9]+.*ivshmem bar2 shared memory pass",
 ]
 to_bin = true
 uefi = false

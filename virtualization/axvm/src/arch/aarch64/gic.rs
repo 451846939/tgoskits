@@ -1,8 +1,11 @@
 //! AArch64 GIC host operations for the ArceOS-backed AxVM runtime.
 
-use arm_gic_driver::v3::{
-    ICH_ELRSR_EL2, ICH_HCR_EL2, ICH_LR_EL2, ICH_VTR_EL2, ReadWriteable, Readable, ich_lr_el2_get,
-    ich_lr_el2_write,
+use arm_gic_driver::{
+    IntId,
+    v3::{
+        ICH_ELRSR_EL2, ICH_HCR_EL2, ICH_LR_EL2, ICH_VTR_EL2, ReadWriteable, Readable,
+        ich_lr_el2_get, ich_lr_el2_write,
+    },
 };
 use ax_memory_addr::{PhysAddr, VirtAddr};
 
@@ -44,6 +47,25 @@ pub(crate) fn inject_interrupt(irq: usize) {
 
         if gic.typed_mut::<arm_gic_driver::v3::Gic>().is_some() {
             inject_interrupt_gic_v3(irq);
+            return;
+        }
+
+        panic!("no GIC driver found");
+    });
+}
+
+pub(crate) fn set_physical_irq_pending(irq: usize, pending: bool) {
+    debug!("Setting physical interrupt pending state: irq={irq}, pending={pending}");
+
+    with_gic(|gic| {
+        let intid = unsafe { IntId::raw(irq as u32) };
+        if let Some(gic) = gic.typed_mut::<arm_gic_driver::v2::Gic>() {
+            gic.set_pending(intid, pending);
+            return;
+        }
+
+        if let Some(gic) = gic.typed_mut::<arm_gic_driver::v3::Gic>() {
+            gic.set_pending(intid, pending);
             return;
         }
 

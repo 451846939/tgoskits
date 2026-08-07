@@ -26,6 +26,11 @@ use crate::{
     boot::images::load_vm_image_from_memory, runtime::IVC_LAYOUT_VERSION,
 };
 
+struct InterruptParent {
+    phandle: u32,
+    address_cells: u32,
+}
+
 pub fn create_guest_fdt(
     fdt: &Fdt,
     passthrough_device_names: &[String],
@@ -304,6 +309,7 @@ impl FdtTree {
         self.set_property(node_id, prop_u32_list("bus-range", &[bus, bus]))?;
         self.set_property(node_id, prop_empty("dma-coherent"))?;
         self.set_property(node_id, self.vpci_ranges_property(mem_base, mem_size))?;
+        self.add_vpci_interrupt_map(node_id, device)?;
 
         self.inner_mut()
             .view_typed_mut(node_id)
@@ -325,6 +331,89 @@ impl FdtTree {
         push_u64_cells(&mut cells, mem_base, self.root_cells("#address-cells", 2));
         push_u64_cells(&mut cells, mem_size, 2);
         prop_u32_list("ranges", &cells)
+    }
+
+    fn add_vpci_interrupt_map(
+        &mut self,
+        node_id: NodeId,
+        device: &EmulatedDeviceConfig,
+    ) -> AxVmResult {
+        if device.irq_id == 0 {
+            return Ok(());
+        }
+        let gic_parent = self.primary_gic_interrupt_parent()?.ok_or_else(|| {
+            ax_err_type!(
+                InvalidInput,
+                "vPCI IRQ requires a GIC interrupt-controller node in guest FDT"
+            )
+        })?;
+        let Some(gic_spi) = (device.irq_id as u32).checked_sub(32) else {
+            return Err(ax_err_type!(
+                InvalidInput,
+                "vPCI IRQ must be a GIC SPI interrupt"
+            ));
+        };
+
+        self.set_property(
+            node_id,
+            prop_u32_list("interrupt-map-mask", &[0, 0, 0, 0x7]),
+        )?;
+
+        let mut cells = Vec::new();
+        cells.extend_from_slice(&[0, 0, 0, 1, gic_parent.phandle]);
+        for _ in 0..gic_parent.address_cells {
+            cells.push(0);
+        }
+        cells.extend_from_slice(&[0, gic_spi, 4]);
+        self.set_property(node_id, prop_u32_list("interrupt-map", &cells))
+    }
+
+    fn primary_gic_interrupt_parent(&mut self) -> AxVmResult<Option<InterruptParent>> {
+        let gic_node_id = self
+            .inner()
+            .iter_node_ids()
+            .find(|node_id| self.node_is_gic_interrupt_controller(*node_id));
+        let Some(node_id) = gic_node_id else {
+            return Ok(None);
+        };
+        let address_cells = self
+            .inner()
+            .node(node_id)
+            .and_then(|node| node.get_property("#address-cells"))
+            .and_then(|prop| prop.get_u32())
+            .unwrap_or(0);
+        if let Some(phandle) = self
+            .inner()
+            .node(node_id)
+            .and_then(|node| node.get_property("phandle"))
+            .and_then(|prop| prop.get_u32())
+        {
+            return Ok(Some(InterruptParent {
+                phandle,
+                address_cells,
+            }));
+        }
+
+        let phandle = self.next_phandle();
+        self.set_property(node_id, prop_u32_list("phandle", &[phandle]))?;
+        Ok(Some(InterruptParent {
+            phandle,
+            address_cells,
+        }))
+    }
+
+    fn node_is_gic_interrupt_controller(&self, node_id: NodeId) -> bool {
+        self.inner().node(node_id).is_some_and(|node| {
+            node.get_property("interrupt-controller").is_some()
+                && node
+                    .get_property("#interrupt-cells")
+                    .and_then(|prop| prop.get_u32())
+                    == Some(3)
+                && node
+                    .get_property("compatible")
+                    .and_then(|prop| prop.as_str())
+                    .is_some_and(|compatible| compatible.contains("gic"))
+        })
     }
 
     fn add_ivc_channel_node(&mut self, device: &EmulatedDeviceConfig) -> AxVmResult {
@@ -464,6 +553,16 @@ mod tests {
         let mut prop = Property::new(name, alloc::vec![]);
         prop.set_u32_ls(&[value]);
         prop
+    }
+
+    fn prop_string(name: &str, value: &str) -> Property {
+        let mut prop = Property::new(name, alloc::vec![]);
+        prop.set_string(value);
+        prop
+    }
+
+    fn prop_empty(name: &str) -> Property {
+        Property::new(name, alloc::vec![])
     }
 
     fn test_fdt(dts: &str) -> Fdt {
@@ -725,5 +824,85 @@ mod tests {
         assert!(node.get_property("ranges").is_some());
         assert_eq!(typed_node.regs()[0].address, 0x5000_0000);
         assert_eq!(typed_node.regs()[0].size, Some(0x10_0000));
+    }
+
+    #[test]
+    fn runtime_patch_adds_virtual_pci_interrupt_map() {
+        let mut fdt = Fdt::new();
+        let root = fdt.root_id();
+        fdt.node_mut(root)
+            .unwrap()
+            .set_property(prop_u32("#address-cells", 2));
+        fdt.node_mut(root)
+            .unwrap()
+            .set_property(prop_u32("#size-cells", 2));
+        let intc = fdt.add_node(root, Node::new("intc@8000000"));
+        fdt.node_mut(intc)
+            .unwrap()
+            .set_property(prop_string("compatible", "arm,gic-v3"));
+        fdt.node_mut(intc)
+            .unwrap()
+            .set_property(prop_empty("interrupt-controller"));
+        fdt.node_mut(intc)
+            .unwrap()
+            .set_property(prop_u32("#interrupt-cells", 3));
+        fdt.node_mut(intc)
+            .unwrap()
+            .set_property(prop_u32("#address-cells", 2));
+        fdt.node_mut(intc)
+            .unwrap()
+            .set_property(prop_u32("phandle", 0x8002));
+        let dtb = fdt.encode().as_ref().to_vec();
+        let cfg = AxVMCrateConfig {
+            devices: axvmconfig::VMDevicesConfig {
+                emu_devices: alloc::vec![axvmconfig::EmulatedDeviceConfig {
+                    name: "ivshmem-pci".into(),
+                    base_gpa: 0x5000_0000,
+                    length: 0x10_0000,
+                    irq_id: 60,
+                    emu_type: axvmconfig::EmulatedDeviceType::IvshmemPci,
+                    cfg_list: alloc::vec![
+                        0,
+                        5,
+                        0,
+                        0x1af4,
+                        0x1110,
+                        0x5010_0000,
+                        0x30_0000,
+                        0x5010_0000,
+                        0x1000,
+                        1,
+                        0,
+                        2,
+                        0,
+                        0x5020_0000,
+                        0x20_0000,
+                        0,
+                    ],
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let patched = super::patch_guest_fdt_for_runtime(&dtb, &[], &cfg, None, false).unwrap();
+        let reparsed = Fdt::from_bytes(&patched).unwrap();
+        let node_id = reparsed.get_by_path_id("/pcie@50000000").unwrap();
+        let node = reparsed.node(node_id).unwrap();
+
+        assert_eq!(
+            node.get_property("interrupt-map-mask")
+                .unwrap()
+                .get_u32_iter()
+                .collect::<alloc::vec::Vec<_>>(),
+            alloc::vec![0, 0, 0, 0x7]
+        );
+        assert_eq!(
+            node.get_property("interrupt-map")
+                .unwrap()
+                .get_u32_iter()
+                .collect::<alloc::vec::Vec<_>>(),
+            alloc::vec![0, 0, 0, 1, 0x8002, 0, 0, 0, 28, 4]
+        );
     }
 }

@@ -13,7 +13,7 @@ use super::{
         arceos_ivc_guest_requests, arceos_x86_64_guest_request, axvisor_case_asset_config,
         build_group_needs_arceos_x86_64_guest, case_needs_arceos_x86_64_guest,
         inject_arceos_ivc_guest_images, inject_arceos_x86_64_guest_image, inject_linux_ivc_assets,
-        inject_linux_vpci_assets, inject_zephyr_ivc_guest_images,
+        inject_linux_ivshmem_assets, inject_zephyr_ivc_guest_images,
     },
     discover_qemu_cases,
     discovery::{
@@ -327,7 +327,7 @@ impl Axvisor {
                 case.case.case.name
             )
         })?;
-        inject_linux_vpci_assets(
+        inject_linux_ivshmem_assets(
             self.app.workspace_root(),
             request,
             case,
@@ -335,7 +335,7 @@ impl Axvisor {
         )
         .with_context(|| {
             format!(
-                "failed to prepare Linux vPCI assets for Axvisor qemu case `{}`",
+                "failed to prepare Linux ivshmem assets for Axvisor qemu case `{}`",
                 case.case.case.name
             )
         })?;
