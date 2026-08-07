@@ -6,10 +6,10 @@ use core::{marker::PhantomData, mem::align_of, ops::Deref, pin::Pin, ptr};
 use crate::{
     CpuId, CpuLocal, CpuLocalOwnerBorrow, CpuRemote, CpuSet, CurrentExitPermit, CurrentThreadToken,
     IrqRegisterResult, IrqWaitCell, IrqWaitRegistration, IrqWaitToken, ParkCommit, ParkPrepare,
-    PiMutexLockResult, PiMutexRef, PiWaitToken, RtPriority, ScheduleDecision, SchedulePolicy,
-    SchedulerOutcome, TaskError, TaskSystem, ThreadBuilder, ThreadCore, ThreadExtensionLease,
-    ThreadHandle, ThreadId, ThreadRuntimeSnapshot, ThreadState, ThreadWakeHandle, WaitQueue,
-    WakeResult,
+    PiMutexLockResult, PiMutexRef, PiWaitCancelOutcome, PiWaitToken, RtPriority, ScheduleDecision,
+    SchedulePolicy, SchedulerOutcome, TaskError, TaskSystem, ThreadBuilder, ThreadCore,
+    ThreadExtensionLease, ThreadHandle, ThreadId, ThreadRuntimeSnapshot, ThreadState,
+    ThreadWakeHandle, WaitQueue, WakeResult,
     executor::CoroutineHeader,
     inbox::PublishResult,
     lock::PreemptScope,
@@ -45,7 +45,8 @@ pub use membarrier::{
     register_current_membarrier,
 };
 pub use pi::{
-    pi_block_current, pi_mutex_claim, pi_mutex_lock_slow, pi_mutex_release_owned, pi_wait_cancel,
+    pi_mutex_claim, pi_mutex_lock_slow, pi_mutex_release_owned, pi_park_current_once,
+    pi_wait_cancel, pi_wait_try_cancel,
 };
 use runtime_cpu::{
     RuntimeCpuPin, RuntimeSchedulerFrameGuard, runtime_current_cpu, validate_schedule_context,

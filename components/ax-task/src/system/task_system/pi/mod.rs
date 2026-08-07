@@ -16,6 +16,19 @@ pub enum PiMutexLockResult<'lock> {
     Waiting(PiWaitToken<'lock>),
 }
 
+/// Result of trying to cancel one committed PI waiter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PiWaitCancelOutcome {
+    /// The waiter was removed and every inherited donation was withdrawn.
+    Cancelled,
+    /// Unlock already published an ownerless handoff to this waiter.
+    ///
+    /// The caller must claim the mutex before observing interruption, matching
+    /// Linux `rt_mutex_slowlock_block()` trying the lock before checking the
+    /// pending task state.
+    HandoffPending,
+}
+
 impl fmt::Debug for PiMutexLockResult<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

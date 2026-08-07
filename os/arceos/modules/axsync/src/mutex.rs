@@ -5,9 +5,9 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use ax_kernel_guard::NoPreempt as PreemptGuard;
 use ax_task::{
     CurrentThreadToken, PiMutexAcquire, PiMutexCore, PiMutexLockResult, PiMutexOwnedRelease,
-    PiMutexRef, PiWaitStateError, PiWaitToken, TaskError, ThreadId,
-    current_needs_reschedule_pinned, current_thread_token, pi_block_current, pi_mutex_claim,
-    pi_mutex_lock_slow, pi_mutex_release_owned, validate_blocking_context,
+    PiMutexRef, PiWaitCancelOutcome, PiWaitStateError, PiWaitToken, TaskError, ThreadId,
+    current_needs_reschedule_pinned, current_thread_token, pi_mutex_claim, pi_mutex_lock_slow,
+    pi_mutex_release_owned, pi_park_current_once, pi_wait_try_cancel, validate_blocking_context,
 };
 #[cfg(test)]
 use ax_task::{ThreadHandle, current_thread_handle};
@@ -28,6 +28,34 @@ pub struct RawMutex {
 enum LockAttempt {
     Acquired,
     Contended,
+}
+
+/// Interruption observed while waiting for a PI mutex.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PiMutexLockInterrupted;
+
+impl core::fmt::Display for PiMutexLockInterrupted {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("PI mutex wait interrupted")
+    }
+}
+
+impl core::error::Error for PiMutexLockInterrupted {}
+
+/// Linux rtmutex-style interruptible acquisition for a PI mutex.
+pub trait InterruptibleMutexExt<T: ?Sized> {
+    /// Acquires this mutex unless `should_interrupt` becomes true while the
+    /// caller remains queued.
+    ///
+    /// A published ownerless handoff wins over interruption. The returned
+    /// guard therefore has the same acquire-before-signal ordering as Linux
+    /// `mutex_lock_interruptible()` under PREEMPT_RT.
+    fn lock_interruptible<F>(
+        &self,
+        should_interrupt: F,
+    ) -> Result<MutexGuard<'_, T>, PiMutexLockInterrupted>
+    where
+        F: FnMut() -> bool;
 }
 
 const OWNER_SPIN_BATCH: usize = 64;
@@ -112,6 +140,31 @@ impl RawMutex {
         }
     }
 
+    fn lock_pi_interruptible(
+        &self,
+        mut should_interrupt: impl FnMut() -> bool,
+    ) -> Result<(), PiMutexLockInterrupted> {
+        let mut blocking_context_validated = false;
+
+        loop {
+            let (current, attempt) = self.try_or_observe_current();
+            match attempt {
+                LockAttempt::Acquired => return Ok(()),
+                LockAttempt::Contended => {
+                    if !blocking_context_validated {
+                        task_result(
+                            validate_blocking_context(),
+                            "validate interruptible PI mutex sleep context",
+                        );
+                        blocking_context_validated = true;
+                        continue;
+                    }
+                    return self.lock_contended_interruptible(&current, &mut should_interrupt);
+                }
+            }
+        }
+    }
+
     fn lock_contended(&self, current: &CurrentThreadToken) {
         let sequence = self.next_waiter_sequence.fetch_add(1, Ordering::Relaxed);
         let token = match task_result(
@@ -127,6 +180,42 @@ impl RawMutex {
         self.wait_for_handoff(token, current);
     }
 
+    fn lock_contended_interruptible(
+        &self,
+        current: &CurrentThreadToken,
+        should_interrupt: &mut impl FnMut() -> bool,
+    ) -> Result<(), PiMutexLockInterrupted> {
+        let sequence = self.next_waiter_sequence.fetch_add(1, Ordering::Relaxed);
+        let token = match task_result(
+            pi_mutex_lock_slow(self.mutex_ref(), current, sequence),
+            "register interruptible PI mutex waiter",
+        ) {
+            PiMutexLockResult::Acquired => return Ok(()),
+            PiMutexLockResult::Waiting(token) => token,
+        };
+
+        loop {
+            if token.is_granted() || self.try_claim_waiter(&token, current) {
+                return Ok(());
+            }
+            if should_interrupt() {
+                match task_result(
+                    pi_wait_try_cancel(&token),
+                    "cancel interruptible PI mutex waiter",
+                ) {
+                    PiWaitCancelOutcome::Cancelled => return Err(PiMutexLockInterrupted),
+                    PiWaitCancelOutcome::HandoffPending => continue,
+                }
+            }
+            if !token.can_claim() && !self.spin_on_owner(&token) {
+                task_result(
+                    pi_park_current_once(&token),
+                    "park interruptible PI mutex waiter",
+                );
+            }
+        }
+    }
+
     fn wait_for_handoff(&self, token: PiWaitToken<'_>, current: &CurrentThreadToken) {
         loop {
             if token.is_granted() {
@@ -136,7 +225,7 @@ impl RawMutex {
                 break;
             }
             if !token.can_claim() && !self.spin_on_owner(&token) {
-                task_result(pi_block_current(&token), "block on PI mutex");
+                task_result(pi_park_current_once(&token), "park PI mutex waiter");
             }
         }
         assert!(
@@ -276,6 +365,19 @@ impl RawMutex {
 
     #[cfg(feature = "lockdep")]
     #[track_caller]
+    fn lock_interruptible_nested(
+        &self,
+        subclass: LockSubclass,
+        should_interrupt: impl FnMut() -> bool,
+    ) -> Result<(), PiMutexLockInterrupted> {
+        let lockdep = crate::lockdep::LockdepAcquire::prepare_nested(self, false, subclass);
+        let result = self.lock_pi_interruptible(should_interrupt);
+        lockdep.finish(result.is_ok());
+        result
+    }
+
+    #[cfg(feature = "lockdep")]
+    #[track_caller]
     fn try_lock_nested(&self, subclass: LockSubclass) -> bool {
         let lockdep = crate::lockdep::LockdepAcquire::prepare_nested(self, true, subclass);
         let acquired = self.try_lock_pi();
@@ -361,6 +463,28 @@ fn task_result<T>(result: Result<T, TaskError>, operation: &'static str) -> T {
 pub type Mutex<T> = lock_api::Mutex<RawMutex, T>;
 /// A non-send guard returned by [`Mutex`].
 pub type MutexGuard<'a, T> = lock_api::MutexGuard<'a, RawMutex, T>;
+
+impl<T: ?Sized> InterruptibleMutexExt<T> for Mutex<T> {
+    #[track_caller]
+    fn lock_interruptible<F>(
+        &self,
+        should_interrupt: F,
+    ) -> Result<MutexGuard<'_, T>, PiMutexLockInterrupted>
+    where
+        F: FnMut() -> bool,
+    {
+        // SAFETY: this reference is used only for the matching acquisition;
+        // the returned guard retains the safe mutex borrow.
+        let raw = unsafe { self.raw() };
+        #[cfg(feature = "lockdep")]
+        raw.lock_interruptible_nested(ax_lockdep::DEFAULT_LOCK_SUBCLASS, should_interrupt)?;
+        #[cfg(not(feature = "lockdep"))]
+        raw.lock_pi_interruptible(should_interrupt)?;
+
+        // SAFETY: the raw acquisition above established current as owner.
+        Ok(unsafe { self.make_guard_unchecked() })
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -709,6 +833,32 @@ mod tests {
         drop(guard);
 
         assert!(!mutex.is_locked());
+        crate::test_runtime::clear();
+    }
+
+    #[test]
+    fn uncontended_interruptible_lock_acquires_before_observing_interruption() {
+        let (system, cpu) = install_current_thread();
+        let _runtime = crate::test_runtime::install(
+            (&*system as *const TaskSystem).expose_provenance(),
+            (cpu.as_ref().get_ref() as *const ax_task::CpuLocal).expose_provenance(),
+        );
+        let mutex = Mutex::new(7usize);
+        let mut interrupt_checks = 0usize;
+
+        let guard = mutex
+            .lock_interruptible(|| {
+                interrupt_checks += 1;
+                true
+            })
+            .unwrap();
+
+        assert_eq!(*guard, 7);
+        assert_eq!(
+            interrupt_checks, 0,
+            "Linux rtmutex acquisition wins before pending interruption is observed"
+        );
+        drop(guard);
         crate::test_runtime::clear();
     }
 

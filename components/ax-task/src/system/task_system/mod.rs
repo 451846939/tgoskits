@@ -40,7 +40,7 @@ pub use outcome::{
     ScheduleDecision, SchedulerOutcome, SwitchInCompletion,
 };
 pub(crate) use park_exit::CurrentExitPermit;
-pub use pi::PiMutexLockResult;
+pub use pi::{PiMutexLockResult, PiWaitCancelOutcome};
 use priority_index::RootDomainPriorityIndex;
 use registry::{
     CpuRegistration, DeadlineCallbackClaim, DetachedThreadRecord, TaskSystemState, ThreadRecord,

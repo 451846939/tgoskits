@@ -2,6 +2,11 @@
 
 use super::*;
 
+enum PiWaiterRemoval {
+    Removed(Option<ThreadId>),
+    HandoffPending,
+}
+
 impl TaskSystem {
     fn remove_registered_waiter(
         &self,
@@ -9,7 +14,7 @@ impl TaskSystem {
         lock: PiMutexRaw,
         generation: u64,
         reject_handoff_top: bool,
-    ) -> Result<Option<ThreadId>, TaskError> {
+    ) -> Result<PiWaiterRemoval, TaskError> {
         let mut lock_state = unsafe {
             // SAFETY: the token or rollback caller retains the mutex identity.
             lock.lock_state()
@@ -35,7 +40,7 @@ impl TaskSystem {
             && snapshot.is_ownerless()
             && lock_state.waiters.first() == Some(registration.key)
         {
-            return Err(TaskError::InvalidPiState);
+            return Ok(PiWaiterRemoval::HandoffPending);
         }
         if !lock_state.waiters.contains(registration.key) {
             return Err(TaskError::InvalidPiState);
@@ -51,7 +56,7 @@ impl TaskSystem {
                 core.publish_unlocked();
             }
         }
-        Ok(owner)
+        Ok(PiWaiterRemoval::Removed(owner))
     }
 
     /// Registers one contender in the mutex-owned PI waiter tree.
@@ -190,6 +195,9 @@ impl TaskSystem {
                             waiter_core.id().as_u64() as usize,
                         )
                     });
+                let PiWaiterRemoval::Removed(rollback_owner) = rollback_owner else {
+                    task_runtime::fatal_invariant(0x5049_1216, waiter_core.id().as_u64() as usize)
+                };
                 if let Some(rollback_owner) = rollback_owner {
                     self.recompute_pi_cleanup_chain(rollback_owner, waiter)
                         .unwrap_or_else(|_| {
@@ -215,13 +223,28 @@ impl TaskSystem {
 
     /// Cancels a committed waiter which has not been selected for claim.
     pub fn pi_wait_cancel(&self, token: PiWaitToken<'_>) -> Result<(), TaskError> {
+        match self.pi_wait_try_cancel(&token)? {
+            PiWaitCancelOutcome::Cancelled => Ok(()),
+            PiWaitCancelOutcome::HandoffPending => Err(TaskError::InvalidPiState),
+        }
+    }
+
+    /// Tries to cancel a committed waiter without consuming a published
+    /// ownerless handoff.
+    pub fn pi_wait_try_cancel(
+        &self,
+        token: &PiWaitToken<'_>,
+    ) -> Result<PiWaitCancelOutcome, TaskError> {
         let _preempt = PreemptScope::enter();
-        let owner =
+        let removal =
             self.remove_registered_waiter(&token.core, token.lock, token.generation, true)?;
+        let PiWaiterRemoval::Removed(owner) = removal else {
+            return Ok(PiWaitCancelOutcome::HandoffPending);
+        };
         if let Some(owner) = owner {
             self.recompute_pi_cleanup_chain(owner, token.thread_id())?;
         }
-        Ok(())
+        Ok(PiWaitCancelOutcome::Cancelled)
     }
 
     /// Publishes an ownerless handoff and wakes the current top waiter.

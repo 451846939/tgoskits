@@ -66,7 +66,9 @@ mod test_runtime;
 
 #[cfg(feature = "multitask")]
 #[cfg_attr(doc, doc(cfg(feature = "multitask")))]
-pub use self::mutex::{LockSubclass, LockdepMutexExt, RawMutex};
+pub use self::mutex::{
+    InterruptibleMutexExt, LockSubclass, LockdepMutexExt, PiMutexLockInterrupted, RawMutex,
+};
 #[cfg(feature = "multitask")]
 #[cfg_attr(doc, doc(cfg(feature = "multitask")))]
 pub use self::mutex::{Mutex as PiMutex, MutexGuard as PiMutexGuard, RawMutex as RawPiMutex};

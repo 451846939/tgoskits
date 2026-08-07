@@ -14,7 +14,7 @@ use core::{
 use ax_errno::{AxError, AxResult};
 use ax_fs_ng::vfs::current_fs_context;
 use ax_runtime::hal::cpu::uspace::UserContext;
-use ax_sync::PiMutex;
+use ax_sync::{InterruptibleMutexExt, PiMutex};
 use axfs_ng_vfs::Location;
 use kernel_elf_parser::AuxType;
 use linux_raw_sys::general::{AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW};
@@ -26,7 +26,7 @@ use crate::{
     mm::{
         copy_from_kernel, load_user_app, new_user_aspace_empty, vm_load_string, vm_load_until_nul,
     },
-    task::{future::block_on, rebind_task_tid, release_thread_pid, yield_now, zap_thread},
+    task::{future::block_on, rebind_task_tid, release_thread_pid, zap_thread},
 };
 
 fn commit_address_space_handoff<OldAddressSpace>(
@@ -152,28 +152,19 @@ fn do_execve(
     // the holder has crossed into irreversible teardown — which we observe
     // by `zap_thread` setting our `exit_request`.
     //
-    // We can't use `ax_sync::PiMutex::lock` directly: its PI wait is not
-    // cancelled by zap's `task.interrupt()`, and (worse) on release the loser would acquire
-    // the mutex and proceed with execve on top of the holder's already-
-    // committed new image. Busy-yield with an `exit_request` probe gives
-    // us:
-    //   - fall-through to acquisition if the holder fails before commit,
-    //   - cooperative exit (EINTR → user-return → `do_exit(0, false)`) if
-    //     the holder zaps us during its sibling-teardown loop,
-    // without consuming any flag the user-return `check_signals` needs.
+    // PREEMPT_RT turns this mutex into an rtmutex. Its wait loop first tries
+    // to take a published ownerless handoff, then checks the kill condition,
+    // and removes a cancelled waiter together with its PI donation. The
+    // Starry kill condition is the persistent sibling `exit_request`: generic
+    // signal wakeups must not abort this serialization boundary.
     //
     // Note: we deliberately do *not* abort on generic `task.interrupt()`
     // (signal wakeups). Linux's execve is killable but not arbitrarily
     // signal-interruptible while it serializes through `cred_guard_mutex`.
-    let _exec_guard = loop {
-        if let Some(g) = proc_data.exec_lock().try_lock() {
-            break g;
-        }
-        if thr.has_exit_request() {
-            return Err(AxError::Interrupted);
-        }
-        yield_now();
-    };
+    let _exec_guard = proc_data
+        .exec_lock()
+        .lock_interruptible(|| thr.has_exit_request())
+        .map_err(|_| AxError::Interrupted)?;
 
     // Collect metadata from the already-resolved location before touching
     // anything. An anonymous memfd has no filesystem path, so fall back to the
@@ -394,12 +385,12 @@ fn do_execve(
     // viewpoint), did its `do_exit(0, false)`, and is no longer in the
     // task table or thread group, so the destination TID is free.
     if my_tid != tgid {
-        release_thread_pid(&proc_data.identity(), my_tid as u64);
-        thr.set_tid(tgid);
-        rebind_task_tid(curr, my_tid, tgid);
+        rebind_task_tid(curr, my_tid, tgid)
+            .unwrap_or_else(|error| panic!("de_thread TID transfer invariant failed: {error}"));
         proc_data.clear_retired_leader_nice();
         proc_data.signal.rename_child(my_tid, tgid);
         proc_data.proc.rename_thread(my_tid, tgid);
+        release_thread_pid(&proc_data.identity(), my_tid as u64);
     }
 
     // Reset every user-visible register to a fresh-process state, not

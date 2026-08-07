@@ -803,6 +803,16 @@ ABA。任务等待通过 park/completion 睡眠，不在禁抢占区做无界 sp
 的 CPU、guard、TaskSystem 指针和 IPI 观测也必须是测试线程局部状态；进程全局 fake 会让
 并行测试彼此清空 guard depth 或借用过期指针，既制造假失败，也会掩盖真实事务顺序。
 
+可中断获取必须直接复用同一 PI registration，而不能在外层用 `try_lock + yield` 轮询。
+Linux v7.1 `rt_mutex_slowlock_block()` 每轮先执行 `try_to_take_rt_mutex()`，只有仍未取得锁时
+才检查 pending signal；若退出等待，则在 `wait_lock` 下移除 waiter 并同步撤销 owner
+donation。因此 ax-task 的取消事务显式返回 `Cancelled | HandoffPending`：前者证明 waiter
+和 donation 已一起撤销，后者证明 unlock 已把 ownerless handoff 发布给该 waiter，调用方
+必须先 claim。`pi_park_current_once()` 只执行一次 park，任何 signal/exit wake 都返回
+ax-sync 的 rtmutex 状态循环重新检查，而不是在 facade 内部吞掉无关 wake。Starry exec 的
+`cred_guard_mutex` 等价锁使用这个接口并只把 sibling `exit_request` 视为 kill 条件，删除
+无界 `yield_now()` 忙等。
+
 ### 锁选择
 
 - worker 独占数据：不加锁；
@@ -818,6 +828,12 @@ ABA。任务等待通过 park/completion 睡眠，不在禁抢占区做无界 sp
 ### PID/zombie
 
 `ProcessIdentity` 是 PID 可见性与 reap 的唯一状态机。parent/children/process-group 更新通过稳定 PID/PGID 排序的关系事务完成，避免 reparent 与 retire 锁序反转。
+
+非 leader exec 的 TID 转移对应 Linux `de_thread()` 在 `tasklist_lock` 下执行
+`exchange_tids()`：Starry 在同一个 `TASK_TABLE` PI guard 内验证 scheduler generation、
+预先插入目标 key、更新 `Thread::tid` 并移除旧 key，因此 task lookup 不会观察到 key 与
+线程身份不一致。旧线程 TID 的 namespace reservation 只在 signal child 与 thread-group
+索引完成重命名后释放；进程 PID 仍由既有 `ProcessIdentity` 持有，不新建第二套 PID owner。
 
 `waitpid` 与 `waitid` 对应 Linux `__do_wait()` 的循环语义：仅 syscall 入口的第一次扫描可
 决定“当前没有符合条件的 child”并返回 `ECHILD`；一旦进入阻塞，每次 event wake 和

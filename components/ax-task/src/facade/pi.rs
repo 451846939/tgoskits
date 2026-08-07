@@ -15,27 +15,26 @@ pub fn pi_mutex_lock_slow<'lock>(
     runtime_task_system()?.pi_mutex_lock_slow(lock, current.id(), sequence)
 }
 
-/// Blocks the calling waiter until it is selected to claim or granted.
-pub fn pi_block_current(token: &PiWaitToken<'_>) -> Result<(), TaskError> {
+/// Performs one scheduler park attempt for a PI waiter.
+///
+/// The caller must recheck ownership, interruption, and timeout after this
+/// function returns. This mirrors Linux `rt_mutex_schedule()`: an unrelated
+/// wake returns control to the rtmutex state loop instead of being consumed by
+/// an inner uninterruptible wait.
+pub fn pi_park_current_once(token: &PiWaitToken<'_>) -> Result<(), TaskError> {
     if token.can_claim() || token.is_granted() {
         return Ok(());
     }
     let system = runtime_task_system()?;
-    loop {
-        let mut ticket = match prepare_pi_park_attempt(system, token)? {
-            PiParkAttempt::Complete => return Ok(()),
-            PiParkAttempt::Retry => continue,
-            PiParkAttempt::Prepared(ticket) => ticket,
-        };
-        if token.can_claim() || token.is_granted() {
-            cancel_current_park(&mut ticket)?;
-            return Ok(());
-        }
-        commit_current_park(&mut ticket)?;
-        if token.can_claim() || token.is_granted() {
-            return Ok(());
-        }
+    let mut ticket = match prepare_pi_park_attempt(system, token)? {
+        PiParkAttempt::Complete | PiParkAttempt::Retry => return Ok(()),
+        PiParkAttempt::Prepared(ticket) => ticket,
+    };
+    if token.can_claim() || token.is_granted() {
+        cancel_current_park(&mut ticket)?;
+        return Ok(());
     }
+    commit_current_park(&mut ticket)
 }
 
 pub(super) fn prepare_pi_park_attempt(
@@ -61,6 +60,12 @@ pub(super) fn prepare_pi_park_attempt(
 /// Cancels a PI wait token after a handoff-before-block race.
 pub fn pi_wait_cancel(token: PiWaitToken<'_>) -> Result<(), TaskError> {
     runtime_task_system()?.pi_wait_cancel(token)
+}
+
+/// Tries to cancel one PI waiter while preserving an ownerless handoff that
+/// already selected it.
+pub fn pi_wait_try_cancel(token: &PiWaitToken<'_>) -> Result<PiWaitCancelOutcome, TaskError> {
+    runtime_task_system()?.pi_wait_try_cancel(token)
 }
 
 /// Publishes a raw-mutex-owner PI handoff and wakes the selected waiter.

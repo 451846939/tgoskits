@@ -796,15 +796,42 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
 /// holds in the new image. This re-keys the global task lookup table so
 /// signal/wait targeting the leader TID resolves to the renamed thread.
 ///
-/// Caller is responsible for ensuring no other task currently occupies
-/// `new_tid` (the original leader must already have been zapped and
-/// removed from the table). The two updates are not atomic with respect
-/// to each other; a brief window exists where both keys point at the same
-/// task, which is harmless because both lookups resolve to the same task.
-pub fn rebind_task_tid(task: &UserTaskRef, old_tid: Pid, new_tid: Pid) {
+/// The original leader must already have been zapped and removed. The table
+/// lock is the Starry equivalent of the Linux `tasklist_lock` section around
+/// `exchange_tids()`: lookup cannot observe the new key before `Thread::tid`
+/// changes or the old key after it changes.
+pub fn rebind_task_tid(task: &UserTaskRef, old_tid: Pid, new_tid: Pid) -> AxResult<()> {
+    if old_tid == new_tid {
+        return Ok(());
+    }
+    let scheduler_id = task.id();
     let mut table = TASK_TABLE.lock();
-    table.insert(new_tid, task.downgrade());
-    table.remove(&old_tid);
+    let registered = table
+        .get(&old_tid)
+        .copied()
+        .filter(|registered| registered.scheduler_id() == scheduler_id)
+        .ok_or(AxError::BadState)?;
+    if table.contains_key(&new_tid) {
+        return Err(AxError::BadState);
+    }
+
+    // Insertion performs any allocation before the user-visible identity is
+    // changed. Readers remain excluded by the same table lock throughout.
+    let replaced = table.insert(new_tid, registered);
+    assert!(
+        replaced.is_none(),
+        "validated de_thread destination changed under the task-table lock"
+    );
+    task.as_thread().set_tid(new_tid);
+    let removed = table
+        .remove(&old_tid)
+        .expect("validated de_thread source disappeared under the task-table lock");
+    assert_eq!(
+        removed.scheduler_id(),
+        scheduler_id,
+        "de_thread removed a different scheduler generation"
+    );
+    Ok(())
 }
 
 /// Request a sibling thread to exit with thread-only semantics.

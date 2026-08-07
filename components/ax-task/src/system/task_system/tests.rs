@@ -5033,6 +5033,34 @@ fn queued_pi_owner_is_reclassified_inside_one_owner_rq_transaction() {
 }
 
 #[test]
+fn interruptible_pi_cancel_defers_to_an_ownerless_handoff() {
+    let system = TaskSystem::new(TaskSystemConfig::new(1)).unwrap();
+    let mut cpu = create_online_pi_cpu(&system);
+    let owner = system
+        .create_thread(ThreadSpec::new(SchedulePolicy::default()))
+        .unwrap();
+    let waiter = system
+        .create_thread(ThreadSpec::new(SchedulePolicy::default()))
+        .unwrap();
+    place_pi_owner(&system, cpu.as_mut(), &owner);
+    let lock = PiMutexCore::new();
+    let token = commit_pi_wait(&system, &lock, waiter.id(), owner.id()).unwrap();
+
+    system
+        .pi_mutex_release(lock.mutex_ref().unwrap(), owner.id())
+        .unwrap();
+    assert!(token.can_claim());
+    assert_eq!(
+        system.pi_wait_try_cancel(&token).unwrap(),
+        crate::PiWaitCancelOutcome::HandoffPending,
+        "Linux rtmutex tries to take an ownerless handoff before honoring interruption"
+    );
+
+    system.pi_mutex_claim(&token).unwrap();
+    assert!(token.is_granted());
+}
+
+#[test]
 fn deadline_pi_boost_overrides_constrained_wake_throttling() {
     let system = Box::pin(TaskSystem::new(TaskSystemConfig::new(1)).unwrap());
     let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
