@@ -34,9 +34,9 @@ impl FatFilesystemInner {
 }
 
 pub struct FatFilesystem {
-    inner: SleepMutex<FatFilesystemInner>,
+    inner: PiMutex<FatFilesystemInner>,
     disk_flusher: SeekableDiskFlusher,
-    root_dir: IrqMutex<Option<DirEntry>>,
+    root_dir: SpinMutex<Option<DirEntry>>,
 }
 
 impl FatFilesystem {
@@ -51,9 +51,9 @@ impl FatFilesystem {
         };
         let root_inode = inner.alloc_inode();
         let result = Arc::new(Self {
-            inner: SleepMutex::new(inner),
+            inner: PiMutex::new(inner),
             disk_flusher,
-            root_dir: IrqMutex::default(),
+            root_dir: SpinMutex::new(None),
         });
 
         let root_dir = DirEntry::new_dir(
