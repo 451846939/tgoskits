@@ -12,6 +12,10 @@ args = [
   "nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65",
   "-drive",
   "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-riscv64-alpine.img",
+  "-device",
+  "virtio-blk-device,drive=disk1",
+  "-drive",
+  "id=disk1,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-riscv64-alpine.img,readonly=on,snapshot=on",
   "-append",
   "root=/dev/nvme0n1 rw init=/bin/sh",
   "-m",
@@ -23,17 +27,10 @@ fail_regex = [
   "(?i)login incorrect",
   "(?i)permission denied",
   "(?m)^(?:echo|cat|rm):",
+  "(?i)IPI extension is not available",
 ]
-success_regex = [
-  '(?m)^AXVISOR_NVME_RW_PAYLOAD\s*$',
-  '(?m)^AXVISOR_NVME_ROOTFS_RW_PASSED\s*$',
-]
-shell_prefix = "axvisor:/$"
-shell_init_cmd = '''
-echo AXVISOR_NVME_RW_PAYLOAD > /tmp/axvisor-nvme-rw
-cat /tmp/axvisor-nvme-rw
-rm -f /tmp/axvisor-nvme-rw
-echo AXVISOR_NVME_ROOTFS_RW_PASSED
-'''
+success_regex = ['(?m)^guest smp ipi pass!\s*$']
+shell_prefix = "~ #"
+shell_init_cmd = "mount -t proc proc /proc 2>/dev/null || true; [ \"$(nproc)\" -ge 3 ] && dmesg | grep -q 'SBI IPI extension detected' && grep -Eq 'IPI[^:]*:.*[1-9]' /proc/interrupts && echo 'guest smp ipi pass!' || exit 1"
 to_bin = true
 uefi = false
