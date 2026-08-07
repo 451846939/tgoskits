@@ -1954,4 +1954,17 @@ mod tests {
         assert_eq!(*live_endpoint_handles.lock(), BTreeMap::from([(0x82, 3)]));
         assert_eq!(claimed_interfaces.lock().get(&interface), Some(&0));
     }
+
+    #[test]
+    fn uvc_claim_keeps_alternate_when_endpoint_cleanup_is_busy() {
+        let interface = 1;
+        let claimed_interfaces = Mutex::new(BTreeMap::from([(interface, 2)]));
+
+        let result = commit_userspace_uvc_claim(&claimed_interfaces, interface, 0, |_| {
+            Err(AxError::ResourceBusy)
+        });
+
+        assert_eq!(result, Err(AxError::ResourceBusy));
+        assert_eq!(claimed_interfaces.lock().get(&interface), Some(&2));
+    }
 }
