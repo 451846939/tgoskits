@@ -44,12 +44,6 @@ const EXCEPTION_SYNC: usize = TrapKind::Synchronous as usize;
 /// Equals to [`TrapKind::Irq`], used in exception.S.
 const EXCEPTION_IRQ: usize = TrapKind::Irq as usize;
 
-const AARCH64_EXCEPTION_INSN_SIZE: usize = 4;
-
-fn advance_aarch64_exception_pc(ctx: &mut TrapFrame) {
-    ctx.set_exception_pc(ctx.exception_pc() + AARCH64_EXCEPTION_INSN_SIZE);
-}
-
 #[repr(u8)]
 #[derive(Debug)]
 #[allow(unused)]
@@ -164,14 +158,13 @@ fn handle_hvc_psci_version(ctx: &mut TrapFrame) -> Option<ArmVcpuResult<ArmVmExi
         return None;
     }
 
-    advance_aarch64_exception_pc(ctx);
     ctx.set_gpr(0, PSCI_VERSION_0_2);
     Some(Ok(ArmVmExit::Nothing))
 }
 
 fn handle_hvc64_exception(ctx: &mut TrapFrame) -> ArmVcpuResult<ArmVmExit> {
-    advance_aarch64_exception_pc(ctx);
-
+    // The low-level AArch64 trap entry already saves the guest return PC for
+    // HVC exits. Advancing it here would skip the instruction after `hvc`.
     // Is this a psci call?
     //
     // By convention, a psci call can use either the `hvc` or the `smc` instruction.
@@ -410,14 +403,14 @@ mod tests {
     const TEST_PC: usize = 0x8020_0000;
 
     #[test]
-    fn hvc_psci_exit_advances_exception_pc() {
+    fn hvc_psci_exit_keeps_exception_pc() {
         let mut ctx = TrapFrame::default();
         ctx.set_exception_pc(TEST_PC);
         ctx.set_gpr(0, PSCI_VERSION_32 as usize);
 
         let exit = handle_hvc64_exception(&mut ctx).expect("PSCI HVC should produce VM exit");
 
-        assert_eq!(ctx.exception_pc(), TEST_PC + AARCH64_EXCEPTION_INSN_SIZE);
+        assert_eq!(ctx.exception_pc(), TEST_PC);
         assert!(matches!(
             exit,
             ArmVmExit::Hypercall {
@@ -428,7 +421,7 @@ mod tests {
     }
 
     #[test]
-    fn generic_hvc_exit_advances_exception_pc() {
+    fn generic_hvc_exit_keeps_exception_pc() {
         let mut ctx = TrapFrame::default();
         ctx.set_exception_pc(TEST_PC);
         ctx.set_gpr(0, GENERIC_HVC_NR as usize);
@@ -437,7 +430,7 @@ mod tests {
 
         let exit = handle_hvc64_exception(&mut ctx).expect("generic HVC should produce VM exit");
 
-        assert_eq!(ctx.exception_pc(), TEST_PC + AARCH64_EXCEPTION_INSN_SIZE);
+        assert_eq!(ctx.exception_pc(), TEST_PC);
         assert!(matches!(
             exit,
             ArmVmExit::Hypercall {
