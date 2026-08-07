@@ -850,6 +850,10 @@ impl EndpointOp for Endpoint {
             .ok_or(TransferError::InvalidEndpoint)
     }
 
+    fn supports_retire_after_quiesce(&self) -> bool {
+        true
+    }
+
     fn reset(&mut self) -> EndpointResetFuture {
         if !self.inflight.is_empty() || self.outstanding_trbs != 0 {
             return Box::pin(async { Err(TransferError::QueueFull) });

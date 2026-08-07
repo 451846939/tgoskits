@@ -218,6 +218,15 @@ impl SubmittedTransfer {
             SubmittedTransferInner::Control { .. } => Err(AxError::Unsupported),
         }
     }
+
+    pub(super) fn supports_retire_after_quiesce(&self) -> bool {
+        match &self.inner {
+            SubmittedTransferInner::Endpoint { endpoint, .. } => {
+                endpoint.lock().supports_retire_after_quiesce()
+            }
+            SubmittedTransferInner::Control { .. } => false,
+        }
+    }
 }
 
 fn wait_endpoint(

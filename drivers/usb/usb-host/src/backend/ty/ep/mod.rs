@@ -43,6 +43,10 @@ pub(crate) trait EndpointOp: Send + Any + 'static {
         Err(TransferError::NotSupported)
     }
 
+    fn supports_retire_after_quiesce(&self) -> bool {
+        false
+    }
+
     fn reset(&mut self) -> EndpointResetFuture {
         Box::pin(async { Err(TransferError::NotSupported) })
     }
@@ -104,6 +108,10 @@ impl Endpoint {
 
     pub fn retire_after_quiesce(&mut self, id: RequestId) -> Result<(), TransferError> {
         self.raw.retire_request_after_quiesce(id)
+    }
+
+    pub fn supports_retire_after_quiesce(&self) -> bool {
+        self.raw.supports_retire_after_quiesce()
     }
 
     /// Resets host-controller state for this endpoint after a successful

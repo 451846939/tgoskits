@@ -307,6 +307,13 @@ impl SubmittedUrb {
         }
     }
 
+    fn supports_retire_after_quiesce(&self) -> bool {
+        match &self.transfer {
+            SubmittedUrbTransfer::Live(transfer) => transfer.supports_retire_after_quiesce(),
+            SubmittedUrbTransfer::Deferred(_) => true,
+        }
+    }
+
     fn deferred_quirk(&self) -> Option<UsbfsQuirk> {
         match &self.transfer {
             SubmittedUrbTransfer::Live(_) => None,
@@ -408,17 +415,34 @@ impl UsbDeviceFile {
             self.claimed_interfaces.lock().insert(interface, alternate);
             return Ok(0);
         }
+        let retire_after_quiesce = submitted
+            .iter()
+            .all(SubmittedUrb::supports_retire_after_quiesce);
+        let submitted = if retire_after_quiesce {
+            submitted
+        } else {
+            let remaining = cleanup_submitted_urbs(submitted, Some(USBFS_URB_CANCEL_TIMEOUT));
+            if !remaining.is_empty() {
+                self.submitted_urbs.lock().extend(remaining);
+                return Err(AxError::ResourceBusy);
+            }
+            Vec::new()
+        };
         if let Err(err) = self.with_live_lease(|lease| lease.claim_interface(interface, alternate))
         {
             self.submitted_urbs.lock().extend(submitted);
             return Err(err);
         }
-        let remaining = retire_quiesced_urbs(submitted);
+        self.claimed_interfaces.lock().insert(interface, alternate);
+        let remaining = if retire_after_quiesce {
+            retire_quiesced_urbs(submitted)
+        } else {
+            Vec::new()
+        };
         if !remaining.is_empty() {
             self.submitted_urbs.lock().extend(remaining);
             return Err(AxError::ResourceBusy);
         }
-        self.claimed_interfaces.lock().insert(interface, alternate);
         Ok(0)
     }
 
@@ -435,11 +459,30 @@ impl UsbDeviceFile {
             let remaining = if alternate != 0
                 && usbfs_quirk_for_interface(&self.snapshot, interface, alternate).is_none()
             {
+                let retire_after_quiesce = submitted
+                    .iter()
+                    .all(SubmittedUrb::supports_retire_after_quiesce);
+                let submitted = if retire_after_quiesce {
+                    submitted
+                } else {
+                    let remaining =
+                        cleanup_submitted_urbs(submitted, Some(USBFS_URB_CANCEL_TIMEOUT));
+                    if !remaining.is_empty() {
+                        self.submitted_urbs.lock().extend(remaining);
+                        return Err(AxError::ResourceBusy);
+                    }
+                    Vec::new()
+                };
                 if let Err(err) = lease.claim_interface(interface, 0) {
                     self.submitted_urbs.lock().extend(submitted);
                     return Err(err);
                 }
-                retire_quiesced_urbs(submitted)
+                self.claimed_interfaces.lock().insert(interface, 0);
+                if retire_after_quiesce {
+                    retire_quiesced_urbs(submitted)
+                } else {
+                    Vec::new()
+                }
             } else {
                 cleanup_submitted_urbs(submitted, Some(USBFS_URB_CANCEL_TIMEOUT))
             };
@@ -1501,7 +1544,10 @@ impl Drop for UsbDeviceFile {
                             index += 1;
                         }
                     }
-                    if lease.claim_interface(interface, 0).is_ok() {
+                    let retire_after_quiesce = interface_urbs
+                        .iter()
+                        .all(SubmittedUrb::supports_retire_after_quiesce);
+                    if retire_after_quiesce && lease.claim_interface(interface, 0).is_ok() {
                         submitted.extend(retire_quiesced_urbs(interface_urbs));
                     } else {
                         submitted.extend(interface_urbs);
