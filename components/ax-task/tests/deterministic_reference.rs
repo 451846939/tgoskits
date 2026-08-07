@@ -246,6 +246,7 @@ struct ReferenceScheduler {
     next_sequence: u64,
     accounted_until_ns: u64,
     need_resched: bool,
+    rr_current_requeued: bool,
 }
 
 impl ReferenceScheduler {
@@ -269,6 +270,7 @@ impl ReferenceScheduler {
             next_sequence: 4,
             accounted_until_ns: 0,
             need_resched: false,
+            rr_current_requeued: false,
         }
     }
 
@@ -295,19 +297,38 @@ impl ReferenceScheduler {
         let expired = self.current.entity.charge(runtime_ns);
         self.advance_fair_virtual_time(true);
         self.accounted_until_ns = now_ns;
-        if expired {
-            self.need_resched = true;
-        }
+        self.finish_class_tick(expired);
         expired
     }
 
     fn settle_current(&mut self, now_ns: u64) {
         let runtime_ns = now_ns.saturating_sub(self.accounted_until_ns);
-        if self.current.entity.charge(runtime_ns) {
-            self.need_resched = true;
-        }
+        let expired = self.current.entity.charge(runtime_ns);
+        self.finish_class_tick(expired);
         self.advance_fair_virtual_time(true);
         self.accounted_until_ns = now_ns;
+    }
+
+    fn finish_class_tick(&mut self, expired: bool) {
+        if !expired {
+            return;
+        }
+        if let ReferenceEntity::RoundRobin {
+            remaining_quantum_ns,
+        } = &mut self.current.entity
+        {
+            // Linux `task_tick_rt()` refreshes the quantum immediately and
+            // requeues a running RR entity only when a peer exists at the
+            // same priority. The current identity remains installed until the
+            // subsequent scheduler transaction.
+            *remaining_quantum_ns = RR_QUANTUM_NS;
+            if !self.ready.is_empty() {
+                self.rr_current_requeued = true;
+                self.need_resched = true;
+            }
+            return;
+        }
+        self.need_resched = true;
     }
 
     fn enqueue_current(&mut self, reason: ReferenceEnqueue) {
@@ -324,6 +345,12 @@ impl ReferenceScheduler {
             // reference stream does not reach.
             return;
         }
+        if self.rr_current_requeued {
+            debug_assert!(matches!(current.entity, ReferenceEntity::RoundRobin { .. }));
+            self.rr_current_requeued = false;
+            self.ready.push(current);
+            return;
+        }
         let keeps_active_position = match current.entity {
             // Linux keeps RT/DL current linked in their active structures.
             // A scheduler entry alone therefore cannot assign a fresh FIFO or
@@ -333,8 +360,8 @@ impl ReferenceScheduler {
             }
             ReferenceEntity::Deadline { .. } => matches!(reason, ReferenceEnqueue::Preempted),
             ReferenceEntity::RoundRobin {
-                remaining_quantum_ns,
-            } => matches!(reason, ReferenceEnqueue::Preempted) && remaining_quantum_ns != 0,
+                remaining_quantum_ns: _,
+            } => matches!(reason, ReferenceEnqueue::Preempted),
             ReferenceEntity::Fair { .. } => false,
         };
         if !keeps_active_position {
@@ -352,6 +379,7 @@ impl ReferenceScheduler {
 
     fn select_next(&mut self, now_ns: u64) -> ThreadId {
         self.current = pick_reference(self.scenario, &mut self.ready, &mut self.virtual_time);
+        self.rr_current_requeued = false;
         self.accounted_until_ns = now_ns;
         self.current.id
     }
@@ -452,11 +480,6 @@ impl ReferenceEntity {
                     *remaining_request_ns = FAIR_SLICE_NS;
                     *virtual_deadline = (*vruntime).max(virtual_time).saturating_add(FAIR_SLICE_NS);
                 }
-            }
-            Self::RoundRobin {
-                remaining_quantum_ns,
-            } if matches!(reason, ReferenceEnqueue::Yield) || *remaining_quantum_ns == 0 => {
-                *remaining_quantum_ns = RR_QUANTUM_NS;
             }
             Self::Fifo | Self::RoundRobin { .. } | Self::Deadline { .. } => {}
         }

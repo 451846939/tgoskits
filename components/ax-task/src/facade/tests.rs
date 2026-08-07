@@ -493,7 +493,7 @@ mod tests {
     }
 
     #[test]
-    fn clock_event_publishes_owner_reschedule_before_returning() {
+    fn clock_event_publishes_rr_rotation_without_timer_backlog() {
         let system = Box::pin(TaskSystem::new(crate::TaskSystemConfig::new(1)).unwrap());
         let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
         let policy =
@@ -513,12 +513,21 @@ mod tests {
         // quantum expiry exercised below.
         schedule_current_cpu().unwrap();
         assert!(!current_cpu_needs_resched().unwrap());
+        let peer = system.create_thread(ThreadSpec::new(policy)).unwrap();
+        system.make_ready(peer.id()).unwrap();
+        {
+            let _irq = RuntimeIrqGuard::enter();
+            system.enqueue(cpu.as_mut(), peer.id()).unwrap();
+        }
         test_runtime::set_scheduler_ns(10);
         let outcome = on_clock_event(instant(10), 64).unwrap();
 
         assert!(outcome.slice_expired());
         assert_eq!(outcome.expired(), 0);
-        assert!(outcome.pending());
+        assert!(
+            !outcome.pending(),
+            "a completed RR class hook must not manufacture timer backlog"
+        );
         assert!(
             current_cpu_needs_resched().unwrap(),
             "the scheduler core must publish owner-local preemption before returning to runtime"

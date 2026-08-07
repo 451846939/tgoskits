@@ -256,6 +256,72 @@ fn fifo_preemption_preserves_the_head_position() {
 }
 
 #[test]
+fn lone_round_robin_quantum_does_not_request_reschedule() {
+    let mut queue = RunQueue::new();
+    let priority = RtPriority::new(10).unwrap();
+    let policy = SchedulePolicy::round_robin_with_quantum(priority, 100).unwrap();
+    let thread = ThreadId::from_parts(0, 1);
+    queue
+        .enqueue_test(
+            thread,
+            policy,
+            SchedulingEntity::new(policy, 1, 0),
+            0,
+            EnqueueReason::Wake,
+        )
+        .unwrap();
+    assert_eq!(pick_linked_current(&mut queue), thread);
+
+    let (charge, ..) = queue.charge_current(100, 100, 0, 0, 1, 0).unwrap();
+    let tick = SchedulerClass::Realtime.task_tick(&mut queue, thread, policy, charge);
+
+    assert!(
+        !tick.request_reschedule,
+        "Linux refreshes a lone RR task's quantum without rescheduling it"
+    );
+    assert!(
+        !queue
+            .rt
+            .get(priority.get(), thread)
+            .unwrap()
+            .entity()
+            .round_robin_quantum_expired(),
+        "the lone RR task must start a fresh quantum in place"
+    );
+}
+
+#[test]
+fn competing_round_robin_quantum_rotates_the_active_queue() {
+    let mut queue = RunQueue::new();
+    let priority = RtPriority::new(10).unwrap();
+    let policy = SchedulePolicy::round_robin_with_quantum(priority, 100).unwrap();
+    let current = ThreadId::from_parts(0, 1);
+    let peer = ThreadId::from_parts(1, 1);
+    for thread in [current, peer] {
+        queue
+            .enqueue_test(
+                thread,
+                policy,
+                SchedulingEntity::new(policy, 1, 0),
+                0,
+                EnqueueReason::Wake,
+            )
+            .unwrap();
+    }
+    assert_eq!(pick_linked_current(&mut queue), current);
+
+    let (charge, ..) = queue.charge_current(100, 100, 0, 0, 1, 0).unwrap();
+    let tick = SchedulerClass::Realtime.task_tick(&mut queue, current, policy, charge);
+
+    assert!(tick.request_reschedule);
+    assert_eq!(
+        queue.rt.select().unwrap().id,
+        peer,
+        "Linux requeues an expired RR current behind its same-priority peer"
+    );
+}
+
+#[test]
 fn first_fair_placement_cannot_start_behind_runqueue_virtual_time() {
     let mut queue = RunQueue::new();
     queue.set_virtual_time_for_test(10_000);

@@ -35,6 +35,66 @@ fn enqueue_preemption_remains_sticky_until_scheduler_entry() {
 }
 
 #[test]
+fn scheduler_entry_rotates_rr_when_settlement_expires_the_quantum() {
+    let (system, mut cpu) = online_system(TaskSystemConfig::new(1));
+    let policy = SchedulePolicy::round_robin_with_quantum(RtPriority::new(50).unwrap(), 8).unwrap();
+    let first = ready_thread(&system, policy);
+    let second = ready_thread(&system, policy);
+    system.enqueue_at(cpu.as_mut(), first.id(), 0).unwrap();
+    system.enqueue_at(cpu.as_mut(), second.id(), 0).unwrap();
+    assert_eq!(
+        system.schedule_at(cpu.as_mut(), 0).unwrap().next(),
+        first.id()
+    );
+
+    system.charge_current_at(cpu.as_mut(), 7, 7, 0).unwrap();
+    assert_eq!(
+        system.schedule_at(cpu.as_mut(), 8).unwrap().next(),
+        second.id(),
+        "Linux task_tick_rt rotates the linked current in the same rq transaction"
+    );
+}
+
+#[test]
+fn rr_yield_preserves_the_remaining_quantum() {
+    let (system, mut cpu) = online_system(TaskSystemConfig::new(1));
+    let policy = SchedulePolicy::round_robin_with_quantum(RtPriority::new(50).unwrap(), 8).unwrap();
+    let first = ready_thread(&system, policy);
+    let second = ready_thread(&system, policy);
+    system.enqueue_at(cpu.as_mut(), first.id(), 0).unwrap();
+    system.enqueue_at(cpu.as_mut(), second.id(), 0).unwrap();
+    assert_eq!(
+        system.schedule_at(cpu.as_mut(), 0).unwrap().next(),
+        first.id()
+    );
+
+    assert!(
+        !system
+            .charge_current_at(cpu.as_mut(), 7, 7, 0)
+            .unwrap()
+            .slice_expired()
+    );
+    assert_eq!(
+        system.yield_current_at(cpu.as_mut(), 7).unwrap().next(),
+        second.id()
+    );
+    system.complete_context_switch(cpu.as_mut()).unwrap();
+    assert_eq!(
+        system.yield_current_at(cpu.as_mut(), 7).unwrap().next(),
+        first.id()
+    );
+    system.complete_context_switch(cpu.as_mut()).unwrap();
+
+    assert!(
+        system
+            .charge_current_at(cpu.as_mut(), 8, 1, 0)
+            .unwrap()
+            .slice_expired(),
+        "Linux yield_task_rt requeues RR without refreshing its remaining time slice"
+    );
+}
+
+#[test]
 fn rt_bandwidth_throttles_at_quota_until_the_next_period() {
     let (system, mut cpu) = online_system(TaskSystemConfig::new(1));
     let thread = ready_thread(&system, SchedulePolicy::fifo(RtPriority::new(80).unwrap()));

@@ -430,7 +430,12 @@ impl CpuRunQueueState {
             false
         };
         self.queue.update_fair_virtual_time(current_entity.fair());
-        let class_tick = SchedulerClass::for_policy(policy).task_tick(charge);
+        let class_tick = SchedulerClass::for_policy(policy).task_tick(
+            &mut self.queue,
+            current_thread,
+            policy,
+            charge,
+        );
         Ok(RqCurrentTick::Task {
             charge,
             request_reschedule: class_tick.request_reschedule || deadline_replenish_reschedule,

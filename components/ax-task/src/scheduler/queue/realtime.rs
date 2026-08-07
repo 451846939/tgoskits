@@ -4,7 +4,7 @@ use alloc::{boxed::Box, sync::Arc};
 use core::ptr::NonNull;
 
 use super::{EnqueueReason, QueuedThread, QueuedThreadSnapshot};
-use crate::{SchedulingEntity, ThreadId};
+use crate::{SchedulePolicy, SchedulingEntity, ThreadId};
 
 const RT_PRIORITY_LEVELS: usize = 99;
 const FIXED_PRIORITY_LEVELS: usize = RT_PRIORITY_LEVELS;
@@ -291,18 +291,10 @@ impl RealtimeRunQueue {
     ) -> Option<SchedulingEntity> {
         let index = (priority - 1) as usize;
         let position = self.active[index].position(id)?;
-        let move_to_tail = {
-            let thread = self.active[index].iter().nth(position)?;
-            matches!(reason, EnqueueReason::Yield)
-                || (matches!(reason, EnqueueReason::Preempted)
-                    && thread.active.entity().round_robin_quantum_expired())
-        };
+        let move_to_tail = matches!(reason, EnqueueReason::Yield);
         if move_to_tail {
-            let mut node = self.active[index].remove_at(position)?;
-            let thread = node.thread_mut();
-            let policy = thread.active.policy();
-            thread.active.entity_mut().reset_round_robin_quantum(policy);
-            let entity = thread.active.entity().clone();
+            let node = self.active[index].remove_at(position)?;
+            let entity = node.thread().active.entity().clone();
             self.active[index].push_back(node);
             Some(entity)
         } else {
@@ -311,6 +303,49 @@ impl RealtimeRunQueue {
                 .nth(position)
                 .map(QueuedThread::entity)
         }
+    }
+
+    /// Linux `task_tick_rt()` for one linked RR current.
+    ///
+    /// The current task stays in the active priority array.  Expiration
+    /// refreshes its quantum unconditionally; only a peer at the same
+    /// priority causes `requeue_task_rt()` and a reschedule request.
+    pub(super) fn task_tick_round_robin(
+        &mut self,
+        priority: u8,
+        id: ThreadId,
+        policy: SchedulePolicy,
+    ) -> Option<bool> {
+        let index = (priority - 1) as usize;
+        let position = self.active[index].position(id)?;
+        let expired = self.active[index]
+            .iter()
+            .nth(position)?
+            .active
+            .entity()
+            .round_robin_quantum_expired();
+        if !expired {
+            return Some(false);
+        }
+
+        let has_peer = self.active[index].len > 1;
+        if has_peer {
+            let mut node = self.active[index].remove_at(position)?;
+            node.thread_mut()
+                .active
+                .entity_mut()
+                .reset_round_robin_quantum(policy);
+            self.active[index].push_back(node);
+        } else {
+            self.active[index]
+                .head
+                .as_deref_mut()?
+                .thread_mut()
+                .active
+                .entity_mut()
+                .reset_round_robin_quantum(policy);
+        }
+        Some(has_peer)
     }
 
     fn after_remove(&mut self, index: usize, mut node: Box<RealtimeNode>) -> QueuedThread {

@@ -2083,7 +2083,9 @@ review 提出的 A5 方向有效，但不能把“running 留队”机械套到�
 - Deadline current 的 CBS accounting 在一个 dispatch interval 内保持 queue key 稳定，只在
   rq 锁内替换 active node 的 augmented payload，不执行 remove/insert；absolute deadline
   的变化由 `put_prev` 在 current 离开 dispatch 时统一 remove/reinsert 并 rekey；
-- RR yield/quantum expiry 只把原 intrusive node 移到同优先级尾部，普通 FIFO/未耗尽 RR
+- RR yield 与 quantum expiry 都只移动原 intrusive node，但二者不共享 quantum 生命周期：
+  `yield_task_rt()` 只移到同优先级尾部并保留剩余 quantum；`task_tick_rt()` 在耗尽时立即刷新
+  quantum，且只有同优先级存在 peer 才移到队尾并请求 reschedule。普通 FIFO/未耗尽 RR
   preemption 保持原位置；Fair 继续沿用原 EEVDF remove/insert 语义。
 
 两项最低层红测在旧实现稳定证明 RT 与 Deadline pick 后 membership 已消失；新实现要求
@@ -2365,6 +2367,10 @@ entity 由 owner-local `DeadlineServer` 和 donor-parameter `DeadlineServer` 组
 - class 生命周期只经过 `enqueue/dequeue/check_preempt/put_prev/pick/set_next/task_tick`。
   common rq 统一提交 current、membership、placement、runtime accounting 和 root-domain
   publication；class 后端不得再发布另一份 running/current 状态；
+- `task_tick` 接受当前 rq、current identity 与 policy，不再把所有 class 压成脱离队列的
+  `slice_expired -> resched` 布尔映射。RR quantum 的刷新和 active queue 轮转在同一 rq
+  transaction 内完成；单一 RR 任务只刷新 quantum，FIFO 永不因 slice 触发调度，主动
+  yield 不刷新 RR quantum；
 - Deadline active tree、throttled membership、timer lifetime anchor、`this_bw/running_bw`
   账本和 class-local pushable index 全部位于同一个 `DeadlineRunQueue`。root-domain
   `total_bw/admission`、每 rq `this_bw/running_bw`、每 rq `extra_bw` 仍是 Linux 定义的三个

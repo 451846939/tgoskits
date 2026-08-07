@@ -60,7 +60,7 @@ impl SchedulerClass {
         self,
         run_queue: &mut RunQueue,
         mut thread: QueuedThread,
-        mut reason: EnqueueReason,
+        reason: EnqueueReason,
         current_fair: Option<FairEntity>,
     ) -> Result<ClassEnqueue, TaskError> {
         if let SchedulingEntity::Fair(fair) = thread.active.entity_mut() {
@@ -91,15 +91,6 @@ impl SchedulerClass {
             {
                 fair.renew_request(virtual_time);
             }
-        }
-        if self == Self::Realtime
-            && (reason == EnqueueReason::Yield
-                || (reason == EnqueueReason::Preempted
-                    && thread.active.entity().round_robin_quantum_expired()))
-        {
-            let policy = thread.active.policy();
-            thread.active.entity_mut().reset_round_robin_quantum(policy);
-            reason = EnqueueReason::Yield;
         }
         let entity = thread.active.entity().clone();
         let membership = match self {
@@ -282,7 +273,13 @@ impl SchedulerClass {
 
     /// Linux `task_tick()` class hook. Runtime accounting itself is common rq
     /// state; the class owns the policy-specific reschedule decision.
-    pub(crate) const fn task_tick(self, charge: DispatchCharge) -> ClassTick {
+    pub(crate) fn task_tick(
+        self,
+        run_queue: &mut RunQueue,
+        current: ThreadId,
+        policy: SchedulePolicy,
+        charge: DispatchCharge,
+    ) -> ClassTick {
         ClassTick {
             request_reschedule: match self {
                 // Linux `update_curr_dl_se()` always dequeues and reschedules
@@ -290,7 +287,22 @@ impl SchedulerClass {
                 // only user-visible overrun notification, never whether the
                 // throttled task may keep running.
                 Self::Deadline => charge.slice_expired,
-                Self::Realtime | Self::Fair | Self::IdleFair => charge.slice_expired,
+                Self::Realtime => match policy {
+                    SchedulePolicy::RoundRobin { priority, .. } if charge.slice_expired => {
+                        run_queue
+                            .rt
+                            .task_tick_round_robin(priority.get(), current, policy)
+                            .unwrap_or_else(|| {
+                                task_runtime::fatal_invariant(
+                                    0x5251_1010,
+                                    current.as_u64() as usize,
+                                )
+                            })
+                    }
+                    SchedulePolicy::RoundRobin { .. } | SchedulePolicy::Fifo { .. } => false,
+                    _ => task_runtime::fatal_invariant(0x5251_1011, current.as_u64() as usize),
+                },
+                Self::Fair | Self::IdleFair => charge.slice_expired,
                 Self::Stop => false,
             },
             realtime: matches!(self, Self::Realtime),
