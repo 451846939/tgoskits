@@ -253,6 +253,7 @@ struct SubmittedUrb {
     user_urb_ptr: usize,
     transfer: SubmittedUrbTransfer,
     interface: Option<u8>,
+    discarded: bool,
     buffer: Vec<u8>,
     is_in: bool,
     data_offset: usize,
@@ -546,7 +547,7 @@ impl UsbDeviceFile {
         let mut submitted_urbs = self.submitted_urbs.lock();
         let index = submitted_urbs
             .iter()
-            .position(|submitted| submitted.user_urb_ptr == user_urb_ptr)
+            .position(|submitted| !submitted.discarded && submitted.user_urb_ptr == user_urb_ptr)
             .ok_or(AxError::InvalidInput)?;
         submitted_urbs.remove(index).ok_or(AxError::InvalidInput)
     }
@@ -805,6 +806,9 @@ impl UsbDeviceFile {
         submitted: SubmittedUrb,
         result: AxResult<TransferCompletion>,
     ) {
+        if submitted.discarded {
+            return;
+        }
         if submitted.log {
             match &result {
                 Ok(completion) => debug!(
@@ -918,6 +922,9 @@ impl UsbDeviceFile {
                         }
 
                         for (submitted, result) in ready {
+                            if submitted.discarded {
+                                continue;
+                            }
                             complete_urb(
                                 &pending_urbs,
                                 &poll_urbs,
@@ -1002,6 +1009,9 @@ impl UsbDeviceFile {
                         })
                         .await;
                         if let Some((submitted, result)) = completed {
+                            if submitted.discarded {
+                                continue;
+                            }
                             complete_urb(
                                 &pending_urbs,
                                 &poll_urbs,
@@ -1120,6 +1130,7 @@ impl UsbDeviceFile {
             user_urb_ptr: arg,
             transfer: SubmittedUrbTransfer::Live(transfer),
             interface: Some(claimed_endpoint.interface),
+            discarded: false,
             buffer,
             is_in,
             data_offset: 0,
@@ -1197,6 +1208,7 @@ impl UsbDeviceFile {
             user_urb_ptr: arg,
             transfer: SubmittedUrbTransfer::Live(transfer),
             interface: None,
+            discarded: false,
             buffer,
             is_in,
             data_offset: 8,
@@ -1248,6 +1260,7 @@ impl UsbDeviceFile {
                 user_urb_ptr: arg,
                 transfer: SubmittedUrbTransfer::Deferred(UsbfsQuirk::DeferredStatusInterrupt),
                 interface: Some(claimed_endpoint.interface),
+                discarded: false,
                 buffer: Vec::new(),
                 is_in: true,
                 data_offset: 0,
@@ -1301,14 +1314,12 @@ impl UsbDeviceFile {
     }
 
     fn submit_urb(&self, arg: usize) -> AxResult<usize> {
+        let _lifecycle_guard = self.lifecycle_lock.lock();
         self.collect_submitted_urbs(None);
         let urb = (arg as *const descriptor::UsbdevfsUrb).vm_read()?;
         let type_ = urb.type_;
         match type_ {
-            descriptor::USBDEVFS_URB_TYPE_CONTROL => {
-                let _lifecycle_guard = self.lifecycle_lock.lock();
-                self.submit_control_urb(arg)
-            }
+            descriptor::USBDEVFS_URB_TYPE_CONTROL => self.submit_control_urb(arg),
             descriptor::USBDEVFS_URB_TYPE_BULK => self.submit_bulk_urb(arg),
             descriptor::USBDEVFS_URB_TYPE_INTERRUPT => self.submit_interrupt_urb(arg),
             descriptor::USBDEVFS_URB_TYPE_ISO => self.submit_iso_urb(arg),
@@ -1350,8 +1361,10 @@ impl UsbDeviceFile {
     }
 
     fn discard_urb(&self, arg: usize) -> AxResult<usize> {
-        let submitted = self.drain_submitted_urb_by_ptr(arg)?;
+        let _lifecycle_guard = self.lifecycle_lock.lock();
+        let mut submitted = self.drain_submitted_urb_by_ptr(arg)?;
         submitted.cancel()?;
+        submitted.discarded = true;
 
         complete_urb(
             &self.pending_urbs,
@@ -1364,14 +1377,8 @@ impl UsbDeviceFile {
         );
 
         if !submitted.is_deferred() {
-            let lease = self.lease.lock().clone();
-            ax_task::spawn_with_name(
-                move || {
-                    let _lease = lease;
-                    cleanup_submitted_urbs(alloc::vec![submitted], None);
-                },
-                "usbfs-urb-discard".to_owned(),
-            );
+            self.submitted_urbs.lock().push_back(submitted);
+            self.ensure_urb_worker();
         }
         Ok(0)
     }
