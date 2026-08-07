@@ -6,7 +6,7 @@ mod tree;
 
 use alloc::{
     borrow::ToOwned,
-    collections::{BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::Arc,
     vec::Vec,
 };
@@ -413,8 +413,12 @@ impl UsbDeviceFile {
                 self.submitted_urbs.lock().extend(remaining);
                 return Err(AxError::ResourceBusy);
             }
-            self.claimed_interfaces.lock().insert(interface, alternate);
-            return Ok(0);
+            return commit_userspace_uvc_claim(
+                &self.claimed_interfaces,
+                interface,
+                alternate,
+                |interface| self.release_endpoint_handles_for_interface(interface),
+            );
         }
         let retire_after_quiesce = submitted
             .iter()
@@ -1384,6 +1388,17 @@ impl UsbDeviceFile {
     }
 }
 
+fn commit_userspace_uvc_claim(
+    claimed_interfaces: &Mutex<BTreeMap<u8, u8>>,
+    interface: u8,
+    alternate: u8,
+    release_endpoint_handles: impl FnOnce(u8) -> AxResult<()>,
+) -> AxResult<usize> {
+    release_endpoint_handles(interface)?;
+    claimed_interfaces.lock().insert(interface, alternate);
+    Ok(0)
+}
+
 impl FileLike for UsbDeviceFile {
     fn read(&self, dst: &mut IoDst) -> AxResult<usize> {
         self.base.read(dst)
@@ -1914,4 +1929,29 @@ fn write_iso_packet_descs(
         vm_write_slice(ptr, descs)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uvc_claim_releases_live_endpoints_before_updating_alternate() {
+        let interface = 1;
+        let claimed_interfaces = Mutex::new(BTreeMap::from([(interface, 2)]));
+        let live_endpoint_handles = Mutex::new(BTreeMap::from([(0x81, interface), (0x82, 3)]));
+
+        let result =
+            commit_userspace_uvc_claim(&claimed_interfaces, interface, 0, |claimed_interface| {
+                assert_eq!(claimed_interfaces.lock().get(&interface), Some(&2));
+                live_endpoint_handles
+                    .lock()
+                    .retain(|_, owner| *owner != claimed_interface);
+                Ok(())
+            });
+
+        assert_eq!(result, Ok(0));
+        assert_eq!(*live_endpoint_handles.lock(), BTreeMap::from([(0x82, 3)]));
+        assert_eq!(claimed_interfaces.lock().get(&interface), Some(&0));
+    }
 }
