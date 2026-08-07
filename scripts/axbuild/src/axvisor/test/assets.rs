@@ -14,39 +14,11 @@ use crate::{
 
 const ARCEOS_QEMU_GUEST_PACKAGE: &str = "ax-helloworld";
 const ARCEOS_QEMU_GUEST_KERNEL_PATH: &str = "/guest/arceos/ax-helloworld-x86_64.bin";
-const ARCEOS_IVC_GUEST_PACKAGES: &[&str] = &["arceos-ivc-publisher", "arceos-ivc-subscriber"];
-const AXVISOR_IVC_LINUX_PUBLISHER_GUEST_PATH: &str = "/root/ivc-publish";
-const AXVISOR_IVC_LINUX_SUBSCRIBER_GUEST_PATH: &str = "/root/ivc-subscribe";
-const AXVISOR_IVC_ZEPHYR_PUBLISHER_GUEST_PATH: &str = "/guest/zephyr/zephyr-ivc-publisher.bin";
 const AXVISOR_IVSHMEM_BAR2_SMOKE_GUEST_PATH: &str = "/root/ivshmem-bar2-smoke";
 const AXVISOR_IVSHMEM_BAR2_INITRAMFS_GUEST_PATH: &str = "/guest/linux/ivshmem-bar2-initramfs.cpio";
 
-#[derive(Clone, Copy)]
-struct ArceosIvcGuestProfile {
-    arch: &'static str,
-    target: &'static str,
-    packages: &'static [&'static str],
-    vmconfig_marker: &'static str,
-}
-
-const ARCEOS_IVC_GUEST_PROFILES: &[ArceosIvcGuestProfile] = &[ArceosIvcGuestProfile {
-    arch: "aarch64",
-    target: "aarch64-unknown-none-softfloat",
-    packages: ARCEOS_IVC_GUEST_PACKAGES,
-    vmconfig_marker: "ivc",
-}];
-
 pub(super) fn arceos_x86_64_guest_request() -> anyhow::Result<ResolvedBuildRequest> {
     arceos_guest_request(ARCEOS_QEMU_GUEST_PACKAGE, "x86_64", "x86_64-unknown-none")
-}
-
-pub(super) fn arceos_ivc_guest_requests(
-    request: &ResolvedAxvisorRequest,
-) -> anyhow::Result<Vec<ResolvedBuildRequest>> {
-    matching_arceos_ivc_guest_profiles(request)
-        .flat_map(|profile| profile.matching_packages(request))
-        .map(|(profile, package)| arceos_guest_request(package, profile.arch, profile.target))
-        .collect()
 }
 
 fn arceos_guest_request(
@@ -134,89 +106,6 @@ pub(super) fn inject_arceos_x86_64_guest_image(
     result
 }
 
-pub(super) fn inject_arceos_ivc_guest_images(
-    workspace_root: &Path,
-    request: &ResolvedAxvisorRequest,
-    case: &PreparedAxvisorQemuCase,
-    prepared_assets: &mut test_case::PreparedCaseAssets,
-) -> anyhow::Result<()> {
-    let guests = arceos_ivc_guest_image_specs(workspace_root, request);
-    if guests.is_empty() {
-        return Ok(());
-    }
-
-    let (overlay_dir, temporary_overlay_run_dir) =
-        direct_overlay_dir(workspace_root, request, case)?;
-    for (source, guest_path) in guests {
-        ensure_file_exists(&source, "ArceOS IVC guest image")?;
-        copy_guest_overlay_file(&source, &overlay_dir, &guest_path, "ArceOS IVC guest image")?;
-    }
-    let result = crate::rootfs::inject::inject_overlay(&prepared_assets.rootfs_path, &overlay_dir);
-    test_case::remove_case_run_dir(temporary_overlay_run_dir.as_deref());
-    result
-}
-
-pub(super) fn inject_linux_ivc_assets(
-    workspace_root: &Path,
-    request: &ResolvedAxvisorRequest,
-    case: &PreparedAxvisorQemuCase,
-    prepared_assets: &mut test_case::PreparedCaseAssets,
-) -> anyhow::Result<()> {
-    if !case_needs_linux_ivc_assets(request, case) {
-        return Ok(());
-    }
-
-    let out_dir = build_linux_ivc_assets(workspace_root, &request.arch)?;
-    let publisher = out_dir.join("ivc-publish");
-    let subscriber = out_dir.join("ivc-subscribe");
-    ensure_file_exists(&publisher, "Linux IVC publisher demo")?;
-    ensure_file_exists(&subscriber, "Linux IVC subscriber demo")?;
-
-    let (overlay_dir, temporary_overlay_run_dir) =
-        direct_overlay_dir(workspace_root, request, case)?;
-    copy_guest_overlay_file(
-        &publisher,
-        &overlay_dir,
-        AXVISOR_IVC_LINUX_PUBLISHER_GUEST_PATH,
-        "Linux IVC publisher demo",
-    )?;
-    copy_guest_overlay_file(
-        &subscriber,
-        &overlay_dir,
-        AXVISOR_IVC_LINUX_SUBSCRIBER_GUEST_PATH,
-        "Linux IVC subscriber demo",
-    )?;
-    let result = crate::rootfs::inject::inject_overlay(&prepared_assets.rootfs_path, &overlay_dir);
-    test_case::remove_case_run_dir(temporary_overlay_run_dir.as_deref());
-    result
-}
-
-pub(super) fn inject_zephyr_ivc_guest_images(
-    workspace_root: &Path,
-    request: &ResolvedAxvisorRequest,
-    case: &PreparedAxvisorQemuCase,
-    prepared_assets: &mut test_case::PreparedCaseAssets,
-) -> anyhow::Result<()> {
-    if !case_needs_zephyr_ivc_assets(request, case) {
-        return Ok(());
-    }
-
-    let image = build_zephyr_ivc_publisher(workspace_root)?;
-    ensure_file_exists(&image, "Zephyr IVC publisher image")?;
-
-    let (overlay_dir, temporary_overlay_run_dir) =
-        direct_overlay_dir(workspace_root, request, case)?;
-    copy_guest_overlay_file(
-        &image,
-        &overlay_dir,
-        AXVISOR_IVC_ZEPHYR_PUBLISHER_GUEST_PATH,
-        "Zephyr IVC publisher image",
-    )?;
-    let result = crate::rootfs::inject::inject_overlay(&prepared_assets.rootfs_path, &overlay_dir);
-    test_case::remove_case_run_dir(temporary_overlay_run_dir.as_deref());
-    result
-}
-
 pub(super) fn inject_linux_ivshmem_assets(
     workspace_root: &Path,
     request: &ResolvedAxvisorRequest,
@@ -288,45 +177,6 @@ fn copy_guest_overlay_file(
     Ok(())
 }
 
-fn arceos_ivc_guest_image_specs(
-    workspace_root: &Path,
-    request: &ResolvedAxvisorRequest,
-) -> Vec<(PathBuf, String)> {
-    matching_arceos_ivc_guest_profiles(request)
-        .flat_map(|profile| profile.matching_packages(request))
-        .map(|(profile, package)| {
-            let source = arceos_guest_elf_path(workspace_root, profile.target, package, false)
-                .with_extension("bin");
-            let guest_path = format!("/guest/arceos/{package}.bin");
-            (source, guest_path)
-        })
-        .collect()
-}
-
-fn case_needs_linux_ivc_assets(
-    request: &ResolvedAxvisorRequest,
-    case: &PreparedAxvisorQemuCase,
-) -> bool {
-    case.case.case.name.contains("ivc")
-        && request.vmconfigs.iter().any(|path| {
-            path.file_stem()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.contains("linux-ivc"))
-        })
-}
-
-fn case_needs_zephyr_ivc_assets(
-    request: &ResolvedAxvisorRequest,
-    case: &PreparedAxvisorQemuCase,
-) -> bool {
-    case.case.case.name.contains("ivc")
-        && request.vmconfigs.iter().any(|path| {
-            path.file_stem()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.contains("zephyr-ivc"))
-        })
-}
-
 fn case_needs_linux_ivshmem_assets(
     request: &ResolvedAxvisorRequest,
     case: &PreparedAxvisorQemuCase,
@@ -337,47 +187,6 @@ fn case_needs_linux_ivshmem_assets(
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.contains("linux-ivshmem"))
         })
-}
-
-fn build_linux_ivc_assets(workspace_root: &Path, arch: &str) -> anyhow::Result<PathBuf> {
-    let source_dir = workspace_root.join("apps/linux/ivc");
-    let build_script = source_dir.join("build.sh");
-    ensure_file_exists(&build_script, "Linux IVC build script")?;
-
-    let out_dir = workspace_root.join("tmp/axbuild/ivc").join(arch);
-    let mut command = Command::new(&build_script);
-    command
-        .current_dir(&source_dir)
-        .env("AXVISOR_IVC_ARCH", arch)
-        .env("AXVISOR_IVC_OUT_DIR", &out_dir);
-
-    let status = command
-        .status()
-        .with_context(|| format!("failed to run {}", build_script.display()))?;
-    if !status.success() {
-        anyhow::bail!("Linux IVC asset build failed with status {status}");
-    }
-    Ok(out_dir)
-}
-
-fn build_zephyr_ivc_publisher(workspace_root: &Path) -> anyhow::Result<PathBuf> {
-    let source_dir = workspace_root.join("apps/zephyr/ivc_publisher");
-    let build_script = source_dir.join("build.sh");
-    ensure_file_exists(&build_script, "Zephyr IVC build script")?;
-
-    let out_dir = workspace_root.join("tmp/axbuild/zephyr/ivc_publisher/out");
-    let mut command = Command::new(&build_script);
-    command
-        .current_dir(&source_dir)
-        .env("AXVISOR_ZEPHYR_IVC_OUT_DIR", &out_dir);
-
-    let status = command
-        .status()
-        .with_context(|| format!("failed to run {}", build_script.display()))?;
-    if !status.success() {
-        anyhow::bail!("Zephyr IVC publisher build failed with status {status}");
-    }
-    Ok(out_dir.join("zephyr-ivc-publisher.bin"))
 }
 
 fn build_linux_ivshmem_assets(workspace_root: &Path, arch: &str) -> anyhow::Result<PathBuf> {
@@ -464,47 +273,6 @@ pub(super) fn build_group_needs_arceos_x86_64_guest(request: &ResolvedAxvisorReq
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.starts_with("arceos") && !name.contains("ivc"))
         })
-}
-
-fn matching_arceos_ivc_guest_profiles(
-    request: &ResolvedAxvisorRequest,
-) -> impl Iterator<Item = &'static ArceosIvcGuestProfile> + '_ {
-    ARCEOS_IVC_GUEST_PROFILES
-        .iter()
-        .filter(|profile| profile.has_matching_package(request))
-}
-
-impl ArceosIvcGuestProfile {
-    fn has_matching_package(&self, request: &ResolvedAxvisorRequest) -> bool {
-        self.packages
-            .iter()
-            .any(|package| self.matches_package(request, package))
-    }
-
-    fn matching_packages<'a>(
-        &'a self,
-        request: &'a ResolvedAxvisorRequest,
-    ) -> impl Iterator<Item = (&'a Self, &'static str)> + 'a {
-        self.packages
-            .iter()
-            .copied()
-            .filter(move |package| self.matches_package(request, package))
-            .map(move |package| (self, package))
-    }
-
-    fn matches_package(&self, request: &ResolvedAxvisorRequest, package: &str) -> bool {
-        request.arch == self.arch
-            && request
-                .vmconfigs
-                .iter()
-                .any(|path| self.matches_vmconfig_path(path, package))
-    }
-
-    fn matches_vmconfig_path(&self, path: &Path, package: &str) -> bool {
-        path.file_stem()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.contains(self.vmconfig_marker) && name.starts_with(package))
-    }
 }
 
 pub(super) fn case_needs_arceos_x86_64_guest(

@@ -126,10 +126,10 @@ fn discover_qemu_cases_matches_target_variant_configs() {
 fn discover_qemu_cases_does_not_duplicate_matching_variant_name() {
     let root = tempfile::tempdir().unwrap();
     let wrapper_dir = root.path().join("suite/qemu");
-    let case_dir = wrapper_dir.join("ivc");
+    let case_dir = wrapper_dir.join("ivshmem");
     fs::create_dir_all(&case_dir).unwrap();
-    let build_config = wrapper_dir.join("build-aarch64-unknown-none-softfloat-ivc.toml");
-    let qemu_config = case_dir.join("qemu-aarch64-ivc.toml");
+    let build_config = wrapper_dir.join("build-aarch64-unknown-none-softfloat-ivshmem.toml");
+    let qemu_config = case_dir.join("qemu-aarch64-ivshmem.toml");
     fs::write(&build_config, "").unwrap();
     fs::write(&qemu_config, "").unwrap();
 
@@ -137,15 +137,15 @@ fn discover_qemu_cases_does_not_duplicate_matching_variant_name() {
         &root.path().join("suite"),
         "aarch64",
         "aarch64-unknown-none-softfloat",
-        Some("ivc"),
+        Some("ivshmem"),
         "test",
         "qemu",
     )
     .unwrap();
 
     assert_eq!(cases.len(), 1);
-    assert_eq!(cases[0].name, "ivc");
-    assert_eq!(cases[0].display_name, "qemu-ivc/ivc");
+    assert_eq!(cases[0].name, "ivshmem");
+    assert_eq!(cases[0].display_name, "qemu-ivshmem/ivshmem");
     assert_eq!(cases[0].qemu_config_path, qemu_config);
     assert_eq!(cases[0].build_config_path, build_config);
 }

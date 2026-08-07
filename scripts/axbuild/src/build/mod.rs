@@ -30,7 +30,7 @@ pub(crate) use config_file::{
 };
 pub(crate) use info::{
     ARCEOS_LINKER_SCRIPT, BareKernelLinkMode, BuildInfo, append_encoded_rustflags,
-    build_info_enables_backtrace_path, env_truthy, toolchain_rustflags_for_features,
+    build_info_enables_backtrace_path, env_truthy,
 };
 use info::{PIE_TARGET_DIR, STD_TARGET_DIR, TARGET_JSON_ROOT};
 #[cfg(test)]

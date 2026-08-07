@@ -10,10 +10,9 @@ use ostool::{build::config::Cargo, run::qemu::QemuConfig};
 use super::{
     AXVISOR_NORMAL_GROUP, AxvisorQemuCase,
     assets::{
-        arceos_ivc_guest_requests, arceos_x86_64_guest_request, axvisor_case_asset_config,
+        arceos_x86_64_guest_request, axvisor_case_asset_config,
         build_group_needs_arceos_x86_64_guest, case_needs_arceos_x86_64_guest,
-        inject_arceos_ivc_guest_images, inject_arceos_x86_64_guest_image, inject_linux_ivc_assets,
-        inject_linux_ivshmem_assets, inject_zephyr_ivc_guest_images,
+        inject_arceos_x86_64_guest_image, inject_linux_ivshmem_assets,
     },
     discover_qemu_cases,
     discovery::{
@@ -128,18 +127,6 @@ impl Axvisor {
             rootfs::ensure_qemu_rootfs_ready(&build_group.request, self.app.workspace_root(), None)
                 .await?;
             build_group.cargo = build::load_cargo_config(&build_group.request)?;
-            for guest_request in arceos_ivc_guest_requests(&build_group.request)? {
-                let package = guest_request.package.clone();
-                self.build_arceos_direct_guest_image(guest_request)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "failed to build ArceOS guest image `{package}` for Axvisor qemu \
-                             build group `{}`",
-                            build_group.group.build_group
-                        )
-                    })?;
-            }
             if build_group_needs_arceos_x86_64_guest(&build_group.request) {
                 self.build_arceos_x86_64_guest_image()
                     .await
@@ -303,30 +290,6 @@ impl Axvisor {
                 )
             })?;
         }
-        inject_arceos_ivc_guest_images(
-            self.app.workspace_root(),
-            request,
-            case,
-            &mut prepared_assets,
-        )
-        .with_context(|| {
-            format!(
-                "failed to prepare ArceOS IVC guest image for Axvisor qemu case `{}`",
-                case.case.case.name
-            )
-        })?;
-        inject_linux_ivc_assets(
-            self.app.workspace_root(),
-            request,
-            case,
-            &mut prepared_assets,
-        )
-        .with_context(|| {
-            format!(
-                "failed to prepare Linux IVC assets for Axvisor qemu case `{}`",
-                case.case.case.name
-            )
-        })?;
         inject_linux_ivshmem_assets(
             self.app.workspace_root(),
             request,
@@ -336,18 +299,6 @@ impl Axvisor {
         .with_context(|| {
             format!(
                 "failed to prepare Linux ivshmem assets for Axvisor qemu case `{}`",
-                case.case.case.name
-            )
-        })?;
-        inject_zephyr_ivc_guest_images(
-            self.app.workspace_root(),
-            request,
-            case,
-            &mut prepared_assets,
-        )
-        .with_context(|| {
-            format!(
-                "failed to prepare Zephyr IVC guest image for Axvisor qemu case `{}`",
                 case.case.case.name
             )
         })?;
@@ -392,17 +343,6 @@ impl Axvisor {
         let request = arceos_x86_64_guest_request()?;
         self.build_arceos_guest_image(request, crate::arceos::build::load_cargo_config)
             .await
-    }
-
-    async fn build_arceos_direct_guest_image(
-        &mut self,
-        request: ResolvedBuildRequest,
-    ) -> anyhow::Result<PathBuf> {
-        self.build_arceos_guest_image(
-            request,
-            crate::arceos::build::load_direct_guest_cargo_config,
-        )
-        .await
     }
 
     async fn build_arceos_guest_image(
