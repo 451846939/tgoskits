@@ -1,3 +1,5 @@
+//! CPU-owner scheduler state and switch continuation.
+
 use super::*;
 use crate::{SchedulerClockEvent, system::task_system::TaskSystem};
 mod dispatch_state;

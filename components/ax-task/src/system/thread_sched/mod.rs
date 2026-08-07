@@ -1,4 +1,4 @@
-//! Per-thread scheduler state owned independently from the generation registry.
+//! Per-thread scheduler state independent from the generation registry.
 
 mod deadline_state;
 mod pi_state;

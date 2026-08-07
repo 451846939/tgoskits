@@ -119,6 +119,16 @@ fn limits_each_ready_batch_to_sixty_four_polls() {
 }
 
 #[test]
+#[should_panic(expected = "coroutine generation exhausted")]
+fn coroutine_generation_exhaustion_is_not_reused() {
+    let fixture = executor();
+    let executor = fixture.local();
+    executor.next_generation.set(u64::MAX);
+
+    let _ = executor.allocate_coroutine_id();
+}
+
+#[test]
 fn closes_the_wake_during_park_window() {
     let fixture = executor();
     let executor = fixture.local();

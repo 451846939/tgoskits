@@ -1,3 +1,5 @@
+//! Remotely observable runqueue and owner-work publication state.
+
 use super::*;
 
 mod deadline;
@@ -103,4 +105,4 @@ impl CpuRemote {
     }
 }
 
-include!("remote/tests.rs");
+include!("tests.rs");

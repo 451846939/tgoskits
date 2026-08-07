@@ -260,7 +260,11 @@ impl LocalExecutor {
 
     fn allocate_coroutine_id(&self) -> CoroutineId {
         let generation = self.next_generation.get();
-        self.next_generation.set(generation.wrapping_add(1).max(1));
+        self.next_generation.set(
+            generation
+                .checked_add(1)
+                .expect("coroutine generation exhausted"),
+        );
         CoroutineId::new(self.shared.owner_thread, generation)
     }
 

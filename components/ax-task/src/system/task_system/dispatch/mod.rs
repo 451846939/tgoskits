@@ -1,0 +1,61 @@
+//! Wake consumption, runqueue dispatch, and policy-application internals.
+
+use super::*;
+
+#[derive(Clone, Copy)]
+pub(super) struct PolicyGenerationCommit {
+    pub(super) base_policy: SchedulePolicy,
+    pub(super) running_policy_changed: bool,
+    pub(super) held_deadline_reservation: u64,
+    pub(super) committed_deadline_reservation: u64,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static WAKE_TARGET_SELECTIONS: core::cell::Cell<usize> = const {
+        core::cell::Cell::new(0)
+    };
+    static OWNER_DISPATCH_CONSTRUCTIONS: core::cell::Cell<usize> = const {
+        core::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+pub(super) fn reset_wake_target_selections() {
+    WAKE_TARGET_SELECTIONS.set(0);
+}
+
+#[cfg(test)]
+pub(super) fn wake_target_selections() -> usize {
+    WAKE_TARGET_SELECTIONS.get()
+}
+
+#[cfg(test)]
+pub(super) fn reset_owner_dispatch_constructions() {
+    OWNER_DISPATCH_CONSTRUCTIONS.set(0);
+}
+
+#[cfg(test)]
+pub(super) fn owner_dispatch_constructions() -> usize {
+    OWNER_DISPATCH_CONSTRUCTIONS.get()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WakeTransition {
+    Notified,
+    Activate,
+    DeferredUntilSwitchTail,
+}
+
+pub(super) struct OwnerDispatchCommit {
+    overrun_work: Option<Arc<ThreadCore>>,
+}
+
+impl OwnerDispatchCommit {
+    const NONE: Self = Self { overrun_work: None };
+}
+
+mod bandwidth;
+mod current;
+mod policy;
+mod wake;

@@ -246,7 +246,11 @@ impl WaitQueue {
 
     fn pop_front_task_context(&self) -> Option<Waiter> {
         let mut waiters = self.waiters.lock();
-        self.notification_generation.fetch_add(1, Ordering::Release);
+        self.notification_generation
+            .try_update(Ordering::Release, Ordering::Relaxed, |generation| {
+                generation.checked_add(1)
+            })
+            .unwrap_or_else(|_| panic!("wait-queue notification generation exhausted"));
         waiters.pop_front()
     }
 }
@@ -410,5 +414,16 @@ mod tests {
         crate::test_runtime::set_hard_irq(false);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "wait-queue notification generation exhausted")]
+    fn notification_generation_is_never_reused() {
+        let queue = WaitQueue::new();
+        queue
+            .notification_generation
+            .store(u64::MAX, Ordering::Relaxed);
+
+        let _ = queue.notify_one();
     }
 }

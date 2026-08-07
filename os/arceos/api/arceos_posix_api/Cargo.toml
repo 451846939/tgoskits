@@ -31,7 +31,7 @@ select = ["fd"]
 poll = ["fd"]
 epoll = ["multitask", "fd"]
 serial = ["ax-runtime/serial"]
-eventfd = ["fd"]
+eventfd = ["fd", "multitask"]
 
 [dependencies]
 # ArceOS modules

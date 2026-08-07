@@ -1,4 +1,4 @@
-//! Runtime-backed scheduler facade for crates below `ax-runtime`.
+//! Runtime-backed scheduler capabilities for crates below `ax-runtime`.
 
 use alloc::{boxed::Box, string::String, sync::Arc};
 use core::{marker::PhantomData, mem::align_of, ops::Deref, pin::Pin, ptr};
@@ -370,4 +370,4 @@ pub unsafe fn finish_initial_context_switch() -> Result<(), TaskError> {
     Ok(())
 }
 
-include!("facade/tests.rs");
+include!("tests.rs");

@@ -5,13 +5,11 @@
 //! publishes only the target-vCPU bit and wakes one pre-created worker.
 
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
-use ax_kspin::SpinNoIrq;
-
-use crate::{AxVmError, AxVmResult, ax_err, host::task::IrqNotification};
+use crate::{AxVmError, AxVmResult, ax_err, host::task::IrqNotification, sync::MutexExt};
 
 const KICK_WORKER_STACK_SIZE: usize = 0x20_000;
 
@@ -22,7 +20,7 @@ pub(crate) struct DeferredVcpuKick {
     worker_started: AtomicBool,
     stopping: AtomicBool,
     notify: IrqNotification,
-    worker: SpinNoIrq<Option<crate::ThreadHandle>>,
+    worker: Mutex<Option<crate::ThreadHandle>>,
 }
 
 impl DeferredVcpuKick {
@@ -34,13 +32,13 @@ impl DeferredVcpuKick {
             worker_started: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
             notify: IrqNotification::new(),
-            worker: SpinNoIrq::new(None),
+            worker: Mutex::new(None),
         })
     }
 
     /// Starts the task-context worker before an architecture enables IRQ input.
     pub(crate) fn start(self: &Arc<Self>) -> AxVmResult {
-        let mut worker = self.worker.lock();
+        let mut worker = self.worker.lock_unpoisoned();
         if worker.is_some() {
             return Ok(());
         }
@@ -93,7 +91,7 @@ impl DeferredVcpuKick {
         self.worker_started.store(false, Ordering::Release);
         self.stopping.store(true, Ordering::Release);
         self.notify.notify_from_task();
-        let worker = self.worker.lock().take();
+        let worker = self.worker.lock_unpoisoned().take();
         let join_result = worker.map_or(Ok(0), crate::host::task::join_thread);
         self.pending_vcpus.store(0, Ordering::Release);
         join_result

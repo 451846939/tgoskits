@@ -174,6 +174,15 @@ mod scheduler_ipi_tests {
     }
 
     #[test]
+    #[should_panic(expected = "idle-pull generation exhausted")]
+    fn idle_pull_generation_exhaustion_is_not_reused() {
+        let remote = CpuRemote::create(CpuId::new(0), TaskSystemConfig::new(1));
+        remote.set_idle_pull_generation_exhausted_for_test();
+
+        let _ = remote.begin_idle_pull();
+    }
+
+    #[test]
     fn inactive_cpu_accepts_owner_delivery_but_rejects_new_placement() {
         let remote = CpuRemote::create(CpuId::new(1), TaskSystemConfig::new(2));
         assert!(remote.mark_online());

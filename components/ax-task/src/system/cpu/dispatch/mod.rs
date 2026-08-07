@@ -1,4 +1,4 @@
-//! Runqueue-current ownership, runtime accounting, and switch-tail handoff.
+//! Runqueue-current ownership, runtime accounting, and switch-tail state.
 
 mod accounting;
 mod current;

@@ -1,4 +1,4 @@
-//! Operating-system capability boundary used by the scheduler.
+//! Operating-system capability boundary owned by the scheduler runtime.
 //!
 //! Runtime resources, clock-domain values, and provider operations are split
 //! by owned invariant while retaining one trait-FFI table at the OS boundary.

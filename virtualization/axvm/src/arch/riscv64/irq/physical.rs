@@ -5,18 +5,19 @@ use std::{
     hint::spin_loop,
     ptr,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicUsize, Ordering},
     },
     vec::Vec,
 };
 
-use ax_kspin::SpinNoIrq;
 use axvm_types::InterruptTriggerMode;
 use riscv_vplic::{PLIC_NUM_SOURCES, VPlicGlobal};
 
 use super::DeferredVcpuKick;
-use crate::{AxVmError, AxVmResult, ThreadHandle, ax_err, host::task::IrqNotification};
+use crate::{
+    AxVmError, AxVmResult, ThreadHandle, ax_err, host::task::IrqNotification, sync::MutexExt,
+};
 
 const PHYSICAL_IRQ_WORKER_STACK_SIZE: usize = 0x20_000;
 const CLAIM_IDLE: u8 = 0;
@@ -37,8 +38,8 @@ pub(super) fn publish_physical_claim_from_irq(source: u32) -> bool {
 pub(super) struct PhysicalIrqBridge {
     shared: Arc<PhysicalBridgeShared>,
     bindings: Box<[Arc<PhysicalSourceBinding>]>,
-    registrations: SpinNoIrq<Vec<PhysicalRouteRegistration>>,
-    worker: SpinNoIrq<Option<ThreadHandle>>,
+    registrations: Mutex<Vec<PhysicalRouteRegistration>>,
+    worker: Mutex<Option<ThreadHandle>>,
     running: AtomicBool,
 }
 
@@ -92,8 +93,8 @@ impl PhysicalIrqBridge {
         Ok(Arc::new(Self {
             shared,
             bindings: bindings.into_boxed_slice(),
-            registrations: SpinNoIrq::new(Vec::new()),
-            worker: SpinNoIrq::new(None),
+            registrations: Mutex::new(Vec::new()),
+            worker: Mutex::new(None),
             running: AtomicBool::new(false),
         }))
     }
@@ -139,7 +140,7 @@ impl PhysicalIrqBridge {
                 ));
             }
         }
-        self.registrations.lock().clear();
+        self.registrations.lock_unpoisoned().clear();
         if let Err(error) = self.stop_worker()
             && first_error.is_none()
         {
@@ -194,13 +195,13 @@ impl PhysicalIrqBridge {
             )
         }
         .map_err(|error| AxVmError::host("start RISC-V physical IRQ worker", error))?;
-        *self.worker.lock() = Some(worker);
+        *self.worker.lock_unpoisoned() = Some(worker);
         Ok(())
     }
 
     fn install_and_activate_routes(&self) -> AxVmResult {
         {
-            let mut registrations = self.registrations.lock();
+            let mut registrations = self.registrations.lock_unpoisoned();
             for binding in &self.bindings {
                 registrations.push(PhysicalRouteRegistration::install(binding)?);
             }
@@ -227,7 +228,7 @@ impl PhysicalIrqBridge {
             binding.accepting.store(false, Ordering::Release);
             let _ = ax_plat::irq::riscv64_hv::deactivate_guest_plic_source(binding.source as u32);
         }
-        self.registrations.lock().clear();
+        self.registrations.lock_unpoisoned().clear();
         let stop_result = self.stop_worker();
         self.release_outstanding_claims();
         self.running.store(false, Ordering::Release);
@@ -237,7 +238,7 @@ impl PhysicalIrqBridge {
     fn stop_worker(&self) -> AxVmResult {
         self.shared.stopping.store(true, Ordering::Release);
         self.shared.notify.notify_from_task();
-        let worker = self.worker.lock().take();
+        let worker = self.worker.lock_unpoisoned().take();
         worker
             .map_or(Ok(0), crate::host::task::join_thread)
             .map(|_exit_code| ())

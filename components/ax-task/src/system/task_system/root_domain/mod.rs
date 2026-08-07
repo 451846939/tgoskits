@@ -1,4 +1,4 @@
-//! Root-domain topology, priority indexes, and Deadline bandwidth ownership.
+//! Linux-style root-domain topology, priority indexes, and Deadline bandwidth ownership.
 
 mod rt_bandwidth;
 
@@ -225,7 +225,10 @@ impl RootDomain {
         let push = self.push_iterator(class);
         let target = {
             let mut state = push.state.lock();
-            state.requested_generation = state.requested_generation.wrapping_add(1);
+            state.requested_generation = state
+                .requested_generation
+                .checked_add(1)
+                .expect("root-domain push generation exhausted");
             if state.phase != RootDomainPushPhase::Idle {
                 None
             } else {
@@ -786,5 +789,17 @@ mod tests {
         let state = root.realtime_push.state.lock();
         assert_eq!(state.phase, RootDomainPushPhase::Idle);
         assert_eq!(state.scan_generation, state.requested_generation);
+    }
+
+    #[test]
+    #[should_panic(expected = "root-domain push generation exhausted")]
+    fn push_iterator_generation_exhaustion_is_not_reused() {
+        crate::test_runtime::reset_irq_state();
+        let config = TaskSystemConfig::new(1);
+        let runqueues = Vec::from([CpuRemote::create(CpuId::new(0), config)]);
+        let root = RootDomain::new(config, runqueues);
+        root.realtime_push.state.lock().requested_generation = u64::MAX;
+
+        root.request_rt_deadline_push(RootDomainPushClass::Realtime, CpuId::new(0));
     }
 }

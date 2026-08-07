@@ -11,7 +11,7 @@ use core::ffi::{c_int, c_uint};
 
 use ax_errno::{LinuxError, LinuxResult};
 use ax_io::PollState;
-use ax_sync::Mutex;
+use ax_sync::PiMutex;
 
 use super::fd_ops::{FileLike, add_file_like};
 use crate::ctypes;
@@ -19,7 +19,7 @@ use crate::ctypes;
 const EFD_SUPPORTED_FLAGS: u32 = ctypes::EFD_SEMAPHORE | ctypes::EFD_CLOEXEC | ctypes::EFD_NONBLOCK;
 
 pub struct EventFd {
-    inner: Mutex<EventFdInner>,
+    inner: PiMutex<EventFdInner>,
 }
 
 struct EventFdInner {
@@ -32,7 +32,7 @@ struct EventFdInner {
 impl EventFd {
     pub fn new(initval: u32, semaphore: bool, nonblocking: bool) -> Self {
         Self {
-            inner: Mutex::new(EventFdInner {
+            inner: PiMutex::new(EventFdInner {
                 counter: initval as u64,
                 semaphore,
                 nonblocking,

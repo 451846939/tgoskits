@@ -2389,6 +2389,38 @@ entity 由 owner-local `DeadlineServer` 和 donor-parameter `DeadlineServer` 组
 先判断是否违反上述不变量；若不违反，才作为统一适配/实现错误修复，禁止恢复已删除字段、旧
 API、超时重试、轮询推进或 silent fallback。
 
+### 2026-08-07 所有权模型收口与调用方冻结
+
+在统一编译前再次按 Linux v7.1 `rq`、`rt_bandwidth`、`rt_mutex`、`hrtimer` 和
+`irq_work` 的生命周期反向扫描 ax-task、ax-runtime、Starry 与 AxVM。该轮不再增加兼容层，
+而是把剩余实现直接收敛到已冻结的 owner 模型：
+
+- `RunQueue` 的 accounting、balance、dispatch、lifecycle 与 membership 分模块保存各自不变量；
+  `TaskSystem` 的 dispatch 分为 wake、bandwidth、current 与 policy，PI 分为 schedule、graph 与
+  operations。拆分只缩小 owner transaction 的可见面，不复制 rq、placement 或 PI 状态；
+- `ThreadCore` 的 lifecycle、policy、runtime accounting 与 wake state 分模块，ax-runtime 的
+  thread publication、extension 与 lifecycle 分模块。强句柄仍只租用同一个 generation-bearing
+  registry identity，不增加旧 `TaskInner`、`CurrentTask` 或 task-side scheduler mirror；
+- coroutine、runqueue membership、idle-pull、root-domain push iterator、wait notification 和
+  AxVM timer token 的 identity 空间耗尽都作为致命不变量处理，禁止整数回绕后复用旧 identity；
+- root RT period timer 在 `Idle -> Armed` 时获得唯一 generation。重复 activate、owner CPU
+  migration 和 `Firing` 期间的新 activity 都属于同一个已 armed timer 生命周期；finish 只消费
+  move-only firing identity，不以重新编号掩盖并发 activation；
+- PI lock 的销毁边界是 waiter/donation graph 已 quiesce。无 waiter 时，嵌入锁的 owner word
+  不是调度器可观察的悬空边；因此不得自创“Drop 时必须 unlocked”规则。注册、handoff、deboost
+  和 wake 仍在同一 PI 元数据事务中完成，锁外才执行 wake；
+- Starry 的 `UserTaskRef` 是 scheduler handle 到 Linux thread/process identity 的唯一适配层，
+  futex、signal interruption、timer worker 和 IRQ waiter 只消费 runtime facade，不恢复旧 ax-task
+  对象；进程 identity 仍由 dev 的 `ProcessIdentity` 状态机独占；
+- AxVM 的物理 IRQ endpoint 独占预分配 route slot、reader grace、claim state 与
+  `IrqNotification`。硬 IRQ 不取得 VM task registry 锁；route registration、worker handle 与
+  timer wheel 是纯任务态 owner，使用可睡眠 mutex。永久 per-CPU timer worker 由全局 timer
+  service 显式持有强 `ThreadHandle`，而不是 drop handle 后依赖隐式泄漏。
+
+至此任务调度核心及实现该模型所必需的 runtime/Starry/AxVM 边界不再保留旧实现或双轨状态。
+后续编译、QEMU 和性能阶段可以修复违反上述不变量的实现错误，但不得以旧字段、轮询推进、
+超时重试或 fallback 恢复已删除架构。
+
 ## 模块化结果
 
 - `TaskSystem` orchestration 只负责编排，registry/reap、placement、owner scheduling、deadline、PI、balance、deferred work 分模块；

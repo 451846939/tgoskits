@@ -1,30 +1,26 @@
 //! AxVM-owned CPU-bucketed VM timer wheels.
 
 #[cfg(test)]
-use std::sync::{
-    Mutex, MutexGuard,
-    atomic::AtomicU64,
-};
-#[cfg(test)]
-use std::vec::Vec;
+use std::sync::{MutexGuard, atomic::AtomicU64};
 use std::{
     boxed::Box,
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     sync::{
-        Arc,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
 };
 
-use ax_kernel_guard::NoPreempt;
-use ax_kspin::SpinNoIrq;
-use ax_lazyinit::LazyInit;
 use ax_timer_list::{TimeValue, TimerEvent, TimerList};
 
-use crate::host::task::{IrqNotification, MonotonicDeadline};
 #[cfg(not(test))]
 use crate::host::{HostTime, default_host};
+use crate::{
+    ThreadHandle,
+    host::task::{IrqNotification, MonotonicDeadline},
+    sync::MutexExt,
+};
 
 static TOKEN: AtomicUsize = AtomicUsize::new(0);
 const TIMER_WORKER_STACK_SIZE: usize = 0x20_000;
@@ -64,7 +60,7 @@ struct TimerWheels {
     wheels: BTreeMap<usize, TimerList<VmTimerEvent>>,
     owners: BTreeMap<usize, usize>,
     notifications: BTreeMap<usize, Arc<IrqNotification>>,
-    workers_started: BTreeSet<usize>,
+    workers: BTreeMap<usize, ThreadHandle>,
 }
 
 impl TimerWheels {
@@ -73,7 +69,7 @@ impl TimerWheels {
             wheels: BTreeMap::new(),
             owners: BTreeMap::new(),
             notifications: BTreeMap::new(),
-            workers_started: BTreeSet::new(),
+            workers: BTreeMap::new(),
         }
     }
 
@@ -93,11 +89,14 @@ impl TimerWheels {
     }
 
     fn worker_started(&self, cpu_id: usize) -> bool {
-        self.workers_started.contains(&cpu_id)
+        self.workers.contains_key(&cpu_id)
     }
 
-    fn mark_worker_started(&mut self, cpu_id: usize) {
-        self.workers_started.insert(cpu_id);
+    fn install_worker(&mut self, cpu_id: usize, worker: ThreadHandle) {
+        assert!(
+            self.workers.insert(cpu_id, worker).is_none(),
+            "AxVM timer CPU already owns a worker"
+        );
     }
 
     fn register(
@@ -151,7 +150,15 @@ impl TimerWheels {
     }
 }
 
-static TIMER_WHEELS: LazyInit<SpinNoIrq<TimerWheels>> = LazyInit::new();
+static TIMER_WHEELS: OnceLock<Mutex<TimerWheels>> = OnceLock::new();
+
+fn next_timer_token() -> usize {
+    TOKEN
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |token| {
+            token.checked_add(1)
+        })
+        .expect("AxVM timer identity space exhausted")
+}
 
 pub(crate) fn register_timer(
     deadline_ns: u64,
@@ -164,7 +171,7 @@ pub(crate) fn register_timer_handle(
     deadline_ns: u64,
     callback: Box<dyn FnOnce(Duration) + Send + 'static>,
 ) -> VmTimerHandle {
-    let token = TOKEN.fetch_add(1, Ordering::Relaxed);
+    let token = next_timer_token();
     let (owner_cpu, notification) = with_current_timer_wheels(|cpu_id, timer_wheels| {
         timer_wheels.register(
             cpu_id,
@@ -179,7 +186,6 @@ pub(crate) fn register_timer_handle(
 }
 
 pub(crate) fn cancel_timer_handle(handle: VmTimerHandle) {
-    let _guard = NoPreempt::new();
     let notification = with_timer_wheels(|timer_wheels| {
         timer_wheels
             .cancel_handle(handle)
@@ -191,10 +197,7 @@ pub(crate) fn cancel_timer_handle(handle: VmTimerHandle) {
 }
 
 pub(crate) fn cancel_timer(token: usize) {
-    let handle = {
-        let _guard = NoPreempt::new();
-        with_timer_wheels(|timer_wheels| timer_wheels.handle(token))
-    };
+    let handle = with_timer_wheels(|timer_wheels| timer_wheels.handle(token));
     if let Some(handle) = handle {
         cancel_timer_handle(handle);
     }
@@ -278,18 +281,16 @@ pub(crate) fn init_percpu() -> crate::AxVmResult {
         "AxVM timer worker {} started on CPU {cpu_id}",
         worker.id().as_u64()
     );
-    with_current_timer_wheels(|cpu_id, timer_wheels| timer_wheels.mark_worker_started(cpu_id));
-    drop(worker);
+    with_current_timer_wheels(|cpu_id, timer_wheels| timer_wheels.install_worker(cpu_id, worker));
     Ok(())
 }
 
 fn with_timer_wheels<R>(operation: impl FnOnce(&mut TimerWheels) -> R) -> R {
-    let timer_wheels = TIMER_WHEELS.get_or_init(|| SpinNoIrq::new(TimerWheels::new()));
-    operation(&mut timer_wheels.lock())
+    let timer_wheels = TIMER_WHEELS.get_or_init(|| Mutex::new(TimerWheels::new()));
+    operation(&mut timer_wheels.lock_unpoisoned())
 }
 
 fn with_current_timer_wheels<R>(operation: impl FnOnce(usize, &mut TimerWheels) -> R) -> R {
-    let _guard = NoPreempt::new();
     let cpu_id = current_cpu_id();
     with_timer_wheels(|timer_wheels| operation(cpu_id, timer_wheels))
 }
@@ -324,6 +325,7 @@ mod tests {
 
     fn reset_global_timer_state() {
         with_timer_wheels(|timer_wheels| *timer_wheels = TimerWheels::new());
+        TOKEN.store(0, Ordering::Release);
         TEST_CURRENT_CPU.store(0, Ordering::Release);
         TEST_NOW_NS.store(0, Ordering::Release);
     }
@@ -532,5 +534,16 @@ mod tests {
             with_timer_wheels(|timer_wheels| timer_wheels.next_deadline(2)),
             None
         );
+    }
+
+    #[test]
+    fn timer_token_exhaustion_is_not_reused() {
+        let _guard = lock_test_mutex(&TEST_LOCK);
+        TOKEN.store(usize::MAX, Ordering::Release);
+
+        let exhausted = std::panic::catch_unwind(next_timer_token);
+
+        TOKEN.store(0, Ordering::Release);
+        assert!(exhausted.is_err(), "an exhausted timer identity was reused");
     }
 }

@@ -289,6 +289,12 @@ VM 和 POSIX callback timer 不进入 ax-task。
 
 AxVM 使用 CPU-affine task worker。worker 用 task deadline 睡到 timer wheel 的下一期限；插入更早 VM timer 时，通过 bounded IRQ-safe endpoint 唤醒。VM callback 只在线程上下文执行。
 
+timer wheel、token owner map、notification map 和永久 worker registry 都属于任务态 timer
+service，使用可睡眠 mutex。读取当前 CPU 只选择稳定的 wheel bucket；后续线程迁移不改变
+handle 中记录的 owner CPU，cancel 直接访问该 bucket 并通知对应 worker。硬 IRQ 不访问这些
+容器，只能发布到独立的 `IrqNotification` endpoint。每个 per-CPU worker 的强 `ThreadHandle`
+由永久 registry 持有，CPU service identity 不依赖 detached handle 或析构兜底。
+
 ### Starry
 
 Starry wall/POSIX timer 的 queue metadata 使用 PiMutex。producer 先修改队列并推进 epoch，再通知固定 worker。worker 在取 snapshot 前采样 epoch，使并发 registration 进入 wait predicate，而不是被当作旧 baseline 吸收。

@@ -9,11 +9,12 @@ use ax_task::{
     runtime::{
         AddressSpaceActivation, AddressSpaceDestroyOutcome, AddressSpaceHandle,
         AddressSpaceReclaimArmOutcome, ContextSwitch, ContextThreadBinding, CpuRemoteHandle,
-        CurrentCpuLocalHandle, CurrentCpuOwnerHandles, ExecutionContextHandle, IrqGuardToken,
-        KernelContextRequest, PreemptGuardToken, RuntimeCpuId, RuntimeHandleResult,
-        RuntimeScheduleOrigin, RuntimeSchedulerEntry, RuntimeSchedulerReturn, RuntimeStatus,
-        SchedSwitchRecord, SchedulerDeadlineUpdate, StackHandle, StackRequest, TaskRuntime,
-        TaskSystemHandle, TlsHandle, TlsRequest, UserContextRequest,
+        CurrentCpuLocalHandle, CurrentCpuOwnerHandles, CurrentThreadPublication,
+        ExecutionContextHandle, IrqGuardToken, KernelContextRequest, PreemptGuardToken,
+        RqClockSample, RuntimeCpuId, RuntimeHandleResult, RuntimeScheduleOrigin,
+        RuntimeSchedulerEntry, RuntimeSchedulerReturn, RuntimeStatus, SchedSwitchRecord,
+        SchedulerDeadlineUpdate, StackHandle, StackRequest, TaskRuntime, TaskSystemHandle,
+        TlsHandle, TlsRequest, UserContextRequest,
     },
 };
 
@@ -24,6 +25,8 @@ std::thread_local! {
     static TASK_SYSTEM: Cell<usize> = const { Cell::new(0) };
     static CPU_LOCAL: Cell<usize> = const { Cell::new(0) };
     static CPU_REMOTE: Cell<usize> = const { Cell::new(0) };
+    static CURRENT_PUBLICATION: Cell<CurrentThreadPublication> =
+        const { Cell::new(CurrentThreadPublication::NONE) };
     static PREEMPT_DEPTH: Cell<usize> = const { Cell::new(0) };
     static SCHEDULE_CONTEXT_SAFE: Cell<bool> = const { Cell::new(true) };
     static IRQ_GUARD_ENTRIES: Cell<usize> = const { Cell::new(0) };
@@ -96,19 +99,7 @@ impl_task_runtime! {
             unsafe { CpuRemoteHandle::from_raw(CPU_REMOTE.with(Cell::get)) }
         }
         unsafe fn current_thread_publication() -> CurrentThreadPublication {
-            let raw = CPU_REMOTE.with(Cell::get);
-            if raw == 0 {
-                return CurrentThreadPublication::NONE;
-            }
-            // SAFETY: install/clear retain the TaskSystem owning this endpoint.
-            let remote = unsafe { &*core::ptr::with_exposed_provenance::<CpuRemote>(raw) };
-            let Some(id) = remote.current_thread() else {
-                return CurrentThreadPublication::NONE;
-            };
-            let system = unsafe { &*core::ptr::with_exposed_provenance::<TaskSystem>(TASK_SYSTEM.with(Cell::get)) };
-            system
-                .thread_handle(id)
-                .map_or(CurrentThreadPublication::NONE, |thread| thread.runtime_publication())
+            CURRENT_PUBLICATION.with(Cell::get)
         }
         unsafe fn cpu_remote_handle(cpu: RuntimeCpuId) -> CpuRemoteHandle {
             let raw = TASK_SYSTEM.with(Cell::get);
@@ -277,8 +268,22 @@ impl Drop for InstalledRuntime {
 }
 
 pub(crate) fn install(task_system: usize, cpu_local: usize) -> InstalledRuntime {
+    let publication = if task_system == 0 {
+        CurrentThreadPublication::NONE
+    } else {
+        // SAFETY: the caller retains this TaskSystem until `clear`.
+        let system = unsafe { &*core::ptr::with_exposed_provenance::<TaskSystem>(task_system) };
+        system
+            .cpu_remote(CpuId::new(0))
+            .and_then(CpuRemote::current_thread)
+            .and_then(|thread| system.thread_handle(thread).ok())
+            .map_or(CurrentThreadPublication::NONE, |thread| {
+                thread.runtime_publication()
+            })
+    };
     TASK_SYSTEM.with(|handle| handle.set(task_system));
     CPU_LOCAL.with(|handle| handle.set(cpu_local));
+    CURRENT_PUBLICATION.with(|current| current.set(publication));
     let remote = if task_system == 0 {
         0
     } else {
@@ -296,6 +301,7 @@ pub(crate) fn install(task_system: usize, cpu_local: usize) -> InstalledRuntime 
 }
 
 pub(crate) fn clear() {
+    CURRENT_PUBLICATION.with(|current| current.set(CurrentThreadPublication::NONE));
     CPU_REMOTE.with(|handle| handle.set(0));
     CPU_LOCAL.with(|handle| handle.set(0));
     TASK_SYSTEM.with(|handle| handle.set(0));

@@ -506,8 +506,9 @@ mod tests {
         );
         assert_eq!(
             crate::test_runtime::preempt_guard_entries(),
-            1,
-            "only the PI metadata lock may pin the CPU after a typed current token was captured"
+            3,
+            "Linux rtmutex registration takes the wait transaction, waiter PI state, and owner PI \
+             state under three nested non-sleeping owner scopes"
         );
         crate::test_runtime::clear();
     }
@@ -527,11 +528,12 @@ mod tests {
         system.make_ready(waiter_thread.id()).unwrap();
         system.enqueue(cpu.as_mut(), waiter_thread.id()).unwrap();
         let token = commit_pi_wait(&system, &raw.core, waiter_thread.id(), owner.id()).unwrap();
-        assert!(!token.is_selected());
+        assert!(token.is_top_waiter());
+        assert!(!token.can_claim());
         system
             .pi_mutex_release(raw.mutex_ref(), owner.id())
             .unwrap();
-        assert!(token.is_selected());
+        assert!(token.is_top_waiter());
         assert!(token.can_claim());
         assert!(!token.is_granted());
         system.pi_mutex_claim(&token).unwrap();
@@ -587,7 +589,7 @@ mod tests {
         let token = commit_pi_wait(&system, &raw.core, waiter_thread.id(), owner.id()).unwrap();
         unlock_test_owner(&raw);
 
-        assert!(token.is_selected());
+        assert!(token.is_top_waiter());
         assert!(token.can_claim());
         system.pi_mutex_claim(&token).unwrap();
         crate::test_runtime::clear();
@@ -610,7 +612,7 @@ mod tests {
         let token = commit_pi_wait(&system, &raw.core, waiter_thread.id(), owner.id()).unwrap();
 
         unlock_test_owner(&raw);
-        assert!(token.is_selected());
+        assert!(token.is_top_waiter());
         assert!(!token.is_granted());
 
         system.pi_mutex_claim(&token).unwrap();
@@ -645,14 +647,14 @@ mod tests {
             commit_pi_wait(&system, &raw.core, second_thread.id(), owner.id()).unwrap();
 
         unlock_test_owner(&raw);
-        assert!(first_token.is_selected());
-        assert!(!second_token.is_selected());
+        assert!(first_token.is_top_waiter());
+        assert!(!second_token.is_top_waiter());
 
         assert!(!second_token.can_claim());
         system.pi_mutex_claim(&first_token).unwrap();
 
         assert!(!second_token.is_granted());
-        assert!(!first_token.is_selected());
+        assert!(!first_token.is_top_waiter());
         assert!(first_token.is_granted());
         assert!(raw.core.is_owned_by(first_thread.id()));
         system.pi_wait_cancel(second_token).unwrap();

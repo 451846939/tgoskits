@@ -113,8 +113,9 @@ impl CpuRemote {
                 return IdlePullReservation::AlreadyPending;
             }
             let generation = (current & IDLE_PULL_GENERATION_MASK)
-                .wrapping_add(IDLE_PULL_GENERATION_STEP)
-                & IDLE_PULL_GENERATION_MASK;
+                .checked_add(IDLE_PULL_GENERATION_STEP)
+                .filter(|generation| generation & !IDLE_PULL_GENERATION_MASK == 0)
+                .expect("idle-pull generation exhausted");
             let pending = generation | IDLE_PULL_PENDING;
             match self.idle_pull.state.compare_exchange_weak(
                 current,
@@ -219,5 +220,12 @@ impl CpuRemote {
         self.idle_pull.state.load(Ordering::Acquire)
             & (IDLE_PULL_PHASE_MASK | IDLE_PULL_PUBLISHER_MASK)
             == IDLE_PULL_IDLE
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_idle_pull_generation_exhausted_for_test(&self) {
+        self.idle_pull
+            .state
+            .store(IDLE_PULL_GENERATION_MASK, Ordering::Release);
     }
 }

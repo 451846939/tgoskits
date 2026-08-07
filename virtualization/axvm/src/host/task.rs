@@ -22,7 +22,7 @@ pub(crate) fn current_thread() -> ThreadHandle {
 
 pub(crate) unsafe fn spawn_thread_with_extension_and_affinity<F>(
     entry: F,
-    name: alloc::string::String,
+    name: std::string::String,
     stack_size: usize,
     extension: Option<ThreadExtension>,
     affinity: Option<CpuSet>,

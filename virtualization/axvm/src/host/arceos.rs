@@ -1,7 +1,10 @@
 //! Default private ArceOS host adapter for AxVM.
 
 use std::{
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
     thread,
     time::Duration,
 };
@@ -9,7 +12,6 @@ use std::{
 use ax_memory_addr::PAGE_SIZE_4K;
 use ax_std::os::arceos::{api, modules, task as runtime_task};
 use axvm_types::{HostPhysAddr, HostVirtAddr};
-use spin::Once;
 
 #[cfg(any(feature = "fs", feature = "host-fs"))]
 use crate::AxVmError;
@@ -133,7 +135,7 @@ pub(crate) use runtime_task::{
 /// Hard-IRQ-safe event consumed by one fixed ArceOS service thread.
 pub(crate) struct ArceOsIrqNotification {
     event: runtime_task::IrqWaitCell,
-    waiter: Once<ArceOsIrqWaiter>,
+    waiter: OnceLock<ArceOsIrqWaiter>,
 }
 
 struct ArceOsIrqWaiter {
@@ -146,7 +148,7 @@ impl ArceOsIrqNotification {
     pub(crate) const fn new() -> Self {
         Self {
             event: runtime_task::IrqWaitCell::new(),
-            waiter: Once::new(),
+            waiter: OnceLock::new(),
         }
     }
 
@@ -167,7 +169,7 @@ impl ArceOsIrqNotification {
     /// Returns `true` only when the task deadline won the wake race.
     pub(crate) fn wait_until(&self, deadline: Option<ArceOsMonotonicDeadline>) -> bool {
         let current = current_thread();
-        let waiter = self.waiter.call_once(|| ArceOsIrqWaiter {
+        let waiter = self.waiter.get_or_init(|| ArceOsIrqWaiter {
             owner: current.id(),
             registration: runtime_task::IrqWaitRegistration::new(current.wake_handle()),
             park: runtime_task::WaitQueue::new(),
@@ -210,7 +212,7 @@ pub(crate) fn current_thread() -> ArceOsThreadHandle {
 
 pub(crate) unsafe fn spawn_thread_with_extension_and_affinity<F>(
     entry: F,
-    name: alloc::string::String,
+    name: std::string::String,
     stack_size: usize,
     extension: Option<ArceOsThreadExtension>,
     affinity: Option<ArceOsCpuSet>,

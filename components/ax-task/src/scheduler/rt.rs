@@ -163,6 +163,8 @@ struct RootRtBandwidthState {
     owner: Option<CpuId>,
     deadline: Option<MonotonicDeadline>,
     generation: u64,
+    firing: bool,
+    activation_during_firing: bool,
 }
 
 /// The single root-domain hard timer corresponding to Linux `rt_bandwidth`.
@@ -186,6 +188,8 @@ impl RootRtBandwidth {
                 owner: None,
                 deadline: None,
                 generation: 0,
+                firing: false,
+                activation_during_firing: false,
             }),
         }
     }
@@ -208,15 +212,21 @@ impl RootRtBandwidth {
             return false;
         }
         let mut state = self.state.lock();
-        state.generation = state
-            .generation
-            .checked_add(1)
-            .expect("root RT bandwidth generation exhausted");
         let started = state.deadline.is_none();
-        if state.deadline.is_none() {
+        if started {
+            state.generation = state
+                .generation
+                .checked_add(1)
+                .expect("root RT bandwidth generation exhausted");
             state.owner = Some(cpu);
             state.deadline =
                 Some(now.deadline_after(core::time::Duration::from_nanos(self.period_ns)));
+        } else if state.firing {
+            // Linux keeps rt_period_active set while the callback temporarily
+            // drops rt_runtime_lock to scan runqueues. Remember an activation
+            // from that window so an idle callback result cannot stop the
+            // period which the new RT work just made necessary.
+            state.activation_during_firing = true;
         }
         started
     }
@@ -232,7 +242,7 @@ impl RootRtBandwidth {
     pub(crate) fn begin_period(&self, cpu: CpuId, now: MonotonicInstant) -> Option<RtPeriodFiring> {
         let mut state = self.state.lock();
         let deadline = state.deadline?;
-        if state.owner != Some(cpu) || !now.reached(deadline) {
+        if state.owner != Some(cpu) || state.firing || !now.reached(deadline) {
             return None;
         }
         let elapsed_ns = now.as_nanos() - deadline.as_nanos();
@@ -243,6 +253,8 @@ impl RootRtBandwidth {
             .and_then(MonotonicDeadline::from_nanos)
             .expect("RT period deadline exceeded the monotonic clock domain");
         state.deadline = Some(next_ns);
+        state.firing = true;
+        state.activation_during_firing = false;
         Some(RtPeriodFiring {
             generation: state.generation,
             overruns,
@@ -252,11 +264,19 @@ impl RootRtBandwidth {
     /// Completes a callback after all online rq ledgers were replenished.
     pub(crate) fn finish_period(&self, firing: RtPeriodFiring, keep_active: bool) {
         let mut state = self.state.lock();
-        if state.generation != firing.generation || keep_active {
+        assert!(state.firing, "root RT period must finish an active firing");
+        assert_eq!(
+            state.generation, firing.generation,
+            "root RT period firing identity changed in flight"
+        );
+        state.firing = false;
+        if keep_active || state.activation_during_firing {
+            state.activation_during_firing = false;
             return;
         }
         state.owner = None;
         state.deadline = None;
+        state.activation_during_firing = false;
     }
 
     /// Moves an active pinned period timer away from an offlining CPU.
@@ -266,10 +286,6 @@ impl RootRtBandwidth {
             return false;
         }
         state.owner = Some(replacement);
-        state.generation = state
-            .generation
-            .checked_add(1)
-            .expect("root RT bandwidth generation exhausted");
         true
     }
 
@@ -337,6 +353,17 @@ mod tests {
             root.state().deadline.map(MonotonicDeadline::as_nanos),
             Some(2_000_000_000)
         );
+    }
+
+    #[test]
+    fn an_armed_period_is_not_reidentified_by_redundant_activation() {
+        let root = RootRtBandwidth::new(TaskSystemConfig::new(1));
+        assert!(root.activate(CpuId::new(0), instant(0)));
+        let generation = root.state().generation;
+
+        assert!(!root.activate(CpuId::new(0), instant(1)));
+
+        assert_eq!(root.state().generation, generation);
     }
 
     #[test]
