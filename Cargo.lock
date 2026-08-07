@@ -728,14 +728,14 @@ dependencies = [
  "aarch64-cpu 11.2.0",
  "ax-lazyinit",
  "ax-memory-addr",
- "ax-page-table-entry",
- "ax-page-table-multiarch",
  "ax-percpu",
  "axbacktrace",
+ "bitflags 2.13.1",
  "cfg-if",
  "cpu-local",
  "log",
  "loongArch64",
+ "page-table-generic",
  "riscv",
  "tock-registers 0.10.1",
  "x86",
@@ -909,7 +909,6 @@ dependencies = [
  "ax-kernel-guard",
  "ax-kspin",
  "ax-memory-addr",
- "ax-page-table-multiarch",
  "ax-percpu",
  "ax-plat",
  "axplat-dyn",
@@ -918,6 +917,7 @@ dependencies = [
  "fdt-parser",
  "heapless",
  "log",
+ "page-table-generic",
  "quote",
  "rdrive",
  "spin",
@@ -1048,8 +1048,8 @@ dependencies = [
  "ax-lazyinit",
  "ax-memory-addr",
  "ax-memory-set",
- "ax-page-table-multiarch",
  "log",
+ "page-table-generic",
 ]
 
 [[package]]
@@ -5597,6 +5597,7 @@ dependencies = [
 name = "page-table-generic"
 version = "0.7.4"
 dependencies = [
+ "ax-memory-addr",
  "bitflags 2.13.1",
  "env_logger",
  "heapless",
@@ -7921,8 +7922,6 @@ dependencies = [
  "ax-memory-set",
  "ax-mm",
  "ax-net",
- "ax-page-table-entry",
- "ax-page-table-multiarch",
  "ax-percpu",
  "ax-runtime",
  "ax-std",
@@ -7969,6 +7968,7 @@ dependencies = [
  "mmio-api",
  "num_enum",
  "ouroboros",
+ "page-table-generic",
  "rand 0.10.2",
  "ranges-ext",
  "rbpf",
