@@ -93,13 +93,7 @@ pub fn run() -> crate::TestResult {
     for remote_cpu in 1..cpu_num {
         // SAFETY: the CPU id is encoded as pointer provenance-free data; the
         // thunk neither dereferences it nor performs blocking work.
-        unsafe {
-            ax_ipi::call_on_cpu(
-                CpuId(remote_cpu),
-                acknowledge_ipi,
-                remote_cpu as *mut (),
-            )
-        }
+        unsafe { ax_ipi::call_on_cpu(CpuId(remote_cpu), acknowledge_ipi, remote_cpu as *mut ()) }
             .expect("online-CPU hard call failed");
     }
 

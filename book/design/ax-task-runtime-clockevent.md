@@ -257,7 +257,9 @@ publish payload -> Release sticky/epoch -> send IPI
 
 handler 入口先消费旧 doorbell，再 drain payload。并发 producer 看到旧 doorbell 已被 claim 后，可以创建新物理边。
 
-ax-runtime 的 `SchedulerIpiDoorbell` 是唯一物理 coalescer。ax-task 不保留第二套 claimed epoch 或 IPI acknowledgement API。
+已合入 dev 的 `ax-ipi::DeliveryEdge` 是唯一物理 coalescer。ax-task 只维护 owner-rq 的逻辑
+request/ack generation；ax-runtime 在 IPI handler 入口统一 claim 物理 edge，随后读取 scheduler、
+hard-call 等各自的逻辑 pending 状态，不保留 scheduler 专用 claimed epoch。
 
 ## 网络 poll 的单 owner 交接
 

@@ -345,10 +345,11 @@ impl<'a> OwnerRqTxn<'a> {
     pub(crate) fn next_balance_candidate(
         &mut self,
         scan_epoch: u64,
+        class: Option<SchedulingClass>,
         may_migrate: impl FnMut(&QueuedThread) -> bool,
     ) -> Option<QueuedThreadSnapshot> {
         self.scheduler_queue_mut()
-            .next_balance_candidate(scan_epoch, may_migrate)
+            .next_balance_candidate(scan_epoch, class, may_migrate)
     }
 
     pub(crate) fn detach_for_transfer(

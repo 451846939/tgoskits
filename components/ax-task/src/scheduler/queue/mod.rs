@@ -6,6 +6,7 @@ mod accounting;
 mod balance;
 mod class;
 mod deadline;
+mod deadline_pushable;
 mod dispatch;
 mod lifecycle;
 mod membership;
@@ -23,8 +24,8 @@ use super::fair_queue::FairRunQueue;
 #[cfg(test)]
 use crate::ActiveSchedulingState;
 use crate::{
-    CurrentDispatch, DispatchCharge, FairEntity, FairMode, SchedulePolicy, SchedulingEntity,
-    TaskError, ThreadCore, ThreadId,
+    CurrentDispatch, DispatchCharge, FairEntity, FairMode, SchedulePolicy, SchedulingClass,
+    SchedulingEntity, TaskError, ThreadCore, ThreadId,
 };
 
 #[cfg(test)]

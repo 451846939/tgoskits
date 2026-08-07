@@ -249,14 +249,15 @@ pub trait TaskRuntime {
     /// clockevent in an unknowable half-committed state.
     fn publish_scheduler_deadline(update: SchedulerDeadlineUpdate);
 
-    /// Sends a coalescible scheduler IPI directly to `cpu`.
+    /// Notifies `cpu` after the scheduler has published owner work.
     ///
-    /// [`RuntimeStatus::Success`] means the published scheduler generation is
-    /// covered by either a fresh physical edge or an older edge still in
-    /// flight. Coalescing is therefore never reported as transport
-    /// backpressure. Every other status is an unrecoverable violation of the
-    /// scheduler delivery contract.
-    fn send_scheduler_ipi(cpu: RuntimeCpuId, generation: u64) -> RuntimeStatus;
+    /// The logical request generation remains owned by ax-task. The runtime
+    /// transports only a coalescible physical edge, matching Linux's split
+    /// between `TIF_NEED_RESCHED`/rq state and the reschedule IPI. Success
+    /// means either a fresh edge was sent or an in-flight edge already covers
+    /// this publication; every other status is an unrecoverable lifecycle
+    /// violation.
+    fn notify_scheduler_cpu(cpu: RuntimeCpuId) -> RuntimeStatus;
 
     /// Commits one local interrupt wait after the scheduler clears polling.
     ///

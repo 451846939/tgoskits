@@ -189,77 +189,79 @@ impl TaskSystem {
                 let queued_top_rt = transaction.highest_rt_priority();
                 let top_rt_count =
                     queued_top_rt.map_or(0, |priority| transaction.rt_count_at_priority(priority));
-                let candidate = transaction.next_balance_candidate(scan_epoch, |candidate| {
-                    #[cfg(test)]
-                    BALANCE_CANDIDATE_VISITS.set(BALANCE_CANDIDATE_VISITS.get().saturating_add(1));
-                    let class_allowed = match reason {
-                        BalanceReason::IdlePull => !matches!(
-                            candidate.policy(),
-                            SchedulePolicy::Fair {
-                                mode: FairMode::Idle,
-                                ..
+                let candidate =
+                    transaction.next_balance_candidate(scan_epoch, class_filter, |candidate| {
+                        #[cfg(test)]
+                        BALANCE_CANDIDATE_VISITS
+                            .set(BALANCE_CANDIDATE_VISITS.get().saturating_add(1));
+                        let class_allowed = match reason {
+                            BalanceReason::IdlePull => !matches!(
+                                candidate.policy(),
+                                SchedulePolicy::Fair {
+                                    mode: FairMode::Idle,
+                                    ..
+                                }
+                            ),
+                            BalanceReason::RtDeadlinePush => matches!(
+                                candidate.policy(),
+                                SchedulePolicy::Deadline(_)
+                                    | SchedulePolicy::Fifo { .. }
+                                    | SchedulePolicy::RoundRobin { .. }
+                            ),
+                            BalanceReason::FairPeriodic => matches!(
+                                candidate.policy(),
+                                SchedulePolicy::Fair {
+                                    mode: FairMode::Normal | FairMode::Batch,
+                                    ..
+                                }
+                            ),
+                        };
+                        let matches_filter = class_filter.is_none_or(|class| match class {
+                            SchedulingClass::Deadline => {
+                                matches!(candidate.policy(), SchedulePolicy::Deadline(_))
                             }
-                        ),
-                        BalanceReason::RtDeadlinePush => matches!(
-                            candidate.policy(),
-                            SchedulePolicy::Deadline(_)
-                                | SchedulePolicy::Fifo { .. }
-                                | SchedulePolicy::RoundRobin { .. }
-                        ),
-                        BalanceReason::FairPeriodic => matches!(
-                            candidate.policy(),
-                            SchedulePolicy::Fair {
-                                mode: FairMode::Normal | FairMode::Batch,
-                                ..
+                            SchedulingClass::Realtime => matches!(
+                                candidate.policy(),
+                                SchedulePolicy::Fifo { .. } | SchedulePolicy::RoundRobin { .. }
+                            ),
+                            SchedulingClass::Fair => matches!(
+                                candidate.policy(),
+                                SchedulePolicy::Fair {
+                                    mode: FairMode::Normal | FairMode::Batch,
+                                    ..
+                                }
+                            ),
+                            SchedulingClass::Idle => matches!(
+                                candidate.policy(),
+                                SchedulePolicy::Fair {
+                                    mode: FairMode::Idle,
+                                    ..
+                                }
+                            ),
+                            SchedulingClass::Stop => {
+                                matches!(candidate.policy(), SchedulePolicy::KernelStop)
                             }
-                        ),
-                    };
-                    let matches_filter = class_filter.is_none_or(|class| match class {
-                        SchedulingClass::Deadline => {
-                            matches!(candidate.policy(), SchedulePolicy::Deadline(_))
+                        });
+                        if !class_allowed || !matches_filter {
+                            return false;
                         }
-                        SchedulingClass::Realtime => matches!(
-                            candidate.policy(),
-                            SchedulePolicy::Fifo { .. } | SchedulePolicy::RoundRobin { .. }
-                        ),
-                        SchedulingClass::Fair => matches!(
-                            candidate.policy(),
-                            SchedulePolicy::Fair {
-                                mode: FairMode::Normal | FairMode::Batch,
-                                ..
+                        let candidate_priority = match candidate.policy() {
+                            SchedulePolicy::Fifo { priority }
+                            | SchedulePolicy::RoundRobin { priority, .. } => priority.get(),
+                            _ => return true,
+                        };
+                        match current_policy {
+                            Some(SchedulePolicy::Deadline(_)) => true,
+                            Some(SchedulePolicy::Fifo { priority })
+                            | Some(SchedulePolicy::RoundRobin { priority, .. }) => {
+                                candidate_priority <= priority.get()
                             }
-                        ),
-                        SchedulingClass::Idle => matches!(
-                            candidate.policy(),
-                            SchedulePolicy::Fair {
-                                mode: FairMode::Idle,
-                                ..
-                            }
-                        ),
-                        SchedulingClass::Stop => {
-                            matches!(candidate.policy(), SchedulePolicy::KernelStop)
+                            _ => queued_top_rt.is_some_and(|top| {
+                                candidate_priority < top
+                                    || (candidate_priority == top && top_rt_count > 1)
+                            }),
                         }
                     });
-                    if !class_allowed || !matches_filter {
-                        return false;
-                    }
-                    let candidate_priority = match candidate.policy() {
-                        SchedulePolicy::Fifo { priority }
-                        | SchedulePolicy::RoundRobin { priority, .. } => priority.get(),
-                        _ => return true,
-                    };
-                    match current_policy {
-                        Some(SchedulePolicy::Deadline(_)) => true,
-                        Some(SchedulePolicy::Fifo { priority })
-                        | Some(SchedulePolicy::RoundRobin { priority, .. }) => {
-                            candidate_priority <= priority.get()
-                        }
-                        _ => queued_top_rt.is_some_and(|top| {
-                            candidate_priority < top
-                                || (candidate_priority == top && top_rt_count > 1)
-                        }),
-                    }
-                });
                 transaction.commit();
                 candidate
             }?;
@@ -533,7 +535,7 @@ impl TaskSystem {
             let selection = self.select_owner_balance_transfer_by(
                 cpu.as_ref().get_ref(),
                 BalanceReason::FairPeriodic,
-                None,
+                Some(SchedulingClass::Fair),
                 |candidate, sched| {
                     let candidate_demand = candidate.placement_demand();
                     self.cpu_remotes

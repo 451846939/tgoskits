@@ -40,7 +40,7 @@ mod scheduler_ipi_tests {
     }
 
     #[test]
-    fn overdue_fair_balance_deadline_becomes_sticky_owner_work() {
+    fn deadline_selection_does_not_claim_an_overdue_fair_timer() {
         let system = TaskSystem::new(TaskSystemConfig::new(1)).unwrap();
         let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
         system
@@ -58,14 +58,19 @@ mod scheduler_ipi_tests {
         let next = cpu.as_mut().next_oneshot_deadline(
             MonotonicInstant::from_nanos(deadline.as_nanos()).unwrap(),
         );
-        assert!(
-            next.is_none_or(|next| next > deadline),
-            "an overdue balance event must not be rearmed at timer resolution: {next:?}"
+        assert_eq!(
+            next,
+            Some(deadline),
+            "a pure deadline query must leave the overdue physical source armed"
         );
         assert!(
-            cpu.remote().needs_reschedule(),
-            "the due deadline must remain visible as scheduler work"
+            !cpu.remote().needs_reschedule(),
+            "deadline selection must not steal the firing owner's transition"
         );
+        assert!(cpu.as_mut().scheduler_work_due(
+            MonotonicInstant::from_nanos(deadline.as_nanos()).unwrap(),
+        ));
+        assert!(cpu.remote().needs_reschedule());
     }
 
     #[test]

@@ -18,6 +18,12 @@ pub(crate) struct CpuDeadlineState {
     pub(crate) queue: TaskDeadlineQueue,
     pub(crate) expired_buffer: Vec<ExpiredTaskDeadline>,
     pub(crate) expired_count: usize,
+    /// Mirrors Linux `hrtimer_cpu_base::softirq_activated`.
+    ///
+    /// A due queue head does not set this bit. Only the hard clockevent path
+    /// may transfer progress ownership to `ktimers/%u`; the worker clears the
+    /// bit after draining every due and buffered soft expiry.
+    pub(crate) softirq_activated: bool,
     pub(crate) generation: u64,
     pub(crate) publication: Option<SchedulerDeadlinePublicationState>,
     #[cfg(test)]
@@ -30,6 +36,7 @@ impl CpuDeadlineState {
             queue: TaskDeadlineQueue::new(config.thread_capacity()),
             expired_buffer: vec![ExpiredTaskDeadline::EMPTY; config.batch_limit()],
             expired_count: 0,
+            softirq_activated: false,
             generation: 0,
             publication: None,
             #[cfg(test)]

@@ -14,22 +14,24 @@ pub(crate) unsafe fn run_on_cpu_sync(
 #[cfg(any(feature = "ipi", feature = "wake-ipi", test))]
 fn dispatch_shared_ipi(
     drain_callbacks: impl FnOnce(),
-    claim_scheduler_delivery: impl FnOnce() -> bool,
+    scheduler_work_pending: impl FnOnce() -> bool,
     publish_scheduler_work: impl FnOnce(),
 ) {
-    if claim_scheduler_delivery() {
+    if scheduler_work_pending() {
         publish_scheduler_work();
     }
     drain_callbacks();
 }
 
 #[cfg(all(feature = "multitask", any(feature = "ipi", feature = "wake-ipi")))]
-fn claim_local_scheduler_delivery() -> bool {
-    let Some(claim) = crate::task::claim_scheduler_ipi_doorbell() else {
-        return false;
-    };
-    debug_assert_ne!(claim.generation(), 0);
-    true
+fn local_scheduler_work_pending() -> bool {
+    let pending = crate::task::current_cpu_needs_resched()
+        .expect("IPI delivery requires an online scheduler CPU");
+    #[cfg(feature = "qperf-metrics")]
+    if pending {
+        crate::task::record_scheduler_ipi_consume();
+    }
+    pending
 }
 
 #[cfg(all(feature = "irq", feature = "ipi"))]
@@ -37,15 +39,14 @@ pub(crate) fn irq_handler(_ctx: ax_hal::irq::IrqContext) -> ax_hal::irq::IrqRetu
     ax_ipi::claim_current_delivery();
     dispatch_shared_ipi(
         || {
-            ax_ipi::drain_hard_calls().unwrap_or_else(|error| {
-                panic!("failed to continue hard-call draining: {error:?}")
-            });
+            ax_ipi::drain_hard_calls()
+                .unwrap_or_else(|error| panic!("failed to continue hard-call draining: {error:?}"));
             ax_ipi::legacy::drain_current_callbacks();
         },
         || {
             #[cfg(feature = "multitask")]
             {
-                claim_local_scheduler_delivery()
+                local_scheduler_work_pending()
             }
             #[cfg(not(feature = "multitask"))]
             {
@@ -64,12 +65,13 @@ pub(crate) fn irq_handler(_ctx: ax_hal::irq::IrqContext) -> ax_hal::irq::IrqRetu
 
 #[cfg(all(feature = "irq", feature = "wake-ipi", not(feature = "ipi")))]
 pub(crate) fn irq_handler(_ctx: ax_hal::irq::IrqContext) -> ax_hal::irq::IrqReturn {
+    ax_ipi::claim_current_delivery();
     dispatch_shared_ipi(
         || {},
         || {
             #[cfg(feature = "multitask")]
             {
-                claim_local_scheduler_delivery()
+                local_scheduler_work_pending()
             }
             #[cfg(not(feature = "multitask"))]
             {

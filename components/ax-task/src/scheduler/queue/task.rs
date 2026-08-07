@@ -3,7 +3,7 @@
 use alloc::{boxed::Box, sync::Arc};
 use core::{cell::UnsafeCell, fmt};
 
-use super::{deadline, realtime};
+use super::{deadline, deadline_pushable, realtime};
 use crate::{
     ActiveSchedulingState, CpuSet, SchedulePolicy, SchedulingEntity, ThreadCore, ThreadId,
 };
@@ -38,16 +38,22 @@ impl RqTaskMetadata {
 /// `sched_entity`, `sched_rt_entity`, and `sched_dl_entity` in `task_struct`.
 pub(crate) struct RunQueueNodeStorage {
     deadline: UnsafeCell<Option<Box<deadline::DeadlineNode>>>,
+    deadline_pushable: UnsafeCell<Option<Box<deadline_pushable::DeadlinePushableNode>>>,
     fair: UnsafeCell<Option<Box<crate::scheduler::fair_queue::FairNode>>>,
     realtime: UnsafeCell<Option<Box<realtime::RealtimeNode>>>,
+    realtime_pushable: UnsafeCell<Option<Box<realtime::RealtimePushableNode>>>,
 }
 
 impl RunQueueNodeStorage {
     pub(crate) fn new() -> Self {
         Self {
             deadline: UnsafeCell::new(Some(deadline::DeadlineNode::empty())),
+            deadline_pushable: UnsafeCell::new(Some(
+                deadline_pushable::DeadlinePushableNode::empty(),
+            )),
             fair: UnsafeCell::new(Some(crate::scheduler::fair_queue::FairNode::empty())),
             realtime: UnsafeCell::new(Some(realtime::RealtimeNode::empty())),
+            realtime_pushable: UnsafeCell::new(Some(realtime::RealtimePushableNode::empty())),
         }
     }
 
@@ -61,6 +67,26 @@ impl RunQueueNodeStorage {
         assert!(
             unsafe { &mut *self.deadline.get() }.replace(node).is_none(),
             "unlinked Deadline node must have one storage owner"
+        );
+    }
+
+    pub(crate) unsafe fn take_deadline_pushable(
+        &self,
+    ) -> Box<deadline_pushable::DeadlinePushableNode> {
+        unsafe { &mut *self.deadline_pushable.get() }
+            .take()
+            .expect("one thread cannot own two Deadline pushable links")
+    }
+
+    pub(crate) unsafe fn return_deadline_pushable(
+        &self,
+        node: Box<deadline_pushable::DeadlinePushableNode>,
+    ) {
+        assert!(
+            unsafe { &mut *self.deadline_pushable.get() }
+                .replace(node)
+                .is_none(),
+            "unlinked Deadline pushable node must have one storage owner"
         );
     }
 
@@ -87,6 +113,24 @@ impl RunQueueNodeStorage {
         assert!(
             unsafe { &mut *self.realtime.get() }.replace(node).is_none(),
             "unlinked RT node must have one storage owner"
+        );
+    }
+
+    pub(crate) unsafe fn take_realtime_pushable(&self) -> Box<realtime::RealtimePushableNode> {
+        unsafe { &mut *self.realtime_pushable.get() }
+            .take()
+            .expect("one thread cannot own two RT pushable links")
+    }
+
+    pub(crate) unsafe fn return_realtime_pushable(
+        &self,
+        node: Box<realtime::RealtimePushableNode>,
+    ) {
+        assert!(
+            unsafe { &mut *self.realtime_pushable.get() }
+                .replace(node)
+                .is_none(),
+            "unlinked RT pushable node must have one storage owner"
         );
     }
 }

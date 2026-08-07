@@ -45,34 +45,29 @@ impl CpuLocal {
         let this = unsafe { self.get_unchecked_mut() };
         let timer = {
             let deadlines = this.remote.lock_deadline_base();
-            let deferred_timer_backlog = deadlines.expired_count != 0
-                || deadlines
-                    .queue
-                    .has_immediately_actionable_soft_entry(monotonic_now);
-            if deferred_timer_backlog {
-                // Linux leaves an activated soft hrtimer base to `ktimers/%u`
-                // instead of repeatedly programming the same expired edge.
-                // The deadline base is the payload authority; the worker event
-                // is only a wakeup and cannot make this decision stale.
+            if deadlines.softirq_activated {
+                // Linux suppresses `softirq_expires_next` only after the hard
+                // hrtimer path has set `softirq_activated` and woken
+                // `ktimers/%u`. A merely overdue queue head remains the next
+                // physical event so the device's minimum delta creates that
+                // ownership transfer instead of silently stopping progress.
                 None
             } else {
                 deadlines.queue.next_deadline()
             }
         };
         let scheduler = match this.scheduler_clock_event(monotonic_now) {
+            // Deadline selection is a pure observation. An already-due hard
+            // scheduler timer remains a physical clockevent source and the
+            // runtime clamps it to the device minimum delta. Only the firing
+            // owner may convert it into sticky scheduler work.
             Some(SchedulerClockEvent::Due) => {
-                // Linux does not start a scheduler hrtimer whose expiry has
-                // already passed: the owning runqueue handles that state
-                // immediately. The owner state remains the only deadline
-                // authority; sticky work forces a scheduler safe point without
-                // manufacturing a resolution-rate interrupt loop.
-                this.remote.request_scheduler_work();
-                None
+                MonotonicDeadline::from_nanos(monotonic_now.as_nanos())
             }
             Some(SchedulerClockEvent::Future(deadline)) => Some(deadline),
             None => None,
         };
-        let fair_balance = this.fair_balance_clockevent_deadline(monotonic_now);
+        let fair_balance = this.fair_balance_clockevent_deadline();
         let rt_period = this.rt_bandwidth.deadline_for(this.owner);
         [timer, scheduler, fair_balance, rt_period]
             .into_iter()
@@ -223,15 +218,8 @@ impl CpuLocal {
         }
     }
 
-    fn fair_balance_clockevent_deadline(
-        &mut self,
-        monotonic_now: MonotonicInstant,
-    ) -> Option<MonotonicDeadline> {
+    fn fair_balance_clockevent_deadline(&self) -> Option<MonotonicDeadline> {
         if !self.has_periodic_fair_balance_work() {
-            return None;
-        }
-        if self.dispatch.publish_fair_balance_due(monotonic_now) {
-            self.remote.request_scheduler_work();
             return None;
         }
         self.dispatch.fair_balance_deadline()
@@ -365,6 +353,9 @@ impl CpuLocal {
         let output = &mut expired_buffer[expired_count..];
         let batch = queue.expire_soft(request, output);
         task_deadlines.expired_count += batch.expired();
+        if batch.expired() != 0 || batch.pending() {
+            task_deadlines.softirq_activated = true;
+        }
         batch
     }
 
@@ -442,5 +433,13 @@ impl CpuLocal {
 
     pub(crate) fn has_expired_task_deadlines(&self) -> bool {
         self.remote.lock_deadline_base().expired_count != 0
+    }
+
+    /// Completes one Linux-style soft hrtimer drain transaction.
+    ///
+    /// `pending` retains ownership in `ktimers/%u`; otherwise the queue once
+    /// again owns its earliest physical clockevent deadline.
+    pub(crate) fn finish_task_deadline_softirq(self: Pin<&mut Self>, pending: bool) {
+        self.remote.lock_deadline_base().softirq_activated = pending;
     }
 }

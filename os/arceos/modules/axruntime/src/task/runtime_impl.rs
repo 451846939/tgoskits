@@ -104,12 +104,6 @@ impl_task_runtime! {
             if cpu != unsafe { Self::current_cpu_id() } {
                 return RuntimeStatus::InvalidArgument;
             }
-            #[cfg(any(feature = "ipi", feature = "wake-ipi"))]
-            if current_scheduler_ipi_doorbell_pending() {
-                return RuntimeStatus::Busy;
-            }
-            #[cfg(any(feature = "ipi", feature = "wake-ipi"))]
-            reset_current_scheduler_ipi_doorbell_for_offline();
             #[cfg(feature = "irq")]
             crate::clock_event_runtime::take_current_clock_event_offline();
             release_current_active_address_space();
@@ -243,28 +237,32 @@ impl_task_runtime! {
             crate::clock_event_runtime::publish_local_scheduler_deadline(update);
         }
 
-        fn send_scheduler_ipi(cpu: RuntimeCpuId, generation: u64) -> RuntimeStatus {
+        fn notify_scheduler_cpu(cpu: RuntimeCpuId) -> RuntimeStatus {
             #[cfg(any(feature = "ipi", feature = "wake-ipi"))]
             {
                 let cpu_id = cpu.as_u32() as usize;
                 if cpu_id >= ax_hal::cpu_num() {
                     return RuntimeStatus::InvalidArgument;
                 }
-                publish_then_notify_scheduler_ipi(
-                    || publish_scheduler_ipi_doorbell(cpu_id, generation),
-                    || {
-                        #[cfg(feature = "qperf-metrics")]
-                        record_scheduler_ipi_send();
-                        ax_hal::irq::send_ipi(
-                            ax_hal::irq::ipi_irq(),
-                            ax_hal::irq::IpiTarget::Other { cpu_id },
-                        );
-                    },
-                )
+                match ax_ipi::notify_cpu(ax_hal::irq::CpuId(cpu_id)) {
+                    Ok(notification) => {
+                        if notification == ax_ipi::IpiNotification::Sent {
+                            #[cfg(feature = "qperf-metrics")]
+                            record_scheduler_ipi_send();
+                        }
+                        RuntimeStatus::Success
+                    }
+                    Err(ax_hal::irq::IrqError::InvalidCpu) => RuntimeStatus::InvalidArgument,
+                    Err(ax_hal::irq::IrqError::CpuOffline) => RuntimeStatus::NotInitialized,
+                    Err(ax_hal::irq::IrqError::Busy) => RuntimeStatus::Busy,
+                    Err(ax_hal::irq::IrqError::NoMemory) => RuntimeStatus::NoMemory,
+                    Err(ax_hal::irq::IrqError::Unsupported) => RuntimeStatus::Unsupported,
+                    Err(_) => RuntimeStatus::Platform,
+                }
             }
             #[cfg(not(any(feature = "ipi", feature = "wake-ipi")))]
             {
-                let _ = (cpu, generation);
+                let _ = cpu;
                 RuntimeStatus::Unsupported
             }
         }

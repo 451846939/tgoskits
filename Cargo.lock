@@ -1580,6 +1580,7 @@ dependencies = [
  "ax-driver",
  "ax-hal",
  "ax-std",
+ "ax-task",
  "axbacktrace",
  "axbuild",
  "axtest",

@@ -15,6 +15,7 @@ const RT_PRIORITY_BITMAP: u128 = (1_u128 << RT_PRIORITY_LEVELS) - 1;
 pub(crate) struct RealtimeNode {
     thread: Option<QueuedThread>,
     next: Option<Box<RealtimeNode>>,
+    pushable: bool,
 }
 
 impl RealtimeNode {
@@ -22,12 +23,14 @@ impl RealtimeNode {
         Box::new(Self {
             thread: None,
             next: None,
+            pushable: false,
         })
     }
 
     fn reset(&mut self, thread: QueuedThread) {
         self.thread = Some(thread);
         self.next = None;
+        self.pushable = false;
     }
 
     fn thread(&self) -> &QueuedThread {
@@ -40,6 +43,27 @@ impl RealtimeNode {
         self.thread
             .as_mut()
             .expect("linked RT node must own one scheduling entity")
+    }
+}
+
+/// Per-thread linkage for Linux `rt_rq::pushable_tasks`.
+#[derive(Debug)]
+pub(crate) struct RealtimePushableNode {
+    thread: ThreadId,
+    next: Option<Box<RealtimePushableNode>>,
+}
+
+impl RealtimePushableNode {
+    pub(crate) fn empty() -> Box<Self> {
+        Box::new(Self {
+            thread: ThreadId::from_parts(0, 0),
+            next: None,
+        })
+    }
+
+    fn reset(&mut self, thread: ThreadId) {
+        self.thread = thread;
+        self.next = None;
     }
 }
 
@@ -134,6 +158,98 @@ struct RealtimeIter<'queue> {
     next: Option<&'queue RealtimeNode>,
 }
 
+#[derive(Debug)]
+struct RealtimePushableLevel {
+    head: Option<Box<RealtimePushableNode>>,
+    tail: Option<NonNull<RealtimePushableNode>>,
+    len: usize,
+}
+
+// SAFETY: `tail` points into the Box chain owned by `head`, and the complete
+// pushable list moves only with its exclusively owned rq.
+unsafe impl Send for RealtimePushableLevel {}
+
+impl RealtimePushableLevel {
+    const fn new() -> Self {
+        Self {
+            head: None,
+            tail: None,
+            len: 0,
+        }
+    }
+
+    fn push_back(&mut self, mut node: Box<RealtimePushableNode>) {
+        let node_pointer = NonNull::from(node.as_mut());
+        match self.tail {
+            Some(mut tail) => unsafe {
+                // SAFETY: `tail` is the final node in the chain owned by this
+                // list and the rq lock provides unique access.
+                tail.as_mut().next = Some(node);
+            },
+            None => self.head = Some(node),
+        }
+        self.tail = Some(node_pointer);
+        self.len += 1;
+    }
+
+    fn position(&self, thread: ThreadId) -> Option<usize> {
+        self.iter().position(|candidate| candidate == thread)
+    }
+
+    fn remove_at(&mut self, position: usize) -> Option<Box<RealtimePushableNode>> {
+        if position >= self.len {
+            return None;
+        }
+        let mut previous = None;
+        let mut link = &mut self.head;
+        for _ in 0..position {
+            let node = link.as_mut()?;
+            previous = Some(NonNull::from(node.as_mut()));
+            link = &mut node.next;
+        }
+        let mut removed = link.take()?;
+        *link = removed.next.take();
+        self.len -= 1;
+        if self.tail == Some(NonNull::from(removed.as_mut())) {
+            self.tail = previous;
+        }
+        if self.head.is_none() {
+            self.tail = None;
+        }
+        Some(removed)
+    }
+
+    fn iter(&self) -> RealtimePushableIter<'_> {
+        RealtimePushableIter {
+            next: self.head.as_deref(),
+        }
+    }
+}
+
+impl Drop for RealtimePushableLevel {
+    fn drop(&mut self) {
+        while let Some(mut node) = self.head.take() {
+            self.head = node.next.take();
+        }
+        self.tail = None;
+        self.len = 0;
+    }
+}
+
+struct RealtimePushableIter<'queue> {
+    next: Option<&'queue RealtimePushableNode>,
+}
+
+impl Iterator for RealtimePushableIter<'_> {
+    type Item = ThreadId;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let node = self.next?;
+        self.next = node.next.as_deref();
+        Some(node.thread)
+    }
+}
+
 impl<'queue> Iterator for RealtimeIter<'queue> {
     type Item = &'queue QueuedThread;
 
@@ -153,6 +269,7 @@ pub(super) struct RealtimeRunQueue {
     active_bitmap: u128,
     exempt_bitmap: u128,
     exempt_count: [usize; FIXED_PRIORITY_LEVELS],
+    pushable: [RealtimePushableLevel; FIXED_PRIORITY_LEVELS],
     pushable_bitmap: u128,
 }
 
@@ -163,6 +280,7 @@ impl RealtimeRunQueue {
             active_bitmap: 0,
             exempt_bitmap: 0,
             exempt_count: [0; FIXED_PRIORITY_LEVELS],
+            pushable: core::array::from_fn(|_| RealtimePushableLevel::new()),
             pushable_bitmap: 0,
         }
     }
@@ -183,16 +301,67 @@ impl RealtimeRunQueue {
         self.pushable_bitmap & RT_PRIORITY_BITMAP != 0
     }
 
-    pub(super) fn refresh_pushable_priority(&mut self, priority: u8, current: Option<ThreadId>) {
+    pub(super) fn refresh_pushable(
+        &mut self,
+        thread: ThreadId,
+        priority: u8,
+        current: Option<ThreadId>,
+    ) {
         let index = (priority - 1) as usize;
-        let mut pushable = false;
-        for thread in self.active[index].iter() {
-            if thread.migration_capable && current != Some(thread.id) {
-                pushable = true;
+        let Some(position) = self.active[index].position(thread) else {
+            return;
+        };
+        let (should_be_pushable, is_pushable, core) = {
+            let node = self.active[index]
+                .head
+                .as_deref()
+                .and_then(|head| nth_node(head, position))
+                .expect("RT position must identify one linked node");
+            (
+                node.thread().migration_capable && current != Some(thread),
+                node.pushable,
+                Arc::clone(&node.thread().core),
+            )
+        };
+        match (is_pushable, should_be_pushable) {
+            (false, true) => {
+                let mut node = unsafe {
+                    // SAFETY: the task is linked to this rq and the owner rq
+                    // lock serializes its independent pushable membership.
+                    core.runqueue_nodes().take_realtime_pushable()
+                };
+                node.reset(thread);
+                self.pushable[index].push_back(node);
+                self.active[index]
+                    .head
+                    .as_deref_mut()
+                    .and_then(|head| nth_node_mut(head, position))
+                    .expect("RT position must remain stable under the rq lock")
+                    .pushable = true;
             }
+            (true, false) => {
+                let pushable_position = self.pushable[index]
+                    .position(thread)
+                    .expect("RT pushable flag must match its priority list");
+                let node = self.pushable[index]
+                    .remove_at(pushable_position)
+                    .expect("RT pushable position must remain linked");
+                unsafe {
+                    // SAFETY: the node is detached from the pushable list
+                    // before it returns to task-owned storage.
+                    core.runqueue_nodes().return_realtime_pushable(node);
+                }
+                self.active[index]
+                    .head
+                    .as_deref_mut()
+                    .and_then(|head| nth_node_mut(head, position))
+                    .expect("RT position must remain stable under the rq lock")
+                    .pushable = false;
+            }
+            _ => {}
         }
         let bit = 1_u128 << index;
-        if pushable {
+        if self.pushable[index].len != 0 {
             self.pushable_bitmap |= bit;
         } else {
             self.pushable_bitmap &= !bit;
@@ -237,6 +406,14 @@ impl RealtimeRunQueue {
     pub(super) fn remove(&mut self, priority: u8, id: ThreadId) -> Option<QueuedThread> {
         let index = (priority - 1) as usize;
         let position = self.active[index].position(id)?;
+        if self.active[index]
+            .head
+            .as_deref()
+            .and_then(|head| nth_node(head, position))
+            .is_some_and(|node| node.pushable)
+        {
+            self.refresh_pushable(id, priority, Some(id));
+        }
         let node = self.active[index].remove_at(position)?;
         Some(self.after_remove(index, node))
     }
@@ -258,18 +435,24 @@ impl RealtimeRunQueue {
         None
     }
 
-    pub(super) fn find_first_matching(
+    pub(super) fn find_first_pushable_matching(
         &self,
         predicate: &mut impl FnMut(&QueuedThread) -> bool,
     ) -> Option<QueuedThreadSnapshot> {
-        self.active
+        self.pushable
             .iter()
+            .enumerate()
             .take(RT_PRIORITY_LEVELS)
             .rev()
-            .find_map(|level| {
+            .find_map(|(index, level)| {
                 level
                     .iter()
-                    .find(|thread| predicate(thread))
+                    .find_map(|thread| {
+                        self.active[index]
+                            .iter()
+                            .find(|candidate| candidate.id == thread)
+                            .filter(|entry| predicate(entry))
+                    })
                     .map(QueuedThreadSnapshot::from)
             })
     }
@@ -349,6 +532,10 @@ impl RealtimeRunQueue {
     }
 
     fn after_remove(&mut self, index: usize, mut node: Box<RealtimeNode>) -> QueuedThread {
+        assert!(
+            !node.pushable,
+            "RT active node must leave its pushable list before dequeue"
+        );
         let thread = node
             .thread
             .take()
@@ -372,6 +559,22 @@ impl RealtimeRunQueue {
         }
         thread
     }
+}
+
+fn nth_node(mut node: &RealtimeNode, mut position: usize) -> Option<&RealtimeNode> {
+    while position != 0 {
+        node = node.next.as_deref()?;
+        position -= 1;
+    }
+    Some(node)
+}
+
+fn nth_node_mut(mut node: &mut RealtimeNode, mut position: usize) -> Option<&mut RealtimeNode> {
+    while position != 0 {
+        node = node.next.as_deref_mut()?;
+        position -= 1;
+    }
+    Some(node)
 }
 
 fn bitmap_highest_priority(bitmap: u128) -> Option<u8> {

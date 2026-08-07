@@ -136,7 +136,7 @@ impl_task_runtime! {
             )
         }
         fn publish_scheduler_deadline(_update: SchedulerDeadlineUpdate) {}
-        fn send_scheduler_ipi(_cpu: RuntimeCpuId, _generation: u64) -> RuntimeStatus {
+        fn notify_scheduler_cpu(_cpu: RuntimeCpuId) -> RuntimeStatus {
             RuntimeStatus::Success
         }
         fn wait_for_interrupt() {}

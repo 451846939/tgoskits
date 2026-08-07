@@ -158,24 +158,15 @@ impl VirtualRuntimeState {
         Ok(generation)
     }
 
-    pub(super) fn publish_ipi(&mut self, cpu: u32, generation: u64) -> RuntimeStatus {
-        if generation == 0 {
-            return RuntimeStatus::InvalidArgument;
-        }
+    pub(super) fn notify_ipi(&mut self, cpu: u32) -> RuntimeStatus {
         let Some(state) = self.cpu_mut(cpu) else {
             return RuntimeStatus::InvalidArgument;
         };
-        if generation <= state.ipi_delivered_generation {
-            self.record(
-                cpu,
-                VirtualRuntimeEventKind::IpiEdgeCoalesced,
-                generation,
-                0,
-                0,
-            );
-            return RuntimeStatus::Success;
-        }
-        state.ipi_delivered_generation = generation;
+        state.ipi_delivered_generation = state
+            .ipi_delivered_generation
+            .checked_add(1)
+            .expect("virtual physical IPI epoch exhausted");
+        let generation = state.ipi_delivered_generation;
         let kind = if state.ipi_edge_pending {
             VirtualRuntimeEventKind::IpiEdgeCoalesced
         } else {

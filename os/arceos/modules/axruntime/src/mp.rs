@@ -79,7 +79,7 @@ pub fn rust_main_secondary(cpu_id: usize) -> ! {
     #[cfg(not(feature = "multitask"))]
     ax_hal::init_later_secondary(cpu_id);
 
-    #[cfg(feature = "ipi")]
+    #[cfg(any(feature = "ipi", feature = "wake-ipi"))]
     ax_ipi::init();
 
     // Bring up local IRQ/IPI delivery before publishing INITED_CPUS so the
@@ -105,7 +105,7 @@ pub fn rust_main_secondary(cpu_id: usize) -> ! {
     #[cfg(feature = "multitask")]
     crate::guard::release_bootstrap_preemption();
 
-    #[cfg(all(feature = "irq", feature = "ipi"))]
+    #[cfg(all(feature = "irq", any(feature = "ipi", feature = "wake-ipi")))]
     {
         ax_hal::asm::flush_tlb(None);
         ax_ipi::mark_current_cpu_ready();

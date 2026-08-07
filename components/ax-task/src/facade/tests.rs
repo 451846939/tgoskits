@@ -1555,6 +1555,36 @@ mod tests {
     }
 
     #[test]
+    fn overdue_unactivated_soft_timer_keeps_a_physical_clockevent() {
+        let system = Box::pin(TaskSystem::new(crate::TaskSystemConfig::new(1)).unwrap());
+        let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
+        system
+            .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
+            .unwrap();
+        system.bring_cpu_online(cpu.as_mut()).unwrap();
+        let _runtime_handles = InstalledTaskHandles::new(system.as_ref(), cpu.as_mut());
+        let CurrentParkStart::Prepared(mut park) = begin_current_park().unwrap() else {
+            panic!("a fresh current thread must prepare its first park")
+        };
+        park.arm_deadline(deadline(10)).unwrap();
+
+        let mut irq = RuntimeIrqGuard::enter();
+        let mut owner = runtime_current_cpu_mut(&mut irq).unwrap();
+        let update = owner
+            .as_mut()
+            .next_scheduler_deadline_update(instant(10))
+            .unwrap();
+        assert_eq!(
+            update.deadline(),
+            Some(deadline(10)),
+            "an overdue queue head remains a physical deadline until IRQ transfers it to ktimers"
+        );
+        drop(owner);
+        drop(irq);
+        park.cancel().unwrap();
+    }
+
+    #[test]
     fn pi_wait_preparation_uses_one_owner_transaction() {
         use super::pi::{PiParkAttempt, prepare_pi_park_attempt};
         use crate::{PiMutexAcquire, PiMutexCore};
@@ -1712,7 +1742,7 @@ mod tests {
         );
 
         test_runtime::reenter_current_thread_from_next_hook();
-        let _status = task_runtime::send_scheduler_ipi(RuntimeCpuId::new(0), 1);
+        let _status = task_runtime::notify_scheduler_cpu(RuntimeCpuId::new(0));
         assert_eq!(
             test_runtime::take_hook_reentry_error(),
             None,

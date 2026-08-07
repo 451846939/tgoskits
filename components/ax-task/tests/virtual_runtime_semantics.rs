@@ -20,7 +20,7 @@ fn scheduler_ipi_claim_publishes_work_on_the_target_cpu() {
     support::clear_handles();
 
     assert_eq!(
-        task_runtime::send_scheduler_ipi(RuntimeCpuId::new(1), 1),
+        task_runtime::notify_scheduler_cpu(RuntimeCpuId::new(1)),
         RuntimeStatus::Success
     );
     assert!(support::dispatch_scheduler_ipi(1));
@@ -33,15 +33,15 @@ fn scheduler_ipi_claim_publishes_work_on_the_target_cpu() {
 }
 
 #[test]
-fn scheduler_ipi_claims_the_delivered_generation_before_local_work() {
+fn scheduler_ipi_claims_the_physical_edge_before_local_work() {
     support::clear_handles();
 
     assert_eq!(
-        task_runtime::send_scheduler_ipi(RuntimeCpuId::new(1), 1),
+        task_runtime::notify_scheduler_cpu(RuntimeCpuId::new(1)),
         RuntimeStatus::Success
     );
     assert_eq!(
-        task_runtime::send_scheduler_ipi(RuntimeCpuId::new(1), 2),
+        task_runtime::notify_scheduler_cpu(RuntimeCpuId::new(1)),
         RuntimeStatus::Success
     );
     assert_eq!(support::ipi_count(1), 1, "one physical edge must coalesce");
@@ -85,7 +85,7 @@ fn idle_commit_rechecks_a_physical_edge_published_after_polling() {
     support::clear_virtual_runtime_events();
 
     assert_eq!(
-        task_runtime::send_scheduler_ipi(RuntimeCpuId::new(1), 1),
+        task_runtime::notify_scheduler_cpu(RuntimeCpuId::new(1)),
         RuntimeStatus::Success
     );
     idle_current_cpu_once().unwrap();
@@ -176,7 +176,7 @@ fn cpu_offline_waits_for_the_physical_ipi_and_local_work_to_quiesce() {
     support::set_current_cpu(1);
 
     assert_eq!(
-        task_runtime::send_scheduler_ipi(RuntimeCpuId::new(1), 1),
+        task_runtime::notify_scheduler_cpu(RuntimeCpuId::new(1)),
         RuntimeStatus::Success
     );
     assert_eq!(

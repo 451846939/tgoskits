@@ -3,7 +3,7 @@
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::cmp::Ordering;
 
-use super::{QueuedThread, QueuedThreadSnapshot};
+use super::{QueuedThread, QueuedThreadSnapshot, deadline_pushable::DeadlinePushableTasks};
 use crate::{
     DeadlineBandwidthSnapshot, SchedulingEntity, TaskError, ThreadCore, ThreadId,
     runtime::task_runtime,
@@ -131,6 +131,18 @@ impl PartialOrd for DeadlineQueueKey {
 }
 
 impl DeadlineQueueKey {
+    pub(super) const fn empty() -> Self {
+        Self {
+            absolute_deadline_ns: 0,
+            sequence: 0,
+            thread: ThreadId::from_parts(0, 0),
+        }
+    }
+
+    pub(super) const fn thread(self) -> ThreadId {
+        self.thread
+    }
+
     fn for_thread(thread: &QueuedThread) -> Self {
         Self {
             absolute_deadline_ns: deadline_entity(thread)
@@ -156,11 +168,7 @@ pub(crate) struct DeadlineNode {
 impl DeadlineNode {
     pub(crate) fn empty() -> Box<Self> {
         Box::new(Self {
-            key: DeadlineQueueKey {
-                absolute_deadline_ns: 0,
-                sequence: 0,
-                thread: ThreadId::from_parts(0, 0),
-            },
+            key: DeadlineQueueKey::empty(),
             thread: None,
             left: None,
             right: None,
@@ -201,8 +209,7 @@ pub(super) struct DeadlineRunQueue {
     throttled: Vec<Option<(u32, QueuedThread)>>,
     members: Vec<Arc<ThreadCore>>,
     bandwidth: DeadlineRunQueueBandwidth,
-    pushable: Vec<Option<u32>>,
-    pushable_count: usize,
+    pushable: DeadlinePushableTasks,
     len: usize,
 }
 
@@ -214,8 +221,7 @@ impl DeadlineRunQueue {
             throttled: Vec::new(),
             members: Vec::with_capacity(thread_capacity),
             bandwidth: DeadlineRunQueueBandwidth::new(max_bw_scaled),
-            pushable: Vec::new(),
-            pushable_count: 0,
+            pushable: DeadlinePushableTasks::new(),
             len: 0,
         }
     }
@@ -227,9 +233,7 @@ impl DeadlineRunQueue {
         if self.throttled.len() <= slot {
             self.throttled.resize_with(slot.saturating_add(1), || None);
         }
-        if self.pushable.len() <= slot {
-            self.pushable.resize(slot.saturating_add(1), None);
-        }
+        self.pushable.prepare_thread_slot(slot);
     }
 
     pub(super) fn install_throttled(&mut self, thread: QueuedThread) -> Result<(), TaskError> {
@@ -319,40 +323,36 @@ impl DeadlineRunQueue {
     }
 
     pub(super) const fn has_pushable(&self) -> bool {
-        self.pushable_count != 0
-    }
-
-    fn set_pushable(&mut self, thread: ThreadId, pushable: bool) {
-        let entry = &mut self.pushable[thread.slot() as usize];
-        let present = entry.is_some_and(|generation| generation == thread.generation());
-        match (present, pushable) {
-            (false, true) => {
-                assert!(entry.replace(thread.generation()).is_none());
-                self.pushable_count = self
-                    .pushable_count
-                    .checked_add(1)
-                    .expect("Deadline pushable count must fit usize");
-            }
-            (true, false) => {
-                *entry = None;
-                self.pushable_count = self
-                    .pushable_count
-                    .checked_sub(1)
-                    .expect("Deadline pushable count must match membership");
-            }
-            _ => {}
-        }
+        !self.pushable.is_empty()
     }
 
     pub(super) fn refresh_pushable(&mut self, thread: ThreadId, current: Option<ThreadId>) {
-        let pushable = self
+        let queued = self
             .keys
             .get(thread.slot() as usize)
             .and_then(|entry| *entry)
             .filter(|(generation, _)| *generation == thread.generation())
-            .and_then(|(_, key)| self.get(key))
-            .is_some_and(|entry| entry.migration_capable && current != Some(thread));
-        self.set_pushable(thread, pushable);
+            .and_then(|(_, key)| {
+                self.get(key).map(|entry| {
+                    (
+                        key,
+                        entry.migration_capable && current != Some(thread),
+                        Arc::clone(&entry.core),
+                    )
+                })
+            });
+        let Some((key, should_be_pushable, core)) = queued else {
+            return;
+        };
+        let is_pushable = self.pushable.contains(thread);
+        match (is_pushable, should_be_pushable) {
+            (false, true) => self.pushable.insert(key, &core),
+            (true, false) => {
+                let removed = self.pushable.remove(key, &core);
+                debug_assert!(removed);
+            }
+            _ => {}
+        }
     }
 
     pub(super) fn insert(&mut self, thread: QueuedThread) -> DeadlineQueueKey {
@@ -387,7 +387,10 @@ impl DeadlineRunQueue {
             self.keys[key.thread.slot() as usize] = Some(indexed);
             return None;
         }
-        self.set_pushable(key.thread, false);
+        if self.pushable.contains(key.thread) {
+            let core = Arc::clone(&self.get(key)?.core);
+            assert!(self.pushable.remove(key, &core));
+        }
         let (root, removed) = remove_node(self.root.take(), key);
         self.root = root;
         let removed = removed.expect("Deadline identity index must match its ordered tree");
@@ -437,11 +440,14 @@ impl DeadlineRunQueue {
         Some((new_key, entity))
     }
 
-    pub(super) fn find_first_matching(
+    pub(super) fn find_first_pushable_matching(
         &self,
         predicate: &mut impl FnMut(&QueuedThread) -> bool,
     ) -> Option<QueuedThreadSnapshot> {
-        find_first_matching(self.root.as_deref(), predicate).map(QueuedThreadSnapshot::from)
+        self.pushable
+            .find_first_matching(|key| self.get(key).is_some_and(&mut *predicate))
+            .and_then(|key| self.get(key))
+            .map(QueuedThreadSnapshot::from)
     }
 
     pub(super) fn earliest_deadline_ns(&self) -> Option<u64> {
@@ -475,6 +481,7 @@ impl DeadlineRunQueue {
             self.keys.iter().filter(|entry| entry.is_some()).count(),
             self.len
         );
+        self.pushable.assert_invariants();
     }
 }
 
@@ -626,16 +633,6 @@ fn find_node_mut(
         Ordering::Greater => find_node_mut(node.right.as_deref_mut(), key),
         Ordering::Equal => Some(node),
     }
-}
-
-fn find_first_matching<'queue>(
-    node: Option<&'queue DeadlineNode>,
-    predicate: &mut impl FnMut(&QueuedThread) -> bool,
-) -> Option<&'queue QueuedThread> {
-    let node = node?;
-    find_first_matching(node.left.as_deref(), predicate)
-        .or_else(|| predicate(node.thread()).then_some(node.thread()))
-        .or_else(|| find_first_matching(node.right.as_deref(), predicate))
 }
 
 #[cfg(test)]

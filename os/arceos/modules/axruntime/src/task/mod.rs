@@ -90,28 +90,15 @@ use resources::{
     allocate_runtime_stack, allocate_runtime_tls, deallocate_runtime_stack, deallocate_runtime_tls,
 };
 pub use runtime_impl::{SchedSwitchTraceHook, install_sched_switch_trace_hook};
-#[cfg(all(test, any(feature = "ipi", feature = "wake-ipi")))]
-use scheduler_events::SchedulerIpiDoorbell;
-#[cfg(test)]
-use scheduler_events::SchedulerIpiPublication;
-#[cfg(all(test, not(any(feature = "ipi", feature = "wake-ipi"))))]
-use scheduler_events::publish_then_notify_scheduler_ipi;
-#[cfg(all(feature = "qperf-metrics", any(feature = "ipi", feature = "wake-ipi")))]
-use scheduler_events::record_scheduler_ipi_send;
 pub use scheduler_events::timer_irq_count;
 #[cfg(feature = "qperf-metrics")]
 pub use scheduler_events::{
     QperfRuntimeSchedulerMetricsSnapshot, qperf_runtime_scheduler_metrics_snapshot,
 };
-#[cfg(any(feature = "ipi", feature = "wake-ipi"))]
-pub(crate) use scheduler_events::{
-    claim_scheduler_ipi_doorbell, current_scheduler_ipi_doorbell_pending,
-    reset_current_scheduler_ipi_doorbell_for_offline,
-};
 #[cfg(feature = "irq")]
 pub(crate) use scheduler_events::{on_clock_event, publish_scheduler_tick};
-#[cfg(any(feature = "ipi", feature = "wake-ipi"))]
-use scheduler_events::{publish_scheduler_ipi_doorbell, publish_then_notify_scheduler_ipi};
+#[cfg(all(feature = "qperf-metrics", any(feature = "ipi", feature = "wake-ipi")))]
+use scheduler_events::{record_scheduler_ipi_consume, record_scheduler_ipi_send};
 pub use spawn::{
     prepare_raw, prepare_raw_with_extension_in_address_space_and_policy, spawn_raw,
     spawn_raw_with_affinity, spawn_raw_with_extension, spawn_raw_with_extension_and_affinity,

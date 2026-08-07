@@ -19,16 +19,16 @@ pub(super) enum SchedulerRequestDelivery {
     /// The owner is in the IRQ-disabled idle polling region and will observe
     /// the sticky work bit before committing to sleep.
     PollingOwner,
-    /// The runtime must publish a physical-delivery generation.
+    /// The runtime must notify the shared physical IPI delivery edge.
     ///
-    /// The logical request generation is already committed in ax-task; the
-    /// runtime transports that exact generation without inventing another.
+    /// The logical request generation remains entirely in ax-task. The
+    /// runtime transports only a coalescible edge and cannot acknowledge or
+    /// replace that logical state.
     DoorbellRequired,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SchedulerRequestPublication {
-    generation: u64,
     delivery: SchedulerRequestDelivery,
 }
 
@@ -132,16 +132,12 @@ impl CpuRemote {
                 )
             })
             .unwrap_or_else(|_| panic!("scheduler request generation exhausted"));
-        let generation = request_generation(previous) + 1;
         let delivery = if previous & REQUEST_IDLE_POLLING != 0 {
             SchedulerRequestDelivery::PollingOwner
         } else {
             SchedulerRequestDelivery::DoorbellRequired
         };
-        SchedulerRequestPublication {
-            generation,
-            delivery,
-        }
+        SchedulerRequestPublication { delivery }
     }
 
     pub(in crate::system::cpu) fn publish_hard_timer_work(&self) {
@@ -189,8 +185,8 @@ impl CpuRemote {
             );
         };
         let _irq = IrqScope::enter();
-        let publication = self.request_scheduler_work_owned();
-        self.ring_scheduler_doorbell(publication.generation);
+        let _publication = self.request_scheduler_work_owned();
+        self.ring_scheduler_doorbell();
     }
 
     pub(super) fn deliver_scheduler_work_owned(
@@ -202,11 +198,11 @@ impl CpuRemote {
         {
             return true;
         }
-        self.ring_scheduler_doorbell(publication.generation)
+        self.ring_scheduler_doorbell()
     }
 
-    fn ring_scheduler_doorbell(&self, generation: u64) -> bool {
-        match task_runtime::send_scheduler_ipi(RuntimeCpuId::new(self.owner.as_u32()), generation) {
+    fn ring_scheduler_doorbell(&self) -> bool {
+        match task_runtime::notify_scheduler_cpu(RuntimeCpuId::new(self.owner.as_u32())) {
             RuntimeStatus::Success => true,
             status => task_runtime::fatal_invariant(
                 0x4950_4900 | status as u32,

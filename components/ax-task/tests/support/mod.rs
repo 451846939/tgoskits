@@ -584,10 +584,8 @@ impl_trait! {
             });
             LAST_DEADLINE_GENERATION.with(|generation| generation.set(update.generation()));
         }
-        fn send_scheduler_ipi(cpu: RuntimeCpuId, generation: u64) -> RuntimeStatus {
-            VIRTUAL_RUNTIME.with(|runtime| {
-                runtime.borrow_mut().publish_ipi(cpu.as_u32(), generation)
-            })
+        fn notify_scheduler_cpu(cpu: RuntimeCpuId) -> RuntimeStatus {
+            VIRTUAL_RUNTIME.with(|runtime| runtime.borrow_mut().notify_ipi(cpu.as_u32()))
         }
         fn wait_for_interrupt() {
             let cpu = CURRENT_CPU.with(Cell::get);

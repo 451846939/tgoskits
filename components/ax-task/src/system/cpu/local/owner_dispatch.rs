@@ -43,6 +43,7 @@ impl CpuLocal {
             && run_queue.deadline_members_are_empty()
             && deadlines.queue.is_empty()
             && deadlines.expired_count == 0
+            && !deadlines.softirq_activated
             && self.dispatch.switch_handoff.is_none()
             && self.remote.is_quiescent_for_offline()
     }

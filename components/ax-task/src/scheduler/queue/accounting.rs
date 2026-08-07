@@ -270,7 +270,7 @@ impl RunQueue {
         match policy {
             SchedulePolicy::Deadline(_) => self.deadline.refresh_pushable(thread, current),
             SchedulePolicy::Fifo { priority } | SchedulePolicy::RoundRobin { priority, .. } => {
-                self.rt.refresh_pushable_priority(priority.get(), current);
+                self.rt.refresh_pushable(thread, priority.get(), current);
             }
             SchedulePolicy::KernelStop | SchedulePolicy::Fair { .. } => {}
         }

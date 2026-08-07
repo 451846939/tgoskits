@@ -75,7 +75,7 @@ impl RunQueue {
                     .expect("RT membership must retain its queue node")
                     .migration_capable = migration_capable;
                 self.rt
-                    .refresh_pushable_priority(priority, self.linked_current());
+                    .refresh_pushable(id, priority, self.linked_current());
             }
             QueueMembershipClass::Fair => {
                 let mut thread = self
@@ -108,28 +108,24 @@ impl RunQueue {
     pub(crate) fn next_balance_candidate(
         &mut self,
         scan_epoch: u64,
+        class: Option<SchedulingClass>,
         mut may_migrate: impl FnMut(&QueuedThread) -> bool,
     ) -> Option<QueuedThreadSnapshot> {
-        let linked_current = self.linked_current();
-        let candidate = self
-            .deadline
-            .find_first_matching(&mut |thread| {
-                Some(thread.id) != linked_current
-                    && thread.balance_scan_epoch != scan_epoch
-                    && may_migrate(thread)
-            })
-            .or_else(|| {
-                self.rt.find_first_matching(&mut |thread| {
-                    Some(thread.id) != linked_current
-                        && thread.balance_scan_epoch != scan_epoch
-                        && may_migrate(thread)
-                })
-            })
-            .or_else(|| {
-                self.fair.find_first_matching(&mut |thread| {
-                    thread.balance_scan_epoch != scan_epoch && may_migrate(thread)
-                })
-            })?;
+        let mut eligible =
+            |thread: &QueuedThread| thread.balance_scan_epoch != scan_epoch && may_migrate(thread);
+        let candidate = match class {
+            Some(SchedulingClass::Deadline) => {
+                self.deadline.find_first_pushable_matching(&mut eligible)
+            }
+            Some(SchedulingClass::Realtime) => self.rt.find_first_pushable_matching(&mut eligible),
+            Some(SchedulingClass::Fair) => self.fair.find_first_matching(&mut eligible),
+            Some(SchedulingClass::Stop | SchedulingClass::Idle) => None,
+            None => self
+                .deadline
+                .find_first_pushable_matching(&mut eligible)
+                .or_else(|| self.rt.find_first_pushable_matching(&mut eligible))
+                .or_else(|| self.fair.find_first_matching(&mut eligible)),
+        }?;
         self.mark_balance_candidate(candidate.id, scan_epoch);
         Some(candidate)
     }

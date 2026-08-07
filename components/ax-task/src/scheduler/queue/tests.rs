@@ -603,7 +603,7 @@ fn fair_pushable_summary_uses_wrapped_runqueue_order() {
     let epoch = queue.begin_balance_scan();
     assert_eq!(
         queue
-            .next_balance_candidate(epoch, |_| true)
+            .next_balance_candidate(epoch, None, |_| true)
             .expect("one Fair candidate must be movable")
             .id,
         ThreadId::from_parts(1, 1),

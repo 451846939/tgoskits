@@ -588,6 +588,7 @@ impl TaskSystem {
             processed += 1;
         }
         let pending = cpu.has_expired_task_deadlines() || cpu.has_due_task_deadline(monotonic_now);
+        cpu.as_mut().finish_task_deadline_softirq(pending);
         if pending {
             cpu.remote().publish_ktimer_work();
         }

@@ -167,10 +167,10 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
     #[cfg(not(feature = "multitask"))]
     initialize_primary_platform(cpu_id, arg);
 
-    #[cfg(feature = "ipi")]
+    #[cfg(any(feature = "ipi", feature = "wake-ipi"))]
     {
         ax_ipi::init();
-        #[cfg(feature = "irq")]
+        #[cfg(all(feature = "irq", feature = "ipi"))]
         ax_hal::irq::set_run_on_cpu_sync(crate::ipi_delivery::run_on_cpu_sync);
     }
 
@@ -197,7 +197,7 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
     #[cfg(feature = "multitask")]
     crate::guard::release_bootstrap_preemption();
 
-    #[cfg(all(feature = "irq", feature = "ipi"))]
+    #[cfg(all(feature = "irq", any(feature = "ipi", feature = "wake-ipi")))]
     ax_ipi::mark_current_cpu_ready();
 
     #[cfg(feature = "multitask")]
@@ -249,7 +249,7 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
         core::hint::spin_loop();
     }
 
-    #[cfg(all(feature = "irq", feature = "ipi"))]
+    #[cfg(all(feature = "irq", any(feature = "ipi", feature = "wake-ipi")))]
     ax_ipi::wait_for_all_cpus_ready();
 
     #[cfg(all(feature = "smp", feature = "ipi"))]

@@ -137,13 +137,9 @@ fn exercise_irq_masked_idle_wake(target_cpu: usize, sender_cpu: usize) {
         // SAFETY: the thunk uses only static atomics and is bounded hard-IRQ
         // work. `call_on_cpu` does not return before it has completed.
         unsafe {
-            ax_ipi::call_on_cpu(
-                CpuId(target_cpu),
-                idle_wake_callback,
-                core::ptr::null_mut(),
-            )
+            ax_ipi::call_on_cpu(CpuId(target_cpu), idle_wake_callback, core::ptr::null_mut())
         }
-            .expect("idle-wake hard call failed");
+        .expect("idle-wake hard call failed");
     });
 
     sender.join().unwrap();

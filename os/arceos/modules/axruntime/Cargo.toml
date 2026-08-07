@@ -19,10 +19,9 @@ host-test = [
   "ax-percpu/host-test",
 ]
 ipi = ["irq", "dep:ax-ipi", "ax-hal/ipi"]
-# Register a lightweight IPI IRQ handler that only acknowledges SGIs so idle
-# CPUs can wake and re-enter the scheduler. This intentionally does not enable
-# the ax-ipi callback queue.
-wake-ipi = ["irq", "ax-hal/ipi"]
+# Scheduler-only users still share ax-ipi's typed, coalescible physical edge;
+# logical pending state remains in ax-task.
+wake-ipi = ["irq", "dep:ax-ipi", "ax-hal/ipi"]
 irq = [
   "paging",
   "ax-hal/irq",

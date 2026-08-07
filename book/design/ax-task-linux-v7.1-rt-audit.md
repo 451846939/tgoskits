@@ -444,14 +444,15 @@ queued 实体；不能把旧 inbox quiescent 当作 offline 完成条件。
 
 ### 物理门铃
 
-deadline、owner control 与 deferred task-work 仍使用逻辑 sticky work。ax-runtime 的
-`SchedulerIpiDoorbell` 是这些 owner-only 工作的唯一物理 coalescer：
+deadline、owner control 与 deferred task-work 仍使用逻辑 sticky work。#1916 引入的
+`ax-ipi::DeliveryEdge` 是所有 IPI 用户共享的唯一物理 coalescer；ax-runtime 不再为 scheduler
+维护第二套 doorbell generation：
 
-1. producer 发布 inbox/payload；
-2. `published_epoch` 单调递增；
-3. 仅 `edge_armed: false -> true` 的 producer 发送 IPI；
-4. handler 入口先清 edge，再把当前 `published_epoch` 记为 `claimed_epoch`；
-5. handler drain 期间的新 generation 因 edge 已清而拥有新的物理 IPI。
+1. producer 先发布 inbox/payload 及 ax-task 的逻辑 request generation；
+2. `ax_ipi::notify_cpu()` 把该 publication 映射为一个可合并的物理 edge；
+3. 已 armed 的 edge 覆盖并发 publication，不复制逻辑 pending 状态；
+4. handler 入口先调用 `ax_ipi::claim_current_delivery()`，再读取各逻辑 owner；
+5. drain 期间的新 publication 看到已 claim 的 edge 后可以重新发送 IPI。
 
 `RuntimeStatus::Busy` 不再表示 coalescing：成功意味着当前 generation 已由新边或在途边
 覆盖，错误只表示运行时无法兑现投递。全局 deferred task-work 同样以
@@ -2490,6 +2491,44 @@ API、超时重试、轮询推进或 silent fallback。
 该复审也否定了两个看似统一、实则偏离 PREEMPT_RT 的修改方向：不得把 ktimer worker 的任务
 运行时间扣成 hardirq 时间；不得把 `on_rq`、`rq->curr` 和 class linkage 压成一个无法表示
 Fair-current/RT-running 留队差异的枚举。
+
+### 2026-08-07 #1916 接入与优先级迁移索引检查点
+
+基于 `origin/dev@159c16bcb` 重新核对 #1916 的 typed IPI transport，并逐行对照 Linux v7.1
+`kernel/sched/rt.c` 的 `pushable_tasks`、`kernel/sched/deadline.c` 的
+`pushable_dl_tasks_root` 以及 `kernel/time/hrtimer.c` 的 `softirq_activated`。本检查点得到以下
+结论和改动：
+
+- #1916 的 `ax-ipi::DeliveryEdge` 已提供完整的物理 `Idle/Sending/Armed + epoch` 生命周期。
+  ax-runtime 原有 scheduler 专用 doorbell 与它重复，现已删除；scheduler、hard-call 和 legacy
+  IPI 用户在 handler 入口统一 claim 物理 edge。ax-task 的 generation 仍是逻辑 rq request/ack
+  authority，只通过 `notify_scheduler_cpu()` 请求一个物理边，二者不再传递或复制 generation；
+- 当前 RT/DL overload publication 虽然已有 cpupri/cpudl，但 rq 内只保存 RT priority bitmap 和
+  DL slot membership，真正 push/pull 仍扫描 active class tree。这与 Linux “优先级索引负责选
+  候选、active tree 负责 pick”不一致。RT 现使用每 priority 的独立 task-embedded FIFO
+  pushable linkage；DL 使用独立 task-embedded、按 absolute deadline 排序的 AVL tree，作为
+  Rust 中与 Linux plist/rb-tree 等价的无分配实现。enqueue/dequeue、set-next/put-prev、affinity、
+  reclassify 和 migration 都通过 class hook 更新该唯一 membership，balance 不再扫描 running
+  entity 或不可迁移任务；
+- 原 soft-timer 选择把“queue head 已过期”直接等同于“ktimer worker 已获得 owner”，可能在
+  hard IRQ 尚未转移 payload 前停止物理 clockevent。现增加与 Linux
+  `hrtimer_cpu_base::softirq_activated` 同义的 owner bit：只有 hard clockevent path promote 后
+  才能抑制已到期物理边；worker 完成有界 drain 后清除或重新发布该 bit；
+- scheduler/fair deadline selection 改为 pure peek。普通 park arm/cancel 或 deadline
+  publication 不得顺便把已到期 Fair timer 转成 pending，也不得以 scheduler work 代替一个尚未
+  firing 的硬 timer；已到期 hard deadline继续交给 `LocalClockEvent`，由设备最小 delta 触发唯一
+  firing transaction。
+
+本检查点不宣称整体重构完成。后续必须先完成以下架构闭环，再进入小错误和性能修复：
+
+1. 对 RT/DL pushable class hook 做确定性 ordering、current exclusion、affinity change、迁移回滚
+   测试，并删除剩余 generic balance filter 与 active-tree fallback；
+2. 核验 `OwnerRqTxn` 的 put-prev/pick/set-next、root-domain push iterator 与 switch-tail 在所有
+   error path 都只发布一次 cpupri/cpudl/overload；
+3. 完成 clockevent `Firing`、ktimer owner bit、idle polling 与 hotplug 迁移的 virtual-runtime/
+   loom 覆盖，确认任何进度都不依赖偶然 tick 或 task-context 查询；
+4. 统一编译 ax-task、ax-runtime、ax-sync 及 mandatory callers，随后运行 x86 ArceOS/Starry
+   QEMU；只有架构闭环后才定位具体测试和性能回退。
 
 ## 模块化结果
 

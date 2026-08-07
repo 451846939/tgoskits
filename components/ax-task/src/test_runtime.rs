@@ -383,7 +383,7 @@ impl TaskRuntime for UnitTestRuntime {
         run_hook_reentry_query();
         LAST_SCHEDULER_DEADLINE_UPDATE.with(|observed| observed.set(Some(update)));
     }
-    fn send_scheduler_ipi(_cpu: RuntimeCpuId, _generation: u64) -> RuntimeStatus {
+    fn notify_scheduler_cpu(_cpu: RuntimeCpuId) -> RuntimeStatus {
         run_hook_reentry_query();
         SCHEDULER_IPI_SEND_COUNT.with(|count| count.set(count.get() + 1));
         let irq_guards = ACTIVE_IRQ_TOKENS.with(|tokens| tokens.borrow().len());
