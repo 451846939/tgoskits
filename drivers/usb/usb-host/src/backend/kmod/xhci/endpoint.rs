@@ -79,11 +79,17 @@ struct SubmittedTd {
     cancelled: bool,
 }
 
-#[derive(Clone)]
 enum SubmittedTdKind {
     Normal { completion_trb: TransferId },
     Control(ControlTd),
     Iso { packets: Vec<IsoPacketTd> },
+}
+
+#[derive(Clone, Copy)]
+enum ReclaimTarget {
+    Normal(TransferId),
+    Control(ControlTd),
+    Iso,
 }
 
 #[derive(Clone, Copy)]
@@ -239,7 +245,7 @@ impl Endpoint {
         event_trb: TransferId,
         event: TransferEvent,
     ) -> Result<Transfer, TransferError> {
-        let submitted = self.inflight.remove(&request_id).ok_or_else(|| {
+        let submitted = self.remove_request(request_id).ok_or_else(|| {
             warn!(
                 "xhci: completion for missing request dci={} request_id={} event_trb={:#x}",
                 self.dci.raw(),
@@ -248,6 +254,22 @@ impl Endpoint {
             );
             TransferError::InvalidEndpoint
         })?;
+
+        if submitted.cancelled {
+            return Err(TransferError::Cancelled);
+        }
+
+        if matches!(event.completion_code(), Ok(CompletionCode::StallError)) {
+            self.halted.store(true, Ordering::Release);
+        }
+        if !matches!(submitted.kind, SubmittedTdKind::Iso { .. }) {
+            self.validate_completion_code(event, &submitted.transfer)?;
+        }
+        self.transfer_from_completion(submitted, event_trb, event)
+    }
+
+    fn remove_request(&mut self, request_id: EndpointRequestId) -> Option<SubmittedTd> {
+        let submitted = self.inflight.remove(&request_id)?;
         self.outstanding_trbs = self.outstanding_trbs.saturating_sub(submitted.trb_count);
         match &submitted.kind {
             SubmittedTdKind::Normal { completion_trb } => {
@@ -264,18 +286,7 @@ impl Endpoint {
                 }
             }
         }
-
-        if submitted.cancelled {
-            return Err(TransferError::Cancelled);
-        }
-
-        if matches!(event.completion_code(), Ok(CompletionCode::StallError)) {
-            self.halted.store(true, Ordering::Release);
-        }
-        if !matches!(submitted.kind, SubmittedTdKind::Iso { .. }) {
-            self.validate_completion_code(event, &submitted.transfer)?;
-        }
-        self.transfer_from_completion(submitted, event_trb, event)
+        Some(submitted)
     }
 
     fn transfer_from_completion(
@@ -628,9 +639,7 @@ impl EndpointOp for Endpoint {
 
         let mut data_bus_addr = 0;
         if transfer.buffer_len() > 0 {
-            if matches!(transfer.direction, Direction::Out) {
-                transfer.prepare_for_device_all();
-            }
+            transfer.prepare_for_device_all();
             data_bus_addr = transfer.dma_addr();
             let buffer_end = data_bus_addr + transfer.buffer_len() as u64;
             if data_bus_addr > self.kernel.dma_mask() || buffer_end > self.kernel.dma_mask() {
@@ -784,19 +793,23 @@ impl EndpointOp for Endpoint {
         id: RequestId,
     ) -> Option<Result<TransferCompletion, TransferError>> {
         let request_id = Self::private_request_id(id);
-        let kind = self.inflight.get(&request_id)?.kind.clone();
-        match kind {
-            SubmittedTdKind::Normal { completion_trb } => {
+        let target = match &self.inflight.get(&request_id)?.kind {
+            SubmittedTdKind::Normal { completion_trb } => ReclaimTarget::Normal(*completion_trb),
+            SubmittedTdKind::Control(control_td) => ReclaimTarget::Control(*control_td),
+            SubmittedTdKind::Iso { .. } => ReclaimTarget::Iso,
+        };
+        match target {
+            ReclaimTarget::Normal(completion_trb) => {
                 let event = self.ring.get_finished(completion_trb.0)?;
                 Some(
                     self.complete_request(request_id, completion_trb, event)
                         .map(|transfer| transfer_to_completion(id, transfer)),
                 )
             }
-            SubmittedTdKind::Control(control_td) => {
+            ReclaimTarget::Control(control_td) => {
                 self.reclaim_control_request(id, request_id, control_td)
             }
-            SubmittedTdKind::Iso { .. } => self.reclaim_iso_request(id, request_id),
+            ReclaimTarget::Iso => self.reclaim_iso_request(id, request_id),
         }
     }
 
@@ -828,6 +841,13 @@ impl EndpointOp for Endpoint {
             .ok_or(TransferError::InvalidEndpoint)?;
         submitted.cancelled = true;
         Ok(())
+    }
+
+    fn retire_request_after_quiesce(&mut self, id: RequestId) -> Result<(), TransferError> {
+        let request_id = Self::private_request_id(id);
+        self.remove_request(request_id)
+            .map(drop)
+            .ok_or(TransferError::InvalidEndpoint)
     }
 
     fn reset(&mut self) -> EndpointResetFuture {
