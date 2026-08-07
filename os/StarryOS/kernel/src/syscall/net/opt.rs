@@ -417,7 +417,13 @@ pub fn sys_getsockopt(
         };
 
         if level == SOL_SOCKET && optname == SO_ACCEPTCONN {
-            *get::<i32>(optval, optlen)? = socket.is_listening() as i32;
+            write_fixed(
+                current,
+                optval,
+                optlen_ptr,
+                optlen,
+                socket.is_listening() as i32,
+            )?;
             return Ok(0);
         }
         if level == SOL_SOCKET && optname == SO_TYPE {

@@ -131,8 +131,8 @@ impl FileLike for MountTableFile {
         self.file.file_mmap()
     }
 
-    fn ioctl(&self, cmd: u32, arg: usize) -> AxResult<usize> {
-        self.file.ioctl(cmd, arg)
+    fn ioctl(&self, current: &crate::task::UserTaskRef, cmd: u32, arg: usize) -> AxResult<usize> {
+        self.file.ioctl(current, cmd, arg)
     }
 
     fn open_flags(&self) -> u32 {

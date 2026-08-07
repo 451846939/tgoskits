@@ -6,7 +6,7 @@ use core::{
 
 use ax_errno::{AxError, AxResult, LinuxError};
 use ax_fs_ng::vfs::is_mount_busy as fs_is_mount_busy;
-use ax_sync::Mutex;
+use ax_sync::PiMutex;
 use axfs_ng_vfs::{Filesystem, MetadataUpdate, Mountpoint, NodePermission};
 use axpoll::{IoEvents, Pollable};
 use linux_raw_sys::general::{
@@ -14,11 +14,10 @@ use linux_raw_sys::general::{
     MOUNT_ATTR_NODEV, MOUNT_ATTR_NOEXEC, MOUNT_ATTR_NOSUID, MOUNT_ATTR_RDONLY,
     MOUNT_ATTR_STRICTATIME, MOVE_MOUNT_F_EMPTY_PATH, O_PATH, fsconfig_command,
 };
-use starry_vm::VmPtr;
 
 use crate::{
     file::{Directory, FD_TABLE, File, FileLike},
-    mm::vm_load_string,
+    mm::{VmPtr, vm_load_string},
     pseudofs::{
         MemoryFs,
         dev::{
@@ -217,14 +216,14 @@ struct MountContextState {
 
 struct MountContext {
     kind: MountContextKind,
-    state: Mutex<MountContextState>,
+    state: PiMutex<MountContextState>,
 }
 
 impl MountContext {
     fn new(kind: MountContextKind) -> Self {
         Self {
             kind,
-            state: Mutex::new(MountContextState {
+            state: PiMutex::new(MountContextState {
                 filesystem: None,
                 source: None,
                 root_mode: NodePermission::from_bits_truncate(0o755),
@@ -305,7 +304,7 @@ pub fn sys_fsopen(
         return Err(AxError::OperationNotPermitted);
     }
 
-    let kind = match vm_load_string(fs_name)?.as_str() {
+    let kind = match vm_load_string(current, fs_name)?.as_str() {
         "tmpfs" => MountContextKind::Tmpfs,
         "ramfs" => MountContextKind::Ramfs,
         "devpts" => MountContextKind::DevPts,
@@ -335,8 +334,8 @@ pub fn sys_fsconfig(
             if key.is_null() || value.is_null() || aux != 0 || state.filesystem.is_some() {
                 return Err(AxError::InvalidInput);
             }
-            let key = vm_load_string(key)?;
-            let value = vm_load_string(value.cast())?;
+            let key = vm_load_string(current, key)?;
+            let value = vm_load_string(current, value.cast())?;
             match (context.kind, key.as_str()) {
                 (_, "source") if state.filesystem.is_none() && !value.is_empty() => {
                     state.source = Some(value);
@@ -367,7 +366,7 @@ pub fn sys_fsconfig(
             if key.is_null() || !value.is_null() || aux != 0 {
                 return Err(AxError::InvalidInput);
             }
-            match vm_load_string(key)?.as_str() {
+            match vm_load_string(current, key)?.as_str() {
                 // Linux systemd deliberately falls back from tmpfs to ramfs
                 // when the kernel cannot configure tmpfs with `noswap`.
                 "noswap"
@@ -469,7 +468,7 @@ pub fn sys_move_mount(
     to_path: *const c_char,
     flags: u32,
 ) -> AxResult<isize> {
-    if flags != MOVE_MOUNT_F_EMPTY_PATH || !vm_load_string(from_path)?.is_empty() {
+    if flags != MOVE_MOUNT_F_EMPTY_PATH || !vm_load_string(current, from_path)?.is_empty() {
         return Err(AxError::InvalidInput);
     }
     if !current.as_thread().cred().has_cap_sys_admin() {
@@ -480,7 +479,7 @@ pub fn sys_move_mount(
     if !source.is_detached_mount_handle() {
         return Err(AxError::InvalidInput);
     }
-    let path = vm_load_string(to_path)?;
+    let path = vm_load_string(current, to_path)?;
     let fs_context = ax_fs_ng::vfs::current_fs_context();
     let mount_namespace = fs_context.lock().mount_namespace().clone();
     let target = if path.starts_with('/') {
@@ -517,11 +516,11 @@ pub fn sys_mount_setattr(
     if !current.as_thread().cred().has_cap_sys_admin() {
         return Err(AxError::OperationNotPermitted);
     }
-    if !vm_load_string(path)?.is_empty() {
+    if !vm_load_string(current, path)?.is_empty() {
         return Err(AxError::InvalidInput);
     }
 
-    let attributes = attributes.vm_read()?;
+    let attributes = attributes.vm_read(current)?;
     validate_mount_attributes(&attributes)?;
 
     let directory = Directory::from_fd(dirfd)?;

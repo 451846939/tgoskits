@@ -227,9 +227,7 @@ fn mount_table_namespace(
     };
 
     let task = get_task(pid).ok()?;
-    let scope = task.as_thread().scope.read();
-    let fs_context = FS_CONTEXT.scope(&scope).clone();
-    drop(scope);
+    let fs_context = task.as_thread().clone_scope_item(&FS_CONTEXT);
     Some(fs_context.lock().mount_namespace().clone())
 }
 

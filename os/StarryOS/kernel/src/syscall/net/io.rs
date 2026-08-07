@@ -5,7 +5,6 @@ use ax_errno::{AxError, AxResult};
 use ax_io::prelude::*;
 use ax_net::{
     CMsgData, IpCmsg, RecvFlags, RecvOptions, SendFlags, SendOptions, SocketAddrEx, SocketCmsg,
-    SocketOps,
 };
 use ax_runtime::hal::time::wall_time;
 use linux_raw_sys::{

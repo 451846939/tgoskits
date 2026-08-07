@@ -341,7 +341,7 @@ impl Directory {
     pub(crate) fn new_detached_mount(inner: Location, open_flags: u32) -> Self {
         Self {
             inner,
-            offset: Mutex::new(0),
+            offset: PiMutex::new(0),
             open_flags,
             detached_mount_handle: true,
         }

@@ -632,9 +632,7 @@ pub fn handle_syscall(current: &UserTaskRef, uctx: &mut UserContext) {
             uctx.arg4() as _,
         ) as _,
         Sysno::umount2 => sys_umount2(current, uctx.arg0() as _, uctx.arg1() as _) as _,
-        Sysno::pivot_root => {
-            sys_pivot_root(current, uctx.arg0() as _, uctx.arg1() as _) as _
-        }
+        Sysno::pivot_root => sys_pivot_root(current, uctx.arg0() as _, uctx.arg1() as _) as _,
         Sysno::fsopen => sys_fsopen(current, uctx.arg0() as _, uctx.arg1() as _),
         Sysno::fsconfig => sys_fsconfig(
             current,
