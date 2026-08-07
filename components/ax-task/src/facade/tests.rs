@@ -10,6 +10,7 @@ mod tests {
         inbox::{InboxKind, InboxMessage, InboxNode, PublishResult},
         runtime::{AddressSpaceHandle, AddressSpaceToken},
         test_runtime,
+        timer::ExpiredTaskDeadline,
     };
 
     static PARKING_EXIT_CALLBACKS: AtomicUsize = AtomicUsize::new(0);
@@ -107,7 +108,11 @@ mod tests {
             ThreadExtension::new(0, &ORDERING_EXTENSION_OPS)
         };
 
-        prepare_next_address_space(AddressSpaceHandle::NONE, ThreadId::from_parts(1, 1));
+        prepare_next_address_space(
+            AddressSpaceHandle::NONE,
+            AddressSpaceHandle::NONE,
+            ThreadId::from_parts(1, 1),
+        );
 
         assert_eq!(test_runtime::installed_address_space(), Some(0));
         assert_eq!(
@@ -177,6 +182,62 @@ mod tests {
     }
 
     #[test]
+    fn membarrier_registration_publishes_requested_then_ready_for_current_mm() {
+        use crate::{
+            MembarrierError, ThreadResources,
+            runtime::{
+                ExecutionContextHandle, MembarrierRegistration, StackHandle, TlsHandle,
+            },
+        };
+
+        let system = Box::pin(TaskSystem::new(crate::TaskSystemConfig::new(1)).unwrap());
+        let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
+        let address_space = unsafe {
+            // SAFETY: the unit runtime treats these distinct scalar resources
+            // as live for the complete fixture and consumes them at teardown.
+            AddressSpaceToken::from_raw(0x4d42_1000)
+        };
+        let address_space_handle = address_space.handle();
+        let resources = unsafe {
+            // SAFETY: every non-zero scalar has one unique fixture owner.
+            ThreadResources::new(
+                ExecutionContextHandle::from_raw(0x4d42_1001),
+                StackHandle::from_raw(0x4d42_1002),
+                TlsHandle::from_raw(0x4d42_1003),
+                address_space,
+            )
+        };
+        system
+            .install_bootstrap_thread(cpu.as_mut(), unsafe {
+                ThreadSpec::new(SchedulePolicy::default()).with_resources(resources)
+            })
+            .unwrap();
+        system.bring_cpu_online(cpu.as_mut()).unwrap();
+        let _runtime_handles = InstalledTaskHandles::new(system.as_ref(), cpu.as_mut());
+
+        // Linux permits GLOBAL_EXPEDITED regardless of whether the caller's
+        // mm registered it; registration only controls which remote rq values
+        // are selected as targets.
+        membarrier(MembarrierCommand::GlobalExpedited).unwrap();
+        assert_eq!(
+            membarrier(MembarrierCommand::PrivateExpedited),
+            Err(MembarrierError::NotRegistered)
+        );
+        register_current_membarrier(MembarrierRegistration::PrivateExpedited).unwrap();
+        let state = task_runtime::address_space_membarrier_state(address_space_handle);
+        assert!(state.requested(MembarrierRegistration::PrivateExpedited));
+        assert!(state.ready(MembarrierRegistration::PrivateExpedited));
+        let rq_state = cpu.remote().lock_run_queue().membarrier_state();
+        assert_eq!(rq_state.identity(), state.identity());
+        assert!(rq_state.requested(MembarrierRegistration::PrivateExpedited));
+        assert!(
+            !rq_state.ready(MembarrierRegistration::PrivateExpedited),
+            "registration synchronizes requested state before mm publishes ready"
+        );
+        membarrier(MembarrierCommand::PrivateExpedited).unwrap();
+    }
+
+    #[test]
     fn timer_expiry_during_parking_is_committed_by_the_owner_thread() {
         let system = Box::pin(TaskSystem::new(crate::TaskSystemConfig::new(1)).unwrap());
         let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
@@ -203,16 +264,10 @@ mod tests {
             1,
             "Linux rq->nr_running still accounts current until the owner park transaction commits"
         );
-        let mut irq_return_passes = 0;
-        while current_cpu_needs_resched().unwrap() {
-            assert!(
-                schedule_current_cpu().unwrap().parking_deferred(),
-                "timer IRQ-return scheduling must defer until the park token commits"
-            );
-            irq_return_passes += 1;
-            assert!(irq_return_passes < 2, "PARKING must not spin at IRQ return");
-        }
-        assert_eq!(irq_return_passes, 1);
+        assert!(
+            !current_cpu_needs_resched().unwrap(),
+            "a soft timeout must wake ktimers/%u instead of forcing an IRQ-return scheduler pass"
+        );
         assert_eq!(
             system.thread_state(running.id()).unwrap(),
             crate::ThreadState::Parking
@@ -266,7 +321,7 @@ mod tests {
         system.bring_cpu_online(cpu.as_mut()).unwrap();
         let _runtime_handles = InstalledTaskHandles::new(system.as_ref(), cpu.as_mut());
 
-        system.service_soft_timer_work(cpu.as_mut()).unwrap();
+        assert_eq!(system.service_ktimer_work(cpu.as_mut()).unwrap().processed(), 0);
         assert_eq!(
             cpu.deadline_expire_passes_for_test(),
             0,
@@ -344,7 +399,7 @@ mod tests {
             "an affinity update that does not migrate must not enter a scheduler safe point"
         );
         let mut expired = [ExpiredTaskDeadline::EMPTY; 1];
-        assert_eq!(take_current_expired_task_deadlines(&mut expired).unwrap(), 1);
+        assert_eq!(cpu.as_mut().take_expired_task_deadlines(&mut expired), 1);
         assert_eq!(
             expired[0].thread(),
             Some(unrelated.id()),
@@ -385,7 +440,7 @@ mod tests {
             "park commit must use one runqueue-clock sample"
         );
         let mut expired = [ExpiredTaskDeadline::EMPTY; 1];
-        assert_eq!(take_current_expired_task_deadlines(&mut expired).unwrap(), 1);
+        assert_eq!(cpu.as_mut().take_expired_task_deadlines(&mut expired), 1);
         assert_eq!(
             expired[0].thread(),
             Some(unrelated.id()),
@@ -394,7 +449,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_safe_point_only_services_deadlines_claimed_by_clock_irq() {
+    fn scheduler_safe_point_never_executes_irq_claimed_soft_timeout() {
         let system = Box::pin(TaskSystem::new(crate::TaskSystemConfig::new(1)).unwrap());
         let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
         let running = system
@@ -422,8 +477,13 @@ mod tests {
         assert_eq!(on_clock_event(instant(10), 64).unwrap().expired(), 1);
         assert!(schedule_current_cpu().unwrap().parking_deferred());
         assert!(
+            !running.core.take_park_notification(),
+            "the IRQ-off scheduler frame must leave soft timeout wakeup to the timer worker"
+        );
+        assert_eq!(system.service_ktimer_work(cpu.as_mut()).unwrap().processed(), 1);
+        assert!(
             running.core.take_park_notification(),
-            "the soft-timer owner must complete the IRQ-claimed expiration"
+            "the task-context timer worker must complete the IRQ-claimed expiration"
         );
         assert!(
             !cancel_current_park_deadline(&running, &mut ticket).unwrap(),
@@ -439,12 +499,19 @@ mod tests {
         let policy =
             SchedulePolicy::round_robin_with_quantum(crate::RtPriority::new(1).unwrap(), 10)
                 .unwrap();
-        system
-            .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(policy))
+        let running = system
+            .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
             .unwrap();
         system.bring_cpu_online(cpu.as_mut()).unwrap();
+        system.set_thread_policy(running.id(), policy).unwrap();
+        test_runtime::set_scheduler_ns(0);
+        system.drain_owner_control(cpu.as_mut()).unwrap();
         let _runtime_handles = InstalledTaskHandles::new(system.as_ref(), cpu.as_mut());
 
+        // Reclassifying the running task publishes one Linux-style reschedule
+        // request. Consume that owner transaction before isolating the RR
+        // quantum expiry exercised below.
+        schedule_current_cpu().unwrap();
         assert!(!current_cpu_needs_resched().unwrap());
         test_runtime::set_scheduler_ns(10);
         let outcome = on_clock_event(instant(10), 64).unwrap();
@@ -517,12 +584,12 @@ mod tests {
                 .update()
                 .deadline()
                 .is_none_or(|deadline| deadline.as_nanos() > 11),
-            "an expired bounded backlog must be advanced by sticky task work, not by a timer \
+            "an expired bounded backlog must be advanced by ktimers, not by a timer \
              interrupt rearmed at the 1ns hardware resolution"
         );
         assert!(
-            owner_snapshot(&system, cpu.as_ref()).need_resched(),
-            "the deferred owner pass must remain a scheduler-visible safe point"
+            cpu.remote().ktimer_event().is_pending(),
+            "hard IRQ must publish the per-CPU ktimer event after transferring timeout payload"
         );
     }
 
@@ -564,23 +631,23 @@ mod tests {
         assert_eq!(on_clock_event(instant(10), 2).unwrap().expired(), 2);
         let mut first_event = [ExpiredTaskDeadline::EMPTY; 1];
         assert_eq!(
-            take_current_expired_task_deadlines(&mut first_event).unwrap(),
+            cpu.as_mut().take_expired_task_deadlines(&mut first_event),
             1
         );
         let mut second_event = [ExpiredTaskDeadline::EMPTY; 1];
         assert_eq!(
-            take_current_expired_task_deadlines(&mut second_event).unwrap(),
+            cpu.as_mut().take_expired_task_deadlines(&mut second_event),
             1
         );
         assert_ne!(first_event[0].thread(), second_event[0].thread());
         assert_eq!(
-            take_current_expired_task_deadlines(&mut second_event).unwrap(),
+            cpu.as_mut().take_expired_task_deadlines(&mut second_event),
             0
         );
     }
 
     #[test]
-    fn scheduler_safe_points_finish_clockevent_backlog_without_another_irq() {
+    fn ktimer_worker_finishes_clockevent_backlog_without_another_irq() {
         let system = Box::pin(
             TaskSystem::new(
                 crate::TaskSystemConfig::new(1)
@@ -617,17 +684,17 @@ mod tests {
         let irq = on_clock_event(instant(10), 1).unwrap();
         assert_eq!(irq.expired(), 1);
         assert!(irq.pending());
+        let mut processed = 0;
         let mut passes = 0;
-        while current_cpu_needs_resched().unwrap() {
-            assert!(schedule_current_cpu().is_ok());
+        while !cpu.remote().lock_deadline_base().queue.is_empty()
+            || cpu.has_expired_task_deadlines()
+        {
+            let batch = system.service_ktimer_work(cpu.as_mut()).unwrap();
+            processed += batch.processed();
             passes += 1;
-            assert!(
-                passes <= 3,
-                "bounded soft-timer work must make progress: {:?}",
-                cpu.remote().scheduler_request_state_for_test()
-            );
+            assert!(passes <= 3, "bounded ktimer work must make progress");
         }
-        assert_eq!(passes, 3);
+        assert_eq!(processed, 3);
         assert!(cpu.remote().lock_deadline_base().queue.is_empty());
     }
 
@@ -1401,7 +1468,7 @@ mod tests {
             "pre-switch validation, switch tail, and exit commit each own one rq transaction"
         );
         let mut expired = [ExpiredTaskDeadline::EMPTY; 1];
-        assert_eq!(take_current_expired_task_deadlines(&mut expired).unwrap(), 1);
+        assert_eq!(cpu.as_mut().take_expired_task_deadlines(&mut expired), 1);
         assert_eq!(
             expired[0].thread(),
             Some(unrelated.id()),

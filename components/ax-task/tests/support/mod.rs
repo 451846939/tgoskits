@@ -670,6 +670,32 @@ impl_trait! {
         ) -> AddressSpaceReclaimArmOutcome {
             AddressSpaceReclaimArmOutcome::Ready
         }
+        fn address_space_membarrier_state(
+            address_space: AddressSpaceHandle,
+        ) -> AddressSpaceMembarrierState {
+            let raw = address_space.into_raw();
+            // SAFETY: integration fixtures retain each address-space token for
+            // every rq snapshot that can contain this test identity.
+            let identity = unsafe { AddressSpaceMembarrierId::from_raw(raw) };
+            // SAFETY: integration fixtures currently model no registrations.
+            unsafe { AddressSpaceMembarrierState::new(identity, 0) }
+        }
+        fn update_address_space_membarrier_state(
+            address_space: AddressSpaceHandle,
+            _registration: MembarrierRegistration,
+            _phase: MembarrierRegistrationPhase,
+        ) -> AddressSpaceMembarrierState {
+            Self::address_space_membarrier_state(address_space)
+        }
+        fn synchronize_membarrier_cpu(
+            _cpu: RuntimeCpuId,
+            action: RuntimeMembarrierAction,
+        ) -> RuntimeStatus {
+            if action == RuntimeMembarrierAction::MemoryBarrier {
+                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            }
+            RuntimeStatus::Success
+        }
         unsafe fn switch_context(switch: ContextSwitch) {
             let cpu = CURRENT_CPU.with(Cell::get);
             VIRTUAL_RUNTIME.with(|runtime| {

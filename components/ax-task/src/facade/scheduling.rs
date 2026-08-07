@@ -180,7 +180,11 @@ pub(super) fn execute_switch_plan(
             )
         };
     }
-    prepare_next_address_space(next.address_space(), next.thread());
+    prepare_next_address_space(
+        previous.address_space(),
+        next.address_space(),
+        next.thread(),
+    );
     #[cfg(feature = "qperf-metrics")]
     crate::metrics::record_context_switch();
     let switch = ContextSwitch::new(previous.context(), next.context())
@@ -205,9 +209,25 @@ fn activate_next_address_space(
 }
 
 pub(super) fn prepare_next_address_space(
+    previous_address_space: crate::runtime::AddressSpaceHandle,
     address_space: crate::runtime::AddressSpaceHandle,
     thread: ThreadId,
 ) {
+    let previous = if previous_address_space.is_none() {
+        crate::runtime::AddressSpaceMembarrierState::NONE
+    } else {
+        task_runtime::address_space_membarrier_state(previous_address_space)
+    };
+    let next = if address_space.is_none() {
+        crate::runtime::AddressSpaceMembarrierState::NONE
+    } else {
+        task_runtime::address_space_membarrier_state(address_space)
+    };
+    if previous.identity() != next.identity() {
+        // Common four-architecture counterpart of Linux's switch_mm()/mmdrop
+        // barrier after publishing rq->curr and before user execution.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    }
     activate_next_address_space(address_space, thread);
 }
 

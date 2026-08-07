@@ -69,6 +69,10 @@ impl TaskSystem {
             task_runtime::fatal_invariant(0x5343_1102, core.id().as_u64() as usize);
         }
 
+        // Linux's smp_mb__after_spinlock() orders prior userspace accesses
+        // before rq->curr can publish a different task or a kernel thread.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+
         let migration_requested =
             placement.requested_migration().is_some() || !sched.affinity.affinity.contains(owner);
         let current_policy = transaction
@@ -411,12 +415,34 @@ impl TaskSystem {
         transaction: &mut OwnerRqTxn<'_>,
         _outgoing: Option<ThreadId>,
     ) -> OwnerNext {
-        let owner = cpu.owner();
         let rt_eligibility = if !transaction.rt_is_effectively_throttled() {
             RtEligibility::Runnable
         } else {
             RtEligibility::Throttled
         };
+        self.pick_owner_next_with_rt_eligibility(cpu, transaction, rt_eligibility)
+    }
+
+    /// Selects the sole bootstrap task before RT runtime and root-domain
+    /// publication are enabled for this CPU.
+    ///
+    /// The bootstrap API accepts only a Fair task, so consulting online RT
+    /// throttling state here would cross the Linux `sched_init()` boundary.
+    pub(super) fn pick_owner_bootstrap_in_rq(
+        &self,
+        cpu: Pin<&mut CpuLocal>,
+        transaction: &mut OwnerRqTxn<'_>,
+    ) -> OwnerNext {
+        self.pick_owner_next_with_rt_eligibility(cpu, transaction, RtEligibility::Runnable)
+    }
+
+    fn pick_owner_next_with_rt_eligibility(
+        &self,
+        cpu: Pin<&mut CpuLocal>,
+        transaction: &mut OwnerRqTxn<'_>,
+        rt_eligibility: RtEligibility,
+    ) -> OwnerNext {
+        let owner = cpu.owner();
         let Some(queued) = transaction.pick_next_task(rt_eligibility) else {
             let (core, active, metadata, rt_quota_exempt) =
                 transaction.take_idle_schedule().unwrap_or_else(|| {

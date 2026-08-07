@@ -96,6 +96,46 @@ fn cpu_online_transition_samples_the_owner_rq_clock_once() {
 }
 
 #[test]
+fn offline_bootstrap_rq_setup_does_not_enter_runtime_irq_service() {
+    let system = TaskSystem::new(TaskSystemConfig::new(1)).unwrap();
+    let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
+
+    crate::test_runtime::reset_irq_guard_entries();
+    system
+        .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
+        .unwrap();
+    system
+        .register_idle_thread(
+            cpu.as_mut(),
+            ThreadSpec::new(SchedulePolicy::fair(Nice::ZERO, FairMode::Idle)),
+        )
+        .unwrap();
+
+    assert_eq!(
+        crate::test_runtime::irq_guard_entries(),
+        0,
+        "Linux sched_init uses the already IRQ-off boot owner, not IRQ-exit service hooks",
+    );
+}
+
+#[test]
+fn offline_bootstrap_accepts_only_the_linux_boot_fair_class() {
+    let system = TaskSystem::new(TaskSystemConfig::new(1)).unwrap();
+    let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
+
+    assert!(matches!(
+        system.install_bootstrap_thread(
+            cpu.as_mut(),
+            ThreadSpec::new(SchedulePolicy::fifo(RtPriority::new(1).unwrap())),
+        ),
+        Err(TaskError::InvalidConfiguration)
+    ));
+    system
+        .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
+        .unwrap();
+}
+
+#[test]
 fn block_transition_samples_the_owner_rq_clock_once() {
     let system = TaskSystem::new(TaskSystemConfig::new(1)).unwrap();
     let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
@@ -3667,12 +3707,16 @@ fn running_rt_task_has_one_active_schedule_owner() {
     let system = TaskSystem::new(TaskSystemConfig::new(1)).unwrap();
     let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
     let running = system
-        .install_bootstrap_thread(
-            cpu.as_mut(),
-            ThreadSpec::new(SchedulePolicy::round_robin(RtPriority::new(1).unwrap())),
-        )
+        .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
         .unwrap();
     system.bring_cpu_online(cpu.as_mut()).unwrap();
+    system
+        .set_thread_policy(
+            running.id(),
+            SchedulePolicy::round_robin(RtPriority::new(1).unwrap()),
+        )
+        .unwrap();
+    system.drain_owner_control_at(cpu.as_mut(), 0).unwrap();
 
     let thread_owner = {
         let state = system.state.lock();
@@ -3957,12 +4001,13 @@ fn running_idle_to_normal_transition_uses_both_class_virtual_times() {
     let system = TaskSystem::new(TaskSystemConfig::new(1)).unwrap();
     let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
     let idle = system
-        .install_bootstrap_thread(
-            cpu.as_mut(),
-            ThreadSpec::new(SchedulePolicy::fair(Nice::ZERO, FairMode::Idle)),
-        )
+        .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
         .unwrap();
     system.bring_cpu_online(cpu.as_mut()).unwrap();
+    system
+        .set_thread_policy(idle.id(), SchedulePolicy::fair(Nice::ZERO, FairMode::Idle))
+        .unwrap();
+    system.drain_owner_control_at(cpu.as_mut(), 0).unwrap();
 
     let normal = system
         .create_thread(ThreadSpec::new(SchedulePolicy::default()))
@@ -4259,13 +4304,17 @@ fn queued_affinity_migration_captures_lag_before_detaching_from_source() {
     let mut cpu0 = system.create_cpu_local(CpuId::new(0)).unwrap();
     let mut cpu1 = system.create_cpu_local(CpuId::new(1)).unwrap();
     for cpu in [&mut cpu0, &mut cpu1] {
-        system
-            .install_bootstrap_thread(
-                cpu.as_mut(),
-                ThreadSpec::new(SchedulePolicy::fifo(RtPriority::new(1).unwrap())),
-            )
+        let bootstrap = system
+            .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
             .unwrap();
         system.bring_cpu_online(cpu.as_mut()).unwrap();
+        system
+            .set_thread_policy(
+                bootstrap.id(),
+                SchedulePolicy::fifo(RtPriority::new(1).unwrap()),
+            )
+            .unwrap();
+        system.drain_owner_control_at(cpu.as_mut(), 0).unwrap();
     }
 
     let migrating = system

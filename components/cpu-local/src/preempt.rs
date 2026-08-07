@@ -27,6 +27,12 @@ impl PreemptState {
         Self(AtomicU32::new(PREEMPT_NO_RESCHED))
     }
 
+    /// Linux `INIT_PREEMPT_COUNT`: the boot current cannot schedule until its
+    /// runqueue, current/idle tasks, and scheduler runtime owner are published.
+    pub(crate) const fn bootstrap_disabled() -> Self {
+        Self(AtomicU32::new(PREEMPT_NO_RESCHED | 1))
+    }
+
     #[inline(always)]
     pub(crate) fn depth(&self) -> u32 {
         self.0.load(Ordering::Relaxed) & PREEMPT_DEPTH_MASK

@@ -4,7 +4,7 @@ use alloc::{boxed::Box, sync::Arc};
 use core::{
     mem::align_of,
     ptr,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicU32, AtomicUsize, Ordering},
 };
 
 use ax_memory_addr::PhysAddr;
@@ -12,7 +12,9 @@ use ax_task::{
     TaskError,
     runtime::{
         AddressSpaceActivation, AddressSpaceActivationKind, AddressSpaceDestroyOutcome,
-        AddressSpaceHandle, AddressSpaceReclaimArmOutcome, AddressSpaceToken, RuntimeStatus,
+        AddressSpaceHandle, AddressSpaceMembarrierId, AddressSpaceMembarrierState,
+        AddressSpaceReclaimArmOutcome, AddressSpaceToken, MembarrierRegistration,
+        MembarrierRegistrationPhase, RuntimeStatus,
     },
 };
 
@@ -51,8 +53,7 @@ struct RuntimeAddressSpace {
     root: usize,
     active_cpus: AtomicUsize,
     reclaim_waiting: AtomicUsize,
-    #[cfg(feature = "uspace")]
-    cpu_tracker: Arc<AddressSpaceCpuTracker>,
+    cpu_state: Arc<AddressSpaceCpuState>,
     _owner: Box<dyn TaskAddressSpaceOwner>,
 }
 
@@ -64,17 +65,19 @@ const _: () = assert!(crate::CPU_CAPACITY <= usize::BITS as usize);
 /// the same tracker. The runtime publishes a CPU bit before installing the
 /// root and clears it only after replacing the hardware root, so page-table
 /// mutation can target every CPU that may retain a translation.
-pub struct AddressSpaceCpuTracker {
+pub struct AddressSpaceCpuState {
     root: usize,
     active_mask: AtomicUsize,
+    membarrier_bits: AtomicU32,
 }
 
-impl AddressSpaceCpuTracker {
-    /// Creates an inactive CPU tracker permanently bound to `root`.
+impl AddressSpaceCpuState {
+    /// Creates inactive runtime state permanently bound to one `mm` root.
     pub fn new(root: PhysAddr) -> Self {
         Self {
             root: root.as_usize(),
             active_mask: AtomicUsize::new(0),
+            membarrier_bits: AtomicU32::new(0),
         }
     }
 
@@ -85,6 +88,36 @@ impl AddressSpaceCpuTracker {
     /// Returns the CPUs that may currently retain translations for this root.
     pub fn active_mask(&self) -> usize {
         self.active_mask.load(Ordering::Acquire)
+    }
+
+    fn membarrier_state(this: &Arc<Self>) -> AddressSpaceMembarrierState {
+        let raw = Arc::as_ptr(this).expose_provenance();
+        // SAFETY: every scheduler token and `AddrSpace` owner retains this Arc,
+        // so its allocation cannot be reused while the identity is rq-visible.
+        let identity = unsafe { AddressSpaceMembarrierId::from_raw(raw) };
+        let bits = this.membarrier_bits.load(Ordering::SeqCst);
+        // SAFETY: `membarrier_bits` is changed only through the typed phase
+        // update below and therefore contains only declared registration bits.
+        unsafe { AddressSpaceMembarrierState::new(identity, bits) }
+    }
+
+    fn update_membarrier_state(
+        this: &Arc<Self>,
+        registration: MembarrierRegistration,
+        phase: MembarrierRegistrationPhase,
+    ) -> AddressSpaceMembarrierState {
+        let bit = match phase {
+            MembarrierRegistrationPhase::Begin => registration.requested_bit(),
+            MembarrierRegistrationPhase::Complete => {
+                assert!(
+                    this.membarrier_bits.load(Ordering::SeqCst) & registration.requested_bit() != 0,
+                    "membarrier registration completed before its requested phase"
+                );
+                registration.ready_bit()
+            }
+        };
+        this.membarrier_bits.fetch_or(bit, Ordering::SeqCst);
+        Self::membarrier_state(this)
     }
 
     #[cfg(any(feature = "uspace", test))]
@@ -115,7 +148,7 @@ impl TaskAddressSpace {
     pub fn new(root: PhysAddr, owner: impl Send + Sync + 'static) -> Result<Self, TaskError> {
         Self::new_with_owner(
             root,
-            Arc::new(AddressSpaceCpuTracker::new(root)),
+            Arc::new(AddressSpaceCpuState::new(root)),
             Box::new(RetainedTaskAddressSpaceOwner(owner)),
         )
     }
@@ -128,13 +161,13 @@ impl TaskAddressSpace {
     /// drop after all active-CPU leases have drained.
     pub fn new_with_task_detach<T: Send + Sync + 'static>(
         root: PhysAddr,
-        cpu_tracker: Arc<AddressSpaceCpuTracker>,
+        cpu_state: Arc<AddressSpaceCpuState>,
         owner: T,
         detach: fn(&T),
     ) -> Result<Self, TaskError> {
         Self::new_with_owner(
             root,
-            cpu_tracker,
+            cpu_state,
             Box::new(DetachableTaskAddressSpaceOwner {
                 owner,
                 detached: core::sync::atomic::AtomicBool::new(false),
@@ -145,10 +178,10 @@ impl TaskAddressSpace {
 
     fn new_with_owner(
         root: PhysAddr,
-        cpu_tracker: Arc<AddressSpaceCpuTracker>,
+        cpu_state: Arc<AddressSpaceCpuState>,
         owner: Box<dyn TaskAddressSpaceOwner>,
     ) -> Result<Self, TaskError> {
-        if root.as_usize() == 0 || !cpu_tracker.matches_root(root) {
+        if root.as_usize() == 0 || !cpu_state.matches_root(root) {
             return Err(TaskError::InvalidRuntimeHandle);
         }
         let address_space = Box::new(RuntimeAddressSpace {
@@ -156,12 +189,9 @@ impl TaskAddressSpace {
             root: root.as_usize(),
             active_cpus: AtomicUsize::new(0),
             reclaim_waiting: AtomicUsize::new(0),
-            #[cfg(feature = "uspace")]
-            cpu_tracker,
+            cpu_state,
             _owner: owner,
         });
-        #[cfg(not(feature = "uspace"))]
-        let _ = cpu_tracker;
         let raw = Box::into_raw(address_space).expose_provenance();
         // SAFETY: the fresh allocation transfers its unique destruction right
         // into this move-only token.
@@ -288,25 +318,27 @@ fn commit_user_address_space_activation(
     publish_active: impl FnOnce(usize),
 ) {
     let same_address_space = next_raw == previous_raw
-        || previous.is_some_and(|previous| Arc::ptr_eq(&previous.cpu_tracker, &next.cpu_tracker));
+        || previous.is_some_and(|previous| Arc::ptr_eq(&previous.cpu_state, &next.cpu_state));
     if same_address_space {
         debug_assert_eq!(
             previous.map(|previous| previous.root),
             Some(next.root),
             "one address-space CPU tracker cannot describe different roots"
         );
-        // Match Linux `switch_mm_irqs_off(prev == next)`: retain the CPU's
-        // existing active-mm lease. A shared immutable tracker proves that the
-        // hardware root and TLB footprint are already correct, even when two
-        // scheduler threads own distinct lifetime tokens for that same mm.
+        // Match Linux arm64's `enter_lazy_tlb()`/`switch_mm_irqs_off()` pair:
+        // retain the active-mm lease, but restore the user root if a kernel
+        // thread temporarily installed the reserved lower root. The runtime
+        // backend suppresses the write when the hardware root is already
+        // correct, so user-to-user switches in the same mm remain a no-op.
+        install_root(next.root);
         return;
     }
     next.active_cpus.fetch_add(1, Ordering::AcqRel);
-    next.cpu_tracker.activate(cpu_id);
+    next.cpu_state.activate(cpu_id);
     install_root(next.root);
     publish_active(next_raw);
     if let Some(previous) = previous {
-        previous.cpu_tracker.deactivate(cpu_id);
+        previous.cpu_state.deactivate(cpu_id);
         release_active_cpu(previous);
     }
 }
@@ -380,7 +412,7 @@ pub(super) fn release_current_active_address_space() {
             let previous = runtime_address_space(previous)
                 .unwrap_or_else(|_| panic!("offline CPU retained a stale active address space"));
             previous
-                .cpu_tracker
+                .cpu_state
                 .deactivate(pin.area().cpu_index().as_usize());
             release_active_cpu(previous);
         })
@@ -414,6 +446,25 @@ pub(super) fn arm_runtime_address_space_reclaim(
     } else {
         AddressSpaceReclaimArmOutcome::Armed
     }
+}
+
+pub(super) fn runtime_address_space_membarrier_state(
+    address_space: AddressSpaceHandle,
+) -> AddressSpaceMembarrierState {
+    let address_space = runtime_address_space(address_space)
+        .unwrap_or_else(|_| panic!("membarrier received an invalid address-space handle"));
+    AddressSpaceCpuState::membarrier_state(&address_space.cpu_state)
+}
+
+pub(super) fn update_runtime_address_space_membarrier_state(
+    address_space: AddressSpaceHandle,
+    registration: MembarrierRegistration,
+    phase: MembarrierRegistrationPhase,
+) -> AddressSpaceMembarrierState {
+    let address_space = runtime_address_space(address_space).unwrap_or_else(|_| {
+        panic!("membarrier registration received an invalid address-space handle")
+    });
+    AddressSpaceCpuState::update_membarrier_state(&address_space.cpu_state, registration, phase)
 }
 
 #[cfg(any(feature = "uspace", test))]
@@ -558,7 +609,7 @@ mod tests {
         let drops = Arc::new(AtomicUsize::new(0));
         let mut token = TaskAddressSpace::new_with_task_detach(
             ax_memory_addr::PhysAddr::from(0x4000),
-            Arc::new(AddressSpaceCpuTracker::new(PhysAddr::from(0x4000))),
+            Arc::new(AddressSpaceCpuState::new(PhysAddr::from(0x4000))),
             CountDetach {
                 detaches: Arc::clone(&detaches),
                 drops: Arc::clone(&drops),
@@ -590,8 +641,8 @@ mod tests {
     }
 
     #[test]
-    fn shared_cpu_tracker_publishes_and_withdraws_cpu_footprints() {
-        let tracker = AddressSpaceCpuTracker::new(PhysAddr::from(0x4000));
+    fn shared_cpu_state_publishes_and_withdraws_cpu_footprints() {
+        let tracker = AddressSpaceCpuState::new(PhysAddr::from(0x4000));
 
         tracker.activate(1);
         tracker.activate(3);
@@ -602,18 +653,58 @@ mod tests {
     }
 
     #[test]
-    fn address_space_cpu_tracker_rejects_mismatched_root() {
-        let tracker = Arc::new(AddressSpaceCpuTracker::new(PhysAddr::from(0x4000)));
+    fn address_space_cpu_state_rejects_mismatched_root() {
+        let tracker = Arc::new(AddressSpaceCpuState::new(PhysAddr::from(0x4000)));
         let token =
             TaskAddressSpace::new_with_task_detach(PhysAddr::from(0x8000), tracker, (), |_| {});
 
         assert!(matches!(token, Err(TaskError::InvalidRuntimeHandle)));
     }
 
+    #[test]
+    fn shared_mm_tokens_share_membarrier_identity_and_registration() {
+        let cpu_state = Arc::new(AddressSpaceCpuState::new(PhysAddr::from(0x4000)));
+        let first = TaskAddressSpace::new_with_task_detach(
+            PhysAddr::from(0x4000),
+            Arc::clone(&cpu_state),
+            (),
+            |_| {},
+        )
+        .unwrap();
+        let second = TaskAddressSpace::new_with_task_detach(
+            PhysAddr::from(0x4000),
+            Arc::clone(&cpu_state),
+            (),
+            |_| {},
+        )
+        .unwrap();
+
+        let requested = update_runtime_address_space_membarrier_state(
+            first.handle(),
+            MembarrierRegistration::PrivateExpedited,
+            MembarrierRegistrationPhase::Begin,
+        );
+        let observed = runtime_address_space_membarrier_state(second.handle());
+        assert_eq!(requested, observed);
+        assert!(observed.requested(MembarrierRegistration::PrivateExpedited));
+        assert!(!observed.ready(MembarrierRegistration::PrivateExpedited));
+
+        let ready = update_runtime_address_space_membarrier_state(
+            second.handle(),
+            MembarrierRegistration::PrivateExpedited,
+            MembarrierRegistrationPhase::Complete,
+        );
+        assert_eq!(
+            runtime_address_space_membarrier_state(first.handle()),
+            ready
+        );
+        assert!(ready.ready(MembarrierRegistration::PrivateExpedited));
+    }
+
     #[cfg(feature = "uspace")]
     #[test]
     fn same_mm_activation_retains_the_existing_cpu_lease_without_hardware_work() {
-        let tracker = Arc::new(AddressSpaceCpuTracker::new(PhysAddr::from(0x4000)));
+        let tracker = Arc::new(AddressSpaceCpuState::new(PhysAddr::from(0x4000)));
         let previous = TaskAddressSpace::new_with_task_detach(
             PhysAddr::from(0x4000),
             Arc::clone(&tracker),
@@ -632,6 +723,7 @@ mod tests {
         let next_runtime = runtime_address_space(next.handle()).unwrap();
         previous_runtime.active_cpus.store(1, Ordering::Release);
         tracker.activate(0);
+        let hardware_root = AtomicUsize::new(0x4000);
         let hardware_installs = AtomicUsize::new(0);
         let active_publications = AtomicUsize::new(0);
 
@@ -641,8 +733,10 @@ mod tests {
             Some(previous_runtime),
             next.handle().into_raw(),
             next_runtime,
-            |_| {
-                hardware_installs.fetch_add(1, Ordering::Relaxed);
+            |root| {
+                if hardware_root.swap(root, Ordering::AcqRel) != root {
+                    hardware_installs.fetch_add(1, Ordering::Relaxed);
+                }
             },
             |_| {
                 active_publications.fetch_add(1, Ordering::Relaxed);
@@ -658,6 +752,61 @@ mod tests {
         assert_eq!(previous_leases, 1);
         assert_eq!(next_leases, 0);
         assert_eq!(hardware_installs.load(Ordering::Relaxed), 0);
+        assert_eq!(active_publications.load(Ordering::Relaxed), 0);
+    }
+
+    #[cfg(feature = "uspace")]
+    #[test]
+    fn lazy_kernel_root_is_restored_before_same_mm_user_execution() {
+        let tracker = Arc::new(AddressSpaceCpuState::new(PhysAddr::from(0x4000)));
+        let previous = TaskAddressSpace::new_with_task_detach(
+            PhysAddr::from(0x4000),
+            Arc::clone(&tracker),
+            (),
+            |_| {},
+        )
+        .unwrap();
+        let next = TaskAddressSpace::new_with_task_detach(
+            PhysAddr::from(0x4000),
+            Arc::clone(&tracker),
+            (),
+            |_| {},
+        )
+        .unwrap();
+        let previous_runtime = runtime_address_space(previous.handle()).unwrap();
+        let next_runtime = runtime_address_space(next.handle()).unwrap();
+        previous_runtime.active_cpus.store(1, Ordering::Release);
+        tracker.activate(0);
+        let hardware_root = AtomicUsize::new(0);
+        let hardware_installs = AtomicUsize::new(0);
+        let active_publications = AtomicUsize::new(0);
+
+        commit_user_address_space_activation(
+            0,
+            previous.handle().into_raw(),
+            Some(previous_runtime),
+            next.handle().into_raw(),
+            next_runtime,
+            |root| {
+                if hardware_root.swap(root, Ordering::AcqRel) != root {
+                    hardware_installs.fetch_add(1, Ordering::Relaxed);
+                }
+            },
+            |_| {
+                active_publications.fetch_add(1, Ordering::Relaxed);
+            },
+        );
+
+        let previous_leases = previous_runtime.active_cpus.load(Ordering::Acquire);
+        let next_leases = next_runtime.active_cpus.load(Ordering::Acquire);
+        previous_runtime.active_cpus.store(0, Ordering::Release);
+        next_runtime.active_cpus.store(0, Ordering::Release);
+        tracker.deactivate(0);
+
+        assert_eq!(hardware_root.load(Ordering::Acquire), 0x4000);
+        assert_eq!(hardware_installs.load(Ordering::Relaxed), 1);
+        assert_eq!(previous_leases, 1);
+        assert_eq!(next_leases, 0);
         assert_eq!(active_publications.load(Ordering::Relaxed), 0);
     }
 }

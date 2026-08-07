@@ -1,6 +1,8 @@
-use core::sync::atomic::{Ordering, fence};
-
 use ax_errno::{AxError, AxResult};
+use ax_runtime::task::{
+    MembarrierCommand, MembarrierError, MembarrierRegistration, TaskError, membarrier,
+    register_current_membarrier,
+};
 use linux_raw_sys::general::membarrier_cmd;
 
 /// Memory barrier commands
@@ -14,9 +16,6 @@ const MEMBARRIER_CMD_PRIVATE_EXPEDITED: i32 =
 const MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED: i32 =
     membarrier_cmd::MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED as i32;
 
-const MEMBARRIER_STATE_PRIVATE_EXPEDITED: u32 = MEMBARRIER_CMD_PRIVATE_EXPEDITED as u32;
-const MEMBARRIER_STATE_GLOBAL_EXPEDITED: u32 = MEMBARRIER_CMD_GLOBAL_EXPEDITED as u32;
-
 /// Supported command flags for query
 const SUPPORTED_COMMANDS: i32 = MEMBARRIER_CMD_GLOBAL
     | MEMBARRIER_CMD_GLOBAL_EXPEDITED
@@ -24,8 +23,17 @@ const SUPPORTED_COMMANDS: i32 = MEMBARRIER_CMD_GLOBAL
     | MEMBARRIER_CMD_PRIVATE_EXPEDITED
     | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED;
 
-fn smp_mb() {
-    fence(Ordering::SeqCst);
+fn map_membarrier_error(error: MembarrierError) -> AxError {
+    match error {
+        MembarrierError::NotRegistered => AxError::OperationNotPermitted,
+        MembarrierError::Task(TaskError::InvalidConfiguration) => AxError::InvalidInput,
+        MembarrierError::Task(TaskError::UnsafeContext) => AxError::OperationNotPermitted,
+        MembarrierError::Task(_) => AxError::BadState,
+    }
+}
+
+fn map_membarrier_registration_error(error: TaskError) -> AxError {
+    map_membarrier_error(MembarrierError::Task(error))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -54,7 +62,7 @@ fn decode_membarrier_action(cmd: i32, flags: u32) -> AxResult<MembarrierAction> 
 }
 
 pub fn sys_membarrier(
-    current: &crate::task::UserTaskRef,
+    _current: &crate::task::UserTaskRef,
     cmd: i32,
     flags: u32,
     _cpu_id: i32,
@@ -62,37 +70,25 @@ pub fn sys_membarrier(
     match decode_membarrier_action(cmd, flags)? {
         MembarrierAction::Query => Ok(SUPPORTED_COMMANDS as isize),
         MembarrierAction::Global => {
-            smp_mb();
+            membarrier(MembarrierCommand::Global).map_err(map_membarrier_error)?;
             Ok(0)
         }
         MembarrierAction::RegisterGlobalExpedited => {
-            current
-                .as_thread()
-                .proc_data
-                .register_membarrier_state(MEMBARRIER_STATE_GLOBAL_EXPEDITED);
+            register_current_membarrier(MembarrierRegistration::GlobalExpedited)
+                .map_err(map_membarrier_registration_error)?;
             Ok(0)
         }
         MembarrierAction::GlobalExpedited => {
-            let proc_data = current.as_thread().proc_data.clone();
-            if proc_data.membarrier_state() & MEMBARRIER_STATE_GLOBAL_EXPEDITED == 0 {
-                return Err(AxError::OperationNotPermitted);
-            }
-            smp_mb();
+            membarrier(MembarrierCommand::GlobalExpedited).map_err(map_membarrier_error)?;
             Ok(0)
         }
         MembarrierAction::RegisterPrivateExpedited => {
-            current
-                .as_thread()
-                .proc_data
-                .register_membarrier_state(MEMBARRIER_STATE_PRIVATE_EXPEDITED);
+            register_current_membarrier(MembarrierRegistration::PrivateExpedited)
+                .map_err(map_membarrier_registration_error)?;
             Ok(0)
         }
         MembarrierAction::PrivateExpedited => {
-            let proc_data = current.as_thread().proc_data.clone();
-            if proc_data.membarrier_state() & MEMBARRIER_STATE_PRIVATE_EXPEDITED == 0 {
-                return Err(AxError::OperationNotPermitted);
-            }
-            smp_mb();
+            membarrier(MembarrierCommand::PrivateExpedited).map_err(map_membarrier_error)?;
             Ok(0)
         }
     }

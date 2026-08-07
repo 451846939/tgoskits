@@ -2,6 +2,12 @@
 
 use super::*;
 
+#[derive(Clone, Copy)]
+enum ThreadCreationContext {
+    Runtime,
+    OfflineBootstrap,
+}
+
 impl TaskSystem {
     /// Creates a thread in the [`ThreadState::New`] state.
     ///
@@ -12,7 +18,7 @@ impl TaskSystem {
         // creation is enabled. Like Linux fork, this establishes task_cpu()
         // before the new task can participate in PI or become runnable.
         let initial_cpu = CpuId::new(unsafe { task_runtime::current_cpu_id() }.as_u32());
-        self.create_thread_on_cpu(spec, initial_cpu)
+        self.create_thread_on_cpu(spec, initial_cpu, ThreadCreationContext::Runtime)
     }
 
     /// Builds an unpublished task with an explicit initial `task_cpu`.
@@ -24,6 +30,7 @@ impl TaskSystem {
         &self,
         spec: ThreadSpec,
         initial_cpu: CpuId,
+        context: ThreadCreationContext,
     ) -> Result<ThreadHandle, TaskError> {
         if initial_cpu.as_usize() >= self.config.cpu_count() {
             return Err(TaskError::InvalidCpu(initial_cpu.as_u32()));
@@ -58,7 +65,16 @@ impl TaskSystem {
         // so a first wake or cross-CPU migration cannot allocate under rq
         // irqsave locks.
         for remote in &self.cpu_remotes {
-            remote.lock_run_queue().prepare_thread_slot(slot as usize);
+            let mut run_queue = match context {
+                ThreadCreationContext::Runtime => remote.lock_run_queue(),
+                ThreadCreationContext::OfflineBootstrap => {
+                    // SAFETY: per-CPU bootstrap retains raw IRQ exclusion and
+                    // PREEMPT_DISABLED until the complete rq/current/idle
+                    // owner is published.
+                    unsafe { remote.lock_run_queue_irq_disabled() }
+                }
+            };
+            run_queue.prepare_thread_slot(slot as usize);
         }
 
         // Runtime construction may allocate, fault, or call into platform
@@ -185,6 +201,20 @@ impl TaskSystem {
         sched.transition(&record.core, ThreadState::Ready)
     }
 
+    /// Performs the initial ready transition before the owner CPU is online.
+    ///
+    /// # Safety
+    ///
+    /// The caller must retain the boot CPU's raw IRQ exclusion and
+    /// `PREEMPT_DISABLED` ownership.
+    unsafe fn make_ready_bootstrap(&self, thread: ThreadId) -> Result<(), TaskError> {
+        let state = self.state.lock();
+        let record = state.thread_record(thread)?;
+        // SAFETY: forwarded from this method's offline boot-owner contract.
+        let mut sched = unsafe { record.sched.lock_bootstrap() };
+        sched.transition(&record.core, ThreadState::Ready)
+    }
+
     /// Installs the CPU's already-running bootstrap execution context.
     ///
     /// This operation is used before a CPU is published online and performs no
@@ -197,33 +227,49 @@ impl TaskSystem {
     ) -> Result<ThreadHandle, TaskError> {
         let unpublished = UnpublishedThreadGuard::new(self, spec);
         self.ensure_owner_cpu_context(&cpu)?;
+        if !matches!(
+            unpublished.spec().policy(),
+            SchedulePolicy::Fair {
+                mode: FairMode::Normal | FairMode::Batch,
+                ..
+            }
+        ) {
+            return Err(TaskError::InvalidConfiguration);
+        }
         {
             let state = self.state.lock();
             let registration = state.cpu_registration(cpu.owner())?;
             if !Arc::ptr_eq(&registration.remote, cpu.remote()) {
                 return Err(TaskError::InvalidRuntimeHandle);
             }
-            if cpu.current().is_some() {
+            // SAFETY: install_bootstrap_thread is an offline owner operation;
+            // its caller retains the boot CPU's raw IRQ exclusion.
+            if unsafe { cpu.remote().lock_run_queue_irq_disabled() }
+                .current_thread()
+                .is_some()
+            {
                 return Err(TaskError::InvalidConfiguration);
             }
         }
 
-        let thread = self.create_thread_on_cpu(unpublished.into_spec(), cpu.owner())?;
+        let thread = self.create_thread_on_cpu(
+            unpublished.into_spec(),
+            cpu.owner(),
+            ThreadCreationContext::OfflineBootstrap,
+        )?;
         let setup = (|| {
             let core = {
                 let state = self.state.lock();
                 Arc::clone(&state.thread_record(thread.id())?.core)
             };
-            let mut sched = core.sched().lock();
+            // SAFETY: the CPU is still offline under the boot owner's raw IRQ
+            // exclusion.
+            let mut sched = unsafe { core.sched().lock_bootstrap() };
             sched.transition(&core, ThreadState::Ready)?;
             let remote = Arc::clone(cpu.remote());
-            let mut transaction = OwnerRqTxn::begin(self, &remote);
-            let now_ns = transaction.clock().wall().as_nanos();
-            if matches!(sched.policy.active().policy(), SchedulePolicy::Deadline(_)) {
-                let mut entity = sched.policy.active().entity().clone();
-                entity.activate_deadline(now_ns);
-                *sched.policy.active_mut().entity_mut() = entity;
-            }
+            // SAFETY: the CPU is still offline under the boot owner's raw IRQ
+            // exclusion and cannot enter the runtime IRQ-exit service.
+            let mut transaction = unsafe { OwnerRqTxn::begin_bootstrap(self, &remote) };
             self.link_owner_ready_thread_locked(
                 cpu.owner(),
                 &mut transaction,
@@ -231,11 +277,11 @@ impl TaskSystem {
                 &mut sched,
                 EnqueueReason::Wake,
             );
-            let next = self.pick_owner_next_in_rq(cpu.as_mut(), &mut transaction, None);
+            let next = self.pick_owner_bootstrap_in_rq(cpu.as_mut(), &mut transaction);
             if !Arc::ptr_eq(&next.core, &core) {
                 task_runtime::fatal_invariant(0x4254_0001, core.id().as_u64() as usize);
             }
-            transaction.commit();
+            transaction.commit_bootstrap();
             Ok(())
         })();
         if let Err(error) = setup {
@@ -270,13 +316,24 @@ impl TaskSystem {
             if !Arc::ptr_eq(&registration.remote, cpu.remote()) {
                 return Err(TaskError::InvalidRuntimeHandle);
             }
-            if cpu.idle().is_some() {
+            // SAFETY: register_idle_thread runs in the same offline bootstrap
+            // owner transaction as install_bootstrap_thread.
+            if unsafe { cpu.remote().lock_run_queue_irq_disabled() }
+                .idle()
+                .is_some()
+            {
                 return Err(TaskError::InvalidConfiguration);
             }
         }
 
-        let thread = self.create_thread_on_cpu(unpublished.into_spec(), cpu.owner())?;
-        let setup = self.make_ready(thread.id()).and_then(|()| {
+        let thread = self.create_thread_on_cpu(
+            unpublished.into_spec(),
+            cpu.owner(),
+            ThreadCreationContext::OfflineBootstrap,
+        )?;
+        // SAFETY: the target CPU remains offline and boot-owned until idle is
+        // installed and the complete runtime endpoint is published.
+        let setup = unsafe { self.make_ready_bootstrap(thread.id()) }.and_then(|()| {
             let state = self.state.lock();
             let core = Arc::clone(&state.thread_record(thread.id())?.core);
             drop(state);
@@ -300,10 +357,17 @@ impl TaskSystem {
         core: Arc<ThreadCore>,
     ) -> Result<(), TaskError> {
         let owner = cpu.owner();
-        if cpu.idle().is_some() {
+        // SAFETY: idle installation precedes CPU online publication and the
+        // boot owner retains local IRQ exclusion.
+        if unsafe { cpu.remote().lock_run_queue_irq_disabled() }
+            .idle()
+            .is_some()
+        {
             return Err(TaskError::InvalidConfiguration);
         }
-        let mut sched = core.sched().lock();
+        // SAFETY: install_idle_core is reached only from the offline bootstrap
+        // transaction above.
+        let mut sched = unsafe { core.sched().lock_bootstrap() };
         let policy = sched.policy.active().policy();
         if sched.lifecycle.state() != ThreadState::Ready
             || !matches!(
@@ -323,14 +387,18 @@ impl TaskSystem {
         let metadata = sched.rq_task_metadata()?;
         let rt_quota_exempt = sched.is_pi_boosted_rt_owner_for(policy);
         let active = sched.policy.take_active();
-        cpu.as_mut().install_idle(
-            self,
-            core.id(),
-            Arc::clone(&core),
-            active,
-            metadata,
-            rt_quota_exempt,
-        );
+        // SAFETY: the CPU remains offline and boot-owned through this direct
+        // init_idle-style rq transaction.
+        unsafe {
+            cpu.as_mut().install_idle_bootstrap(
+                self,
+                core.id(),
+                Arc::clone(&core),
+                active,
+                metadata,
+                rt_quota_exempt,
+            )
+        };
         core.set_wake_cpu_hint(owner);
         Ok(())
     }

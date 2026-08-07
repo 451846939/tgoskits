@@ -608,7 +608,7 @@ root。Starry 的 `SchedulerAddressSpaceLease` 因此把“scheduler slot 已解
 创建独立的 runtime token，但所有 token 仍共享同一个页表根；因此 active CPU footprint
 必须属于 Starry `AddrSpace`，不能属于某一个 scheduler token。当前模型为：
 
-1. `AddrSpace` 创建唯一且永久绑定页表根的 `AddressSpaceCpuTracker`，同一页表根的所有
+1. `AddrSpace` 创建唯一且永久绑定页表根的 `AddressSpaceCpuState`，同一页表根的所有
    runtime token 都保存该 tracker 的强引用；构造器拒绝把 tracker 复用于另一个 root；
 2. CPU 切入新 mm 时先以 Release 发布 CPU bit，再安装页表根；切出时先安装新根，再清除
    旧 mm 的 CPU bit；同一 tracker 的线程切换不反复清位；
@@ -722,7 +722,12 @@ Linux `timespec64_to_ktime()` 规则饱和到有限 `KTIME_MAX`；相对 timeout
 `ktime_add_safe()` 饱和。ns 到 tick 使用向上取整和饱和转换；已过期值只在物理设备边界
 按 clockevent 的最小非零 delta 编程，不回写逻辑 deadline。
 
-物理 timer 是加速路径，不是唯一正确性来源。scheduler safe point 会有界提升已经过期的 task deadline，避免丢失或过晚的硬件边永久挂起 sleeper。
+物理 clockevent 是 deadline 推进的唯一正式入口，不是可丢边后由调度器轮询补救的加速路径。
+硬中断只把有界数量的 task deadline 从 heap 提升到预分配 expired buffer，并发布每 CPU
+`ktimers/<cpu>` worker 的 sticky wake；真正的 sleeper wake 只在该 FIFO worker 的任务上下文
+执行。scheduler safe point 不扫描 task deadline heap，也不提供 `claim_due`、
+`recover_overdue` 或偶然 tick 恢复。硬 scheduler timer 的预算 remainder 仍由统一 scheduler
+request 迫使 owner safe point 继续处理，两者不能互相代替。
 
 旧测试 runtime 曾让 `*_at(now)` 同时隐式代表 scheduler 与 monotonic 时间，并在多个新建
 `TaskSystem` 场景间保留同一 fake source；这既掩盖跨 CPU/rq epoch 错误，也让物理 timer 在
@@ -2378,8 +2383,14 @@ entity 由 owner-local `DeadlineServer` 和 donor-parameter `DeadlineServer` 组
   三者不复制 payload 或完成状态；
 - `LocalClockEvent` 是物理 oneshot 唯一 owner，只有 `Offline/Idle/Armed/Firing`。scheduler
   deadline、periodic tick 与 task soft deadline 只作为逻辑 source 输入最近期限选择；hard
-  IRQ budget 耗尽后由 sticky scheduler request 在 owner safe point 继续，不重新 arm 已过期
+  scheduler timer 的 IRQ budget 耗尽后由 sticky scheduler request 在 owner safe point 继续，
+  task timeout 的 remainder 则只发布给 `ktimers/<cpu>` worker。两条路径都不重新 arm 已过期
   边，不提供 `claim_due/recover_overdue` 或偶然 tick 扫描；
+- membarrier 注册状态只属于共享 `mm` runtime state，使用 requested/ready 两阶段发布；
+  `rq->membarrier_state` 只缓存 `rq->curr` 对应的同一状态。注册先发布 requested，再通过同步
+  IPI 在目标 CPU 的 rq 锁内刷新并执行全屏障，最后发布 ready；expedited 命令从 rq current
+  选择目标并等待固定 hard-call 完成。Starry process policy 不保存第二份注册状态，
+  `CLONE_VM` 共享同一 `mm`，fork/exec 获得新 identity；
 - runtime 当前 CPU 的 local/remote handle、current-thread publication、rq clock sample 和
   hardirq 累计值都来自对应 CPU 的已初始化 per-CPU/cpu-local owner。只有显式的 early
   bootstrap/query API 可以返回 `NONE/NotInitialized`；online scheduler fast path 的缺失、
@@ -2421,12 +2432,49 @@ API、超时重试、轮询推进或 silent fallback。
 后续编译、QEMU 和性能阶段可以修复违反上述不变量的实现错误，但不得以旧字段、轮询推进、
 超时重试或 fallback 恢复已删除架构。
 
+### 2026-08-07 rq、ktimer、membarrier 与 lazy-mm 反向核验
+
+统一修错前又按 Linux v7.1 `task_struct::on_rq`、`cfs_rq::curr`、`ktimers/%u`、
+`sync_runqueues_membarrier_state()`、`membarrier_switch_mm()` 和 arm64 `enter_lazy_tlb()`
+反向检查了一次完整边界，结论与收敛动作如下：
+
+- task 的 `SchedulerPlacement::on_rq`、rq 的 `current` 与 class intrusive node 是 Linux 本身
+  定义的三个正交事实，不应错误合并。`RunQueue::membership` 只是 generation-bearing class
+  linkage locator，不发布 runnable/current 语义；Fair current 离开 EEVDF tree 后由
+  `CurrentClassState::Owned` 持有，RT/DL current 则由 `CurrentClassState::Linked` 指向仍在
+  active class 结构中的 entity。二者都只能在同一个 owner-rq transaction 中转换；没有新增
+  task-side mirror 或兼容查询；
+- `ktimers/%u` 是固定绑定的普通 FIFO kernel thread，不是 hardirq/softirq accounting owner。
+  hardirq 只把 generation-bearing timeout 值移入预分配 buffer 并发布 `IrqWaitCell`；worker
+  的执行时间正常计入该线程的 `rq->clock_task`。公开的
+  `take_current_expired_task_deadlines()` 旁路已经删除，除唯一 ktimer consumer 外，调用方不能
+  取得或执行 IRQ 已 claim 的 timeout payload；永久 worker 的 waiter 保存在自身栈帧，不用
+  `Box::leak` 延长生命周期；
+- membarrier requested/ready 位只保存在共享 `AddressSpaceCpuState`，不同 scheduler token
+  通过同一 `Arc` 获得相同 mm identity。注册和 expedited 命令在普通任务上下文预分配 CPU
+  mask/lease 容器，再持有 CPU publication read-side lease 选择 rq，最后通过固定 hard-call
+  同步目标；CPU offline 不能与该快照交错，因此不存在 `CpuOffline` 重试或本地 CPU fallback；
+- `PRIVATE_EXPEDITED` 的权限判断读取当前共享 mm 的 authoritative `READY` 位，而不是读取注册
+  同步前刻意只含 `REQUESTED` 的本地 rq cache；后者只负责选择当前正在运行同一 mm 的目标。
+  `GLOBAL_EXPEDITED` 与 Linux v7.1 一样不要求调用者自己的 mm 先注册，注册位只决定哪些远端
+  rq 参加这次全局 expedited rendezvous。确定性测试在旧实现中分别得到错误的
+  `NotRegistered`，修复后保持 mm authority 与 rq target cache 的两种职责正交；
+- AArch64 kernel thread 可以像 Linux `enter_lazy_tlb()` 一样保留 previous active-mm lease，
+  同时把 TTBR0 切到 reserved root。再次调度同一 mm 时不能仅因 identity 相同而跳过硬件
+  恢复；same-mm activation 现在保留原 lease、重新确保 user root 已安装，并由 backend 对
+  已正确的 root 消除实际寄存器写。这样 tracker、membarrier identity 与硬件 TTBR0 不再出现
+  “逻辑仍 active、实际仍 reserved”分裂。
+
+该复审也否定了两个看似统一、实则偏离 PREEMPT_RT 的修改方向：不得把 ktimer worker 的任务
+运行时间扣成 hardirq 时间；不得把 `on_rq`、`rq->curr` 和 class linkage 压成一个无法表示
+Fair-current/RT-running 留队差异的枚举。
+
 ## 模块化结果
 
 - `TaskSystem` orchestration 只负责编排，registry/reap、placement、owner scheduling、deadline、PI、balance、deferred work 分模块；
 - `CpuRunQueueState` 按 current/class queue、deadline/RT bandwidth、clock 与派生 publication
   划分；`CpuLocal` 只保留 switch-tail、drain scratch 和 owner continuation，facade 实现按
-  owner dispatch、deadline/soft timer、idle polling 分文件；
+  owner dispatch、hard scheduler deadline、ktimer worker handoff、idle polling 分文件；
 - `TaskRuntime` 按 move-only resource/context ABI、scheduler/monotonic clock ABI 与 provider
   interface 分文件，仍保持单一 trait-FFI 边界；
 - `ThreadSchedState` 按 lifecycle、policy、placement、deadline、PI、runtime binding 划分；

@@ -210,10 +210,7 @@ fn exiting_fifo_reprograms_the_fair_successor_deadline() {
     let system = TaskSystem::new(TaskSystemConfig::new(1)).unwrap();
     let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
     let fifo = system
-        .install_bootstrap_thread(
-            cpu.as_mut(),
-            ThreadSpec::new(SchedulePolicy::fifo(RtPriority::new(40).unwrap())),
-        )
+        .install_bootstrap_thread(cpu.as_mut(), ThreadSpec::new(SchedulePolicy::default()))
         .unwrap();
     system
         .register_idle_thread(
@@ -222,6 +219,12 @@ fn exiting_fifo_reprograms_the_fair_successor_deadline() {
         )
         .unwrap();
     system.bring_cpu_online(cpu.as_mut()).unwrap();
+    system
+        .set_thread_policy(
+            fifo.id(),
+            SchedulePolicy::fifo(RtPriority::new(40).unwrap()),
+        )
+        .unwrap();
     let fair = ready_thread(&system, SchedulePolicy::default());
     let fair_contender = ready_thread(&system, SchedulePolicy::default());
     system.enqueue_at(cpu.as_mut(), fair.id(), 100).unwrap();

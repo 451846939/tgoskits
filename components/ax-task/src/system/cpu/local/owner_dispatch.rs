@@ -82,7 +82,13 @@ impl CpuLocal {
             .map(|dispatch| dispatch.runtime_core().state())
     }
 
-    pub(crate) fn install_idle(
+    /// Installs the dedicated idle task during offline CPU bootstrap.
+    ///
+    /// # Safety
+    ///
+    /// The caller must retain the boot CPU's raw IRQ exclusion and
+    /// `PREEMPT_DISABLED` ownership for the complete operation.
+    pub(crate) unsafe fn install_idle_bootstrap(
         self: Pin<&mut Self>,
         system: &TaskSystem,
         idle: ThreadId,
@@ -94,10 +100,11 @@ impl CpuLocal {
         debug_assert_eq!(idle, core.id());
         // SAFETY: changing fields does not move this pinned object.
         let fields = unsafe { self.get_unchecked_mut() };
-        let mut transaction = OwnerRqTxn::begin(system, &fields.remote);
+        // SAFETY: forwarded from this method's offline boot-owner contract.
+        let mut transaction = unsafe { OwnerRqTxn::begin_bootstrap(system, &fields.remote) };
         transaction.install_idle(Arc::clone(&core), active, metadata, rt_quota_exempt);
         core.sched().placement().install_idle(fields.owner);
-        transaction.commit();
+        transaction.commit_bootstrap();
         fields.remote.publish_idle_thread(idle);
     }
 

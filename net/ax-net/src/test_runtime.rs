@@ -168,6 +168,27 @@ impl_task_runtime! {
         ) -> AddressSpaceReclaimArmOutcome {
             panic!("ax-net unit tests do not own address-space tokens")
         }
+        fn address_space_membarrier_state(
+            _address_space: AddressSpaceHandle,
+        ) -> AddressSpaceMembarrierState {
+            panic!("ax-net unit tests do not own address-space tokens")
+        }
+        fn update_address_space_membarrier_state(
+            _address_space: AddressSpaceHandle,
+            _registration: MembarrierRegistration,
+            _phase: MembarrierRegistrationPhase,
+        ) -> AddressSpaceMembarrierState {
+            panic!("ax-net unit tests do not own address-space tokens")
+        }
+        fn synchronize_membarrier_cpu(
+            _cpu: RuntimeCpuId,
+            action: RuntimeMembarrierAction,
+        ) -> RuntimeStatus {
+            if action == RuntimeMembarrierAction::MemoryBarrier {
+                core::sync::atomic::fence(Ordering::SeqCst);
+            }
+            RuntimeStatus::Success
+        }
         unsafe fn switch_context(_switch: ContextSwitch) {
             panic!("ax-net unit tests do not switch scheduler contexts")
         }

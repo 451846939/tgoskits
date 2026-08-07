@@ -43,8 +43,8 @@ use crate::{
     inbox::{InboxKind, InboxMessage, InboxNode, PublishResult, SchedulerInbox},
     lock::{IrqScope, IrqTicketGuard, IrqTicketLock},
     runtime::{
-        MonotonicDeadline, MonotonicInstant, RuntimeCpuId, RuntimeStatus, SchedulerDeadlineUpdate,
-        task_runtime,
+        AddressSpaceMembarrierState, MonotonicDeadline, MonotonicInstant, RuntimeCpuId,
+        RuntimeStatus, SchedulerDeadlineUpdate, task_runtime,
     },
     thread::ThreadCore,
     timer::{

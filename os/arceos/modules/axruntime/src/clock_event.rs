@@ -235,9 +235,10 @@ impl LocalClockEvent {
                 .selected_deadline()
                 .is_some_and(|deadline| now.reached(deadline.as_monotonic()))
         {
-            // The scheduler safe point owns progress after an IRQ budget
-            // overrun. Keep the logical deadline published but do not turn an
-            // already-due value into an interrupt storm.
+            // The scheduler safe point owns hard-timer remainder, while the
+            // fixed ktimer worker owns task-timeout remainder. Keep the
+            // logical deadline published without turning an already-due value
+            // into an interrupt storm.
             self.armed_deadline = None;
             return ClockEventAction::Stop;
         }

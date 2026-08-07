@@ -45,6 +45,7 @@ pub(crate) struct CpuRunQueueState {
     clock: RunQueueClock,
     queue: RunQueue,
     idle: Option<IdleRqTask>,
+    membarrier_state: AddressSpaceMembarrierState,
 }
 
 /// Per-CPU idle task state owned by rq but never linked as a class entity.
@@ -69,6 +70,7 @@ impl CpuRunQueueState {
                 config.thread_capacity(),
             ),
             idle: None,
+            membarrier_state: AddressSpaceMembarrierState::NONE,
         }
     }
 
@@ -134,7 +136,36 @@ impl CpuRunQueueState {
         if self.queue.current().is_some() {
             task_runtime::fatal_invariant(0x5251_0001, self.owner.as_u32() as usize);
         }
+        self.membarrier_state = Self::state_for_address_space(current.address_space());
         self.queue.install_current(current);
+    }
+
+    fn state_for_address_space(
+        address_space: crate::runtime::AddressSpaceHandle,
+    ) -> AddressSpaceMembarrierState {
+        if address_space.is_none() {
+            AddressSpaceMembarrierState::NONE
+        } else {
+            task_runtime::address_space_membarrier_state(address_space)
+        }
+    }
+
+    pub(crate) const fn membarrier_state(&self) -> AddressSpaceMembarrierState {
+        self.membarrier_state
+    }
+
+    /// Refreshes Linux `rq->membarrier_state` from the currently published
+    /// dispatch. The full barrier pairs registration with user execution on
+    /// this CPU and is intentionally inside the rq transaction.
+    pub(crate) fn refresh_membarrier_state(&mut self) -> AddressSpaceMembarrierState {
+        let state = self
+            .current()
+            .map_or(AddressSpaceMembarrierState::NONE, |current| {
+                Self::state_for_address_space(current.address_space())
+            });
+        self.membarrier_state = state;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        state
     }
 
     pub(crate) fn take_current(&mut self) -> Option<CurrentDispatch> {
@@ -255,6 +286,7 @@ impl CpuRunQueueState {
         thread: ThreadId,
         binding: crate::runtime::ThreadRuntimeBinding,
     ) -> Result<(), TaskError> {
+        let next_membarrier_state = Self::state_for_address_space(binding.address_space());
         let current = self
             .queue
             .current_mut()
@@ -263,7 +295,35 @@ impl CpuRunQueueState {
             return Err(TaskError::InvalidConfiguration);
         }
         current.update_runtime_binding(binding);
+        if self.membarrier_state.identity() != next_membarrier_state.identity() {
+            // Linux pairs exit_mm()/exec's rq->curr mm transition with
+            // membarrier's entry/exit barriers before user execution resumes.
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        }
+        self.membarrier_state = next_membarrier_state;
         Ok(())
+    }
+
+    pub(crate) fn refresh_current_scheduler_metadata(
+        &mut self,
+        thread: ThreadId,
+        metadata: RqTaskMetadata,
+        rt_quota_exempt: bool,
+    ) {
+        let next_membarrier_state =
+            Self::state_for_address_space(metadata.runtime_binding.address_space());
+        let current = self
+            .queue
+            .current_mut()
+            .filter(|current| current.thread() == thread)
+            .unwrap_or_else(|| {
+                task_runtime::fatal_invariant(0x5251_100d, thread.as_u64() as usize)
+            });
+        current.refresh_scheduler_metadata(metadata, rt_quota_exempt);
+        if self.membarrier_state.identity() != next_membarrier_state.identity() {
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        }
+        self.membarrier_state = next_membarrier_state;
     }
 
     pub(crate) fn detach_current_schedule(

@@ -45,15 +45,15 @@ impl CpuLocal {
         let this = unsafe { self.get_unchecked_mut() };
         let timer = {
             let deadlines = this.remote.lock_deadline_base();
-            let deferred_timer_backlog = this.remote.soft_timer_work_pending()
-                && deadlines
+            let deferred_timer_backlog = deadlines.expired_count != 0
+                || deadlines
                     .queue
                     .has_immediately_actionable_soft_entry(monotonic_now);
             if deferred_timer_backlog {
-                // A bounded hard-IRQ pass transferred ownership of the overdue
-                // heap head to sticky soft-timer work. Re-arming that same head
-                // would create an interrupt storm; the claimed scheduler work is
-                // now the sole progress mechanism until the queue is drained.
+                // Linux leaves an activated soft hrtimer base to `ktimers/%u`
+                // instead of repeatedly programming the same expired edge.
+                // The deadline base is the payload authority; the worker event
+                // is only a wakeup and cannot make this decision stale.
                 None
             } else {
                 deadlines.queue.next_deadline()
@@ -133,10 +133,6 @@ impl CpuLocal {
 
     pub(crate) fn invalidate_scheduler_deadline_publication(self: Pin<&mut Self>) {
         self.remote.lock_deadline_base().publication = None;
-    }
-
-    pub(crate) fn soft_timer_work_pending(&self) -> bool {
-        self.remote.soft_timer_work_pending()
     }
 
     pub(crate) fn publish_hard_timer_work(&self) {
@@ -336,7 +332,7 @@ impl CpuLocal {
         let mut this = self;
         let batch = this.as_mut().promote_due_task_deadlines(now, budget);
         if batch.pending() || batch.expired() != 0 {
-            this.remote.publish_soft_timer_work();
+            this.remote.publish_ktimer_work();
         }
         batch
     }
@@ -388,14 +384,6 @@ impl CpuLocal {
     #[cfg(test)]
     pub(crate) fn deadline_expire_passes_for_test(&self) -> usize {
         self.remote.lock_deadline_base().expire_passes
-    }
-
-    pub(crate) fn begin_soft_timer_work(self: Pin<&mut Self>) -> bool {
-        self.remote.begin_soft_timer_work()
-    }
-
-    pub(crate) fn finish_soft_timer_work(self: Pin<&mut Self>, pending: bool) {
-        self.remote.finish_soft_timer_work(pending);
     }
 
     /// Copies expired timer events to task-context storage.

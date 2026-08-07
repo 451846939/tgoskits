@@ -126,6 +126,11 @@ pub(crate) fn start_deferred_task_work_service() -> Result<(), TaskError> {
     ax_task::start_deferred_task_work_service()
 }
 
+/// Creates this CPU's PREEMPT_RT-style soft-timer service before timer IRQs.
+pub(crate) fn start_current_ktimer_service() -> Result<(), TaskError> {
+    ax_task::start_current_ktimer_service()
+}
+
 /// Runs the owner CPU's scheduler/idle handshake forever.
 pub(crate) fn run_idle() -> ! {
     let (current, idle) = with_irq_cpu_pin(|pin| {
@@ -266,7 +271,7 @@ fn initialize_current_cpu(cpu_id: usize) -> Result<ThreadId, TaskError> {
             CPU_LOCAL_OWNER_HANDLE.write_current(pin, owner_handle);
         })
     };
-    crate::guard::assert_boot_guards_released();
+    crate::guard::assert_boot_preemption_held();
     Ok(bootstrap_thread)
 }
 

@@ -440,6 +440,24 @@ mod tests {
     }
 
     #[test]
+    fn installed_cpu_area_starts_with_linux_boot_preemption_disabled() {
+        std::thread::spawn(|| {
+            let area = modeled_area(0);
+            // SAFETY: this fresh host thread exclusively owns the offline CPU
+            // fixture and cannot receive a scheduler interrupt.
+            unsafe { install_cpu_area(area) }.expect("modeled CPU install must succeed");
+
+            assert_eq!(
+                scheduler_preempt_guard_depth(),
+                Ok(1),
+                "boot current must retain PREEMPT_DISABLED until rq/current publication",
+            );
+        })
+        .join()
+        .expect("modeled CPU test thread must not panic");
+    }
+
+    #[test]
     fn generic_preempt_state_follows_current_thread_publication() {
         std::thread::spawn(|| {
             let area = modeled_area(0);

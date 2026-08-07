@@ -395,13 +395,15 @@ fn deadline_yield_ends_the_current_job_until_replenishment() {
 
 #[test]
 fn active_deadline_job_does_not_arm_a_separate_miss_timer() {
-    let (system, mut cpu) = online_system(TaskSystemConfig::new(1));
+    let system = TaskSystem::new(TaskSystemConfig::new(1)).unwrap();
+    let mut cpu = system.create_cpu_local(CpuId::new(0)).unwrap();
     let _idle = system
         .register_idle_thread(
             cpu.as_mut(),
             ThreadSpec::new(SchedulePolicy::fair(Nice::ZERO, FairMode::Idle)),
         )
         .unwrap();
+    system.bring_cpu_online(cpu.as_mut()).unwrap();
     let deadline = ready_thread(
         &system,
         SchedulePolicy::deadline(deadline_policy(5, 10, 100, DeadlineFlags::NONE)),

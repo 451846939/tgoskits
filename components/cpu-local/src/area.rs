@@ -24,7 +24,7 @@ impl CpuRuntimeAnchor {
         Self {
             current_thread: AtomicUsize::new(boot_thread),
             architecture_state: [const { AtomicUsize::new(0) }; 4],
-            preempt_state: PreemptState::new(),
+            preempt_state: PreemptState::bootstrap_disabled(),
             reserved: [0; runtime_anchor_reserved_size()],
         }
     }

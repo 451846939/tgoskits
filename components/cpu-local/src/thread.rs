@@ -114,7 +114,24 @@ impl CurrentThreadHeader {
             cpu_area: AtomicUsize::new(area_base),
             binding_epoch: AtomicUsize::new(CPU_BOUND),
             architecture_state: [const { AtomicUsize::new(0) }; 2],
-            preempt_state: PreemptState::new(),
+            preempt_state: PreemptState::bootstrap_disabled(),
+            runtime_thread_cookie: AtomicUsize::new(0),
+            reserved: [0; current_thread_reserved_size()],
+        }
+    }
+
+    /// Creates the scheduler-owned continuation of the permanent boot header.
+    ///
+    /// It retains Linux's `PREEMPT_DISABLED` boot invariant until the runtime
+    /// has published rq/current/idle and every local scheduler wake source.
+    #[doc(hidden)]
+    pub const fn new_bootstrap(context: CurrentContext) -> Self {
+        Self {
+            context: context.0,
+            cpu_area: AtomicUsize::new(0),
+            binding_epoch: AtomicUsize::new(CPU_UNBOUND),
+            architecture_state: [const { AtomicUsize::new(0) }; 2],
+            preempt_state: PreemptState::bootstrap_disabled(),
             runtime_thread_cookie: AtomicUsize::new(0),
             reserved: [0; current_thread_reserved_size()],
         }
@@ -322,6 +339,16 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bootstrap_and_ordinary_headers_have_distinct_preemption_state() {
+        let context = CurrentContext::from_raw(1).unwrap();
+        let bootstrap = CurrentThreadHeader::new_bootstrap(context);
+        let ordinary = CurrentThreadHeader::new(context);
+
+        assert_eq!(bootstrap.preempt_guard_depth(), 1);
+        assert_eq!(ordinary.preempt_guard_depth(), 0);
+    }
 
     #[test]
     fn runtime_thread_cookie_is_bound_once_in_the_current_cache_line() {

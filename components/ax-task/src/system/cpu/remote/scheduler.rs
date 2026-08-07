@@ -4,10 +4,8 @@ use super::*;
 
 const REQUEST_PREEMPT: u64 = 1 << 0;
 const REQUEST_OWNER_WORK: u64 = 1 << 1;
-const REQUEST_SOFT_TIMER: u64 = 1 << 2;
 const REQUEST_HARD_TIMER: u64 = 1 << 5;
-const REQUEST_REASON_MASK: u64 =
-    REQUEST_PREEMPT | REQUEST_OWNER_WORK | REQUEST_SOFT_TIMER | REQUEST_HARD_TIMER;
+const REQUEST_REASON_MASK: u64 = REQUEST_PREEMPT | REQUEST_OWNER_WORK | REQUEST_HARD_TIMER;
 const REQUEST_ENTRY_MASK: u64 = REQUEST_PREEMPT | REQUEST_OWNER_WORK;
 const REQUEST_IDLE_POLLING: u64 = 1 << 3;
 const REQUEST_PARK_PREEMPT_DEFERRED: u64 = 1 << 4;
@@ -143,32 +141,6 @@ impl CpuRemote {
         SchedulerRequestPublication {
             generation,
             delivery,
-        }
-    }
-
-    pub(in crate::system::cpu) fn publish_soft_timer_work(&self) {
-        let _ = self.publish_scheduler_request_owned(REQUEST_SOFT_TIMER);
-    }
-
-    pub(crate) fn soft_timer_work_pending(&self) -> bool {
-        self.scheduler_request.request.load(Ordering::Acquire) & REQUEST_SOFT_TIMER != 0
-    }
-
-    pub(in crate::system::cpu) fn begin_soft_timer_work(&self) -> bool {
-        self.scheduler_request
-            .request
-            .fetch_and(!REQUEST_SOFT_TIMER, Ordering::AcqRel)
-            & REQUEST_SOFT_TIMER
-            != 0
-    }
-
-    pub(in crate::system::cpu) fn finish_soft_timer_work(&self, pending: bool) {
-        // Only the owner CPU publishes deadline work, and both timer IRQ and
-        // scheduler safe-point paths hold local IRQ exclusion while mutating
-        // CpuLocal. The completed pass therefore owns the full publication
-        // interval and may replace the sticky bit with its actual remainder.
-        if pending {
-            let _ = self.publish_scheduler_request_owned(REQUEST_SOFT_TIMER);
         }
     }
 

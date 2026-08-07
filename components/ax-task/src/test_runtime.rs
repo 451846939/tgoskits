@@ -68,6 +68,8 @@ std::thread_local! {
         const { Cell::new(AddressSpaceDestroyOutcome::Released) };
     static ADDRESS_SPACE_RECLAIM_ARM_OUTCOME: Cell<AddressSpaceReclaimArmOutcome> =
         const { Cell::new(AddressSpaceReclaimArmOutcome::Ready) };
+    static ADDRESS_SPACE_MEMBARRIER_BITS: RefCell<std::collections::BTreeMap<usize, u32>> =
+        const { RefCell::new(std::collections::BTreeMap::new()) };
     static RESOURCE_RELEASE_EVENTS: RefCell<std::vec::Vec<ResourceReleaseEvent>> =
         const { RefCell::new(std::vec::Vec::new()) };
 }
@@ -456,6 +458,49 @@ impl TaskRuntime for UnitTestRuntime {
         _address_space: AddressSpaceHandle,
     ) -> AddressSpaceReclaimArmOutcome {
         ADDRESS_SPACE_RECLAIM_ARM_OUTCOME.with(Cell::get)
+    }
+    fn address_space_membarrier_state(
+        address_space: AddressSpaceHandle,
+    ) -> AddressSpaceMembarrierState {
+        let raw = address_space.into_raw();
+        assert_ne!(
+            raw, 0,
+            "test membarrier state requires a user address space"
+        );
+        let bits = ADDRESS_SPACE_MEMBARRIER_BITS
+            .with(|states| states.borrow().get(&raw).copied().unwrap_or(0));
+        // SAFETY: fixture handles remain unique while their test task exists.
+        let identity = unsafe { AddressSpaceMembarrierId::from_raw(raw) };
+        // SAFETY: the fixture changes only typed requested/ready bits below.
+        unsafe { AddressSpaceMembarrierState::new(identity, bits) }
+    }
+    fn update_address_space_membarrier_state(
+        address_space: AddressSpaceHandle,
+        registration: MembarrierRegistration,
+        phase: MembarrierRegistrationPhase,
+    ) -> AddressSpaceMembarrierState {
+        let raw = address_space.into_raw();
+        ADDRESS_SPACE_MEMBARRIER_BITS.with(|states| {
+            let mut states = states.borrow_mut();
+            let bits = states.entry(raw).or_default();
+            *bits |= match phase {
+                MembarrierRegistrationPhase::Begin => registration.requested_bit(),
+                MembarrierRegistrationPhase::Complete => registration.ready_bit(),
+            };
+        });
+        Self::address_space_membarrier_state(address_space)
+    }
+    fn synchronize_membarrier_cpu(
+        _cpu: RuntimeCpuId,
+        action: RuntimeMembarrierAction,
+    ) -> RuntimeStatus {
+        match action {
+            RuntimeMembarrierAction::MemoryBarrier => core::sync::atomic::fence(Ordering::SeqCst),
+            RuntimeMembarrierAction::RefreshRunQueue => {
+                crate::refresh_current_membarrier_run_queue().unwrap()
+            }
+        }
+        RuntimeStatus::Success
     }
     unsafe fn switch_context(_switch: ContextSwitch) {
         assert!(

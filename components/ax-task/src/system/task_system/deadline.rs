@@ -1,7 +1,10 @@
 //! Deadline diagnostics, deferred callbacks, and owner timer service.
 
 use super::*;
-use crate::{SchedulerClockEvent, scheduler_clock_event, scheduler_time_reached};
+use crate::{
+    SchedulerClockEvent, runtime::SchedulerDeadlineUpdate, scheduler_clock_event,
+    scheduler_time_reached,
+};
 
 enum OwnerDeadlineTimerPlan {
     Unchanged,
@@ -21,6 +24,28 @@ struct OwnerDeadlineReconcile<'a> {
     sched: &'a mut ThreadSchedState,
     cpu: Pin<&'a mut CpuLocal>,
     due: OwnerDeadlineDue,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct KtimerServiceBatch {
+    processed: usize,
+    pending: bool,
+    update: Option<SchedulerDeadlineUpdate>,
+}
+
+impl KtimerServiceBatch {
+    #[cfg(test)]
+    pub(crate) const fn processed(self) -> usize {
+        self.processed
+    }
+
+    pub(crate) const fn pending(self) -> bool {
+        self.pending
+    }
+
+    pub(crate) const fn update(self) -> Option<SchedulerDeadlineUpdate> {
+        self.update
+    }
 }
 
 impl TaskSystem {
@@ -531,39 +556,49 @@ impl TaskSystem {
         Ok((batch.drained(), dispatched))
     }
 
-    pub(crate) fn service_soft_timer_work(
+    /// Runs one PREEMPT_RT `ktimers/%u` task-context pass.
+    ///
+    /// Hard IRQ has already moved a bounded set of soft expirations into the
+    /// per-CPU deadline base. This pass may promote more due soft entries, wake
+    /// their generation-bearing park owners, and then publish the one next
+    /// physical deadline selected from the authoritative base.
+    pub(crate) fn service_ktimer_work(
         &self,
         mut cpu: Pin<&mut CpuLocal>,
-    ) -> Result<(), TaskError> {
-        if !cpu.soft_timer_work_pending() {
-            return Ok(());
+    ) -> Result<KtimerServiceBatch, TaskError> {
+        if task_runtime::in_hard_irq() {
+            return Err(TaskError::UnsafeContext);
         }
         let monotonic_now = task_runtime::monotonic_now();
-        if !cpu.as_mut().begin_soft_timer_work() {
-            return Ok(());
-        }
         let budget = cpu.batch_limit();
-        let service = (|| {
-            let mut processed = 0;
-            while processed < budget {
-                if !cpu.has_expired_task_deadlines() && cpu.has_due_task_deadline(monotonic_now) {
-                    let remaining = budget - processed;
-                    cpu.as_mut()
-                        .promote_due_task_deadlines(monotonic_now, remaining);
-                }
-                let Some(event) = cpu.as_mut().take_one_expired_task_deadline() else {
-                    break;
-                };
-                self.service_expired_deadline(event)?;
-                processed += 1;
+        let mut processed = 0;
+        while processed < budget {
+            if !cpu.has_expired_task_deadlines() && cpu.has_due_task_deadline(monotonic_now) {
+                let remaining = budget - processed;
+                cpu.as_mut()
+                    .promote_due_task_deadlines(monotonic_now, remaining);
             }
-            Ok(())
-        })();
-        let pending = service.is_err()
-            || cpu.has_expired_task_deadlines()
-            || cpu.has_due_task_deadline(monotonic_now);
-        cpu.as_mut().finish_soft_timer_work(pending);
-        service
+            let Some(event) = cpu.as_mut().take_one_expired_task_deadline() else {
+                break;
+            };
+            if let Err(error) = self.service_expired_deadline(event) {
+                cpu.remote().publish_ktimer_work();
+                return Err(error);
+            }
+            processed += 1;
+        }
+        let pending = cpu.has_expired_task_deadlines() || cpu.has_due_task_deadline(monotonic_now);
+        if pending {
+            cpu.remote().publish_ktimer_work();
+        }
+        let update = cpu
+            .as_mut()
+            .next_scheduler_deadline_update_if_changed(monotonic_now)?;
+        Ok(KtimerServiceBatch {
+            processed,
+            pending,
+            update,
+        })
     }
 
     fn service_expired_deadline(&self, event: ExpiredTaskDeadline) -> Result<(), TaskError> {

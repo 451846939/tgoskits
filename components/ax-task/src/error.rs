@@ -160,3 +160,14 @@ pub enum TaskError {
     #[error("runtime resource operation failed with status {0}")]
     RuntimeFailure(u32),
 }
+
+/// Errors produced by the scheduler-owned membarrier protocol.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum MembarrierError {
+    /// An expedited command was issued before registration became ready.
+    #[error("membarrier facility is not registered for the current address space")]
+    NotRegistered,
+    /// The scheduler/runtime boundary rejected the operation.
+    #[error(transparent)]
+    Task(#[from] TaskError),
+}

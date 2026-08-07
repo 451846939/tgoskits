@@ -110,10 +110,7 @@ impl TaskSystem {
                 migration_capable,
                 metadata.clone(),
             );
-            transaction
-                .current_mut()
-                .expect("running policy target must remain current")
-                .refresh_scheduler_metadata(metadata, rt_quota_exempt);
+            transaction.refresh_current_scheduler_metadata(core.id(), metadata, rt_quota_exempt);
             true
         } else if queued {
             sched.policy.install_active(active);

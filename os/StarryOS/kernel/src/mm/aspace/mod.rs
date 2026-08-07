@@ -16,7 +16,7 @@ use ax_runtime::{
         paging::{MappingFlags, PageSize, PageTable, PageTableCursor},
         trap::PageFaultFlags,
     },
-    task::AddressSpaceCpuTracker,
+    task::AddressSpaceCpuState,
 };
 use ax_sync::{LockdepMutexExt, PiMutex};
 
@@ -69,7 +69,7 @@ pub struct AddrSpace {
     pub(crate) scheduler_slots: AtomicUsize,
     /// CPUs whose hardware root may retain translations for this address
     /// space. All scheduler tokens for this page table share this tracker.
-    active_cpus: Arc<AddressSpaceCpuTracker>,
+    active_cpus: Arc<AddressSpaceCpuState>,
     /// All VmX counters for this address space.  Maintained automatically by
     /// `map`, `unmap`, `clear`, and `try_clone`; never touch from outside mm/.
     pub vm_stat: ProcessVmStat,
@@ -110,7 +110,7 @@ impl AddrSpace {
     /// Creates a new empty address space.
     pub fn new_empty(base: VirtAddr, size: usize) -> AxResult<Self> {
         let pt = PageTable::try_new().map_err(|_| AxError::NoMemory)?;
-        let active_cpus = Arc::new(AddressSpaceCpuTracker::new(pt.root_paddr()));
+        let active_cpus = Arc::new(AddressSpaceCpuState::new(pt.root_paddr()));
         Ok(Self {
             va_range: VirtAddrRange::from_start_size(base, size),
             areas: MemorySet::new(),
@@ -824,7 +824,7 @@ pub(crate) fn attach_process_slot(aspace: &Arc<PiMutex<AddrSpace>>) {
 /// Pins one address space for a move-only scheduler token and returns its root.
 pub(crate) fn attach_scheduler_slot(
     aspace: &Arc<PiMutex<AddrSpace>>,
-) -> (PhysAddr, Arc<AddressSpaceCpuTracker>) {
+) -> (PhysAddr, Arc<AddressSpaceCpuState>) {
     let guard = aspace.lock();
     guard.scheduler_slots.fetch_add(1, Ordering::AcqRel);
     (guard.pt.root_paddr(), Arc::clone(&guard.active_cpus))

@@ -5,6 +5,7 @@ use super::*;
 mod deadline;
 mod delivery;
 mod idle_pull;
+mod ktimer;
 mod lifecycle;
 mod load_summary;
 mod owner;
@@ -37,6 +38,7 @@ pub struct CpuRemote {
     owner_state: owner::OwnerState,
     publication: lifecycle::CpuPublicationState,
     scheduler_request: scheduler::SchedulerRequestState,
+    ktimer: ktimer::KtimerWorkerState,
     load: load_summary::RemoteLoadState,
     idle_pull: idle_pull::IdlePullState,
     delivery: delivery::RemoteDeliveryState,
@@ -55,6 +57,7 @@ impl CpuRemote {
             owner_state: owner::OwnerState::new(),
             publication: lifecycle::CpuPublicationState::new(),
             scheduler_request: scheduler::SchedulerRequestState::new(),
+            ktimer: ktimer::KtimerWorkerState::new(),
             load: load_summary::RemoteLoadState::new(),
             idle_pull: idle_pull::IdlePullState::new(),
             delivery: delivery::RemoteDeliveryState::new(),
@@ -70,11 +73,14 @@ impl CpuRemote {
         self.run_queue.lock()
     }
 
-    /// Acquires the rq under an already-active scheduler IRQ-off baton.
+    /// Acquires the rq under an already-active IRQ-off CPU owner.
     ///
     /// # Safety
     ///
-    /// See [`IrqTicketLock::lock_irq_disabled`].
+    /// The caller must retain either the scheduler baton or the offline boot
+    /// CPU's Linux-style `PREEMPT_DISABLED` ownership, with local IRQs disabled
+    /// for the complete guard lifetime. See
+    /// [`IrqTicketLock::lock_irq_disabled`].
     pub(crate) unsafe fn lock_run_queue_irq_disabled(
         &self,
     ) -> IrqTicketGuard<'_, CpuRunQueueState> {

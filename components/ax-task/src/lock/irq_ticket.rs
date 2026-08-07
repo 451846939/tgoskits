@@ -36,14 +36,15 @@ impl<T> IrqTicketLock<T> {
         }
     }
 
-    /// Locks scheduler state when the caller already owns the architecture
-    /// scheduler IRQ-off baton.
+    /// Locks scheduler state when the caller already owns an IRQ-off CPU.
     ///
     /// # Safety
     ///
     /// Local IRQs must remain disabled until the returned guard is dropped.
-    /// The caller must not use this entry from ordinary task context; doing so
-    /// would allow a local hard IRQ to deadlock on the same raw ticket lock.
+    /// The caller must own either the architecture scheduler baton or the
+    /// offline boot CPU's non-preemptible initialization context. Ordinary task
+    /// context must use [`Self::lock`], otherwise a local hard IRQ could
+    /// deadlock on the same raw ticket lock.
     pub(crate) unsafe fn lock_irq_disabled(&self) -> IrqTicketGuard<'_, T> {
         IrqTicketGuard {
             raw: Some(self.raw.lock()),

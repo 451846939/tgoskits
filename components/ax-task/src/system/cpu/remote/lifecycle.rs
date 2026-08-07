@@ -233,7 +233,7 @@ impl CpuRemote {
 
     pub(crate) fn is_quiescent_for_offline(&self) -> bool {
         self.publication.state.load(Ordering::Acquire) == CPU_LIFECYCLE_DRAINING
-            && !self.soft_timer_work_pending()
+            && self.ktimer_is_quiescent_for_offline()
             && !self.needs_reschedule()
             && !self.has_remote_work()
             && !self.is_idle_polling()

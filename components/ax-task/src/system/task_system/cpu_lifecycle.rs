@@ -340,6 +340,9 @@ impl TaskSystem {
             if sched.lifecycle.state() == ThreadState::Exited {
                 continue;
             }
+            if Self::is_parked_ktimer_worker(state, cpu, &record.core, &sched) {
+                continue;
+            }
             if fallback_for(&sched.affinity.affinity).is_none() {
                 return false;
             }
@@ -367,6 +370,11 @@ impl TaskSystem {
             if is_idle(record.core.id()) {
                 continue;
             }
+            let sched = record.sched.lock();
+            if Self::is_parked_ktimer_worker(state, cpu, &record.core, &sched) {
+                continue;
+            }
+            drop(sched);
             if record.core.wake_cpu_hint() != Some(cpu) {
                 continue;
             }
@@ -407,6 +415,9 @@ impl TaskSystem {
                 if sched.lifecycle.state() == ThreadState::Exited {
                     return true;
                 }
+                if Self::is_parked_ktimer_worker(state, cpu, &record.core, &sched) {
+                    return true;
+                }
                 let has_remaining_destination = (0..state.cpus.len()).any(|index| {
                     let candidate = CpuId::new(index as u32);
                     candidate != cpu
@@ -422,6 +433,27 @@ impl TaskSystem {
                     || record.core.wake_cpu_hint() == Some(cpu);
                 has_remaining_destination && !owned_by_cpu
             })
+    }
+
+    /// Linux keeps each `ktimers/%u` task allocated while its CPU is offline.
+    /// The fixed task is hotplug-quiescent only after it has parked on its IRQ
+    /// event and relinquished every rq, timer, and Deadline ownership record.
+    fn is_parked_ktimer_worker(
+        state: &TaskSystemState,
+        cpu: CpuId,
+        core: &ThreadCore,
+        sched: &ThreadSchedState,
+    ) -> bool {
+        state.cpus.get(cpu.as_usize()).is_some_and(|registration| {
+            registration.remote.ktimer_worker() == Some(core.id())
+                && sched.lifecycle.state() == ThreadState::Blocked
+                && sched.placement.queued_cpu().is_none()
+                && sched.placement.execution_cpu().is_none()
+                && sched.placement.on_cpu().is_none()
+                && !sched.placement.has_pending_migration()
+                && sched.deadline.bandwidth.reservation_owner().is_none()
+                && core.sleep_timer_cpu().is_none()
+        })
     }
 
     /// Installs an idle thread for a CPU; idle is selected only when queues empty.

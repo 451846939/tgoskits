@@ -8,6 +8,7 @@ mod delivery;
 mod dispatch;
 mod exited_work;
 mod lifecycle;
+mod membarrier;
 mod model;
 mod outcome;
 mod park_exit;
@@ -26,6 +27,7 @@ use alloc::{sync::Arc, vec::Vec};
 use core::{pin::Pin, ptr};
 
 use exited_work::ExitedThreadWork;
+pub(crate) use membarrier::{MembarrierCpuTargets, MembarrierTarget};
 use model::{
     BalanceReason, BalanceTransferOutcome, DeferredTaskWorkClass, DetachedOwnerMessageBatch,
     FAIR_BALANCE_BALANCED_BACKOFF_FACTOR, FAIR_BALANCE_CONSTRAINED_BACKOFF_FACTOR,
@@ -69,9 +71,10 @@ use crate::{
     inbox::{InboxKind, InboxMessage, InboxOperation, PublishResult, SchedulerInbox},
     lock::{IrqScope, IrqTicketLock, PreemptTicketLock},
     runtime::{
-        AddressSpaceDestroyOutcome, AddressSpaceReclaimArmOutcome, ContextThreadBinding,
-        CpuRemoteHandle, CurrentThreadPublication, MonotonicDeadline, MonotonicInstant,
-        RuntimeCpuId, RuntimeStatus, task_runtime,
+        AddressSpaceDestroyOutcome, AddressSpaceMembarrierId, AddressSpaceMembarrierState,
+        AddressSpaceReclaimArmOutcome, ContextThreadBinding, CpuRemoteHandle,
+        CurrentThreadPublication, MembarrierRegistration, MembarrierRegistrationPhase,
+        MonotonicDeadline, MonotonicInstant, RuntimeCpuId, RuntimeStatus, task_runtime,
     },
     system::cpu::{
         CpuRunQueueState, CurrentClassState, CurrentDispatch, CurrentDispatchState,

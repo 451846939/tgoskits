@@ -78,8 +78,13 @@ fn program_oneshot(
     unmask_irq: impl FnOnce(),
 ) {
     let interval = oneshot_interval_ticks(deadline_ns, current_ticks, frequency_hz);
-    program_interval(interval);
+    // Linux returns a stopped clockevent device to ONESHOT state before
+    // calling ->set_next_event(). In particular, an x86 TSC-deadline event at
+    // the minimum delta can expire between the MSR write and a later LVT
+    // unmask, permanently losing the only edge. Local IRQ exclusion keeps a
+    // previously pending source from entering until the new event is installed.
     unmask_irq();
+    program_interval(interval);
 }
 
 pub fn try_init_epoch_offset(epoch_time_nanos: u64) -> bool {
@@ -209,17 +214,17 @@ mod tests {
     }
 
     #[test]
-    fn oneshot_programming_precedes_irq_unmask() {
+    fn oneshot_device_reenters_oneshot_state_before_programming() {
         let step = Cell::new(0);
         program_oneshot(
             100,
             0,
             1_000_000_000,
             |interval| {
-                assert_eq!(step.replace(1), 0);
+                assert_eq!(step.replace(2), 1);
                 assert_eq!(interval, 100);
             },
-            || assert_eq!(step.replace(2), 1),
+            || assert_eq!(step.replace(1), 0),
         );
         assert_eq!(step.get(), 2);
     }

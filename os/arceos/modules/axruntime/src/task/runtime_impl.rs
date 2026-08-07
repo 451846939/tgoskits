@@ -6,6 +6,15 @@ use super::*;
 
 static SCHED_SWITCH_TRACE_HOOK: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 
+unsafe fn membarrier_ipi_memory_barrier(_arg: *mut ()) {
+    core::sync::atomic::fence(Ordering::SeqCst);
+}
+
+unsafe fn membarrier_ipi_refresh_run_queue(_arg: *mut ()) {
+    ax_task::refresh_current_membarrier_run_queue()
+        .unwrap_or_else(|error| panic!("membarrier rq refresh failed in IPI: {error}"));
+}
+
 /// Allocation-free scheduler-switch diagnostic hook installed by an OS layer.
 pub type SchedSwitchTraceHook = fn(SchedSwitchRecord);
 
@@ -364,6 +373,58 @@ impl_task_runtime! {
             address_space: AddressSpaceHandle,
         ) -> AddressSpaceReclaimArmOutcome {
             arm_runtime_address_space_reclaim(address_space)
+        }
+
+        fn address_space_membarrier_state(
+            address_space: AddressSpaceHandle,
+        ) -> AddressSpaceMembarrierState {
+            runtime_address_space_membarrier_state(address_space)
+        }
+
+        fn update_address_space_membarrier_state(
+            address_space: AddressSpaceHandle,
+            registration: MembarrierRegistration,
+            phase: MembarrierRegistrationPhase,
+        ) -> AddressSpaceMembarrierState {
+            update_runtime_address_space_membarrier_state(address_space, registration, phase)
+        }
+
+        fn synchronize_membarrier_cpu(
+            cpu: RuntimeCpuId,
+            action: RuntimeMembarrierAction,
+        ) -> RuntimeStatus {
+            let cpu = cpu.as_u32() as usize;
+            let callback = match action {
+                RuntimeMembarrierAction::MemoryBarrier => membarrier_ipi_memory_barrier,
+                RuntimeMembarrierAction::RefreshRunQueue => {
+                    membarrier_ipi_refresh_run_queue
+                }
+            };
+            #[cfg(all(feature = "irq", feature = "ipi"))]
+            {
+                // SAFETY: both callbacks are fixed, allocation-free hard-IRQ
+                // operations and carry no argument lifetime.
+                match unsafe {
+                    crate::ipi_delivery::run_on_cpu_sync(cpu, callback, core::ptr::null_mut())
+                } {
+                    Ok(()) => RuntimeStatus::Success,
+                    Err(ax_hal::irq::IrqError::CpuOffline) => RuntimeStatus::Busy,
+                    Err(ax_hal::irq::IrqError::InvalidCpu) => RuntimeStatus::InvalidArgument,
+                    Err(_) => RuntimeStatus::Platform,
+                }
+            }
+            #[cfg(not(all(feature = "irq", feature = "ipi")))]
+            {
+                // A UP runtime executes the same hard-call ABI locally. SMP
+                // membarrier requires the explicit `ipi` capability.
+                let current = unsafe { Self::current_cpu_id() }.as_u32() as usize;
+                if cpu != current {
+                    return RuntimeStatus::Unsupported;
+                }
+                // SAFETY: the selected fixed callback takes no argument.
+                unsafe { callback(core::ptr::null_mut()) };
+                RuntimeStatus::Success
+            }
         }
 
         unsafe fn switch_context(switch: ContextSwitch) {

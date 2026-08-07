@@ -216,19 +216,26 @@ hard IRQ 必须：
 - 不执行任意 callback；
 - 不持有 Starry、驱动或进程对象裸指针。
 
-过期 task deadline 只复制到预分配 CPU-local buffer。真正的 thread wake、callback 和资源回收在 scheduler safe point 或 task worker 执行。
+过期 task deadline 只复制到预分配 CPU-local buffer。真正的 thread wake 只由固定绑定的
+`ktimers/<cpu>` FIFO worker 在任务上下文执行；Deadline extension callback 和资源回收仍由
+独立 task-work worker 执行。scheduler safe point 不消费 task timeout，外部调用方也没有
+公开 drain buffer 的入口；buffer 只属于 ktimer worker 的单 consumer 生命周期。
 
 ### batch 耗尽
 
-预算耗尽时同时发布 sticky deadline work 和 `need_resched`。safe point 在 drain 前 claim 旧 publication；若仍有 remainder 或并发新 publication，再发布新 sticky work。旧 completion 不得清掉新工作。
+hard scheduler timer 预算耗尽时发布 sticky scheduler request 和 `need_resched`，owner safe
+point 在 drain 前 claim 旧 publication；task timeout 预算耗尽时只发布 ktimer event，worker
+在 drain 前 claim 旧 publication。两者若仍有 remainder 或并发新 publication，都重新发布
+自己的 generation-bearing sticky work；旧 completion 不得清掉新工作。
 
 ### 无轮询恢复路径
 
 物理 clockevent 是 deadline 推进的正式所有者，不是可丢失后再由 scheduler 偶然扫描补救的
 加速路径。实现不提供 `claim_due`、`recover_overdue`、析构恢复或周期轮询。正确性由
-generation publication、`Firing` 合并、idle 最终复查和远程 doorbell 共同保证；预算耗尽只
-发布有界 soft-timer work，由 owner scheduler safe point 的 softirq 等价路径继续消费；若该
-路径持续有 remainder，则 sticky request 强制再次进入 safe point，不能依赖偶然 tick 推进。
+generation publication、`Firing` 合并、idle 最终复查和远程 doorbell 共同保证；task timeout
+预算耗尽只发布有界 soft-timer work，由 `ktimers/<cpu>` 这一 threaded-softirq 等价路径继续
+消费；hard scheduler timer remainder 由 scheduler request 驱动 owner safe point。两条路径
+都不能依赖偶然 tick 推进。
 
 ## idle 与远程投递
 

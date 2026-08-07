@@ -131,6 +131,141 @@ opaque_handle!(
     AddressSpaceHandle
 );
 
+/// Stable identity of one Linux-style address-space generation.
+///
+/// Distinct scheduler resource tokens may carry different
+/// [`AddressSpaceHandle`] values while referring to the same shared `mm`.
+/// Runtime providers must therefore derive this identity from the shared
+/// address-space owner rather than from the token allocation itself.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(transparent)]
+pub struct AddressSpaceMembarrierId(usize);
+
+impl AddressSpaceMembarrierId {
+    /// Identity used by kernel threads which do not own a userspace `mm`.
+    pub const NONE: Self = Self(0);
+
+    /// Creates an identity from a runtime-owned shared address-space object.
+    ///
+    /// # Safety
+    ///
+    /// A non-zero value must remain unique for the complete lifetime of the
+    /// corresponding address-space generation. It must not be reused while an
+    /// [`AddressSpaceMembarrierState`] containing it can remain rq-visible.
+    pub const unsafe fn from_raw(raw: usize) -> Self {
+        Self(raw)
+    }
+
+    /// Returns whether this is the kernel-thread sentinel.
+    pub const fn is_none(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Returns the provider-owned opaque identity.
+    pub const fn into_raw(self) -> usize {
+        self.0
+    }
+}
+
+/// One membarrier facility registered by an address space.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum MembarrierRegistration {
+    /// Enables process-independent expedited barriers for this `mm`.
+    GlobalExpedited  = 1,
+    /// Enables expedited barriers restricted to this `mm`.
+    PrivateExpedited = 2,
+}
+
+impl MembarrierRegistration {
+    /// Returns the bit stored while rq synchronization is in progress.
+    pub const fn requested_bit(self) -> u32 {
+        self as u32
+    }
+
+    /// Returns the bit published only after every running rq is synchronized.
+    pub const fn ready_bit(self) -> u32 {
+        (self as u32) << 16
+    }
+}
+
+/// Phase of one irreversible per-address-space registration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum MembarrierRegistrationPhase {
+    /// Publishes the requested bit before inspecting any runqueue.
+    Begin    = 0,
+    /// Publishes the ready bit after synchronous rq refresh completes.
+    Complete = 1,
+}
+
+/// Allocation-free snapshot of one address space's membarrier state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C)]
+pub struct AddressSpaceMembarrierState {
+    identity: AddressSpaceMembarrierId,
+    bits: u32,
+}
+
+impl AddressSpaceMembarrierState {
+    /// State installed for a kernel thread without a userspace `mm`.
+    pub const NONE: Self = Self {
+        identity: AddressSpaceMembarrierId::NONE,
+        bits: 0,
+    };
+
+    /// Constructs a provider snapshot from one live shared `mm` identity.
+    ///
+    /// # Safety
+    ///
+    /// `identity` must obey [`AddressSpaceMembarrierId::from_raw`], and `bits`
+    /// must contain only requested and ready bits produced by
+    /// [`MembarrierRegistration`].
+    pub const unsafe fn new(identity: AddressSpaceMembarrierId, bits: u32) -> Self {
+        Self { identity, bits }
+    }
+
+    /// Returns the shared address-space identity.
+    pub const fn identity(self) -> AddressSpaceMembarrierId {
+        self.identity
+    }
+
+    /// Reports whether registration has begun, including its synchronization
+    /// interval before the ready bit becomes visible.
+    pub const fn requested(self, registration: MembarrierRegistration) -> bool {
+        self.bits & registration.requested_bit() != 0
+    }
+
+    /// Reports whether registration completed its rq synchronization.
+    pub const fn ready(self, registration: MembarrierRegistration) -> bool {
+        self.bits & registration.ready_bit() != 0
+    }
+
+    /// Reports whether any scheduler-visible membarrier facility is active.
+    pub const fn any_requested(self) -> bool {
+        self.bits
+            & (MembarrierRegistration::GlobalExpedited.requested_bit()
+                | MembarrierRegistration::PrivateExpedited.requested_bit())
+            != 0
+    }
+
+    /// Returns the provider-owned atomic representation.
+    pub const fn bits(self) -> u32 {
+        self.bits
+    }
+}
+
+/// Bounded operation executed synchronously on a target CPU.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum RuntimeMembarrierAction {
+    /// Executes a full memory barrier in hard-IRQ context.
+    MemoryBarrier   = 0,
+    /// Refreshes `rq->membarrier_state` from its current dispatch and executes
+    /// the corresponding full barrier.
+    RefreshRunQueue = 1,
+}
+
 /// Immutable scheduler snapshot of one thread's runtime switch bindings.
 ///
 /// Linux keeps the architecture context and `mm` selected by the rq transition

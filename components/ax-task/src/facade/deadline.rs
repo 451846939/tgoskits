@@ -220,16 +220,6 @@ pub fn publish_scheduler_tick(stamp: SchedulerTickStamp) -> Result<(), TaskError
     system.publish_current_scheduler_tick_work(&cpu, stamp.thread, stamp.observed_ns)
 }
 
-/// Copies the last IRQ's expired timer events for task-context processing.
-pub fn take_current_expired_task_deadlines(
-    output: &mut [ExpiredTaskDeadline],
-) -> Result<usize, TaskError> {
-    validate_task_context()?;
-    let mut irq = RuntimeIrqGuard::enter();
-    let mut cpu = runtime_current_cpu_mut(&mut irq)?;
-    Ok(cpu.as_mut().take_expired_task_deadlines(output))
-}
-
 #[cfg(test)]
 pub(crate) fn prepare_current_park(_permit: &BlockingPermit) -> Result<ParkPrepare, TaskError> {
     let mut irq = RuntimeIrqGuard::enter();
@@ -420,7 +410,7 @@ impl TaskClockEventOutcome {
     pub const fn deadline_overrun(self) -> bool {
         self.deadline_overrun
     }
-    /// Returns the number of timer events stored for safe-point handling.
+    /// Returns the number of timer events claimed by this bounded IRQ pass.
     pub const fn expired(self) -> usize {
         self.expired
     }

@@ -113,10 +113,7 @@ impl TaskSystem {
                 sched.affinity.affinity.is_migration_capable(),
                 metadata.clone(),
             );
-            transaction
-                .current_mut()
-                .expect("running PI target must remain current")
-                .refresh_scheduler_metadata(metadata, rt_quota_exempt);
+            transaction.refresh_current_scheduler_metadata(core.id(), metadata, rt_quota_exempt);
             core.publish_effective_schedule(policy, &entity);
             return PiRqFollowup::RemoteReschedule;
         }

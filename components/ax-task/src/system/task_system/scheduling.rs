@@ -217,7 +217,6 @@ impl TaskSystem {
         let initial_request = remote.claim_scheduler_request();
         self.complete_context_switch(cpu.as_mut())?;
         self.drain_owner_work(cpu.as_mut())?;
-        self.service_soft_timer_work(cpu.as_mut())?;
         self.ensure_owner_cpu_online(&cpu)?;
         let previous_core_hint = cpu.current_core();
         let mut previous_sched = previous_core_hint.as_ref().map(|core| core.sched().lock());
@@ -312,7 +311,6 @@ impl TaskSystem {
         let initial_request = remote.claim_scheduler_request();
         self.complete_context_switch(cpu.as_mut())?;
         self.drain_owner_work(cpu.as_mut())?;
-        self.service_soft_timer_work(cpu.as_mut())?;
         self.ensure_owner_cpu_online(&cpu)?;
         let previous_core_hint = cpu.current_core();
         let mut previous_sched = previous_core_hint.as_ref().map(|core| core.sched().lock());
@@ -439,7 +437,6 @@ impl TaskSystem {
         let initial_request = remote.claim_scheduler_request();
         self.complete_context_switch(cpu.as_mut())?;
         self.drain_owner_work(cpu.as_mut())?;
-        self.service_soft_timer_work(cpu.as_mut())?;
         self.ensure_owner_cpu_online(&cpu)?;
         let previous_core_hint = cpu.current_core();
         let mut previous_sched = previous_core_hint.as_ref().map(|core| core.sched().lock());

@@ -66,6 +66,17 @@ impl ThreadSchedCell {
         self.state.lock()
     }
 
+    /// Locks scheduler state during offline CPU bootstrap.
+    ///
+    /// # Safety
+    ///
+    /// The caller must retain raw local IRQ exclusion and the boot CPU's
+    /// `PREEMPT_DISABLED` ownership for the complete guard lifetime.
+    pub(super) unsafe fn lock_bootstrap(&self) -> IrqTicketGuard<'_, ThreadSchedState> {
+        // SAFETY: forwarded from this method's offline boot-owner contract.
+        unsafe { self.state.lock_irq_disabled() }
+    }
+
     pub(crate) fn scheduler_fence_cpu(&self) -> Option<CpuId> {
         self.placement.on_cpu()
     }

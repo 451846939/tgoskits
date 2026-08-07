@@ -26,6 +26,38 @@ fn runtime_page_fault_handler(
     ax_mm::kernel_aspace().lock().handle_page_fault(addr, flags)
 }
 
+/// Establishes scheduler ownership before code that may use task services.
+///
+/// Linux establishes the boot runqueue/current/idle relationship in
+/// `sched_init()` before it starts device initcalls. Keep the same ordering at
+/// this boundary: once platform late-init starts, task identity and scheduler
+/// CPU-local state must already have one authoritative owner.
+#[cfg(any(feature = "multitask", test))]
+pub(super) fn initialize_scheduler_before_platform<E>(
+    initialize_scheduler: impl FnOnce() -> Result<(), E>,
+    initialize_platform: impl FnOnce(),
+) -> Result<(), E> {
+    initialize_scheduler()?;
+    initialize_platform();
+    Ok(())
+}
+
+fn initialize_primary_platform(cpu_id: usize, arg: usize) {
+    info!("Initialize platform devices...");
+    ax_hal::init_later(cpu_id, arg);
+    if rdrive::is_initialized() {
+        crate::registers::append_linker_registers();
+        #[cfg(feature = "irq")]
+        ax_hal::irq::init_boot_irqs(cpu_id)
+            .unwrap_or_else(|error| panic!("failed to initialize boot IRQs: {error:?}"));
+        #[cfg(not(feature = "irq"))]
+        rdrive::probe_pre_kernel()
+            .unwrap_or_else(|error| panic!("failed to run pre-kernel driver probes: {error:?}"));
+    } else {
+        warn!("rdrive is not initialized; skip pre-kernel driver probe");
+    }
+}
+
 /// The main entry point of the ArceOS runtime.
 ///
 /// It is called from the bootstrapping code in the specific platform crate
@@ -39,7 +71,7 @@ fn runtime_page_fault_handler(
 #[cfg_attr(not(test), ax_plat::main)]
 pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
     ax_hal::percpu::init_primary(cpu_id);
-    crate::guard::assert_boot_guards_released();
+    crate::guard::assert_boot_preemption_held();
     // After per-CPU init, before scheduler/IPI/IRQ paths can allocate.
     // This is a no-op for allocator backends that do not need per-CPU state.
     ax_alloc::init_percpu_slab(cpu_id);
@@ -126,22 +158,14 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
         ax_hal::trap::set_page_fault_handler(runtime_page_fault_handler);
     }
 
-    info!("Initialize platform devices...");
-    ax_hal::init_later(cpu_id, arg);
-    if rdrive::is_initialized() {
-        crate::registers::append_linker_registers();
-        #[cfg(feature = "irq")]
-        ax_hal::irq::init_boot_irqs(cpu_id)
-            .unwrap_or_else(|error| panic!("failed to initialize boot IRQs: {error:?}"));
-        #[cfg(not(feature = "irq"))]
-        rdrive::probe_pre_kernel()
-            .unwrap_or_else(|error| panic!("failed to run pre-kernel driver probes: {error:?}"));
-    } else {
-        warn!("rdrive is not initialized; skip pre-kernel driver probe");
-    }
-
     #[cfg(feature = "multitask")]
-    crate::task::initialize_primary(cpu_id).expect("failed to initialize primary task scheduler");
+    initialize_scheduler_before_platform(
+        || crate::task::initialize_primary(cpu_id),
+        || initialize_primary_platform(cpu_id, arg),
+    )
+    .expect("failed to initialize primary task scheduler");
+    #[cfg(not(feature = "multitask"))]
+    initialize_primary_platform(cpu_id, arg);
 
     #[cfg(feature = "ipi")]
     {
@@ -161,11 +185,17 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
         crate::task::publish_current_cpu_online().expect("failed to publish primary scheduler CPU");
 
     #[cfg(all(feature = "irq", feature = "multitask"))]
+    crate::task::start_current_ktimer_service().expect("failed to create primary ktimer service");
+
+    #[cfg(all(feature = "irq", feature = "multitask"))]
     crate::clock_event_runtime::enable_irqs_after_scheduler_online(online_cpu);
     #[cfg(all(feature = "irq", not(feature = "multitask")))]
     ax_hal::asm::enable_irqs();
     #[cfg(all(feature = "multitask", not(feature = "irq")))]
     let _ = online_cpu;
+
+    #[cfg(feature = "multitask")]
+    crate::guard::release_bootstrap_preemption();
 
     #[cfg(all(feature = "irq", feature = "ipi"))]
     ax_ipi::mark_current_cpu_ready();
@@ -235,6 +265,41 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
         #[cfg(feature = "irq")]
         crate::clock_event_runtime::take_current_clock_event_offline();
         ax_hal::power::system_off();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec::Vec;
+    use core::cell::RefCell;
+
+    use super::initialize_scheduler_before_platform;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum BootEvent {
+        SchedulerOwnerPublished,
+        PlatformLateInit,
+    }
+
+    #[test]
+    fn scheduler_owner_is_published_before_platform_late_init() {
+        let events = RefCell::new(Vec::new());
+        initialize_scheduler_before_platform(
+            || {
+                events.borrow_mut().push(BootEvent::SchedulerOwnerPublished);
+                Ok::<(), ()>(())
+            },
+            || events.borrow_mut().push(BootEvent::PlatformLateInit),
+        )
+        .unwrap();
+
+        assert_eq!(
+            events.into_inner(),
+            [
+                BootEvent::SchedulerOwnerPublished,
+                BootEvent::PlatformLateInit,
+            ]
+        );
     }
 }
 

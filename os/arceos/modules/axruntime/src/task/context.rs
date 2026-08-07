@@ -90,15 +90,31 @@ struct RuntimeContext {
     switch_tail: UnsafeCell<Option<RuntimeSwitchTail>>,
 }
 
+#[derive(Clone, Copy)]
+enum InitialPreemptionState {
+    Enabled,
+    BootstrapDisabled,
+}
+
 const _: () = assert!(offset_of!(RuntimeContext, header) == 0);
 
 impl RuntimeContext {
-    fn allocate(inner: ax_hal::context::TaskContext, stack: StackHandle) -> *mut RuntimeContext {
+    fn allocate(
+        inner: ax_hal::context::TaskContext,
+        stack: StackHandle,
+        preemption: InitialPreemptionState,
+    ) -> *mut RuntimeContext {
         let inner = Box::new(UnsafeCell::new(inner));
         let identity = CurrentContext::from_raw(inner.get().expose_provenance())
             .expect("an architecture context allocation must have a non-zero identity");
+        let header = match preemption {
+            InitialPreemptionState::Enabled => CurrentThreadHeader::new(identity),
+            InitialPreemptionState::BootstrapDisabled => {
+                CurrentThreadHeader::new_bootstrap(identity)
+            }
+        };
         Box::into_raw(Box::new(Self {
-            header: CurrentThreadHeader::new(identity),
+            header,
             publication: UnsafeCell::new(CurrentThreadPublication::NONE),
             inner,
             stack,
@@ -278,13 +294,18 @@ fn create_runtime_context_parts(
         ax_hal::context::KernelTlsBase::new(tls_pointer),
     );
     RuntimeHandleResult::success(
-        RuntimeContext::allocate(context, stack_handle).expose_provenance(),
+        RuntimeContext::allocate(context, stack_handle, InitialPreemptionState::Enabled)
+            .expose_provenance(),
     )
 }
 
 pub(super) fn create_bootstrap_context() -> ExecutionContextHandle {
     let context = ax_hal::context::TaskContext::new();
-    let context = RuntimeContext::allocate(context, StackHandle::NONE);
+    let context = RuntimeContext::allocate(
+        context,
+        StackHandle::NONE,
+        InitialPreemptionState::BootstrapDisabled,
+    );
     // SAFETY: Box::into_raw yields a non-null uniquely owned RuntimeContext
     // that stays live until destroy_runtime_context consumes the handle.
     unsafe { ExecutionContextHandle::from_raw(context.expose_provenance()) }
@@ -462,10 +483,16 @@ mod tests {
             // SAFETY: this fresh host thread owns its CPU-local register model.
             unsafe { cpu_local::install_cpu_area(area) }.unwrap();
 
-            let previous =
-                RuntimeContext::allocate(ax_hal::context::TaskContext::new(), StackHandle::NONE);
-            let next =
-                RuntimeContext::allocate(ax_hal::context::TaskContext::new(), StackHandle::NONE);
+            let previous = RuntimeContext::allocate(
+                ax_hal::context::TaskContext::new(),
+                StackHandle::NONE,
+                InitialPreemptionState::Enabled,
+            );
+            let next = RuntimeContext::allocate(
+                ax_hal::context::TaskContext::new(),
+                StackHandle::NONE,
+                InitialPreemptionState::Enabled,
+            );
 
             // SAFETY: both leaked runtime contexts remain pinned for the
             // modeled switch, and this host thread cannot migrate.
@@ -507,10 +534,16 @@ mod tests {
             // SAFETY: this fresh host thread owns its CPU-local register model.
             unsafe { cpu_local::install_cpu_area(area) }.unwrap();
 
-            let previous =
-                RuntimeContext::allocate(ax_hal::context::TaskContext::new(), StackHandle::NONE);
-            let next =
-                RuntimeContext::allocate(ax_hal::context::TaskContext::new(), StackHandle::NONE);
+            let previous = RuntimeContext::allocate(
+                ax_hal::context::TaskContext::new(),
+                StackHandle::NONE,
+                InitialPreemptionState::Enabled,
+            );
+            let next = RuntimeContext::allocate(
+                ax_hal::context::TaskContext::new(),
+                StackHandle::NONE,
+                InitialPreemptionState::Enabled,
+            );
 
             // SAFETY: both leaked contexts remain pinned while the modeled CPU
             // validates and then rolls back this uncommitted switch.

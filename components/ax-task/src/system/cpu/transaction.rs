@@ -12,6 +12,13 @@ pub(crate) enum OwnerRqEntry {
     SchedulerFrame,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OwnerRqContext {
+    RuntimeIrqSave,
+    SchedulerFrame,
+    OfflineBootstrap,
+}
+
 impl OwnerRqEntry {
     /// Begins the selected rq locking protocol.
     ///
@@ -45,6 +52,7 @@ pub(crate) struct OwnerRqTxn<'a> {
     run_queue: Option<IrqTicketGuard<'a, CpuRunQueueState>>,
     clock: RunQueueClockSnapshot,
     request: Option<SchedulerRequestClaim>,
+    context: OwnerRqContext,
     finished: bool,
 }
 
@@ -74,6 +82,7 @@ impl<'a> OwnerRqTxn<'a> {
             run_queue: Some(run_queue),
             clock,
             request: None,
+            context: OwnerRqContext::RuntimeIrqSave,
             finished: false,
         }
     }
@@ -94,6 +103,32 @@ impl<'a> OwnerRqTxn<'a> {
             run_queue: Some(run_queue),
             clock,
             request: None,
+            context: OwnerRqContext::SchedulerFrame,
+            finished: false,
+        }
+    }
+
+    /// Begins the first rq transaction while its owner CPU is still offline.
+    ///
+    /// This is the `sched_init()` counterpart of [`Self::begin_scheduler`]:
+    /// boot already owns raw IRQ exclusion and `PREEMPT_DISABLED`, but no
+    /// runtime IRQ-exit service may run until rq/current/idle are published.
+    ///
+    /// # Safety
+    ///
+    /// The calling CPU must retain its offline boot ownership and local IRQs
+    /// must remain disabled for the complete transaction.
+    pub(crate) unsafe fn begin_bootstrap(system: &'a TaskSystem, remote: &'a CpuRemote) -> Self {
+        // SAFETY: forwarded from this constructor's boot-owner contract.
+        let mut run_queue = unsafe { remote.lock_run_queue_irq_disabled() };
+        let clock = run_queue.update_clock();
+        Self {
+            system,
+            remote,
+            run_queue: Some(run_queue),
+            clock,
+            request: None,
+            context: OwnerRqContext::OfflineBootstrap,
             finished: false,
         }
     }
@@ -195,6 +230,16 @@ impl<'a> OwnerRqTxn<'a> {
             .unwrap_or_else(|_| {
                 task_runtime::fatal_invariant(0x5251_1003, thread.as_u64() as usize)
             });
+    }
+
+    pub(crate) fn refresh_current_scheduler_metadata(
+        &mut self,
+        thread: ThreadId,
+        metadata: RqTaskMetadata,
+        rt_quota_exempt: bool,
+    ) {
+        self.run_queue_mut()
+            .refresh_current_scheduler_metadata(thread, metadata, rt_quota_exempt);
     }
 
     /// Linux-style rq mutation: placement was validated under `p->pi_lock`
@@ -480,12 +525,35 @@ impl<'a> OwnerRqTxn<'a> {
     /// explicit rather than a `Drop` fallback so a partial transition cannot
     /// become externally visible by accident.
     pub(crate) fn commit(mut self) {
+        if self.context == OwnerRqContext::OfflineBootstrap {
+            task_runtime::fatal_invariant(0x5251_100f, self.remote.owner().as_u32() as usize);
+        }
         let run_queue = self
             .run_queue
             .as_ref()
             .expect("an unfinished rq transaction must retain its lock");
         self.system
             .publish_run_queue_summary(self.remote, run_queue);
+        self.finished = true;
+        drop(self.run_queue.take());
+    }
+
+    /// Commits owner-local bootstrap state without publishing an offline rq
+    /// into the root-domain priority indexes.
+    ///
+    /// Linux initializes `rq`, `curr`, and `idle` while the CPU is offline;
+    /// cpupri/cpudl publication starts only when the rq joins the online root
+    /// domain. Keeping the phases separate also prevents `sched_init()` from
+    /// entering the runtime IRQ-exit service through nested index locks.
+    pub(crate) fn commit_bootstrap(mut self) {
+        if self.context != OwnerRqContext::OfflineBootstrap || self.remote.is_online() {
+            task_runtime::fatal_invariant(0x5251_1010, self.remote.owner().as_u32() as usize);
+        }
+        let run_queue = self
+            .run_queue
+            .as_ref()
+            .expect("an unfinished rq transaction must retain its lock");
+        self.remote.publish_run_queue_load_summary(run_queue);
         self.finished = true;
         drop(self.run_queue.take());
     }

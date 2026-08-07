@@ -9,7 +9,7 @@ use state::{RuntimeGuardState, RuntimeIrqState, RuntimePreemptState};
 #[ax_percpu::def_percpu]
 static RUNTIME_GUARD_STATE: RuntimeGuardState = RuntimeGuardState::new();
 
-pub(crate) fn assert_boot_guards_released() {
+pub(crate) fn assert_boot_preemption_held() {
     let state = read_state();
     assert_eq!(
         state.irq,
@@ -23,8 +23,25 @@ pub(crate) fn assert_boot_guards_released() {
     );
     assert_eq!(
         current_preempt_depth(),
+        1,
+        "boot current must retain PREEMPT_DISABLED until scheduler publication"
+    );
+}
+
+#[cfg(feature = "multitask")]
+pub(crate) fn release_bootstrap_preemption() {
+    let state = read_state();
+    assert!(state.irq.is_clear() && state.preempt.is_clear());
+    assert_eq!(
+        current_preempt_depth(),
+        1,
+        "bootstrap release requires the exact Linux boot preemption depth"
+    );
+    finish_kernel_preempt_guard(PreemptExitOrigin::Task);
+    assert_eq!(
+        current_preempt_depth(),
         0,
-        "current-thread preemption guard crossed a runtime boot phase"
+        "bootstrap preemption depth must be released exactly once"
     );
 }
 

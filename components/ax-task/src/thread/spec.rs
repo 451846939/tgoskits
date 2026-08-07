@@ -219,6 +219,13 @@ impl CpuSet {
         self.allowed_count
     }
 
+    /// Iterates selected CPUs in ascending logical-ID order.
+    pub fn iter(&self) -> impl Iterator<Item = CpuId> + '_ {
+        (0..self.topology_len)
+            .map(|index| CpuId::new(index as u32))
+            .filter(|cpu| self.contains(*cpu))
+    }
+
     /// Returns the only allowed CPU when migration is impossible.
     pub(crate) fn sole_cpu(&self) -> Option<CpuId> {
         if self.allowed_count != 1 {

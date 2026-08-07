@@ -1,14 +1,15 @@
 //! Runtime-backed scheduler capabilities for crates below `ax-runtime`.
 
-use alloc::{boxed::Box, string::String, sync::Arc};
+use alloc::{string::String, sync::Arc};
 use core::{marker::PhantomData, mem::align_of, ops::Deref, pin::Pin, ptr};
 
 use crate::{
     CpuId, CpuLocal, CpuLocalOwnerBorrow, CpuRemote, CpuSet, CurrentExitPermit, CurrentThreadToken,
     IrqRegisterResult, IrqWaitCell, IrqWaitRegistration, IrqWaitToken, ParkCommit, ParkPrepare,
-    PiMutexLockResult, PiMutexRef, PiWaitToken, ScheduleDecision, SchedulePolicy, SchedulerOutcome,
-    TaskError, TaskSystem, ThreadBuilder, ThreadCore, ThreadExtensionLease, ThreadHandle, ThreadId,
-    ThreadRuntimeSnapshot, ThreadState, ThreadWakeHandle, WaitQueue, WakeResult,
+    PiMutexLockResult, PiMutexRef, PiWaitToken, RtPriority, ScheduleDecision, SchedulePolicy,
+    SchedulerOutcome, TaskError, TaskSystem, ThreadBuilder, ThreadCore, ThreadExtensionLease,
+    ThreadHandle, ThreadId, ThreadRuntimeSnapshot, ThreadState, ThreadWakeHandle, WaitQueue,
+    WakeResult,
     executor::CoroutineHeader,
     inbox::PublishResult,
     lock::PreemptScope,
@@ -17,10 +18,13 @@ use crate::{
         RuntimeSchedulerEntry, RuntimeSchedulerReturn, RuntimeStatus, SchedSwitchRecord,
         task_runtime,
     },
-    timer::{ExpiredTaskDeadline, TaskDeadlineKind},
+    timer::TaskDeadlineKind,
 };
 
 mod deadline;
+mod irq_worker;
+mod ktimer;
+mod membarrier;
 mod pi;
 mod runtime_cpu;
 mod scheduling;
@@ -29,12 +33,16 @@ mod task_work;
 pub use deadline::{
     CurrentParkResume, CurrentParkStart, PreparedCurrentPark, SchedulerTickStamp,
     TaskClockEventOutcome, begin_current_park, on_clock_event, publish_scheduler_tick,
-    take_current_expired_task_deadlines,
 };
 #[cfg(test)]
 use deadline::{arm_current_park_deadline, cancel_current_park_deadline, prepare_current_park};
 pub(crate) use deadline::{
     begin_current_park_with_permit, cancel_current_park, commit_current_park,
+};
+pub use ktimer::start_current_ktimer_service;
+pub use membarrier::{
+    MembarrierCommand, membarrier, refresh_current_membarrier_run_queue,
+    register_current_membarrier,
 };
 pub use pi::{
     pi_block_current, pi_mutex_claim, pi_mutex_lock_slow, pi_mutex_release_owned, pi_wait_cancel,

@@ -54,10 +54,7 @@ fn task_work_service_loop() -> Result<(), TaskError> {
     let system = runtime_task_system()?;
     let doorbell = system.task_work_doorbell();
     let wake_owner = current_thread_handle()?.wake_handle();
-    let waiter = Box::leak(Box::new(TaskWorkWaiter {
-        registration: IrqWaitRegistration::new(wake_owner),
-        park: WaitQueue::new(),
-    }));
+    let waiter = super::irq_worker::IrqWorkerWaiter::new(wake_owner);
     system.finish_task_work_worker_install();
 
     loop {
@@ -72,7 +69,7 @@ fn task_work_service_loop() -> Result<(), TaskError> {
                 continue;
             }
             TaskWorkServiceAction::Wait => {
-                wait_for_task_work(doorbell.event(), &waiter.registration, &waiter.park)?;
+                waiter.wait(doorbell.event())?;
             }
         }
     }
@@ -118,27 +115,6 @@ pub(super) fn service_task_work_pass(
             Ok(None)
         }
         Err(error) => Err(error),
-    }
-}
-
-struct TaskWorkWaiter {
-    registration: IrqWaitRegistration,
-    park: WaitQueue,
-}
-
-fn wait_for_task_work(
-    event: &IrqWaitCell,
-    registration: &IrqWaitRegistration,
-    park: &WaitQueue,
-) -> Result<(), TaskError> {
-    match event.register(registration) {
-        IrqRegisterResult::Occupied => Err(TaskError::InvalidConfiguration),
-        IrqRegisterResult::ConsumedPending => Ok(()),
-        IrqRegisterResult::Registered(token) | IrqRegisterResult::NotificationInFlight(token) => {
-            let wait = park.try_wait_until(|| !token.is_attached());
-            quiesce_irq_wait(token)?;
-            wait
-        }
     }
 }
 

@@ -279,6 +279,10 @@ impl CurrentDispatch {
         )
     }
 
+    pub(crate) const fn address_space(&self) -> crate::runtime::AddressSpaceHandle {
+        self.task.runtime_binding.address_space()
+    }
+
     pub(crate) fn update_runtime_binding(&mut self, binding: crate::runtime::ThreadRuntimeBinding) {
         self.task.runtime_binding = binding;
     }

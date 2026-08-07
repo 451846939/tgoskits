@@ -52,7 +52,7 @@ pub fn rust_main_secondary(cpu_id: usize) -> ! {
         }
     }
     ax_hal::percpu::init_secondary(cpu_id);
-    crate::guard::assert_boot_guards_released();
+    crate::guard::assert_boot_preemption_held();
     // After per-CPU init, before scheduler/IPI/IRQ paths can allocate.
     // This is a no-op for allocator backends that do not need per-CPU state.
     ax_alloc::init_percpu_slab(cpu_id);
@@ -70,11 +70,14 @@ pub fn rust_main_secondary(cpu_id: usize) -> ! {
     #[cfg(feature = "paging")]
     ax_mm::init_memory_management_secondary();
 
-    ax_hal::init_later_secondary(cpu_id);
-
     #[cfg(feature = "multitask")]
-    crate::task::initialize_secondary(cpu_id)
-        .expect("failed to initialize secondary task scheduler");
+    super::bootstrap::initialize_scheduler_before_platform(
+        || crate::task::initialize_secondary(cpu_id),
+        || ax_hal::init_later_secondary(cpu_id),
+    )
+    .expect("failed to initialize secondary task scheduler");
+    #[cfg(not(feature = "multitask"))]
+    ax_hal::init_later_secondary(cpu_id);
 
     #[cfg(feature = "ipi")]
     ax_ipi::init();
@@ -90,11 +93,17 @@ pub fn rust_main_secondary(cpu_id: usize) -> ! {
         .expect("failed to publish secondary scheduler CPU");
 
     #[cfg(all(feature = "irq", feature = "multitask"))]
+    crate::task::start_current_ktimer_service().expect("failed to create secondary ktimer service");
+
+    #[cfg(all(feature = "irq", feature = "multitask"))]
     super::clock_event_runtime::enable_irqs_after_scheduler_online(online_cpu);
     #[cfg(all(feature = "irq", not(feature = "multitask")))]
     ax_hal::asm::enable_irqs();
     #[cfg(all(feature = "multitask", not(feature = "irq")))]
     let _ = online_cpu;
+
+    #[cfg(feature = "multitask")]
+    crate::guard::release_bootstrap_preemption();
 
     #[cfg(all(feature = "irq", feature = "ipi"))]
     {

@@ -349,6 +349,38 @@ pub trait TaskRuntime {
         address_space: AddressSpaceHandle,
     ) -> AddressSpaceReclaimArmOutcome;
 
+    /// Loads the shared `mm` identity and membarrier registration state.
+    ///
+    /// This operation runs while rq locks or local IRQ exclusion may be held.
+    /// It must be a fixed, allocation-free atomic lookup and must not acquire
+    /// an OS lock or re-enter ax-task. An invalid handle is a fatal provider
+    /// invariant.
+    fn address_space_membarrier_state(
+        address_space: AddressSpaceHandle,
+    ) -> AddressSpaceMembarrierState;
+
+    /// Advances one irreversible per-`mm` membarrier registration phase.
+    ///
+    /// `Begin` publishes the requested bit before ax-task inspects runqueues;
+    /// `Complete` publishes the ready bit only after synchronous target-rq
+    /// refresh. The operation must be allocation-free and atomic.
+    fn update_address_space_membarrier_state(
+        address_space: AddressSpaceHandle,
+        registration: MembarrierRegistration,
+        phase: MembarrierRegistrationPhase,
+    ) -> AddressSpaceMembarrierState;
+
+    /// Executes one bounded membarrier action synchronously on `cpu`.
+    ///
+    /// Providers must not return success until the target callback completes.
+    /// The remote callback runs in hard-IRQ context and may only execute the
+    /// selected full barrier or the ax-task rq refresh entry; it must not
+    /// allocate, sleep, or invoke arbitrary OS callbacks.
+    fn synchronize_membarrier_cpu(
+        cpu: RuntimeCpuId,
+        action: RuntimeMembarrierAction,
+    ) -> RuntimeStatus;
+
     /// Consumes one committed context-switch transaction with local interrupts
     /// disabled.
     ///
