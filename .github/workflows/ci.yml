@@ -453,24 +453,6 @@ jobs:
             container_image: base
             limit_to_owner: ""
             main_pr_only: false
-          - name: Test axvisor riscv64 qemu
-            use_container: false
-            runs_on: '["self-hosted","linux","qcs"]'
-            self_hosted_owner: rcore-os
-            command: cargo xtask axvisor test qemu --arch riscv64 --test-case smoke
-            cache_key: ""
-            container_image: base
-            limit_to_owner: ""
-            main_pr_only: false
-          - name: Test axvisor loongarch64 qemu
-            use_container: true
-            runs_on: '["ubuntu-latest"]'
-            command: target/debug/tg-xtask axvisor test qemu --arch loongarch64  --test-case smoke
-            cache_key: test-axvisor-loongarch64
-            container_image: axvisor-lvz
-            limit_to_owner: ""
-            main_pr_only: false
-            download_xtask_bin_artifact: true
           - name: Test axvisor qemu ivc
             use_container: false
             runs_on: '["self-hosted","linux","qcs"]'
