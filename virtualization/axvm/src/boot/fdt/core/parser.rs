@@ -703,7 +703,7 @@ fn add_ivshmem_bar2_backing_configs(vm_cfg: &mut AxVMConfig) -> AxVmResult {
             continue;
         }
 
-        debug!(
+        info!(
             "Adding ivshmem BAR2 backing mapping {} GPA [{:#x}~{:#x}] -> HPA [{:#x}~{:#x}]",
             name,
             bar2_base,

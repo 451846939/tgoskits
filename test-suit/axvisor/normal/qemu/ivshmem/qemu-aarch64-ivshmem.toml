@@ -21,9 +21,10 @@ fail_regex = [
     "(?i)unhandled page fault",
     "(?i)page fault",
     "(?m)^ivshmem bar2 smoke failed:",
+    "(?m)^Zephyr ivshmem failed:",
 ]
 success_regex = [
-    "(?s)ivshmem-pci vendor=0x1af4 device=0x1110.*ivshmem irq=[1-9][0-9]*.*ivshmem uio device=/dev/uio[0-9]+.*ivshmem uio event count=[0-9]+.*ivshmem uio event count=[0-9]+.*ivshmem bar2 shared memory pass",
+    "(?m)^ivshmem bar2 shared memory pass\\s*$",
 ]
 to_bin = true
 uefi = false

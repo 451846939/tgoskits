@@ -16,6 +16,7 @@ const ARCEOS_QEMU_GUEST_PACKAGE: &str = "ax-helloworld";
 const ARCEOS_QEMU_GUEST_KERNEL_PATH: &str = "/guest/arceos/ax-helloworld-x86_64.bin";
 const AXVISOR_IVSHMEM_BAR2_SMOKE_GUEST_PATH: &str = "/root/ivshmem-bar2-smoke";
 const AXVISOR_IVSHMEM_BAR2_INITRAMFS_GUEST_PATH: &str = "/guest/linux/ivshmem-bar2-initramfs.cpio";
+const AXVISOR_IVSHMEM_ZEPHYR_GUEST_PATH: &str = "/guest/zephyr/zephyr-ivshmem-peer.bin";
 
 pub(super) fn arceos_x86_64_guest_request() -> anyhow::Result<ResolvedBuildRequest> {
     arceos_guest_request(ARCEOS_QEMU_GUEST_PACKAGE, "x86_64", "x86_64-unknown-none")
@@ -121,6 +122,12 @@ pub(super) fn inject_linux_ivshmem_assets(
     let initramfs = out_dir.join("ivshmem-bar2-initramfs.cpio");
     ensure_file_exists(&smoke, "Linux ivshmem BAR2 smoke test")?;
     ensure_file_exists(&initramfs, "Linux ivshmem BAR2 initramfs")?;
+    let zephyr = case_needs_zephyr_ivshmem_assets(request, case)
+        .then(|| build_zephyr_ivshmem_peer(workspace_root))
+        .transpose()?;
+    if let Some(zephyr) = &zephyr {
+        ensure_file_exists(zephyr, "Zephyr ivshmem peer image")?;
+    }
 
     let (overlay_dir, temporary_overlay_run_dir) =
         direct_overlay_dir(workspace_root, request, case)?;
@@ -136,6 +143,14 @@ pub(super) fn inject_linux_ivshmem_assets(
         AXVISOR_IVSHMEM_BAR2_INITRAMFS_GUEST_PATH,
         "Linux ivshmem BAR2 initramfs",
     )?;
+    if let Some(zephyr) = zephyr {
+        copy_guest_overlay_file(
+            &zephyr,
+            &overlay_dir,
+            AXVISOR_IVSHMEM_ZEPHYR_GUEST_PATH,
+            "Zephyr ivshmem peer image",
+        )?;
+    }
     let result = crate::rootfs::inject::inject_overlay(&prepared_assets.rootfs_path, &overlay_dir);
     test_case::remove_case_run_dir(temporary_overlay_run_dir.as_deref());
     result
@@ -189,6 +204,18 @@ fn case_needs_linux_ivshmem_assets(
         })
 }
 
+fn case_needs_zephyr_ivshmem_assets(
+    request: &ResolvedAxvisorRequest,
+    case: &PreparedAxvisorQemuCase,
+) -> bool {
+    case.case.case.name.contains("ivshmem")
+        && request.vmconfigs.iter().any(|path| {
+            path.file_stem()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains("zephyr-ivshmem"))
+        })
+}
+
 fn build_linux_ivshmem_assets(workspace_root: &Path, arch: &str) -> anyhow::Result<PathBuf> {
     let source_dir = workspace_root.join("apps/linux/ivshmem");
     let build_script = source_dir.join("build.sh");
@@ -212,6 +239,26 @@ fn build_linux_ivshmem_assets(workspace_root: &Path, arch: &str) -> anyhow::Resu
         &out_dir.join("ivshmem-bar2-smoke"),
     )?;
     Ok(out_dir)
+}
+
+fn build_zephyr_ivshmem_peer(workspace_root: &Path) -> anyhow::Result<PathBuf> {
+    let source_dir = workspace_root.join("apps/zephyr/ivshmem_peer");
+    let build_script = source_dir.join("build.sh");
+    ensure_file_exists(&build_script, "Zephyr ivshmem build script")?;
+
+    let out_dir = workspace_root.join("tmp/axbuild/ivshmem/zephyr");
+    let mut command = Command::new(&build_script);
+    command
+        .current_dir(&source_dir)
+        .env("AXVISOR_ZEPHYR_IVSHMEM_OUT_DIR", &out_dir);
+
+    let status = command
+        .status()
+        .with_context(|| format!("failed to run {}", build_script.display()))?;
+    if !status.success() {
+        anyhow::bail!("Zephyr ivshmem peer build failed with status {status}");
+    }
+    Ok(out_dir.join("zephyr-ivshmem-peer.bin"))
 }
 
 fn write_ivshmem_bar2_initramfs(output: &Path, init_binary: &Path) -> anyhow::Result<()> {

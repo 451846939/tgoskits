@@ -10,8 +10,10 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
+#include <sys/reboot.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
@@ -112,6 +114,15 @@ static void die(const char *msg)
     fprintf(stderr, "ivshmem bar2 smoke failed: %s: %s\n", msg, strerror(errno));
     sync();
     _exit(1);
+}
+
+static void poweroff_after_success(void)
+{
+    sync();
+    syscall(SYS_reboot, 0xfee1dead, 672274793, 0x4321fedc, NULL);
+    for (;;) {
+        pause();
+    }
 }
 
 static uint64_t monotonic_ns(void)
@@ -588,7 +599,6 @@ static void peer0(volatile uint32_t *bar0, struct bar2_mailbox *box, struct uio_
                   const char *irq)
 {
     clear_mailbox(box);
-    wait_for(&box->b_seq, READY_SEQ, "VM B ready");
     fill_payload(box->a_payload, PAYLOAD_SIZE, 0xa11c0000U);
     box->a_checksum = checksum(box->a_payload, PAYLOAD_SIZE);
     __sync_synchronize();
@@ -609,6 +619,7 @@ static void peer0(volatile uint32_t *bar0, struct bar2_mailbox *box, struct uio_
     }
     puts("VM A reads same data");
     puts("ivshmem bar2 shared memory pass");
+    poweroff_after_success();
 }
 
 static void peer1(volatile uint32_t *bar0, struct bar2_mailbox *box, struct uio_context *uio,
