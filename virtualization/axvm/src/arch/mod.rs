@@ -157,12 +157,13 @@ pub(crate) trait ArchOps {
     fn before_vcpu_run(_vm: &crate::AxVMRef, _vcpu: &crate::vm::AxVCpuRef) {}
 
     fn inject_pending_interrupt(
-        _vm: &crate::AxVMRef,
+        _vm: &crate::AxVM,
         vcpu: &crate::vm::AxVCpuRef,
         interrupt: crate::vm::PendingInterrupt,
-    ) {
+    ) -> Option<crate::vm::PendingInterrupt> {
         match interrupt {
-            crate::vm::PendingInterrupt::Normal(vector) => {
+            crate::vm::PendingInterrupt::Normal(vector)
+            | crate::vm::PendingInterrupt::Replay(vector) => {
                 trace!(
                     "Injecting queued interrupt {vector:#x} into VM[{}] VCpu[{}]",
                     vcpu.vm_id(),
@@ -176,10 +177,12 @@ pub(crate) trait ArchOps {
                         vcpu.id()
                     );
                 }
+                None
             }
             crate::vm::PendingInterrupt::External {
                 vector,
                 physical_irq,
+                priority: _,
             } => {
                 warn!(
                     "VM[{}] VCpu[{}] dropped unsupported external interrupt vector={vector:#x}, \
@@ -187,12 +190,18 @@ pub(crate) trait ArchOps {
                     vcpu.vm_id(),
                     vcpu.id()
                 );
+                None
             }
         }
     }
 
     fn after_external_interrupt(_vm: &crate::AxVMRef, _vcpu: &crate::vm::AxVCpuRef, vector: usize) {
+        let dispatch_start_ns = crate::runtime::rt_trace::now_ns();
         crate::host::arceos::dispatch_host_irq(vector);
+        crate::runtime::rt_trace::trace_host_irq_dispatch(
+            vector,
+            crate::runtime::rt_trace::now_ns().saturating_sub(dispatch_start_ns),
+        );
         crate::check_timer_events();
     }
 
@@ -207,14 +216,22 @@ pub(crate) trait ArchOps {
     ) {
     }
 
-    fn handle_halt(runtime: &crate::vm::VmRuntimeHandle) -> bool {
-        runtime.wait();
+    fn handle_halt(
+        vm: &crate::AxVMRef,
+        runtime: &crate::vm::VmRuntimeHandle,
+        vcpu_id: usize,
+    ) -> bool {
+        runtime.wait_vcpu_until(vcpu_id, || {
+            runtime.has_pending_interrupt(vcpu_id) || !vm.running()
+        });
         false
     }
 
     fn handle_idle(_vm: &crate::AxVMRef, _vcpu: &crate::vm::AxVCpuRef) {
         crate::check_timer_events();
     }
+
+    fn on_vcpu_task_exit(_vm_id: usize, _vcpu_id: usize) {}
 
     fn on_last_vcpu_exit(_vm_id: usize) {}
 

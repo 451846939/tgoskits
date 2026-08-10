@@ -152,6 +152,10 @@ impl IrqIf for DummyIrq {
         None
     }
 
+    fn handle_fiq(_irq: TrapVector) -> Option<IrqId> {
+        None
+    }
+
     fn send_ipi(_irq: IrqId, _target: IpiTarget) {}
 
     fn ipi_irq() -> IrqId {

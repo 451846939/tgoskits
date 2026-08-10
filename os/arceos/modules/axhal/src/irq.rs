@@ -10,7 +10,8 @@ pub use ax_plat::irq::{
     X86_IOAPIC_DOMAIN, X86_LAPIC_DOMAIN, cpu_online, disable_irq, dispatch_irq, enable_irq,
     free_irq, handle, in_irq_context, irq_status, legacy_irq, legacy_irq_raw, request_irq,
     request_percpu_irq, request_shared_irq, resolve_irq_source, resolve_percpu_irq,
-    run_on_cpu_sync, set_enable, set_run_on_cpu_sync, synchronize_irq, try_legacy_irq,
+    run_on_cpu_sync, set_affinity, set_enable, set_run_on_cpu_sync, synchronize_irq,
+    try_legacy_irq,
 };
 #[cfg(feature = "ipi")]
 pub use ax_plat::irq::{IpiTarget, send_ipi};
@@ -27,11 +28,35 @@ pub fn ipi_irq() -> IrqId {
 ///
 /// Make sure called in an interrupt context or hypervisor VM exit handler.
 pub fn handle_irq(vector: usize) -> bool {
+    handle_irq_id(vector).is_some()
+}
+
+/// Dispatches an IRQ and returns its resolved platform identity.
+///
+/// Make sure called in an interrupt context or hypervisor VM exit handler.
+pub fn handle_irq_id(vector: usize) -> Option<IrqId> {
     let guard = ax_kernel_guard::NoPreempt::new();
-    let handled = handle(TrapVector(vector)).is_some();
+    let irq = handle(TrapVector(vector));
 
     drop(guard); // rescheduling may occur when preemption is re-enabled.
-    handled
+    irq
+}
+
+/// FIQ handler for architectures whose interrupt controller exposes a
+/// distinct Group 0 acknowledge path.
+pub fn handle_fiq(vector: usize) -> bool {
+    handle_fiq_id(vector).is_some()
+}
+
+/// Dispatches an FIQ and returns its resolved platform identity.
+///
+/// Make sure called in an interrupt context or hypervisor VM exit handler.
+pub fn handle_fiq_id(vector: usize) -> Option<IrqId> {
+    let guard = ax_kernel_guard::NoPreempt::new();
+    let irq = ax_plat::irq::handle_fiq(TrapVector(vector));
+
+    drop(guard);
+    irq
 }
 
 /// Installs the default ArceOS IRQ dispatcher into `ax-cpu`'s runtime hook.

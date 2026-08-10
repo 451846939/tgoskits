@@ -41,7 +41,8 @@ fn probe(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
     let mut intc = rdrive::get::<Intc>(intc_id).unwrap().lock().unwrap();
     let interrupts = fdt.interrupts();
 
-    let irq_idx = someboot::timer::aarch64_timer_irq_index(someboot::timer::aarch64_timer_mode());
+    let timer_mode = someboot::timer::aarch64_timer_mode();
+    let irq_idx = someboot::timer::aarch64_timer_irq_index(timer_mode);
     let irq = &interrupts[irq_idx].specifier;
     TIMER_IRQ_VEC.call_once(|| irq.to_vec());
     let translation = intc

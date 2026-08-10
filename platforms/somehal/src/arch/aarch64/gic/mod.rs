@@ -88,6 +88,13 @@ pub fn irq_set_enable(irq: IrqId, enable: bool) -> Result<(), crate::irq::IrqErr
     }
 }
 
+pub fn irq_route_to_host(irq: IrqId) -> Result<(), crate::irq::IrqError> {
+    match backend() {
+        GicBackend::V3 => v3::irq_route_to_host(irq),
+        GicBackend::V2 | GicBackend::None => Err(crate::irq::IrqError::Unsupported),
+    }
+}
+
 pub fn irq_set_affinity(
     irq: IrqId,
     affinity: crate::irq::IrqAffinity,
@@ -147,6 +154,20 @@ impl ActiveIrq {
             Self::V3(active) => active.id(),
         }
     }
+
+    pub fn priority(&self) -> Option<u8> {
+        match self {
+            Self::V2(_) => None,
+            Self::V3(active) => Some(active.priority()),
+        }
+    }
+
+    pub fn forward_to_guest(self) -> bool {
+        match self {
+            Self::V2(_) => false,
+            Self::V3(active) => active.forward_to_guest(),
+        }
+    }
 }
 
 pub fn begin_irq() -> Option<ActiveIrq> {
@@ -156,6 +177,20 @@ pub fn begin_irq() -> Option<ActiveIrq> {
         GicBackend::None => {
             if v3::is_support_icc() {
                 v3::begin_irq().map(ActiveIrq::V3)
+            } else {
+                v2::begin_irq().map(ActiveIrq::V2)
+            }
+        }
+    }
+}
+
+pub fn begin_fiq() -> Option<ActiveIrq> {
+    match backend() {
+        GicBackend::V2 => v2::begin_irq().map(ActiveIrq::V2),
+        GicBackend::V3 => v3::begin_fiq().map(ActiveIrq::V3),
+        GicBackend::None => {
+            if v3::is_support_icc() {
+                v3::begin_fiq().map(ActiveIrq::V3)
             } else {
                 v2::begin_irq().map(ActiveIrq::V2)
             }

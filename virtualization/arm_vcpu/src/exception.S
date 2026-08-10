@@ -100,6 +100,22 @@
     # b .Lexception_return_el2 is called by `vmexit_trampoline`
 .endm
 
+.macro HANDLE_LOWER_FIQ_VCPU
+.p2align 7
+    SAVE_REGS_FROM_EL1
+    mov    x0, {exception_fiq}
+    bl     vmexit_trampoline
+    # b .Lexception_return_el2 is called by `vmexit_trampoline`
+.endm
+
+.macro HANDLE_LOWER_SERROR_VCPU
+.p2align 7
+    SAVE_REGS_FROM_EL1
+    mov    x0, {exception_serror}
+    bl     vmexit_trampoline
+    # b .Lexception_return_el2 is called by `vmexit_trampoline`
+.endm
+
 
 .section .text
 .p2align 11
@@ -120,14 +136,14 @@ exception_vector_base_vcpu:
     // lower EL, aarch64
     HANDLE_LOWER_SYNC_VCPU
     HANDLE_LOWER_IRQ_VCPU
-    INVALID_EXCP_EL2 2 2
-    INVALID_EXCP_EL2 3 2
+    HANDLE_LOWER_FIQ_VCPU
+    HANDLE_LOWER_SERROR_VCPU
 
     // lower EL, aarch32
-    INVALID_EXCP_EL2 0 3
-    INVALID_EXCP_EL2 1 3
-    INVALID_EXCP_EL2 2 3
-    INVALID_EXCP_EL2 3 3
+    HANDLE_LOWER_SYNC_VCPU
+    HANDLE_LOWER_IRQ_VCPU
+    HANDLE_LOWER_FIQ_VCPU
+    HANDLE_LOWER_SERROR_VCPU
 
 .global context_vm_entry
 context_vm_entry:

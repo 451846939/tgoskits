@@ -36,6 +36,9 @@ pub use self::{
 /// context frame for aarch64
 pub type TrapFrame = context_frame::Aarch64ContextFrame;
 
+/// AArch64 architected virtual timer PPI.
+pub const VIRTUAL_TIMER_IRQ: usize = 27;
+
 /// Returns the maximum guest page table levels supported by the hardware.
 ///
 /// This is determined by the physical address size:

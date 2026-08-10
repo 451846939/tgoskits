@@ -16,6 +16,14 @@ host-fs = ["ax-std/fs"]
 vmx = ["x86_vcpu/vmx"]
 svm = ["x86_vcpu/svm"]
 sstc = ["riscv_vcpu/sstc"]
+rt-trace = ["arm_vcpu/rt-trace"]
+rt-preemptive-host = []
+rt-shared-wait-baseline = []
+rt-disable-timer-cache = []
+rt-persistent-binding = []
+rt-disable-atomic-vcpu-state = []
+rt-disable-targeted-vcpu-wake = []
+rt-shared-interrupt-queue = []
 
 [dependencies]
 log = "0.4"
@@ -73,6 +81,7 @@ ax-plat = { workspace = true }
 loongarch_vcpu = { workspace = true }
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 aarch64-cpu-ext = "0.1"
+ax-plat = { workspace = true }
 arm_vcpu = { workspace = true }
 arm_vgic = { workspace = true, features = ["vgicv3"] }
 arm-gic-driver = { workspace = true, features = ["rdif"] }

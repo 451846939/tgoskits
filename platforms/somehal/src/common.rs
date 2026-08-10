@@ -9,6 +9,10 @@ pub trait PlatOp {
 
     fn irq_set_enable(irq: IrqId, enable: bool) -> Result<(), IrqError>;
 
+    fn irq_route_to_host(_irq: IrqId) -> Result<(), IrqError> {
+        Err(IrqError::Unsupported)
+    }
+
     fn irq_set_affinity(_irq: IrqId, _affinity: crate::irq::IrqAffinity) -> Result<(), IrqError> {
         Err(IrqError::Unsupported)
     }

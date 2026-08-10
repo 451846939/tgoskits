@@ -15,6 +15,8 @@
 use alloc::format;
 
 use ax_errno::{AxResult, ax_err, ax_err_type};
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+use ax_memory_addr::MemoryAddr;
 use axvmconfig::AxVMCrateConfig;
 #[cfg(target_arch = "x86_64")]
 use axvmconfig::EmulatedDeviceType;
@@ -30,6 +32,15 @@ use crate::{
     AxVMRef, GuestPhysAddr, VMMemoryRegion,
     boot::{BootImageProvider, StaticVmImage},
 };
+
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+const MB: usize = 1024 * 1024;
+
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+fn align_up_checked(value: usize, align: usize) -> Option<usize> {
+    let mask = align.checked_sub(1)?;
+    value.checked_add(mask).map(|addr| addr & !mask)
+}
 
 mod linux;
 #[cfg(target_arch = "x86_64")]
@@ -237,6 +248,8 @@ impl<'a> ImageLoader<'a> {
 
         // Load Ramdisk image and record its size before regenerating the DTB.
         if let Some(buffer) = vm_images.ramdisk {
+            #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+            self.adjust_ramdisk_identity_layout(buffer.len())?;
             self.load_ramdisk_from_memory(buffer)?;
         }
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
@@ -499,6 +512,49 @@ impl<'a> ImageLoader<'a> {
     fn ramdisk_load_gpa(&self) -> AxResult<GuestPhysAddr> {
         self.ramdisk_load_gpa
             .ok_or_else(|| ax_errno::ax_err_type!(NotFound, "Ramdisk load addr is missed"))
+    }
+
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+    fn adjust_ramdisk_identity_layout(&mut self, ramdisk_size: usize) -> AxResult {
+        if !self.main_memory.is_identical() {
+            return Ok(());
+        }
+
+        let aligned_size = align_up_checked(ramdisk_size, 2 * MB).ok_or_else(|| {
+            ax_err_type!(
+                InvalidInput,
+                format!("ramdisk size {ramdisk_size:#x} overflows when aligned")
+            )
+        })?;
+        let reserved_tail = aligned_size.checked_add(8 * MB).ok_or_else(|| {
+            ax_err_type!(
+                InvalidInput,
+                format!("ramdisk tail reservation overflows: size={aligned_size:#x}")
+            )
+        })?;
+        if reserved_tail >= self.main_memory.size() {
+            return ax_err!(
+                InvalidInput,
+                "ramdisk is too large for identity-mapped guest memory"
+            );
+        }
+
+        let load_gpa =
+            (self.main_memory.gpa + self.main_memory.size() - reserved_tail).align_down(2 * MB);
+        self.ramdisk_load_gpa = Some(load_gpa);
+        self.vm.with_config(|config| {
+            if let Some(ref mut ramdisk) = config.image_config.ramdisk {
+                ramdisk.load_gpa = load_gpa;
+            }
+        });
+        info!(
+            "Adjusted identity ramdisk layout for VM[{}]: memory_base={:#x}, \
+             ramdisk_load_gpa={:#x}",
+            self.vm.id(),
+            self.main_memory.gpa.as_usize(),
+            load_gpa.as_usize()
+        );
+        Ok(())
     }
 
     #[cfg(target_arch = "x86_64")]

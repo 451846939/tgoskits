@@ -13,6 +13,10 @@ pub trait ArmVcpuHostIf {
     /// happened.
     fn fetch_irq() -> usize;
 
+    /// Handle or report a pending host FIQ through the controller's Group 0
+    /// acknowledge path.
+    fn fetch_fiq() -> usize;
+
     /// Dispatch a host IRQ taken while running at the current exception level.
     fn handle_irq();
 }
@@ -23,6 +27,10 @@ pub(crate) fn hardware_inject_virtual_interrupt(vector: u8) {
 
 pub(crate) fn fetch_irq() -> usize {
     ax_crate_interface::call_interface!(ArmVcpuHostIf::fetch_irq())
+}
+
+pub(crate) fn fetch_fiq() -> usize {
+    ax_crate_interface::call_interface!(ArmVcpuHostIf::fetch_fiq())
 }
 
 pub(crate) fn handle_irq() {

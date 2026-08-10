@@ -23,6 +23,6 @@ fail_regex = [
 ]
 success_regex = ["(?m)^guest test pass!\\s*$"]
 shell_prefix = "~ #"
-shell_init_cmd = "pwd && echo 'guest test pass!'"
+shell_init_cmd = "pwd && echo cpus=$(nproc) && test $(nproc) -ge 2 && echo 'guest test pass!'"
 to_bin = true
 uefi = false

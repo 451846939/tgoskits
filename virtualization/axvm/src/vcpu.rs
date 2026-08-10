@@ -16,8 +16,20 @@
 
 use alloc::format;
 use core::{cell::UnsafeCell, mem::MaybeUninit};
+#[cfg(not(any(
+    feature = "rt-shared-wait-baseline",
+    feature = "rt-disable-atomic-vcpu-state"
+)))]
+use core::{
+    hint::spin_loop,
+    sync::atomic::{AtomicU8, Ordering},
+};
 
 use ax_errno::{AxResult, ax_err};
+#[cfg(any(
+    feature = "rt-shared-wait-baseline",
+    feature = "rt-disable-atomic-vcpu-state"
+))]
 use ax_kspin::SpinNoIrq as Mutex;
 #[cfg(target_arch = "x86_64")]
 use axvm_types::InterruptTriggerMode;
@@ -27,8 +39,92 @@ use axvm_types::{
 };
 
 /// Mutable runtime state of a virtual CPU.
+#[cfg(any(
+    feature = "rt-shared-wait-baseline",
+    feature = "rt-disable-atomic-vcpu-state"
+))]
 pub struct AxVCpuInnerMut {
     state: VmVcpuState,
+}
+
+#[cfg(not(any(
+    feature = "rt-shared-wait-baseline",
+    feature = "rt-disable-atomic-vcpu-state"
+)))]
+const VCPU_STATE_TRANSITION: u8 = 1 << 7;
+
+#[cfg(not(any(
+    feature = "rt-shared-wait-baseline",
+    feature = "rt-disable-atomic-vcpu-state"
+)))]
+struct AtomicVcpuState(AtomicU8);
+
+#[cfg(not(any(
+    feature = "rt-shared-wait-baseline",
+    feature = "rt-disable-atomic-vcpu-state"
+)))]
+impl AtomicVcpuState {
+    const fn new(state: VmVcpuState) -> Self {
+        Self(AtomicU8::new(state as u8))
+    }
+
+    fn load(&self) -> VmVcpuState {
+        loop {
+            let encoded = self.0.load(Ordering::Acquire);
+            if encoded & VCPU_STATE_TRANSITION == 0 {
+                return decode_vcpu_state(encoded);
+            }
+            spin_loop();
+        }
+    }
+
+    fn compare_exchange(&self, from: VmVcpuState, to: VmVcpuState) -> Result<(), VmVcpuState> {
+        self.0
+            .compare_exchange(from as u8, to as u8, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|encoded| decode_vcpu_state(encoded & !VCPU_STATE_TRANSITION))
+    }
+
+    fn begin_transition(&self, from: VmVcpuState) -> Result<(), VmVcpuState> {
+        self.0
+            .compare_exchange(
+                from as u8,
+                from as u8 | VCPU_STATE_TRANSITION,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(|_| ())
+            .map_err(|encoded| decode_vcpu_state(encoded & !VCPU_STATE_TRANSITION))
+    }
+
+    fn finish_transition(&self, to: VmVcpuState) {
+        debug_assert_ne!(
+            self.0.load(Ordering::Relaxed) & VCPU_STATE_TRANSITION,
+            0,
+            "vCPU state transition is not active"
+        );
+        self.0.store(to as u8, Ordering::Release);
+    }
+
+    fn store(&self, state: VmVcpuState) {
+        self.0.store(state as u8, Ordering::Release);
+    }
+}
+
+#[cfg(not(any(
+    feature = "rt-shared-wait-baseline",
+    feature = "rt-disable-atomic-vcpu-state"
+)))]
+fn decode_vcpu_state(encoded: u8) -> VmVcpuState {
+    match encoded {
+        value if value == VmVcpuState::Invalid as u8 => VmVcpuState::Invalid,
+        value if value == VmVcpuState::Created as u8 => VmVcpuState::Created,
+        value if value == VmVcpuState::Free as u8 => VmVcpuState::Free,
+        value if value == VmVcpuState::Ready as u8 => VmVcpuState::Ready,
+        value if value == VmVcpuState::Running as u8 => VmVcpuState::Running,
+        value if value == VmVcpuState::Blocked as u8 => VmVcpuState::Blocked,
+        _ => panic!("invalid encoded vCPU state: {encoded:#x}"),
+    }
 }
 
 struct AxVCpuInnerConst {
@@ -40,7 +136,16 @@ struct AxVCpuInnerConst {
 /// AxVM-owned architecture-independent vCPU wrapper.
 pub struct AxVCpu<A: VmArchVcpuOps> {
     inner_const: AxVCpuInnerConst,
+    #[cfg(any(
+        feature = "rt-shared-wait-baseline",
+        feature = "rt-disable-atomic-vcpu-state"
+    ))]
     inner_mut: Mutex<AxVCpuInnerMut>,
+    #[cfg(not(any(
+        feature = "rt-shared-wait-baseline",
+        feature = "rt-disable-atomic-vcpu-state"
+    )))]
+    state: AtomicVcpuState,
     arch_vcpu: UnsafeCell<A>,
 }
 
@@ -58,9 +163,18 @@ impl<A: VmArchVcpuOps> AxVCpu<A> {
                 vcpu_id,
                 phys_cpu_set,
             },
+            #[cfg(any(
+                feature = "rt-shared-wait-baseline",
+                feature = "rt-disable-atomic-vcpu-state"
+            ))]
             inner_mut: Mutex::new(AxVCpuInnerMut {
                 state: VmVcpuState::Created,
             }),
+            #[cfg(not(any(
+                feature = "rt-shared-wait-baseline",
+                feature = "rt-disable-atomic-vcpu-state"
+            )))]
+            state: AtomicVcpuState::new(VmVcpuState::Created),
             arch_vcpu: UnsafeCell::new(A::new(vm_id, vcpu_id, arch_config)?),
         })
     }
@@ -97,7 +211,21 @@ impl<A: VmArchVcpuOps> AxVCpu<A> {
 
     /// Returns the current vCPU state.
     pub fn state(&self) -> VmVcpuState {
-        self.inner_mut.lock().state
+        #[cfg(any(
+            feature = "rt-shared-wait-baseline",
+            feature = "rt-disable-atomic-vcpu-state"
+        ))]
+        {
+            self.inner_mut.lock().state
+        }
+
+        #[cfg(not(any(
+            feature = "rt-shared-wait-baseline",
+            feature = "rt-disable-atomic-vcpu-state"
+        )))]
+        {
+            self.state.load()
+        }
     }
 
     /// Runs `f` if the current state equals `from`, then stores `to`.
@@ -110,6 +238,10 @@ impl<A: VmArchVcpuOps> AxVCpu<A> {
     where
         F: FnOnce() -> AxResult<T>,
     {
+        #[cfg(any(
+            feature = "rt-shared-wait-baseline",
+            feature = "rt-disable-atomic-vcpu-state"
+        ))]
         {
             let inner_mut = self.inner_mut.lock();
             if inner_mut.state != from {
@@ -119,15 +251,37 @@ impl<A: VmArchVcpuOps> AxVCpu<A> {
                     format!("VCpu state is not {from:?}, but {current_state:?}")
                 );
             }
+
+            drop(inner_mut);
+            let result = f();
+            self.inner_mut.lock().state = if result.is_err() {
+                VmVcpuState::Invalid
+            } else {
+                to
+            };
+            result
         }
 
-        let result = f();
-        self.inner_mut.lock().state = if result.is_err() {
-            VmVcpuState::Invalid
-        } else {
-            to
-        };
-        result
+        #[cfg(not(any(
+            feature = "rt-shared-wait-baseline",
+            feature = "rt-disable-atomic-vcpu-state"
+        )))]
+        {
+            if let Err(current_state) = self.state.begin_transition(from) {
+                return ax_err!(
+                    BadState,
+                    format!("VCpu state is not {from:?}, but {current_state:?}")
+                );
+            }
+
+            let result = f();
+            self.state.finish_transition(if result.is_err() {
+                VmVcpuState::Invalid
+            } else {
+                to
+            });
+            result
+        }
     }
 
     /// Runs `f` with this vCPU recorded as current on the physical CPU.
@@ -169,6 +323,10 @@ impl<A: VmArchVcpuOps> AxVCpu<A> {
     }
 
     /// Transitions the vCPU state without calling the architecture backend.
+    #[cfg(any(
+        feature = "rt-shared-wait-baseline",
+        feature = "rt-disable-atomic-vcpu-state"
+    ))]
     pub fn transition_state(&self, from: VmVcpuState, to: VmVcpuState) -> AxResult {
         self.with_state_transition(from, to, || Ok(()))
     }
@@ -181,10 +339,44 @@ impl<A: VmArchVcpuOps> AxVCpu<A> {
 
     /// Runs the vCPU until a VM exit.
     pub fn run(&self) -> AxResult<VmExit> {
-        self.transition_state(VmVcpuState::Ready, VmVcpuState::Running)?;
-        self.manipulate_arch_vcpu(VmVcpuState::Running, VmVcpuState::Ready, |arch_vcpu| {
-            arch_vcpu.run()
-        })
+        #[cfg(any(
+            feature = "rt-shared-wait-baseline",
+            feature = "rt-disable-atomic-vcpu-state"
+        ))]
+        {
+            #[cfg(feature = "rt-trace")]
+            crate::runtime::rt_trace::trace_vcpu_state_locks(self.vm_id(), self.id(), 4);
+            self.transition_state(VmVcpuState::Ready, VmVcpuState::Running)?;
+            self.manipulate_arch_vcpu(VmVcpuState::Running, VmVcpuState::Ready, |arch_vcpu| {
+                arch_vcpu.run()
+            })
+        }
+
+        #[cfg(not(any(
+            feature = "rt-shared-wait-baseline",
+            feature = "rt-disable-atomic-vcpu-state"
+        )))]
+        {
+            #[cfg(feature = "rt-trace")]
+            crate::runtime::rt_trace::trace_vcpu_state_locks(self.vm_id(), self.id(), 0);
+            if let Err(current_state) = self
+                .state
+                .compare_exchange(VmVcpuState::Ready, VmVcpuState::Running)
+            {
+                return ax_err!(
+                    BadState,
+                    format!("VCpu state is not Ready, but {current_state:?}")
+                );
+            }
+
+            let result = self.with_current_cpu_set(|| self.get_arch_vcpu().run());
+            self.state.store(if result.is_err() {
+                VmVcpuState::Invalid
+            } else {
+                VmVcpuState::Ready
+            });
+            result
+        }
     }
 
     /// Binds the vCPU to the current physical CPU.
@@ -197,6 +389,15 @@ impl<A: VmArchVcpuOps> AxVCpu<A> {
     /// Unbinds the vCPU from the current physical CPU.
     pub fn unbind(&self) -> AxResult {
         self.manipulate_arch_vcpu(VmVcpuState::Ready, VmVcpuState::Free, |arch_vcpu| {
+            arch_vcpu.unbind()
+        })
+    }
+
+    /// Unbinds a vCPU after an architecture run failure while preserving the
+    /// invalid state for diagnostics.
+    #[cfg(not(feature = "rt-shared-wait-baseline"))]
+    pub(crate) fn unbind_invalid(&self) -> AxResult {
+        self.manipulate_arch_vcpu(VmVcpuState::Invalid, VmVcpuState::Invalid, |arch_vcpu| {
             arch_vcpu.unbind()
         })
     }
@@ -230,6 +431,73 @@ impl<A: VmArchVcpuOps> AxVCpu<A> {
     /// Sets the guest return value.
     pub fn set_return_value(&self, val: usize) {
         self.get_arch_vcpu().set_return_value(val);
+    }
+}
+
+#[cfg(all(
+    test,
+    not(any(
+        feature = "rt-shared-wait-baseline",
+        feature = "rt-disable-atomic-vcpu-state"
+    ))
+))]
+mod tests {
+    use core::sync::atomic::Ordering;
+
+    use axvm_types::VmVcpuState;
+
+    use super::{AtomicVcpuState, VCPU_STATE_TRANSITION, decode_vcpu_state};
+
+    #[test]
+    fn decode_all_vcpu_states() {
+        for state in [
+            VmVcpuState::Invalid,
+            VmVcpuState::Created,
+            VmVcpuState::Free,
+            VmVcpuState::Ready,
+            VmVcpuState::Running,
+            VmVcpuState::Blocked,
+        ] {
+            assert_eq!(decode_vcpu_state(state as u8), state);
+        }
+    }
+
+    #[test]
+    fn rejects_transition_from_unexpected_state() {
+        let state = AtomicVcpuState::new(VmVcpuState::Created);
+
+        assert_eq!(
+            state.begin_transition(VmVcpuState::Free),
+            Err(VmVcpuState::Created)
+        );
+        assert_eq!(state.load(), VmVcpuState::Created);
+    }
+
+    #[test]
+    fn transition_marker_excludes_competing_transition() {
+        let state = AtomicVcpuState::new(VmVcpuState::Free);
+
+        assert_eq!(state.begin_transition(VmVcpuState::Free), Ok(()));
+        assert_ne!(state.0.load(Ordering::Relaxed) & VCPU_STATE_TRANSITION, 0);
+        assert_eq!(
+            state.begin_transition(VmVcpuState::Free),
+            Err(VmVcpuState::Free)
+        );
+        state.finish_transition(VmVcpuState::Ready);
+        assert_eq!(state.load(), VmVcpuState::Ready);
+    }
+
+    #[test]
+    fn running_transition_is_reversible() {
+        let state = AtomicVcpuState::new(VmVcpuState::Ready);
+
+        assert_eq!(
+            state.compare_exchange(VmVcpuState::Ready, VmVcpuState::Running),
+            Ok(())
+        );
+        assert_eq!(state.load(), VmVcpuState::Running);
+        state.store(VmVcpuState::Ready);
+        assert_eq!(state.load(), VmVcpuState::Ready);
     }
 }
 

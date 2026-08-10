@@ -175,6 +175,16 @@ impl ActiveIrq {
     pub fn id(&self) -> IrqId {
         Plat::active_irq_id(&self.inner)
     }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn priority(&self) -> Option<u8> {
+        self.inner.priority()
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn forward_to_guest(self) -> bool {
+        self.inner.forward_to_guest()
+    }
 }
 
 /// Target specification for inter-processor interrupts.
@@ -248,6 +258,10 @@ pub fn irq_set_enable(irq: IrqId, enable: bool) -> Result<(), IrqError> {
     Plat::irq_set_enable(irq, enable)
 }
 
+pub fn irq_route_to_host(irq: IrqId) -> Result<(), IrqError> {
+    Plat::irq_route_to_host(irq)
+}
+
 pub fn irq_set_affinity(irq: IrqId, affinity: IrqAffinity) -> Result<(), IrqError> {
     Plat::irq_set_affinity(irq, affinity)
 }
@@ -276,6 +290,12 @@ pub fn aarch64_gic_irq_id_checked(hwirq: HwIrq) -> Result<IrqId, IrqError> {
 
 pub fn begin_irq(raw: usize) -> Option<ActiveIrq> {
     Plat::begin_irq(raw).map(|inner| ActiveIrq { inner })
+}
+
+#[cfg(target_arch = "aarch64")]
+pub fn begin_fiq(raw: usize) -> Option<ActiveIrq> {
+    let _ = raw;
+    crate::arch::gic::begin_fiq().map(|inner| ActiveIrq { inner })
 }
 
 pub fn resolve_irq_source(source: IrqSource) -> Result<IrqId, IrqError> {

@@ -32,7 +32,7 @@ use axvm::{
         VMImageConfig,
     },
 };
-use axvmconfig::{AxVMCrateConfig, VMType};
+use axvmconfig::{AxVMCrateConfig, VMType, VmMemMappingType};
 
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use axvm::boot::handle_fdt_operations;
@@ -192,6 +192,8 @@ pub fn init_guest_vm(raw_cfg: &str) -> AxResult<usize> {
             format!("VM[{vm_id}] already exists")
         ));
     }
+    #[cfg(target_arch = "aarch64")]
+    crate::manager::register_aarch64_passthrough_irq_routes(vm_id);
     #[cfg(target_arch = "loongarch64")]
     crate::manager::register_loongarch_passthrough_irq_routes(vm_id);
 
@@ -253,7 +255,12 @@ fn guest_boot_policy(
     cfg: &AxVMCrateConfig,
     skip_guest_address_adjustment: bool,
 ) -> GuestBootPolicy {
-    if skip_guest_address_adjustment {
+    let fixed_reserved_main_memory = cfg
+        .kernel
+        .memory_regions
+        .first()
+        .is_some_and(|region| region.map_type == VmMemMappingType::MapReserved);
+    if skip_guest_address_adjustment || fixed_reserved_main_memory {
         GuestBootPolicy::KeepConfigured
     } else {
         GuestBootPolicy::AdjustKernelForBootProtocol {
@@ -455,7 +462,7 @@ impl BootImageProvider for AxvisorBootImageProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axvmconfig::{VmMemConfig, VmMemMappingType};
+    use axvmconfig::VmMemConfig;
 
     fn memory_region(gpa: usize, size: usize, map_type: VmMemMappingType) -> VmMemConfig {
         VmMemConfig {
@@ -490,5 +497,35 @@ mod tests {
         assert_eq!(regions[1].gpa, 0x110000);
         assert_eq!(regions[1].size, 0x10000);
         assert_eq!(regions[1].map_type, VmMemMappingType::MapReserved);
+    }
+
+    #[test]
+    fn reserved_main_memory_keeps_absolute_guest_load_addresses() {
+        let mut crate_config = AxVMCrateConfig::default();
+        crate_config.kernel.memory_regions.push(memory_region(
+            0xc000_0000,
+            0x1000_0000,
+            VmMemMappingType::MapReserved,
+        ));
+
+        assert!(matches!(
+            guest_boot_policy(&crate_config, false),
+            GuestBootPolicy::KeepConfigured
+        ));
+    }
+
+    #[test]
+    fn dynamically_identical_main_memory_still_adjusts_guest_load_addresses() {
+        let mut crate_config = AxVMCrateConfig::default();
+        crate_config.kernel.memory_regions.push(memory_region(
+            0x8000_0000,
+            0x2000_0000,
+            VmMemMappingType::MapIdentical,
+        ));
+
+        assert!(matches!(
+            guest_boot_policy(&crate_config, false),
+            GuestBootPolicy::AdjustKernelForBootProtocol { .. }
+        ));
     }
 }

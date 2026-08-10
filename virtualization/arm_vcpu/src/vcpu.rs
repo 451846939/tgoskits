@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(feature = "rt-trace")]
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
 use aarch64_cpu::registers::*;
 use ax_errno::AxResult;
 use axvm_types::{GuestPhysAddr, NestedPagingConfig, SysRegAddr, VmArchVcpuOps, VmExit};
@@ -26,14 +29,57 @@ use crate::{
 #[ax_percpu::def_percpu]
 static HOST_SP_EL0: u64 = 0;
 
-/// Save host's `SP_EL0` to the current ax-percpu region.
-unsafe fn save_host_sp_el0() {
-    unsafe { HOST_SP_EL0.write_current_raw(SP_EL0.get()) }
+#[ax_percpu::def_percpu]
+static HOST_TPIDR_EL0: u64 = 0;
+
+#[ax_percpu::def_percpu]
+static HOST_TPIDRRO_EL0: u64 = 0;
+
+#[cfg(feature = "rt-trace")]
+static SHARED_REGISTER_CONTEXT_REPORTED: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "rt-trace")]
+static GUEST_ENTRY_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "rt-trace")]
+static GUEST_IRQ_EXIT_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "rt-trace")]
+static GUEST_FIQ_EXIT_COUNT: AtomicU64 = AtomicU64::new(0);
+
+const fn trap_guest_wfi(passthrough_timer: bool) -> bool {
+    // A passthrough timer must be allowed to wake a sleeping guest through its
+    // physical PPI. Trapping WFI in that mode creates a tight EL1/EL2 loop that
+    // can starve the deadline before the timer ever becomes pending.
+    !passthrough_timer
 }
 
-/// Restore host's `SP_EL0` from the current ax-percpu region.
-unsafe fn restore_host_sp_el0() {
-    SP_EL0.set(unsafe { HOST_SP_EL0.read_current_raw() });
+/// Save host registers that are shared with the guest.
+unsafe fn save_host_shared_registers() {
+    unsafe {
+        #[cfg(feature = "rt-trace")]
+        {
+            let entry_count = GUEST_ENTRY_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            let host_tpidr_el0 = TPIDR_EL0.get();
+            if host_tpidr_el0 == 0 {
+                error!(
+                    "AArch64 guest entry has no host TLS context: entry_count={entry_count} \
+                     sp_el0={:#x} tpidrro_el0={:#x}",
+                    SP_EL0.get(),
+                    TPIDRRO_EL0.get(),
+                );
+            }
+        }
+        HOST_SP_EL0.write_current_raw(SP_EL0.get());
+        HOST_TPIDR_EL0.write_current_raw(TPIDR_EL0.get());
+        HOST_TPIDRRO_EL0.write_current_raw(TPIDRRO_EL0.get());
+    }
+}
+
+/// Restore host registers after the guest values have been saved.
+unsafe fn restore_host_shared_registers() {
+    unsafe {
+        SP_EL0.set(HOST_SP_EL0.read_current_raw());
+        TPIDR_EL0.set(HOST_TPIDR_EL0.read_current_raw());
+        TPIDRRO_EL0.set(HOST_TPIDRRO_EL0.read_current_raw());
+    }
 }
 
 /// (v)CPU register state that must be saved or restored when entering/exiting a VM or switching
@@ -59,6 +105,8 @@ pub struct Aarch64VCpu {
     guest_system_regs: GuestSystemRegisters,
     /// The MPIDR_EL1 value for the vCPU.
     mpidr: u64,
+    /// Whether physical timer interrupts are forwarded through a hardware LR.
+    passthrough_timer: bool,
 }
 
 /// Configuration for creating a new `Aarch64VCpu`
@@ -96,10 +144,12 @@ impl axvm_types::VmArchVcpuOps for Aarch64VCpu {
             host_stack_top: 0,
             guest_system_regs: GuestSystemRegisters::default(),
             mpidr: config.mpidr_el1,
+            passthrough_timer: false,
         })
     }
 
     fn setup(&mut self, config: Self::SetupConfig) -> AxResult {
+        self.passthrough_timer = config.passthrough_timer;
         self.init_hv(config);
         Ok(())
     }
@@ -127,21 +177,58 @@ impl axvm_types::VmArchVcpuOps for Aarch64VCpu {
             core::arch::asm!("msr daifset, #2");
         }
 
-        // Run guest.
-        let exit_reson = unsafe {
-            // Save host SP_EL0 to the ctx becase it's used as current task ptr.
-            // This has to be done before vm system regs are restored.
-            save_host_sp_el0();
+        // Run the guest with host IRQs masked across the complete register
+        // ownership transition. A lower-EL exit returns while TPIDR_EL0,
+        // TPIDRRO_EL0, and SP_EL0 still contain guest values, so no host IRQ or
+        // Rust code that may use TLS can run until those values are captured and
+        // the host copies are restored.
+        let exit_reason = unsafe {
+            // Save host registers that are visible to EL1/EL0 before restoring
+            // the guest's copies of those registers.
+            save_host_shared_registers();
             self.restore_vm_system_regs();
-            self.run_guest()
+            let exit_reason = self.run_guest();
+            self.capture_guest_and_restore_host_shared_registers();
+            exit_reason
         };
+
+        let trap_kind = TrapKind::try_from(exit_reason as u8).expect("Invalid TrapKind");
+        #[cfg(feature = "rt-trace")]
+        {
+            let interrupt_exit_count = match trap_kind {
+                TrapKind::Irq => Some(GUEST_IRQ_EXIT_COUNT.fetch_add(1, Ordering::Relaxed) + 1),
+                TrapKind::Fiq => Some(GUEST_FIQ_EXIT_COUNT.fetch_add(1, Ordering::Relaxed) + 1),
+                _ => None,
+            };
+            if let Some(count) = interrupt_exit_count
+                && (count <= 8 || count.is_power_of_two())
+            {
+                info!(
+                    "AArch64 guest interrupt exit count={count} kind={trap_kind:?} mpidr={:#x} \
+                     pc={:#x}",
+                    self.mpidr,
+                    self.ctx.exception_pc()
+                );
+            }
+        }
+
+        // A physical timer IRQ must remain asserted until fetch_irq()/fetch_fiq()
+        // acknowledges it and installs the corresponding virtual interrupt. Other
+        // exits can quiesce the guest timers before running host-side handlers.
+        let interrupt_exit = matches!(trap_kind, TrapKind::Irq | TrapKind::Fiq);
+        if !interrupt_exit {
+            unsafe { GuestSystemRegisters::quiesce_timers() };
+        }
+        let result = self.vmexit_handler(trap_kind);
+        if interrupt_exit {
+            unsafe { GuestSystemRegisters::quiesce_timers() };
+        }
 
         unsafe {
             core::arch::asm!("msr daifclr, #2");
         }
 
-        let trap_kind = TrapKind::try_from(exit_reson as u8).expect("Invalid TrapKind");
-        self.vmexit_handler(trap_kind)
+        result
     }
 
     fn bind(&mut self) -> AxResult {
@@ -207,14 +294,19 @@ impl Aarch64VCpu {
         let mut hcr_el2 =
             HCR_EL2::VM::Enable + HCR_EL2::TSC::EnableTrapEl1SmcToEl2 + HCR_EL2::RW::EL1IsAarch64;
 
-        if !config.passthrough_interrupt {
-            // Set HCR_EL2.IMO will trap IRQs to EL2 while enabling virtual IRQs.
-            //
-            // We must choose one of the two:
-            // - Enable virtual IRQs and trap physical IRQs to EL2.
-            // - Disable virtual IRQs and pass through physical IRQs to EL1.
-            hcr_el2 += HCR_EL2::IMO::EnableVirtualIRQ + HCR_EL2::FMO::EnableVirtualFIQ;
+        if trap_guest_wfi(config.passthrough_timer) {
+            hcr_el2 += HCR_EL2::TWI::SET;
         }
+
+        // Route physical IRQs to EL2 for ownership arbitration. The host IRQ
+        // registry consumes host-owned lines first; only unclaimed lines may
+        // be forwarded to a passthrough VM by the runtime. This keeps the
+        // policy independent of guest type and physical interrupt numbers.
+        hcr_el2 += HCR_EL2::IMO::EnableVirtualIRQ;
+
+        // Keep Group 0 FIQs routed to EL2 for platforms whose firmware already
+        // uses that interrupt group. Group 0 is not used to encode ownership.
+        hcr_el2 += HCR_EL2::FMO::EnableVirtualFIQ;
 
         self.guest_system_regs.hcr_el2 = hcr_el2.into();
 
@@ -302,6 +394,45 @@ impl Aarch64VCpu {
         }
     }
 
+    /// Captures guest-owned shared registers and restores their host-owned
+    /// counterparts before host IRQs or TLS-using Rust code can run.
+    unsafe fn capture_guest_and_restore_host_shared_registers(&mut self) {
+        unsafe {
+            let guest_sp_el0 = SP_EL0.get();
+            let guest_tpidr_el0 = TPIDR_EL0.get();
+            let guest_tpidrro_el0 = TPIDRRO_EL0.get();
+
+            // Restore the host-owned physical registers before collecting the
+            // remaining guest state. If a later system-register access faults,
+            // the host exception and panic paths must already have valid host
+            // stack and TLS register values.
+            restore_host_shared_registers();
+            self.guest_system_regs.store();
+            self.guest_system_regs.set_shared_el0_registers(
+                guest_sp_el0,
+                guest_tpidr_el0,
+                guest_tpidrro_el0,
+            );
+            self.ctx.sp_el0 = guest_sp_el0;
+
+            #[cfg(feature = "rt-trace")]
+            if !SHARED_REGISTER_CONTEXT_REPORTED.swap(true, Ordering::Relaxed) {
+                warn!(
+                    "AArch64 shared-register context: host_saved_tpidr_el0={:#x} \
+                     guest_tpidr_el0={:#x} host_restored_tpidr_el0={:#x} \
+                     host_saved_tpidrro_el0={:#x} guest_tpidrro_el0={:#x} \
+                     host_restored_tpidrro_el0={:#x}",
+                    HOST_TPIDR_EL0.read_current_raw(),
+                    guest_tpidr_el0,
+                    TPIDR_EL0.get(),
+                    HOST_TPIDRRO_EL0.read_current_raw(),
+                    guest_tpidrro_el0,
+                    TPIDRRO_EL0.get(),
+                );
+            }
+        }
+    }
+
     /// Handle VM-Exits.
     ///
     /// Parameters:
@@ -318,23 +449,13 @@ impl Aarch64VCpu {
             self.ctx
         );
 
-        unsafe {
-            // Store guest system regs
-            self.guest_system_regs.store();
-
-            // Store guest `SP_EL0` into the `Aarch64VCpu` struct,
-            // which will be restored when the guest is resumed in `exception_return_el2`.
-            self.ctx.sp_el0 = self.guest_system_regs.sp_el0;
-
-            // Restore host `SP_EL0`.
-            // This has to be done after guest's SP_EL0 is stored by `ext_regs_store`.
-            restore_host_sp_el0();
-        }
-
         let result = match exit_reason {
             TrapKind::Synchronous => handle_exception_sync(&mut self.ctx),
             TrapKind::Irq => Ok(VmExit::ExternalInterrupt {
                 vector: crate::host::fetch_irq() as u64,
+            }),
+            TrapKind::Fiq => Ok(VmExit::ExternalInterrupt {
+                vector: crate::host::fetch_fiq() as u64,
             }),
             _ => panic!("Unhandled exception {:?}", exit_reason),
         };
@@ -480,4 +601,15 @@ fn vtcr_for_config(levels: usize, gpa_bits: usize, pa_bits: usize) -> u64 {
         + VTCR_EL2::IRGN0::NormalWBRAWA;
 
     val.value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::trap_guest_wfi;
+
+    #[test]
+    fn passthrough_timer_uses_guest_wfi_for_hardware_wakeup() {
+        assert!(!trap_guest_wfi(true));
+        assert!(trap_guest_wfi(false));
+    }
 }

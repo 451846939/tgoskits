@@ -56,6 +56,14 @@ pub use manager::{
     AxvmRuntime, current_vcpu_id, current_vm_id, get_vm_by_id, get_vm_list,
     inject_current_vcpu_interrupt, register_vm,
 };
+#[cfg(target_arch = "aarch64")]
+pub use runtime::aarch64_irq::{
+    register_guest_irq_route as register_aarch64_guest_irq_route,
+    register_guest_private_irq_target as register_aarch64_guest_private_irq_target,
+    unregister_guest_irq_routes as unregister_aarch64_guest_irq_routes,
+    unregister_guest_private_irq_targets as unregister_aarch64_guest_private_irq_targets,
+};
+pub use runtime::lifecycle::register_hooks as register_vm_lifecycle_hooks;
 #[cfg(target_arch = "loongarch64")]
 pub use runtime::loongarch_irq::{
     register_guest_irq_route as register_loongarch_guest_irq_route,

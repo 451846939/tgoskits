@@ -14,7 +14,11 @@
 
 mod hvc;
 mod ivc;
+pub mod lifecycle;
+pub(crate) mod rt_trace;
 
+#[cfg(any(target_arch = "aarch64", test))]
+pub mod aarch64_irq;
 #[cfg(target_arch = "loongarch64")]
 pub mod loongarch_irq;
 pub(crate) mod vcpus;

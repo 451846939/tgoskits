@@ -70,12 +70,13 @@ impl ArchOps for LoongArch64Arch {
     }
 
     fn inject_pending_interrupt(
-        vm: &crate::AxVMRef,
+        vm: &crate::AxVM,
         vcpu: &crate::vm::AxVCpuRef,
         interrupt: crate::vm::PendingInterrupt,
-    ) {
+    ) -> Option<crate::vm::PendingInterrupt> {
         match interrupt {
-            crate::vm::PendingInterrupt::Normal(vector) => {
+            crate::vm::PendingInterrupt::Normal(vector)
+            | crate::vm::PendingInterrupt::Replay(vector) => {
                 trace!(
                     "Injecting queued interrupt {vector:#x} into VM[{}] VCpu[{}]",
                     vcpu.vm_id(),
@@ -89,10 +90,12 @@ impl ArchOps for LoongArch64Arch {
                         vcpu.id()
                     );
                 }
+                None
             }
             crate::vm::PendingInterrupt::External {
                 vector,
                 physical_irq,
+                priority: _,
             } => {
                 let Some(vector) = vm.loongarch_external_irq_vector(vector, physical_irq) else {
                     trace!(
@@ -100,7 +103,7 @@ impl ArchOps for LoongArch64Arch {
                          masked in VM[{}]",
                         vm.id()
                     );
-                    return;
+                    return None;
                 };
                 trace!(
                     "Injecting queued LoongArch external interrupt vector={vector:#x}, \
@@ -119,6 +122,7 @@ impl ArchOps for LoongArch64Arch {
                         vcpu.id()
                     );
                 }
+                None
             }
         }
     }
@@ -195,9 +199,13 @@ impl LoongArchVcpuHostIf for LoongArchVcpuHostIfImpl {
     }
 
     fn inject_external_interrupt(vm_id: usize, vcpu_id: usize, vector: usize, physical_irq: usize) {
-        if let Err(err) =
-            crate::runtime::vcpus::queue_external_interrupt(vm_id, vcpu_id, vector, physical_irq)
-        {
+        if let Err(err) = crate::runtime::vcpus::queue_external_interrupt(
+            vm_id,
+            vcpu_id,
+            vector,
+            physical_irq,
+            None,
+        ) {
             warn!(
                 "failed to queue LoongArch external interrupt vector={vector:#x}, \
                  physical_irq={physical_irq:#x} for VM[{vm_id}] VCpu[{vcpu_id}]: {err:?}"

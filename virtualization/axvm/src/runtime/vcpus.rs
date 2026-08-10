@@ -12,14 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use alloc::format;
+use alloc::{format, vec::Vec};
 
 use ax_errno::{AxResult, ax_err_type};
 
+#[cfg(feature = "rt-shared-wait-baseline")]
+use crate::VmStatus;
 use crate::{
-    AsVCpuTask, GuestPhysAddr, StopReason, VCpuTask, VmExit, VmStatus, VmVcpuState,
+    AsVCpuTask, GuestPhysAddr, StopReason, VCpuTask, VmExit, VmVcpuState,
     arch::{ArchOps, CurrentArch},
-    runtime::{VCpuRef, VMRef, sub_running_vm_count},
+    runtime::{VCpuRef, VMRef, rt_trace, sub_running_vm_count},
     vm::VmRuntimeHandle,
 };
 
@@ -31,8 +33,8 @@ const KERNEL_STACK_SIZE: usize = 0x40000; // 256 KiB
 /// # Arguments
 ///
 /// * `vm_id` - The ID of the VM whose VCpu wait queue is used to block the current thread.
-fn wait(vm_vcpus: &VmRuntimeHandle) {
-    vm_vcpus.wait();
+fn wait(vm_vcpus: &VmRuntimeHandle, vcpu_id: usize) {
+    vm_vcpus.wait_vcpu(vcpu_id);
 }
 
 /// Blocks the current thread until the provided condition is met, using the wait queue
@@ -42,11 +44,11 @@ fn wait(vm_vcpus: &VmRuntimeHandle) {
 ///
 /// * `vm_id` - The ID of the VM whose VCpu wait queue is used to block the current thread.
 /// * `condition` - A closure that returns a boolean value indicating whether the condition is met.
-fn wait_for<F>(vm_vcpus: &VmRuntimeHandle, condition: F)
+fn wait_for<F>(vm_vcpus: &VmRuntimeHandle, vcpu_id: usize, condition: F)
 where
     F: Fn() -> bool,
 {
-    vm_vcpus.wait_until(condition);
+    vm_vcpus.wait_vcpu_until(vcpu_id, condition);
 }
 
 /// Notifies the primary VCpu task associated with the specified VM to wake up and resume execution.
@@ -62,7 +64,12 @@ pub(crate) fn notify_primary_vcpu(vm_id: usize) {
         return;
     };
     if let Err(err) = vm.with_runtime(|runtime| {
-        runtime.notify_one();
+        let wake_ns = rt_trace::enabled().then(rt_trace::now_ns);
+        let woke_waiter = runtime.notify_vcpu(0);
+        if let (true, Some(wake_ns)) = (woke_waiter, wake_ns) {
+            runtime.record_vcpu_wake(0, wake_ns);
+        }
+        rt_trace::trace_vcpu_wake(vm_id, 0, woke_waiter);
         Ok(())
     }) {
         warn!("VM[{vm_id}] vCPU runtime not found: {err:?}");
@@ -84,9 +91,72 @@ pub(crate) fn notify_all_vcpus(vm_id: usize) {
     }
 }
 
+fn wake_queued_vcpu(
+    runtime: &VmRuntimeHandle,
+    vm_id: usize,
+    vcpu_id: usize,
+    queued_ns: u64,
+) -> bool {
+    let woke_waiter = runtime.notify_vcpu(vcpu_id);
+    if woke_waiter && rt_trace::enabled() {
+        runtime.record_vcpu_wake(vcpu_id, queued_ns);
+    }
+    rt_trace::trace_vcpu_wake(vm_id, vcpu_id, woke_waiter);
+    woke_waiter
+}
+
 pub(crate) fn queue_interrupt(vm_id: usize, vcpu_id: usize, vector: usize) -> AxResult {
     let vm = crate::get_vm_by_id(vm_id)
         .ok_or_else(|| ax_err_type!(NotFound, format!("VM[{vm_id}] not found")))?;
+
+    #[cfg(not(feature = "rt-shared-wait-baseline"))]
+    return queue_interrupt_for_vm(&vm, vcpu_id, vector);
+
+    #[cfg(feature = "rt-shared-wait-baseline")]
+    if !matches!(vm.status(), VmStatus::Running | VmStatus::Paused) {
+        return Err(ax_err_type!(
+            BadState,
+            format!("VM[{vm_id}] is not accepting interrupts")
+        ));
+    }
+    #[cfg(feature = "rt-shared-wait-baseline")]
+    let queued_ns = rt_trace::now_ns();
+    #[cfg(feature = "rt-shared-wait-baseline")]
+    // Release the VM lifecycle lock before entering wait-queue and scheduler code.
+    let runtime = vm.with_runtime(|runtime| Ok(runtime.clone()))?;
+    #[cfg(feature = "rt-shared-wait-baseline")]
+    let cpu_id = runtime.queue_interrupt(vcpu_id, vector, queued_ns)?;
+    #[cfg(feature = "rt-shared-wait-baseline")]
+    wake_queued_vcpu(&runtime, vm_id, vcpu_id, queued_ns);
+    #[cfg(feature = "rt-shared-wait-baseline")]
+    crate::host::task::send_ipi(cpu_id);
+    #[cfg(feature = "rt-shared-wait-baseline")]
+    rt_trace::trace_interrupt_queued(vm_id, vcpu_id, vector, cpu_id);
+    #[cfg(feature = "rt-shared-wait-baseline")]
+    Ok(())
+}
+
+#[cfg(not(feature = "rt-shared-wait-baseline"))]
+pub(crate) fn queue_interrupt_for_vm(vm: &crate::AxVM, vcpu_id: usize, vector: usize) -> AxResult {
+    let vm_id = vm.id();
+    let queued_ns = rt_trace::now_ns();
+    let runtime = vm.interrupt_runtime(None)?;
+    let cpu_id = runtime.queue_interrupt(vcpu_id, vector, queued_ns)?;
+    wake_queued_vcpu(&runtime, vm_id, vcpu_id, queued_ns);
+    crate::host::task::send_ipi(cpu_id);
+    rt_trace::trace_interrupt_queued(vm_id, vcpu_id, vector, cpu_id);
+    Ok(())
+}
+
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn queue_replay_interrupt_for_vm(
+    vm: &crate::AxVM,
+    vcpu_id: usize,
+    vector: usize,
+) -> AxResult {
+    let vm_id = vm.id();
+
+    #[cfg(feature = "rt-shared-wait-baseline")]
     if !matches!(vm.status(), VmStatus::Running | VmStatus::Paused) {
         return Err(ax_err_type!(
             BadState,
@@ -94,11 +164,13 @@ pub(crate) fn queue_interrupt(vm_id: usize, vcpu_id: usize, vector: usize) -> Ax
         ));
     }
 
-    let cpu_id = vm.with_runtime(|runtime| runtime.queue_interrupt(vcpu_id, vector))?;
-    vm.with_runtime(|runtime| {
-        runtime.notify_all();
-        Ok(())
-    })?;
+    let queued_ns = rt_trace::now_ns();
+    #[cfg(feature = "rt-shared-wait-baseline")]
+    let runtime = vm.with_runtime(|runtime| Ok(runtime.clone()))?;
+    #[cfg(not(feature = "rt-shared-wait-baseline"))]
+    let runtime = vm.interrupt_runtime(None)?;
+    let cpu_id = runtime.queue_replay_interrupt(vcpu_id, vector, queued_ns)?;
+    wake_queued_vcpu(&runtime, vm_id, vcpu_id, queued_ns);
     crate::host::task::send_ipi(cpu_id);
     Ok(())
 }
@@ -109,9 +181,25 @@ pub(crate) fn queue_external_interrupt(
     vcpu_id: usize,
     vector: usize,
     physical_irq: usize,
+    priority: Option<u8>,
 ) -> AxResult {
     let vm = crate::get_vm_by_id(vm_id)
         .ok_or_else(|| ax_err_type!(NotFound, format!("VM[{vm_id}] not found")))?;
+
+    queue_external_interrupt_for_vm(&vm, vcpu_id, vector, physical_irq, priority)
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "loongarch64"))]
+pub(crate) fn queue_external_interrupt_for_vm(
+    vm: &crate::AxVM,
+    vcpu_id: usize,
+    vector: usize,
+    physical_irq: usize,
+    priority: Option<u8>,
+) -> AxResult {
+    let vm_id = vm.id();
+
+    #[cfg(feature = "rt-shared-wait-baseline")]
     if !matches!(vm.status(), VmStatus::Running | VmStatus::Paused) {
         return Err(ax_err_type!(
             BadState,
@@ -119,30 +207,60 @@ pub(crate) fn queue_external_interrupt(
         ));
     }
 
+    let queued_ns = rt_trace::now_ns();
+    #[cfg(feature = "rt-shared-wait-baseline")]
+    let runtime = vm.with_runtime(|runtime| Ok(runtime.clone()))?;
+    #[cfg(not(feature = "rt-shared-wait-baseline"))]
+    let runtime = vm.interrupt_runtime(Some(crate::config::VMInterruptMode::Passthrough))?;
     let cpu_id =
-        vm.with_runtime(|runtime| runtime.queue_external_interrupt(vcpu_id, vector, physical_irq))?;
-    vm.with_runtime(|runtime| {
-        runtime.notify_all();
-        Ok(())
-    })?;
+        runtime.queue_external_interrupt(vcpu_id, vector, physical_irq, priority, queued_ns)?;
+    wake_queued_vcpu(&runtime, vm_id, vcpu_id, queued_ns);
     crate::host::task::send_ipi(cpu_id);
     Ok(())
 }
 
+pub(crate) fn inject_pending_interrupts_with_runtime(
+    vm: &crate::AxVM,
+    runtime: &VmRuntimeHandle,
+    vcpu_id: usize,
+    vcpu: &VCpuRef,
+) {
+    let vm_id = vm.id();
+    let interrupts = runtime.drain_pending_interrupts(vcpu_id);
+
+    if rt_trace::enabled() {
+        let drain_ns = rt_trace::now_ns();
+        let dispatch_latencies: Vec<_> = interrupts
+            .iter()
+            .map(|queued| drain_ns.saturating_sub(queued.queued_ns))
+            .collect();
+        rt_trace::trace_interrupt_drained(vm_id, vcpu_id, &dispatch_latencies);
+    }
+    let mut retries = Vec::new();
+    for queued in interrupts.iter().copied() {
+        if let Some(interrupt) = CurrentArch::inject_pending_interrupt(vm, vcpu, queued.interrupt) {
+            retries.push(crate::vm::QueuedInterrupt {
+                interrupt,
+                queued_ns: queued.queued_ns,
+            });
+        }
+    }
+    if !retries.is_empty() {
+        runtime.requeue_pending_interrupts(vcpu_id, retries);
+    }
+}
+
+#[cfg(feature = "rt-shared-wait-baseline")]
 pub(crate) fn inject_pending_interrupts(vm_id: usize, vcpu_id: usize, vcpu: &VCpuRef) {
     let Some(vm) = crate::get_vm_by_id(vm_id) else {
         warn!("VM[{vm_id}] not found, cannot drain VCpu[{vcpu_id}] interrupts");
         return;
     };
-    let Ok(interrupts) = vm.with_runtime(|runtime| Ok(runtime.drain_pending_interrupts(vcpu_id)))
-    else {
+    let Ok(runtime) = vm.with_runtime(|runtime| Ok(runtime.clone())) else {
         warn!("VM[{vm_id}] vCPU runtime not found, cannot drain VCpu[{vcpu_id}] interrupts");
         return;
     };
-
-    for interrupt in interrupts {
-        CurrentArch::inject_pending_interrupt(&vm, vcpu, interrupt);
-    }
+    inject_pending_interrupts_with_runtime(&vm, &runtime, vcpu_id, vcpu);
 }
 
 /// Cleans up VCpu resources for a VM that is being deleted.
@@ -175,6 +293,22 @@ fn mark_vcpu_running(vm: &VMRef) {
     });
 }
 
+fn finish_stopping_vcpu(vm: &VMRef, runtime: &VmRuntimeHandle, vm_id: usize, vcpu_id: usize) {
+    if runtime.mark_vcpu_exiting() {
+        info!("VM[{vm_id}] VCpu[{vcpu_id}] last VCpu exiting, decreasing running VM count");
+
+        if let Err(err) = vm.finish_stop() {
+            warn!("VM[{vm_id}] finish stop failed: {err:?}");
+        }
+        info!("VM[{vm_id}] state changed to Stopped");
+
+        CurrentArch::on_last_vcpu_exit(vm_id);
+
+        sub_running_vm_count(1);
+        crate::host::task::wait_queue_wake(&super::VMM, 1);
+    }
+}
+
 /// Boot target VCpu on the specified VM.
 /// This function is used to boot a secondary VCpu on a VM, setting the entry point and argument for the VCpu.
 ///
@@ -201,10 +335,7 @@ fn vcpu_on(vm: VMRef, vcpu_id: usize, entry_point: GuestPhysAddr, arg: usize) ->
     CurrentArch::set_vcpu_on_args(&vcpu, vcpu_id, arg);
 
     let vcpu_task = alloc_vcpu_task(&vm, vcpu);
-    vm.with_runtime(|runtime| {
-        runtime.add_vcpu_task(vcpu_id, vcpu_task);
-        Ok(())
-    })?;
+    vm.with_runtime(|runtime| runtime.add_vcpu_task(vcpu_id, vcpu_task))?;
     Ok(())
 }
 
@@ -220,11 +351,17 @@ pub(crate) fn build_vcpu_task(vm: &VMRef, vcpu: VCpuRef) -> crate::TaskInner {
         KERNEL_STACK_SIZE,
     );
 
-    if let Some(phys_cpu_set) = vcpu.phys_cpu_set() {
-        vcpu_task.set_cpumask(crate::host::task::cpu_mask_from_raw_bits(
-            vcpu_task_cpu_mask(vm.id(), vcpu.id(), phys_cpu_set),
-        ));
-    }
+    let effective_mask = vcpu.phys_cpu_set().map(|phys_cpu_set| {
+        let mask = vcpu_task_cpu_mask(vm.id(), vcpu.id(), phys_cpu_set);
+        vcpu_task.set_cpumask(crate::host::task::cpu_mask_from_raw_bits(mask));
+        mask
+    });
+    rt_trace::trace_vcpu_task_affinity(
+        vm.id(),
+        vcpu.id(),
+        vcpu.phys_cpu_set(),
+        effective_mask.unwrap_or(crate::percpu::enabled_cpu_mask()),
+    );
 
     // Use Weak reference in TaskExt to avoid keeping VM alive
     let inner = VCpuTask::new(vm, vcpu);
@@ -285,17 +422,73 @@ fn vcpu_run() {
     };
 
     info!("VM[{}] VCpu[{}] waiting for running", vm.id(), vcpu.id());
-    wait_for(&runtime, || vm.running());
+    wait_for(&runtime, vcpu_id, || vm.running());
 
     info!("VM[{}] VCpu[{}] running...", vm.id(), vcpu.id());
     CurrentArch::before_first_run(&vm, &vcpu);
     mark_vcpu_running(&vm);
 
+    #[cfg(not(feature = "rt-shared-wait-baseline"))]
+    let mut prepared_vcpu = if cfg!(feature = "rt-persistent-binding") && curr.cpumask().len() == 1
+    {
+        match vm.prepare_vcpu_run(&vcpu) {
+            Ok(prepared) => {
+                info!("VM[{vm_id}] VCpu[{vcpu_id}] persistent binding enabled on pinned vCPU task");
+                Some(prepared)
+            }
+            Err(err) => {
+                error!("VM[{vm_id}] VCpu[{vcpu_id}] prepare run context failed: {err:?}");
+                if let Err(stop_err) = vm.stop(StopReason::Fault(format!("{err:?}"))) {
+                    warn!("VM[{vm_id}] shutdown failed after prepare error: {stop_err:?}");
+                }
+                notify_all_vcpus(vm_id);
+                finish_stopping_vcpu(&vm, &runtime, vm_id, vcpu_id);
+                CurrentArch::on_vcpu_task_exit(vm_id, vcpu_id);
+                return;
+            }
+        }
+    } else if cfg!(feature = "rt-persistent-binding") {
+        info!(
+            "VM[{vm_id}] VCpu[{vcpu_id}] persistent binding disabled because task affinity spans \
+             multiple CPUs"
+        );
+        None
+    } else {
+        info!("VM[{vm_id}] VCpu[{vcpu_id}] persistent binding is not enabled");
+        None
+    };
+
     loop {
-        inject_pending_interrupts(vm_id, vcpu_id, &vcpu);
+        if rt_trace::enabled()
+            && let Some(wake_ns) = runtime.take_vcpu_wake_timestamp(vcpu_id)
+        {
+            rt_trace::trace_vcpu_resumed(
+                vm_id,
+                vcpu_id,
+                rt_trace::now_ns().saturating_sub(wake_ns),
+            );
+        }
         CurrentArch::before_vcpu_run(&vm, &vcpu);
 
-        match vm.run_vcpu(vcpu_id) {
+        let run_start_ns = rt_trace::now_ns();
+        #[cfg(feature = "rt-shared-wait-baseline")]
+        let run_result = vm.run_vcpu(vcpu_id);
+        #[cfg(not(feature = "rt-shared-wait-baseline"))]
+        let run_result = if let Some(prepared) = prepared_vcpu.as_mut() {
+            vm.run_prepared_vcpu(prepared, &runtime)
+        } else {
+            vm.run_vcpu_with_runtime(vcpu_id, &runtime)
+        };
+        rt_trace::trace_vmexit(
+            vm_id,
+            vcpu_id,
+            rt_trace::now_ns().saturating_sub(run_start_ns),
+            run_result.as_ref().ok(),
+        );
+        #[cfg(all(target_arch = "aarch64", feature = "rt-trace"))]
+        crate::host::gic::log_vcpu_exit_state(vm_id, vcpu_id);
+
+        match run_result {
             Ok(exit_reason) => match exit_reason {
                 VmExit::Hypercall { nr, args } => {
                     debug!("Hypercall [{nr}] args {args:x?}");
@@ -337,7 +530,7 @@ fn vcpu_run() {
                 }
                 VmExit::Halt => {
                     debug!("VM[{vm_id}] run VCpu[{vcpu_id}] Halt");
-                    if CurrentArch::handle_halt(&runtime) {
+                    if CurrentArch::handle_halt(&vm, &runtime, vcpu_id) {
                         continue;
                     }
                 }
@@ -348,7 +541,7 @@ fn vcpu_run() {
                 VmExit::Nothing => {}
                 VmExit::CpuDown { _state } => {
                     warn!("VM[{vm_id}] run VCpu[{vcpu_id}] CpuDown state {_state:#x}");
-                    wait(&runtime)
+                    wait(&runtime, vcpu_id);
                 }
                 VmExit::CpuUp {
                     target_cpu,
@@ -419,18 +612,13 @@ fn vcpu_run() {
                         continue;
                     }
 
-                    if targets.get(vcpu_id) {
-                        crate::inject_current_vcpu_interrupt(vector as _)
-                            .expect("failed to inject self IPI into current vCPU");
-                    }
-                    let mut remote_targets = targets;
-                    remote_targets.set(vcpu_id, false);
-                    if !remote_targets.is_empty()
-                        && let Err(err) = vm.inject_interrupt_to_vcpu(remote_targets, vector as _)
-                    {
+                    // Guest exit clears the per-CPU CURRENT_VCPU guard. Queue
+                    // self and remote IPIs by explicit VM/vCPU identity so the
+                    // next guest entry drains them in the owning vCPU context.
+                    if let Err(err) = vm.inject_interrupt_to_vcpu(targets, vector as _) {
                         warn!(
                             "Failed to inject interrupt {vector} to VM[{vm_id}] targets \
-                             {remote_targets:?}: {err:?}"
+                             {targets:?}: {err:?}"
                         );
                     }
                 }
@@ -454,9 +642,41 @@ fn vcpu_run() {
                 "VM[{}] VCpu[{}] is suspended, waiting for resume...",
                 vm_id, vcpu_id
             );
-            wait_for(&runtime, || !vm.suspending());
-            info!("VM[{}] VCpu[{}] resumed from suspend", vm_id, vcpu_id);
-            continue;
+            #[cfg(not(feature = "rt-shared-wait-baseline"))]
+            let suspend_ready = if let Some(prepared) = prepared_vcpu.as_mut() {
+                if let Err(err) = vm.suspend_prepared_vcpu(prepared) {
+                    error!("VM[{vm_id}] VCpu[{vcpu_id}] unbind before suspend failed: {err:?}");
+                    if let Err(stop_err) = vm.stop(StopReason::Fault(format!("{err:?}"))) {
+                        warn!("VM[{vm_id}] shutdown failed after suspend error: {stop_err:?}");
+                    }
+                    notify_all_vcpus(vm_id);
+                    false
+                } else {
+                    true
+                }
+            } else {
+                true
+            };
+            #[cfg(feature = "rt-shared-wait-baseline")]
+            let suspend_ready = true;
+
+            if suspend_ready {
+                wait_for(&runtime, vcpu_id, || !vm.suspending());
+                info!("VM[{}] VCpu[{}] resumed from suspend", vm_id, vcpu_id);
+                #[cfg(not(feature = "rt-shared-wait-baseline"))]
+                if let Some(prepared) = prepared_vcpu.as_mut()
+                    && let Err(err) = vm.resume_prepared_vcpu(prepared)
+                {
+                    error!("VM[{vm_id}] VCpu[{vcpu_id}] rebind after resume failed: {err:?}");
+                    if let Err(stop_err) = vm.stop(StopReason::Fault(format!("{err:?}"))) {
+                        warn!("VM[{vm_id}] shutdown failed after resume error: {stop_err:?}");
+                    }
+                    notify_all_vcpus(vm_id);
+                }
+            }
+            if !vm.stopping() {
+                continue;
+            }
         }
 
         // Check if the VM is stopping.
@@ -466,23 +686,18 @@ fn vcpu_run() {
                 vm_id, vcpu_id
             );
 
-            if runtime.mark_vcpu_exiting() {
-                info!("VM[{vm_id}] VCpu[{vcpu_id}] last VCpu exiting, decreasing running VM count");
-
-                if let Err(err) = vm.finish_stop() {
-                    warn!("VM[{vm_id}] finish stop failed: {err:?}");
-                }
-                info!("VM[{}] state changed to Stopped", vm_id);
-
-                CurrentArch::on_last_vcpu_exit(vm_id);
-
-                sub_running_vm_count(1);
-                crate::host::task::wait_queue_wake(&super::VMM, 1);
-            }
+            finish_stopping_vcpu(&vm, &runtime, vm_id, vcpu_id);
 
             break;
         }
     }
 
+    #[cfg(not(feature = "rt-shared-wait-baseline"))]
+    if let Some(prepared) = prepared_vcpu
+        && let Err(err) = vm.finish_prepared_vcpu(prepared)
+    {
+        warn!("VM[{vm_id}] VCpu[{vcpu_id}] final unbind failed: {err:?}");
+    }
+    CurrentArch::on_vcpu_task_exit(vm_id, vcpu_id);
     info!("VM[{}] VCpu[{}] exiting...", vm_id, vcpu_id);
 }

@@ -105,25 +105,57 @@ pub fn is_support_icc() -> bool {
 pub struct ActiveIrq {
     irq: rdrive::IrqId,
     ack: IntId,
+    priority: u8,
+    group: InterruptGroup,
+    deactivate_on_drop: bool,
+}
+
+#[derive(Clone, Copy)]
+enum InterruptGroup {
+    Group0,
+    Group1,
 }
 
 impl ActiveIrq {
     pub fn id(&self) -> rdrive::IrqId {
         self.irq
     }
+
+    pub fn priority(&self) -> u8 {
+        self.priority
+    }
+
+    pub fn forward_to_guest(mut self) -> bool {
+        self.deactivate_on_drop = false;
+        true
+    }
 }
 
 impl Drop for ActiveIrq {
     fn drop(&mut self) {
-        eoi1(self.ack);
-        if eoi_mode() {
+        match self.group {
+            InterruptGroup::Group0 => eoi0(self.ack),
+            InterruptGroup::Group1 => eoi1(self.ack),
+        }
+        if eoi_mode() && self.deactivate_on_drop {
             dir(self.ack);
         }
     }
 }
 
 pub fn begin_irq() -> Option<ActiveIrq> {
-    let ack = ack1();
+    begin_interrupt(InterruptGroup::Group1)
+}
+
+pub fn begin_fiq() -> Option<ActiveIrq> {
+    begin_interrupt(InterruptGroup::Group0)
+}
+
+fn begin_interrupt(group: InterruptGroup) -> Option<ActiveIrq> {
+    let ack = match group {
+        InterruptGroup::Group0 => ack0(),
+        InterruptGroup::Group1 => ack1(),
+    };
     if ack.is_special() {
         return None;
     }
@@ -131,6 +163,9 @@ pub fn begin_irq() -> Option<ActiveIrq> {
     Some(ActiveIrq {
         irq: (ack.to_u32() as usize).into(),
         ack,
+        priority: ICC_RPR_EL1.read(ICC_RPR_EL1::PRIORITY) as u8,
+        group,
+        deactivate_on_drop: true,
     })
 }
 
@@ -144,6 +179,20 @@ pub fn irq_set_enable(irq: IrqId, enable: bool) -> Result<(), crate::irq::IrqErr
     super::with_gic_domain::<Gic, _>(irq.domain, |gic| {
         let intid = checked_runtime_intid(irq.hwirq.0, gic.max_intid())?;
         gic.set_irq_enable(intid, enable);
+        Ok(())
+    })?
+}
+
+pub fn irq_route_to_host(irq: IrqId) -> Result<(), crate::irq::IrqError> {
+    if irq.hwirq.0 < 32 {
+        let intid = checked_private_intid(irq.hwirq.0)?;
+        current_cpu_interface().set_irq_group(intid, true);
+        return Ok(());
+    }
+
+    super::with_gic_domain::<Gic, _>(irq.domain, |gic| {
+        let intid = checked_runtime_intid(irq.hwirq.0, gic.max_intid())?;
+        gic.set_irq_group(intid, true);
         Ok(())
     })?
 }

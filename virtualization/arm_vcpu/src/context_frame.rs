@@ -222,6 +222,19 @@ struct GuestTimerRegisters {
 }
 
 impl GuestSystemRegisters {
+    /// Updates the EL0 registers whose physical storage is shared by host and
+    /// guest execution contexts.
+    pub(crate) fn set_shared_el0_registers(
+        &mut self,
+        sp_el0: u64,
+        tpidr_el0: u64,
+        tpidrro_el0: u64,
+    ) {
+        self.sp_el0 = sp_el0;
+        self.tpidr_el0 = tpidr_el0;
+        self.tpidrro_el0 = tpidrro_el0;
+    }
+
     /// Resets the VM context by setting all registers to zero.
     ///
     /// This method allows the `GuestSystemRegisters` instance to be reused by resetting
@@ -277,6 +290,16 @@ impl GuestSystemRegisters {
             asm!("mrs {0}, HCR_EL2", out(reg) self.hcr_el2);
             asm!("mrs {0}, ACTLR_EL1", out(reg) self.actlr_el1);
             // println!("save sctlr {:x}", self.sctlr_el1);
+        }
+    }
+
+    /// Disarms the EL1 timer sources after their guest-visible state has
+    /// been saved and any physical IRQ exit has been acknowledged.
+    pub(crate) unsafe fn quiesce_timers() {
+        unsafe {
+            asm!("msr CNTP_CTL_EL0, xzr");
+            asm!("msr CNTV_CTL_EL0, xzr");
+            asm!("isb");
         }
     }
 

@@ -37,6 +37,13 @@ impl PlatOp for Plat {
         gic::irq_set_enable(irq, enable)
     }
 
+    fn irq_route_to_host(irq: IrqId) -> Result<(), IrqError> {
+        if !is_gic_domain(irq.domain) {
+            return Err(IrqError::InvalidIrq);
+        }
+        gic::irq_route_to_host(irq)
+    }
+
     fn irq_set_affinity(irq: IrqId, affinity: crate::irq::IrqAffinity) -> Result<(), IrqError> {
         if !is_gic_domain(irq.domain) {
             return Err(IrqError::InvalidIrq);

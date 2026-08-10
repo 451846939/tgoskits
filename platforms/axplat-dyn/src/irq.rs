@@ -1,10 +1,20 @@
-#[cfg(all(target_arch = "riscv64", feature = "hv"))]
+#[cfg(all(any(target_arch = "aarch64", target_arch = "riscv64"), feature = "hv"))]
 use core::sync::atomic::{AtomicPtr, Ordering};
 
+#[cfg(all(target_arch = "aarch64", feature = "hv"))]
+use ax_plat::irq::GuestIrqInjection;
 use ax_plat::irq::{IrqAffinity, IrqError, IrqId, IrqIf, IrqSource, TrapVector, dispatch_irq};
 
 #[cfg(all(target_arch = "loongarch64", feature = "hv"))]
 mod loongarch64_hv;
+
+#[cfg(all(target_arch = "aarch64", feature = "hv"))]
+static VIRTUAL_IRQ_INJECTOR: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
+
+#[cfg(all(target_arch = "aarch64", feature = "hv"))]
+pub fn register_virtual_irq_injector(injector: fn(usize, u8) -> GuestIrqInjection) {
+    VIRTUAL_IRQ_INJECTOR.store(injector as *mut (), Ordering::Release);
+}
 
 #[cfg(all(target_arch = "riscv64", feature = "hv"))]
 static VIRTUAL_IRQ_INJECTOR: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
@@ -16,10 +26,63 @@ pub fn register_virtual_irq_injector(injector: fn(usize) -> bool) {
 
 struct IrqIfImpl;
 
+fn dispatch_active_irq(active: somehal::irq::ActiveIrq) -> Option<IrqId> {
+    let irq = active.id();
+
+    #[cfg(all(target_arch = "riscv64", feature = "hv"))]
+    if is_guest_forwardable(irq) && inject_virtual_irq(irq.hwirq.0 as usize) {
+        return Some(irq);
+    }
+
+    let outcome = dispatch_irq(irq);
+
+    if !outcome.handled {
+        #[cfg(all(target_arch = "aarch64", feature = "hv"))]
+        if is_aarch64_guest_forwardable(irq) {
+            let Some(priority) = active.priority() else {
+                warn!("AArch64 IRQ {irq:?} has no GICv3 running priority");
+                return Some(irq);
+            };
+            match inject_virtual_irq(irq.hwirq.0 as usize, priority) {
+                GuestIrqInjection::NotHandled => {}
+                GuestIrqInjection::Emulated => return Some(irq),
+                GuestIrqInjection::HardwareForwarded => {
+                    if active.forward_to_guest() {
+                        return Some(irq);
+                    }
+                    warn!("AArch64 IRQ {irq:?} cannot defer physical deactivation");
+                    return Some(irq);
+                }
+            }
+        }
+
+        #[cfg(all(target_arch = "loongarch64", feature = "hv"))]
+        if is_loongarch_guest_forwardable(irq)
+            && loongarch64_hv::inject_virtual_irq(irq.hwirq.0 as usize)
+        {
+            return Some(irq);
+        }
+
+        if outcome.called == 0 {
+            warn!("Unhandled IRQ {irq:?}");
+        } else {
+            debug!("Spurious IRQ {irq:?}");
+        }
+    }
+    Some(irq)
+}
+
 #[impl_plat_interface]
 impl IrqIf for IrqIfImpl {
     /// Enables or disables the given IRQ.
     fn set_enable(irq: IrqId, enabled: bool) -> Result<(), IrqError> {
+        #[cfg(all(target_arch = "aarch64", feature = "hv"))]
+        if enabled {
+            match somehal::irq::irq_route_to_host(irq) {
+                Ok(()) | Err(IrqError::Unsupported) => {}
+                Err(err) => return Err(err),
+            }
+        }
         somehal::irq::irq_set_enable(irq, enabled)
     }
 
@@ -33,33 +96,19 @@ impl IrqIf for IrqIfImpl {
 
     /// Handles the IRQ.
     fn handle(vector: TrapVector) -> Option<IrqId> {
-        let irq = {
-            let active = somehal::irq::begin_irq(vector.0)?;
-            let irq = active.id();
+        dispatch_active_irq(somehal::irq::begin_irq(vector.0)?)
+    }
 
-            #[cfg(all(target_arch = "riscv64", feature = "hv"))]
-            if is_guest_forwardable(irq) && inject_virtual_irq(irq.hwirq.0 as usize) {
-                return Some(irq);
-            }
+    fn handle_fiq(vector: TrapVector) -> Option<IrqId> {
+        #[cfg(target_arch = "aarch64")]
+        {
+            dispatch_active_irq(somehal::irq::begin_fiq(vector.0)?)
+        }
 
-            let outcome = dispatch_irq(irq);
-            if !outcome.handled {
-                #[cfg(all(target_arch = "loongarch64", feature = "hv"))]
-                if is_loongarch_guest_forwardable(irq)
-                    && loongarch64_hv::inject_virtual_irq(irq.hwirq.0 as usize)
-                {
-                    return Some(irq);
-                }
-
-                if outcome.called == 0 {
-                    warn!("Unhandled IRQ {irq:?}");
-                } else {
-                    debug!("Spurious IRQ {irq:?}");
-                }
-            }
-            irq
-        };
-        Some(irq)
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            Self::handle(vector)
+        }
     }
 
     fn send_ipi(id: IrqId, target: ax_plat::irq::IpiTarget) {
@@ -99,6 +148,11 @@ impl IrqIf for IrqIfImpl {
     }
 }
 
+#[cfg(all(target_arch = "aarch64", feature = "hv"))]
+fn is_aarch64_guest_forwardable(irq: IrqId) -> bool {
+    somehal::irq::domain_is_kind(irq.domain, somehal::irq::IrqDomainKind::AArch64Gic)
+}
+
 #[cfg(any(all(target_arch = "riscv64", feature = "hv"), test))]
 fn is_guest_forwardable(irq: IrqId) -> bool {
     somehal::irq::domain_is_kind(irq.domain, somehal::irq::IrqDomainKind::RiscvPlic)
@@ -108,6 +162,18 @@ fn is_guest_forwardable(irq: IrqId) -> bool {
 fn is_loongarch_guest_forwardable(irq: IrqId) -> bool {
     somehal::irq::domain_is_kind(irq.domain, somehal::irq::IrqDomainKind::LoongArchEioIntc)
         || somehal::irq::domain_is_kind(irq.domain, somehal::irq::IrqDomainKind::LoongArchPchPic)
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "hv"))]
+fn inject_virtual_irq(irq: usize, priority: u8) -> GuestIrqInjection {
+    let injector = VIRTUAL_IRQ_INJECTOR.load(Ordering::Acquire);
+    if injector.is_null() {
+        warn!("virtual IRQ injector is not registered");
+        return GuestIrqInjection::NotHandled;
+    }
+    unsafe {
+        core::mem::transmute::<*mut (), fn(usize, u8) -> GuestIrqInjection>(injector)(irq, priority)
+    }
 }
 
 #[cfg(all(target_arch = "riscv64", feature = "hv"))]

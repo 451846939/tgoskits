@@ -24,6 +24,24 @@ use axvm_types::VMInterruptMode;
 #[cfg(target_arch = "riscv64")]
 pub(crate) mod riscv;
 
+#[cfg(target_arch = "aarch64")]
+pub use ax_plat::irq::GuestIrqInjection;
+
+/// Host platform hook for registering the AArch64 physical IRQ injector.
+#[cfg(target_arch = "aarch64")]
+#[ax_crate_interface::def_interface]
+pub trait Aarch64PlatformIrqInjectorIf {
+    /// Registers a callback that forwards an unhandled physical GIC IRQ into the current guest.
+    fn register_virtual_irq_injector(injector: fn(usize, u8) -> GuestIrqInjection);
+}
+
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn register_aarch64_virtual_irq_injector(injector: fn(usize, u8) -> GuestIrqInjection) {
+    ax_crate_interface::call_interface!(
+        Aarch64PlatformIrqInjectorIf::register_virtual_irq_injector(injector)
+    );
+}
+
 /// Host platform hook for registering the RISC-V physical IRQ injector.
 #[cfg(target_arch = "riscv64")]
 #[ax_crate_interface::def_interface]

@@ -123,14 +123,43 @@ impl HostTime for ArceOsHost {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
 pub(crate) fn monotonic_time_nanos() -> u64 {
     modules::ax_hal::time::monotonic_time_nanos()
 }
 
 #[cfg(target_arch = "aarch64")]
 pub(crate) fn handle_host_irq(vector: usize) -> Option<usize> {
-    modules::ax_hal::irq::handle_irq(vector).then_some(vector)
+    modules::ax_hal::irq::handle_irq_id(vector).map(|irq| irq.hwirq.0 as usize)
+}
+
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn handle_host_fiq(vector: usize) -> Option<usize> {
+    modules::ax_hal::irq::handle_fiq_id(vector).map(|irq| irq.hwirq.0 as usize)
+}
+
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn set_aarch64_irq_enabled(raw_irq: usize, enabled: bool) -> bool {
+    let Ok(raw_irq) = u32::try_from(raw_irq) else {
+        warn!("failed to resolve AArch64 passthrough IRQ {raw_irq}: out of INTID range");
+        return false;
+    };
+    let irq = match modules::ax_hal::irq::resolve_percpu_irq(modules::ax_hal::irq::HwIrq(raw_irq)) {
+        Ok(irq) => irq,
+        Err(err) => {
+            warn!("failed to resolve AArch64 passthrough IRQ {raw_irq}: {err:?}");
+            return false;
+        }
+    };
+    match modules::ax_hal::irq::set_enable(irq, enabled) {
+        Ok(()) => true,
+        Err(err) => {
+            warn!(
+                "failed to set AArch64 passthrough IRQ {raw_irq} ({irq:?}) enabled={enabled}: \
+                 {err:?}"
+            );
+            false
+        }
+    }
 }
 
 pub(crate) fn dispatch_host_irq(vector: usize) {

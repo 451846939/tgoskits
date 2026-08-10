@@ -54,6 +54,7 @@ dma = ["ax-api/dma", "ax-feat/dma"]
 tls = ["ax-feat/tls"]
 
 # Multi-threading and scheduler
+preempt = ["ax-feat/preempt"]
 multitask = ["ax-api/multitask", "ax-feat/multitask", "ax-posix-api/multitask"]
 lockdep = ["ax-feat/lockdep", "ax-posix-api/lockdep"]
 task-ext = ["ax-feat/task-ext"]

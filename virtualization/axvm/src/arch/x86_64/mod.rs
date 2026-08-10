@@ -88,7 +88,11 @@ impl ArchOps for X86_64Arch {
         }
     }
 
-    fn handle_halt(_runtime: &crate::vm::VmRuntimeHandle) -> bool {
+    fn handle_halt(
+        _vm: &crate::AxVMRef,
+        _runtime: &crate::vm::VmRuntimeHandle,
+        _vcpu_id: usize,
+    ) -> bool {
         true
     }
 

@@ -12,7 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use aarch64_cpu::registers::{ESR_EL2, HCR_EL2, Readable, SCTLR_EL1, VTCR_EL2, VTTBR_EL2};
+use core::sync::atomic::{AtomicBool, Ordering};
+
+use aarch64_cpu::registers::{
+    ESR_EL2, FAR_EL2, HCR_EL2, HPFAR_EL2, Readable, SCTLR_EL1, VTCR_EL2, VTTBR_EL2,
+};
 use ax_errno::{AxError, AxResult};
 use axvm_types::{AccessWidth, GuestPhysAddr, SysRegAddr, VmExit};
 use log::error;
@@ -44,6 +48,10 @@ pub enum TrapKind {
 const EXCEPTION_SYNC: usize = TrapKind::Synchronous as usize;
 /// Equals to [`TrapKind::Irq`], used in exception.S.
 const EXCEPTION_IRQ: usize = TrapKind::Irq as usize;
+/// Equals to [`TrapKind::Fiq`], used in exception.S.
+const EXCEPTION_FIQ: usize = TrapKind::Fiq as usize;
+/// Equals to [`TrapKind::SError`], used in exception.S.
+const EXCEPTION_SERROR: usize = TrapKind::SError as usize;
 
 #[repr(u8)]
 #[derive(Debug)]
@@ -59,6 +67,8 @@ core::arch::global_asm!(
     include_str!("exception.S"),
     exception_sync = const EXCEPTION_SYNC,
     exception_irq = const EXCEPTION_IRQ,
+    exception_fiq = const EXCEPTION_FIQ,
+    exception_serror = const EXCEPTION_SERROR,
 );
 
 /// Handles synchronous exceptions that occur during the execution of a guest VM.
@@ -119,6 +129,12 @@ pub fn handle_exception_sync(ctx: &mut TrapFrame) -> AxResult<VmExit> {
             let val = elr + exception_next_instruction_step();
             ctx.set_exception_pc(val);
             handle_smc64_exception(ctx)
+        }
+        Some(ESR_EL2::EC::Value::TrappedWFIorWFE) => {
+            let elr = ctx.exception_pc();
+            let val = elr + exception_next_instruction_step();
+            ctx.set_exception_pc(val);
+            Ok(VmExit::Idle)
         }
         _ => {
             panic!(
@@ -244,7 +260,7 @@ fn handle_psci_call(ctx: &mut TrapFrame) -> Option<AxResult<VmExit>> {
     const PSCI_FN_CPU_ON: u64 = 0x3;
     const _PSCI_FN_MIGRATE: u64 = 0x5;
     const PSCI_FN_SYSTEM_OFF: u64 = 0x8;
-    const _PSCI_FN_SYSTEM_RESET: u64 = 0x9;
+    const PSCI_FN_SYSTEM_RESET: u64 = 0x9;
     const PSCI_FN_END: u64 = 0x1f;
 
     let fn_ = ctx.gpr[0];
@@ -263,7 +279,10 @@ fn handle_psci_call(ctx: &mut TrapFrame) -> Option<AxResult<VmExit>> {
             entry_point: GuestPhysAddr::from(ctx.gpr[2] as usize),
             arg: ctx.gpr[3],
         })),
-        Some(PSCI_FN_SYSTEM_OFF) => Some(Ok(VmExit::SystemDown)),
+        // A guest shutdown or reset must never be forwarded to the host PSCI
+        // implementation, otherwise one VM can power off or reset the entire
+        // hypervisor. The runtime currently handles both as a VM-level stop.
+        Some(PSCI_FN_SYSTEM_OFF | PSCI_FN_SYSTEM_RESET) => Some(Ok(VmExit::SystemDown)),
         // We just forward these request to the ATF directly.
         Some(PSCI_FN_VERSION..PSCI_FN_END) => None,
         _ => None,
@@ -300,13 +319,24 @@ fn current_el_irq_handler(_tf: &mut TrapFrame) {
 /// Handles synchronous exceptions that occur from the current exception level.
 #[unsafe(no_mangle)]
 fn current_el_sync_handler(tf: &mut TrapFrame) {
+    static FIRST_FAULT_REPORTED: AtomicBool = AtomicBool::new(false);
+
     let esr = ESR_EL2.extract();
     let ec = ESR_EL2.read(ESR_EL2::EC);
     let iss = ESR_EL2.read(ESR_EL2::ISS);
 
-    error!("ESR_EL2: {:#x}", esr.get());
-    error!("Exception Class: {ec:#x}");
-    error!("Instruction Specific Syndrome: {iss:#x}");
+    if !FIRST_FAULT_REPORTED.swap(true, Ordering::Relaxed) {
+        error!(
+            "EL2 sync fault: pc={:#x} lr={:#x} fp={:#x} far={:#x} hpfar={:#x} esr={:#x} \
+             ec={ec:#x} iss={iss:#x}",
+            tf.exception_pc(),
+            tf.gpr[30],
+            tf.gpr[29],
+            FAR_EL2.get(),
+            HPFAR_EL2.get(),
+            esr.get(),
+        );
+    }
 
     panic!(
         "Unhandled synchronous exception from current EL: {:#x?}",
@@ -353,6 +383,10 @@ fn current_el_sync_handler(tf: &mut TrapFrame) {
 #[unsafe(no_mangle)]
 unsafe extern "C" fn vmexit_trampoline() -> ! {
     core::arch::naked_asm!(
+        // Guest PSTATE is restored by ERET and therefore cannot be used as the
+        // host-side interrupt state. Keep host IRQs masked until Rust has saved
+        // the guest-owned shared registers and restored the host-owned values.
+        "msr daifset, #2",
         // Curretly `sp` points to the base address of `Aarch64VCpu.ctx`, which stores guest's `TrapFrame`.
         "add x9, sp, 34 * 8", // Skip the exception frame.
         // Currently `x9` points to `&Aarch64VCpu.host_stack_top`, see `run_guest()` in vcpu.rs.

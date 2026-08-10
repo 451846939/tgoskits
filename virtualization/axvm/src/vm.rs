@@ -12,7 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use alloc::{boxed::Box, collections::BTreeMap, format, string::String, sync::Arc, vec::Vec};
+#[cfg(any(
+    feature = "rt-shared-wait-baseline",
+    feature = "rt-shared-interrupt-queue"
+))]
+use alloc::collections::BTreeMap;
+use alloc::{boxed::Box, format, string::String, sync::Arc, vec::Vec};
+#[cfg(not(feature = "rt-shared-wait-baseline"))]
+use core::sync::atomic::AtomicU64;
 use core::{
     alloc::Layout,
     sync::atomic::{AtomicUsize, Ordering},
@@ -34,7 +41,7 @@ use crate::{
     arch::{ArchNestedPageTable, ArchOps, CurrentArch},
     boot::{GuestBootDescription, GuestFdtBuilder},
     config::{AxVMConfig, PhysCpuList, VMInterruptMode},
-    host::paging::virt_to_phys,
+    host::{HostMemory, default_host, paging::virt_to_phys},
     irq::InterruptFabric,
     layout::VmAddressLayout,
     lifecycle::{Machine, StopReason, VmLifecycleError, VmStatus},
@@ -48,6 +55,11 @@ pub use memory::PreparedMemoryLayout;
 
 const VM_ASPACE_BASE: usize = 0x0;
 const VM_ASPACE_SIZE: usize = 0x7fff_ffff_f000;
+#[cfg(not(feature = "rt-shared-wait-baseline"))]
+const UNASSIGNED_CPU_ID: usize = usize::MAX;
+const INITIAL_PENDING_INTERRUPT_CAPACITY: usize = 8;
+
+type InterruptQueue = Vec<QueuedInterrupt>;
 
 /// A vCPU with architecture-independent interface.
 type VCpu = AxVCpu<crate::arch::ArchVCpu>;
@@ -55,6 +67,48 @@ type VCpu = AxVCpu<crate::arch::ArchVCpu>;
 pub(crate) type AxVCpuRef = Arc<VCpu>;
 /// A reference to a VM.
 pub type AxVMRef = Arc<AxVM>;
+
+#[cfg(not(feature = "rt-shared-wait-baseline"))]
+pub(crate) struct PreparedVcpuRun {
+    vcpu: AxVCpuRef,
+    devices: Arc<AxVmDevices>,
+    bound: bool,
+}
+
+#[cfg(not(feature = "rt-shared-wait-baseline"))]
+impl PreparedVcpuRun {
+    fn bind(&mut self) -> AxResult {
+        if self.bound {
+            return Ok(());
+        }
+        self.vcpu.bind()?;
+        self.bound = true;
+        crate::runtime::rt_trace::trace_vcpu_run_path(
+            self.vcpu.vm_id(),
+            self.vcpu.id(),
+            crate::runtime::rt_trace::VcpuRunPathEvent::Bind,
+        );
+        Ok(())
+    }
+
+    fn unbind(&mut self) -> AxResult {
+        if !self.bound {
+            return Ok(());
+        }
+        if self.vcpu.state() == VmVcpuState::Invalid {
+            self.vcpu.unbind_invalid()?;
+        } else {
+            self.vcpu.unbind()?;
+        }
+        self.bound = false;
+        crate::runtime::rt_trace::trace_vcpu_run_path(
+            self.vcpu.vm_id(),
+            self.vcpu.id(),
+            crate::runtime::rt_trace::VcpuRunPathEvent::Unbind,
+        );
+        Ok(())
+    }
+}
 
 /// Architecture-independent vCPU runtime metadata.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -128,80 +182,372 @@ unsafe impl Send for AxVMResources {}
 unsafe impl Sync for AxVMResources {}
 
 #[allow(dead_code)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PendingInterrupt {
     Normal(usize),
-    External { vector: usize, physical_irq: usize },
+    Replay(usize),
+    External {
+        vector: usize,
+        physical_irq: usize,
+        priority: Option<u8>,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct QueuedInterrupt {
+    pub(crate) interrupt: PendingInterrupt,
+    pub(crate) queued_ns: u64,
+}
+
+/// Runtime state owned by one vCPU.
+#[cfg(not(feature = "rt-shared-wait-baseline"))]
+#[repr(align(128))]
+struct VcpuRuntimeState {
+    wait_queue: crate::WaitQueue,
+    task: Mutex<Option<crate::AxTaskRef>>,
+    target_cpu_id: AtomicUsize,
+    #[cfg(not(feature = "rt-shared-interrupt-queue"))]
+    interrupt_queues: Mutex<InterruptQueueState>,
+    wake_timestamp_ns: AtomicU64,
+}
+
+#[cfg(not(feature = "rt-shared-wait-baseline"))]
+struct InterruptQueueState {
+    pending: InterruptQueue,
+}
+
+#[cfg(not(feature = "rt-shared-wait-baseline"))]
+impl InterruptQueueState {
+    fn new() -> Self {
+        Self {
+            pending: InterruptQueue::with_capacity(INITIAL_PENDING_INTERRUPT_CAPACITY),
+        }
+    }
+
+    fn enqueue(&mut self, interrupt: QueuedInterrupt) {
+        enqueue_pending_interrupt(&mut self.pending, interrupt);
+    }
+
+    fn requeue(&mut self, interrupts: impl IntoIterator<Item = QueuedInterrupt>) {
+        for interrupt in interrupts {
+            self.enqueue(interrupt);
+        }
+    }
+
+    fn drain(&mut self) -> InterruptQueue {
+        core::mem::take(&mut self.pending)
+    }
+
+    fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+}
+
+#[cfg(not(feature = "rt-shared-wait-baseline"))]
+impl VcpuRuntimeState {
+    fn new() -> Self {
+        Self {
+            wait_queue: crate::WaitQueue::new(),
+            task: Mutex::new(None),
+            target_cpu_id: AtomicUsize::new(UNASSIGNED_CPU_ID),
+            #[cfg(not(feature = "rt-shared-interrupt-queue"))]
+            interrupt_queues: Mutex::new(InterruptQueueState::new()),
+            wake_timestamp_ns: AtomicU64::new(0),
+        }
+    }
+
+    #[cfg(not(feature = "rt-shared-interrupt-queue"))]
+    fn enqueue_pending_interrupt(&self, interrupt: QueuedInterrupt) {
+        self.interrupt_queues.lock().enqueue(interrupt);
+    }
+
+    #[cfg(not(feature = "rt-shared-interrupt-queue"))]
+    fn requeue_pending_interrupts(&self, interrupts: impl IntoIterator<Item = QueuedInterrupt>) {
+        self.interrupt_queues.lock().requeue(interrupts);
+    }
+
+    #[cfg(not(feature = "rt-shared-interrupt-queue"))]
+    fn drain_pending_interrupts(&self) -> InterruptQueue {
+        self.interrupt_queues.lock().drain()
+    }
+
+    #[cfg(not(feature = "rt-shared-interrupt-queue"))]
+    fn has_pending_interrupt(&self) -> bool {
+        self.interrupt_queues.lock().has_pending()
+    }
 }
 
 /// Runtime-only resources owned by Running/Paused/Stopping lifecycle states.
 pub(crate) struct VmRuntimeHandle {
     wait_queue: crate::WaitQueue,
+    #[cfg(not(feature = "rt-shared-wait-baseline"))]
+    vcpu_states: Box<[VcpuRuntimeState]>,
+    #[cfg(feature = "rt-shared-wait-baseline")]
     vcpu_task_list: Mutex<BTreeMap<usize, crate::AxTaskRef>>,
-    pending_interrupts: Mutex<BTreeMap<usize, Vec<PendingInterrupt>>>,
+    #[cfg(feature = "rt-shared-wait-baseline")]
+    pending_interrupts: Mutex<BTreeMap<usize, InterruptQueue>>,
+    #[cfg(all(
+        not(feature = "rt-shared-wait-baseline"),
+        feature = "rt-shared-interrupt-queue"
+    ))]
+    shared_interrupt_queues: Mutex<BTreeMap<usize, InterruptQueueState>>,
+    #[cfg(feature = "rt-shared-wait-baseline")]
+    vcpu_wake_timestamps: Mutex<BTreeMap<usize, u64>>,
     running_halting_vcpu_count: AtomicUsize,
 }
 
 impl VmRuntimeHandle {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(vcpu_count: usize) -> Self {
+        #[cfg(feature = "rt-shared-wait-baseline")]
+        let _ = vcpu_count;
+        #[cfg(all(
+            not(feature = "rt-shared-wait-baseline"),
+            feature = "rt-shared-interrupt-queue"
+        ))]
+        let shared_interrupt_queues = (0..vcpu_count)
+            .map(|vcpu_id| (vcpu_id, InterruptQueueState::new()))
+            .collect();
         Self {
             wait_queue: crate::WaitQueue::new(),
+            #[cfg(not(feature = "rt-shared-wait-baseline"))]
+            vcpu_states: core::iter::repeat_with(VcpuRuntimeState::new)
+                .take(vcpu_count)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            #[cfg(feature = "rt-shared-wait-baseline")]
             vcpu_task_list: Mutex::new(BTreeMap::new()),
+            #[cfg(feature = "rt-shared-wait-baseline")]
             pending_interrupts: Mutex::new(BTreeMap::new()),
+            #[cfg(all(
+                not(feature = "rt-shared-wait-baseline"),
+                feature = "rt-shared-interrupt-queue"
+            ))]
+            shared_interrupt_queues: Mutex::new(shared_interrupt_queues),
+            #[cfg(feature = "rt-shared-wait-baseline")]
+            vcpu_wake_timestamps: Mutex::new(BTreeMap::new()),
             running_halting_vcpu_count: AtomicUsize::new(0),
         }
     }
 
-    pub(crate) fn add_vcpu_task(&self, vcpu_id: usize, vcpu_task: crate::AxTaskRef) {
-        self.vcpu_task_list.lock().insert(vcpu_id, vcpu_task);
-        self.pending_interrupts.lock().entry(vcpu_id).or_default();
+    #[cfg(not(feature = "rt-shared-wait-baseline"))]
+    fn vcpu_state(&self, vcpu_id: usize) -> AxResult<&VcpuRuntimeState> {
+        self.vcpu_states.get(vcpu_id).ok_or_else(|| {
+            ax_err_type!(NotFound, format!("vCPU {vcpu_id} runtime state not found"))
+        })
     }
 
-    pub(crate) fn queue_interrupt(&self, vcpu_id: usize, vector: usize) -> AxResult<usize> {
-        let task = self
-            .vcpu_task_list
-            .lock()
-            .get(&vcpu_id)
-            .cloned()
-            .ok_or_else(|| ax_err_type!(NotFound, format!("vCPU {vcpu_id} task not found")))?;
-        self.pending_interrupts
-            .lock()
-            .entry(vcpu_id)
-            .or_default()
-            .push(PendingInterrupt::Normal(vector));
-        Ok(task.cpu_id() as usize)
+    pub(crate) fn add_vcpu_task(&self, vcpu_id: usize, vcpu_task: crate::AxTaskRef) -> AxResult {
+        #[cfg(feature = "rt-shared-wait-baseline")]
+        {
+            self.vcpu_task_list.lock().insert(vcpu_id, vcpu_task);
+            self.pending_interrupts.lock().entry(vcpu_id).or_default();
+            Ok(())
+        }
+
+        #[cfg(not(feature = "rt-shared-wait-baseline"))]
+        {
+            let state = self.vcpu_state(vcpu_id)?;
+            let cpu_id = vcpu_task.cpu_id() as usize;
+            *state.task.lock() = Some(vcpu_task);
+            state.target_cpu_id.store(cpu_id, Ordering::Release);
+            Ok(())
+        }
     }
 
-    #[cfg(target_arch = "loongarch64")]
+    fn queue_pending_interrupt(
+        &self,
+        vcpu_id: usize,
+        interrupt: QueuedInterrupt,
+    ) -> AxResult<usize> {
+        #[cfg(feature = "rt-shared-wait-baseline")]
+        {
+            let cpu_id = self
+                .vcpu_task_list
+                .lock()
+                .get(&vcpu_id)
+                .map(|task| task.cpu_id() as usize)
+                .ok_or_else(|| ax_err_type!(NotFound, format!("vCPU {vcpu_id} task not found")))?;
+            enqueue_pending_interrupt(
+                self.pending_interrupts.lock().entry(vcpu_id).or_default(),
+                interrupt,
+            );
+            Ok(cpu_id)
+        }
+
+        #[cfg(not(feature = "rt-shared-wait-baseline"))]
+        {
+            let state = self.vcpu_state(vcpu_id)?;
+            let cpu_id = state.target_cpu_id.load(Ordering::Acquire);
+            if cpu_id == UNASSIGNED_CPU_ID {
+                return Err(ax_err_type!(
+                    NotFound,
+                    format!("vCPU {vcpu_id} task not found")
+                ));
+            }
+
+            #[cfg(feature = "rt-shared-interrupt-queue")]
+            self.shared_interrupt_queues
+                .lock()
+                .get_mut(&vcpu_id)
+                .ok_or_else(|| {
+                    ax_err_type!(
+                        NotFound,
+                        format!("vCPU {vcpu_id} interrupt queue not found")
+                    )
+                })?
+                .enqueue(interrupt);
+
+            #[cfg(not(feature = "rt-shared-interrupt-queue"))]
+            state.enqueue_pending_interrupt(interrupt);
+            Ok(cpu_id)
+        }
+    }
+
+    pub(crate) fn queue_interrupt(
+        &self,
+        vcpu_id: usize,
+        vector: usize,
+        queued_ns: u64,
+    ) -> AxResult<usize> {
+        self.queue_pending_interrupt(
+            vcpu_id,
+            QueuedInterrupt {
+                interrupt: PendingInterrupt::Normal(vector),
+                queued_ns,
+            },
+        )
+    }
+
+    #[cfg(any(target_arch = "aarch64", target_arch = "loongarch64"))]
     pub(crate) fn queue_external_interrupt(
         &self,
         vcpu_id: usize,
         vector: usize,
         physical_irq: usize,
+        priority: Option<u8>,
+        queued_ns: u64,
     ) -> AxResult<usize> {
-        let task = self
-            .vcpu_task_list
-            .lock()
-            .get(&vcpu_id)
-            .cloned()
-            .ok_or_else(|| ax_err_type!(NotFound, format!("vCPU {vcpu_id} task not found")))?;
-        self.pending_interrupts
-            .lock()
-            .entry(vcpu_id)
-            .or_default()
-            .push(PendingInterrupt::External {
-                vector,
-                physical_irq,
-            });
-        Ok(task.cpu_id() as usize)
+        self.queue_pending_interrupt(
+            vcpu_id,
+            QueuedInterrupt {
+                interrupt: PendingInterrupt::External {
+                    vector,
+                    physical_irq,
+                    priority,
+                },
+                queued_ns,
+            },
+        )
     }
 
-    pub(crate) fn drain_pending_interrupts(&self, vcpu_id: usize) -> Vec<PendingInterrupt> {
-        self.pending_interrupts
-            .lock()
-            .get_mut(&vcpu_id)
-            .map(core::mem::take)
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) fn queue_replay_interrupt(
+        &self,
+        vcpu_id: usize,
+        vector: usize,
+        queued_ns: u64,
+    ) -> AxResult<usize> {
+        self.queue_pending_interrupt(
+            vcpu_id,
+            QueuedInterrupt {
+                interrupt: PendingInterrupt::Replay(vector),
+                queued_ns,
+            },
+        )
+    }
+
+    pub(crate) fn requeue_pending_interrupts(
+        &self,
+        vcpu_id: usize,
+        interrupts: impl IntoIterator<Item = QueuedInterrupt>,
+    ) {
+        #[cfg(feature = "rt-shared-wait-baseline")]
+        {
+            let mut queues = self.pending_interrupts.lock();
+            let queue = queues.entry(vcpu_id).or_default();
+            for interrupt in interrupts {
+                enqueue_pending_interrupt(queue, interrupt);
+            }
+        }
+
+        #[cfg(all(
+            not(feature = "rt-shared-wait-baseline"),
+            feature = "rt-shared-interrupt-queue"
+        ))]
+        if let Some(queue) = self.shared_interrupt_queues.lock().get_mut(&vcpu_id) {
+            queue.requeue(interrupts);
+        }
+
+        #[cfg(all(
+            not(feature = "rt-shared-wait-baseline"),
+            not(feature = "rt-shared-interrupt-queue")
+        ))]
+        if let Ok(state) = self.vcpu_state(vcpu_id) {
+            state.requeue_pending_interrupts(interrupts);
+        }
+    }
+
+    pub(crate) fn drain_pending_interrupts(&self, vcpu_id: usize) -> InterruptQueue {
+        #[cfg(feature = "rt-shared-wait-baseline")]
+        {
+            return self
+                .pending_interrupts
+                .lock()
+                .get_mut(&vcpu_id)
+                .map(core::mem::take)
+                .unwrap_or_default();
+        }
+
+        #[cfg(all(
+            not(feature = "rt-shared-wait-baseline"),
+            feature = "rt-shared-interrupt-queue"
+        ))]
+        {
+            return self
+                .shared_interrupt_queues
+                .lock()
+                .get_mut(&vcpu_id)
+                .map(InterruptQueueState::drain)
+                .unwrap_or_default();
+        }
+
+        #[cfg(all(
+            not(feature = "rt-shared-wait-baseline"),
+            not(feature = "rt-shared-interrupt-queue")
+        ))]
+        self.vcpu_state(vcpu_id)
+            .map(VcpuRuntimeState::drain_pending_interrupts)
             .unwrap_or_default()
+    }
+
+    pub(crate) fn has_pending_interrupt(&self, vcpu_id: usize) -> bool {
+        #[cfg(feature = "rt-shared-wait-baseline")]
+        {
+            return self
+                .pending_interrupts
+                .lock()
+                .get(&vcpu_id)
+                .is_some_and(|interrupts| !interrupts.is_empty());
+        }
+
+        #[cfg(all(
+            not(feature = "rt-shared-wait-baseline"),
+            feature = "rt-shared-interrupt-queue"
+        ))]
+        {
+            return self
+                .shared_interrupt_queues
+                .lock()
+                .get(&vcpu_id)
+                .is_some_and(InterruptQueueState::has_pending);
+        }
+
+        #[cfg(all(
+            not(feature = "rt-shared-wait-baseline"),
+            not(feature = "rt-shared-interrupt-queue")
+        ))]
+        self.vcpu_state(vcpu_id)
+            .is_ok_and(VcpuRuntimeState::has_pending_interrupt)
     }
 
     pub(crate) fn wait(&self) {
@@ -212,12 +558,115 @@ impl VmRuntimeHandle {
         self.wait_queue.wait_until(condition);
     }
 
-    pub(crate) fn notify_one(&self) {
-        self.wait_queue.notify_one(false);
+    pub(crate) fn wait_vcpu(&self, vcpu_id: usize) {
+        #[cfg(feature = "rt-shared-wait-baseline")]
+        {
+            let _ = vcpu_id;
+            self.wait();
+        }
+
+        #[cfg(not(feature = "rt-shared-wait-baseline"))]
+        if let Ok(state) = self.vcpu_state(vcpu_id) {
+            state.wait_queue.wait();
+        } else {
+            self.wait();
+        }
+    }
+
+    pub(crate) fn wait_vcpu_until(&self, vcpu_id: usize, condition: impl Fn() -> bool) {
+        // Avoid taking the scheduler run-queue lock when the lifecycle condition
+        // is already satisfied. Lifecycle transitions can also wake vCPU tasks,
+        // so evaluating a lifecycle condition only from inside WaitQueue would
+        // introduce an avoidable run-queue/lifecycle lock-order dependency.
+        if condition() {
+            return;
+        }
+
+        #[cfg(feature = "rt-shared-wait-baseline")]
+        {
+            let _ = vcpu_id;
+            self.wait_until(condition);
+        }
+
+        #[cfg(not(feature = "rt-shared-wait-baseline"))]
+        if let Ok(state) = self.vcpu_state(vcpu_id) {
+            state.wait_queue.wait_until(condition);
+        } else {
+            self.wait_until(condition);
+        }
     }
 
     pub(crate) fn notify_all(&self) {
         self.wait_queue.notify_all(false);
+        #[cfg(not(feature = "rt-shared-wait-baseline"))]
+        for state in &self.vcpu_states {
+            state.wait_queue.notify_all(false);
+        }
+    }
+
+    pub(crate) fn notify_vcpu(&self, vcpu_id: usize) -> bool {
+        #[cfg(feature = "rt-shared-wait-baseline")]
+        {
+            let _ = vcpu_id;
+            self.wait_queue.notify_all(false);
+            false
+        }
+
+        #[cfg(all(
+            not(feature = "rt-shared-wait-baseline"),
+            feature = "rt-disable-targeted-vcpu-wake"
+        ))]
+        {
+            if self.vcpu_state(vcpu_id).is_err() {
+                return self.wait_queue.notify_one(true);
+            }
+
+            let mut target_woke = false;
+            for (candidate_id, state) in self.vcpu_states.iter().enumerate() {
+                let woke = state.wait_queue.notify_one(true);
+                if candidate_id == vcpu_id {
+                    target_woke = woke;
+                }
+            }
+            target_woke
+        }
+
+        #[cfg(all(
+            not(feature = "rt-shared-wait-baseline"),
+            not(feature = "rt-disable-targeted-vcpu-wake")
+        ))]
+        self.vcpu_state(vcpu_id)
+            .map(|state| state.wait_queue.notify_one(true))
+            .unwrap_or_else(|_| self.wait_queue.notify_one(true))
+    }
+
+    pub(crate) fn record_vcpu_wake(&self, vcpu_id: usize, timestamp_ns: u64) {
+        #[cfg(feature = "rt-shared-wait-baseline")]
+        self.vcpu_wake_timestamps
+            .lock()
+            .insert(vcpu_id, timestamp_ns);
+
+        #[cfg(not(feature = "rt-shared-wait-baseline"))]
+        if let Ok(state) = self.vcpu_state(vcpu_id) {
+            state
+                .wake_timestamp_ns
+                .store(timestamp_ns.saturating_add(1), Ordering::Release);
+        }
+    }
+
+    pub(crate) fn take_vcpu_wake_timestamp(&self, vcpu_id: usize) -> Option<u64> {
+        #[cfg(feature = "rt-shared-wait-baseline")]
+        {
+            return self.vcpu_wake_timestamps.lock().remove(&vcpu_id);
+        }
+
+        #[cfg(not(feature = "rt-shared-wait-baseline"))]
+        self.vcpu_state(vcpu_id).ok().and_then(|state| {
+            state
+                .wake_timestamp_ns
+                .swap(0, Ordering::AcqRel)
+                .checked_sub(1)
+        })
     }
 
     pub(crate) fn mark_vcpu_running(&self) {
@@ -235,12 +684,20 @@ impl VmRuntimeHandle {
 
     pub(crate) fn join_all_vcpu_tasks(&self, vm_id: usize) {
         let current = crate::host::task::current_task();
+        #[cfg(feature = "rt-shared-wait-baseline")]
         let tasks: Vec<_> = self
             .vcpu_task_list
             .lock()
             .values()
             .filter(|task| !current.ptr_eq(task))
             .cloned()
+            .collect();
+        #[cfg(not(feature = "rt-shared-wait-baseline"))]
+        let tasks: Vec<_> = self
+            .vcpu_states
+            .iter()
+            .filter_map(|state| state.task.lock().clone())
+            .filter(|task| !current.ptr_eq(task))
             .collect();
         let task_count = tasks.len();
         info!("VM[{vm_id}] Joining {task_count} VCpu tasks...");
@@ -255,6 +712,18 @@ impl VmRuntimeHandle {
             debug!("VM[{vm_id}] VCpu task[{idx}] exited with code: {exit_code}");
         }
         info!("VM[{vm_id}] VCpu resources cleaned up, {task_count} VCpu tasks joined");
+    }
+}
+
+fn enqueue_pending_interrupt(queue: &mut InterruptQueue, interrupt: QueuedInterrupt) {
+    let duplicate = match interrupt.interrupt {
+        PendingInterrupt::Replay(vector) => queue.iter().any(|queued| {
+            matches!(queued.interrupt, PendingInterrupt::Replay(queued_vector) if queued_vector == vector)
+        }),
+        _ => false,
+    };
+    if !duplicate {
+        queue.push(interrupt);
     }
 }
 
@@ -377,6 +846,15 @@ impl VMMemoryRegion {
     }
 }
 
+fn reserved_region_host_addresses(
+    gpa: GuestPhysAddr,
+    phys_to_virt: impl FnOnce(HostPhysAddr) -> HostVirtAddr,
+) -> (HostPhysAddr, HostVirtAddr) {
+    let hpa = HostPhysAddr::from(gpa.as_usize());
+    let hva = phys_to_virt(hpa);
+    (hpa, hva)
+}
+
 const TEMP_MAX_VCPU_NUM: usize = 64;
 
 /// A Virtual Machine.
@@ -479,6 +957,50 @@ impl AxVM {
             .runtime()
             .ok_or_else(|| ax_err_type!(BadState, "VM runtime is not available"))?;
         f(runtime)
+    }
+
+    #[cfg(not(feature = "rt-shared-wait-baseline"))]
+    pub(crate) fn interrupt_runtime(
+        &self,
+        required_mode: Option<VMInterruptMode>,
+    ) -> AxResult<Arc<VmRuntimeHandle>> {
+        let machine = self.machine.lock();
+        if !matches!(machine.status(), VmStatus::Running | VmStatus::Paused) {
+            return ax_err!(
+                BadState,
+                format!("VM[{}] is not accepting interrupts", self.id())
+            );
+        }
+        if let Some(required_mode) = required_mode {
+            let configured_mode = machine
+                .resources()
+                .ok_or_else(|| ax_err_type!(BadState, "VM resources are not available"))?
+                .config
+                .interrupt_mode();
+            if configured_mode != required_mode {
+                return ax_err!(
+                    BadState,
+                    format!(
+                        "VM[{}] interrupt mode {configured_mode:?} does not accept \
+                         {required_mode:?} interrupts",
+                        self.id()
+                    )
+                );
+            }
+        }
+        machine
+            .runtime()
+            .cloned()
+            .ok_or_else(|| ax_err_type!(BadState, "VM runtime is not available"))
+    }
+
+    #[cfg(not(feature = "rt-shared-wait-baseline"))]
+    pub(crate) fn accepts_passthrough_interrupts(&self) -> bool {
+        let machine = self.machine.lock();
+        matches!(machine.status(), VmStatus::Running | VmStatus::Paused)
+            && machine.resources().is_some_and(|resources| {
+                resources.config.interrupt_mode() == VMInterruptMode::Passthrough
+            })
     }
 
     fn take_stopped_runtime(&self) -> Option<Arc<VmRuntimeHandle>> {
@@ -598,7 +1120,7 @@ impl AxVM {
             .vcpu(0)
             .ok_or_else(|| ax_err_type!(BadState, "VM primary vCPU is not prepared"))?;
         let primary_task = crate::runtime::vcpus::build_vcpu_task(self, primary_vcpu);
-        let runtime = Arc::new(VmRuntimeHandle::new());
+        let runtime = Arc::new(VmRuntimeHandle::new(self.vcpu_num()));
 
         self.machine
             .lock()
@@ -617,7 +1139,8 @@ impl AxVM {
             .map_err(VmLifecycleError::into_ax_error)?;
 
         let task = crate::host::task::spawn_task(primary_task);
-        runtime.add_vcpu_task(0, task);
+        runtime.add_vcpu_task(0, task)?;
+        crate::runtime::lifecycle::notify_started(self.id());
         Ok(())
     }
 
@@ -663,7 +1186,9 @@ impl AxVM {
         self.machine
             .lock()
             .request_stop_with(reason, |_, _| Ok(()))
-            .map_err(VmLifecycleError::into_ax_error)
+            .map_err(VmLifecycleError::into_ax_error)?;
+        crate::runtime::lifecycle::notify_stopping(self.id());
+        Ok(())
     }
 
     pub(crate) fn finish_stop(&self) -> AxResult {
@@ -843,13 +1368,117 @@ impl AxVM {
     /// ## Returns
     /// * `VmExit` - the exit reason of the vCPU, wrapped in an `AxResult`.
     pub fn run_vcpu(&self, vcpu_id: usize) -> AxResult<VmExit> {
+        #[cfg(feature = "rt-shared-wait-baseline")]
+        {
+            self.run_vcpu_inner(vcpu_id, None)
+        }
+
+        #[cfg(not(feature = "rt-shared-wait-baseline"))]
+        {
+            let runtime = self.with_runtime(|runtime| Ok(runtime.clone()))?;
+            self.run_vcpu_inner(vcpu_id, Some(&runtime))
+        }
+    }
+
+    #[cfg(not(feature = "rt-shared-wait-baseline"))]
+    pub(crate) fn run_vcpu_with_runtime(
+        &self,
+        vcpu_id: usize,
+        runtime: &VmRuntimeHandle,
+    ) -> AxResult<VmExit> {
+        self.run_vcpu_inner(vcpu_id, Some(runtime))
+    }
+
+    #[cfg(not(feature = "rt-shared-wait-baseline"))]
+    pub(crate) fn prepare_vcpu_run(&self, vcpu: &AxVCpuRef) -> AxResult<PreparedVcpuRun> {
+        if vcpu.vm_id() != self.id() {
+            return ax_err!(InvalidInput, "vCPU does not belong to this VM");
+        }
+        let devices = self.get_devices()?;
+        crate::runtime::rt_trace::trace_vcpu_run_path(
+            self.id(),
+            vcpu.id(),
+            crate::runtime::rt_trace::VcpuRunPathEvent::DeviceLookup,
+        );
+        let mut prepared = PreparedVcpuRun {
+            vcpu: vcpu.clone(),
+            devices,
+            bound: false,
+        };
+        let state = prepared.vcpu.state();
+        if state != VmVcpuState::Free {
+            return ax_err!(
+                BadState,
+                format!("VCpu state is not Free before persistent binding, but {state:?}")
+            );
+        }
+        prepared.bind()?;
+        Ok(prepared)
+    }
+
+    #[cfg(not(feature = "rt-shared-wait-baseline"))]
+    pub(crate) fn run_prepared_vcpu(
+        &self,
+        prepared: &mut PreparedVcpuRun,
+        runtime: &VmRuntimeHandle,
+    ) -> AxResult<VmExit> {
+        if !prepared.bound {
+            return ax_err!(BadState, "prepared vCPU is not bound");
+        }
+        crate::runtime::rt_trace::trace_vcpu_run_path(
+            self.id(),
+            prepared.vcpu.id(),
+            crate::runtime::rt_trace::VcpuRunPathEvent::PreparedEntry,
+        );
+        self.run_bound_vcpu_inner(
+            prepared.vcpu.id(),
+            &prepared.vcpu,
+            &prepared.devices,
+            Some(runtime),
+        )
+    }
+
+    #[cfg(not(feature = "rt-shared-wait-baseline"))]
+    pub(crate) fn suspend_prepared_vcpu(&self, prepared: &mut PreparedVcpuRun) -> AxResult {
+        prepared.unbind()
+    }
+
+    #[cfg(not(feature = "rt-shared-wait-baseline"))]
+    pub(crate) fn resume_prepared_vcpu(&self, prepared: &mut PreparedVcpuRun) -> AxResult {
+        prepared.bind()
+    }
+
+    #[cfg(not(feature = "rt-shared-wait-baseline"))]
+    pub(crate) fn finish_prepared_vcpu(&self, mut prepared: PreparedVcpuRun) -> AxResult {
+        prepared.unbind()
+    }
+
+    fn run_vcpu_inner(
+        &self,
+        vcpu_id: usize,
+        runtime: Option<&VmRuntimeHandle>,
+    ) -> AxResult<VmExit> {
+        #[cfg(feature = "rt-shared-wait-baseline")]
+        let _ = runtime;
         let vm_id = self.id();
+        crate::runtime::rt_trace::trace_vcpu_run_path(
+            vm_id,
+            vcpu_id,
+            crate::runtime::rt_trace::VcpuRunPathEvent::Lookup,
+        );
         let vcpu = self
             .vcpu(vcpu_id)
             .ok_or_else(|| ax_err_type!(InvalidInput, "Invalid vcpu_id"))?;
 
         match vcpu.state() {
-            VmVcpuState::Free => vcpu.bind()?,
+            VmVcpuState::Free => {
+                vcpu.bind()?;
+                crate::runtime::rt_trace::trace_vcpu_run_path(
+                    vm_id,
+                    vcpu_id,
+                    crate::runtime::rt_trace::VcpuRunPathEvent::Bind,
+                );
+            }
             VmVcpuState::Ready => {}
             state => {
                 return ax_err!(
@@ -860,9 +1489,62 @@ impl AxVM {
         }
 
         let devices = self.get_devices()?;
-        let run_result = vcpu.with_current_cpu_set(|| -> AxResult<VmExit> {
+        crate::runtime::rt_trace::trace_vcpu_run_path(
+            vm_id,
+            vcpu_id,
+            crate::runtime::rt_trace::VcpuRunPathEvent::DeviceLookup,
+        );
+        crate::runtime::rt_trace::trace_vcpu_run_path(
+            vm_id,
+            vcpu_id,
+            crate::runtime::rt_trace::VcpuRunPathEvent::LegacyEntry,
+        );
+        let run_result = self.run_bound_vcpu_inner(vcpu_id, &vcpu, &devices, runtime);
+
+        let unbind_result = vcpu.unbind();
+        if unbind_result.is_ok() {
+            crate::runtime::rt_trace::trace_vcpu_run_path(
+                vm_id,
+                vcpu_id,
+                crate::runtime::rt_trace::VcpuRunPathEvent::Unbind,
+            );
+        }
+        match run_result {
+            Ok(exit_reason) => {
+                unbind_result?;
+                Ok(exit_reason)
+            }
+            Err(err) => {
+                if let Err(unbind_err) = unbind_result {
+                    warn!(
+                        "VM[{vm_id}] VCpu[{vcpu_id}] unbind after run error failed: {unbind_err:?}"
+                    );
+                }
+                Err(err)
+            }
+        }
+    }
+
+    fn run_bound_vcpu_inner(
+        &self,
+        vcpu_id: usize,
+        vcpu: &AxVCpuRef,
+        devices: &Arc<AxVmDevices>,
+        runtime: Option<&VmRuntimeHandle>,
+    ) -> AxResult<VmExit> {
+        #[cfg(feature = "rt-shared-wait-baseline")]
+        let _ = runtime;
+        vcpu.with_current_cpu_set(|| -> AxResult<VmExit> {
             loop {
-                crate::runtime::vcpus::inject_pending_interrupts(self.id(), vcpu_id, &vcpu);
+                #[cfg(feature = "rt-shared-wait-baseline")]
+                crate::runtime::vcpus::inject_pending_interrupts(self.id(), vcpu_id, vcpu);
+                #[cfg(not(feature = "rt-shared-wait-baseline"))]
+                crate::runtime::vcpus::inject_pending_interrupts_with_runtime(
+                    self,
+                    runtime.expect("running vCPU requires runtime state"),
+                    vcpu_id,
+                    vcpu,
+                );
 
                 let exit_reason = vcpu.run()?;
                 trace!("{exit_reason:#x?}");
@@ -884,11 +1566,11 @@ impl AxVM {
                         vcpu.set_gpr(reg, val);
                     }
                     VmExit::MmioWrite { addr, width, data } => {
-                        self.handle_mmio_write(addr, width, data as usize)?;
+                        self.handle_mmio_write(devices, addr, width, data as usize)?;
                     }
                     VmExit::IoRead { port, width } => {
                         let val = devices.handle_port_read(port, width)?;
-                        CurrentArch::set_io_read_result(&vcpu, val);
+                        CurrentArch::set_io_read_result(vcpu, val);
                     }
                     VmExit::IoWrite { port, width, data } => {
                         devices.handle_port_write(port, width, data as usize)?;
@@ -928,7 +1610,12 @@ impl AxVM {
                                         vcpu.set_gpr(reg, val);
                                     }
                                     VmExit::MmioWrite { addr, width, data } => {
-                                        self.handle_mmio_write(addr, width, data as usize)?;
+                                        self.handle_mmio_write(
+                                            devices,
+                                            addr,
+                                            width,
+                                            data as usize,
+                                        )?;
                                     }
                                     exit_reason => break Ok(exit_reason),
                                 }
@@ -942,27 +1629,24 @@ impl AxVM {
                     exit_reason => break Ok(exit_reason),
                 }
             }
-        });
-
-        let unbind_result = vcpu.unbind();
-        match run_result {
-            Ok(exit_reason) => {
-                unbind_result?;
-                Ok(exit_reason)
-            }
-            Err(err) => {
-                if let Err(unbind_err) = unbind_result {
-                    warn!(
-                        "VM[{vm_id}] VCpu[{vcpu_id}] unbind after run error failed: {unbind_err:?}"
-                    );
-                }
-                Err(err)
-            }
-        }
+        })
     }
 
-    fn handle_mmio_write(&self, addr: GuestPhysAddr, width: AccessWidth, data: usize) -> AxResult {
-        let devices = self.get_devices()?;
+    fn handle_mmio_write(
+        &self,
+        cached_devices: &AxVmDevices,
+        addr: GuestPhysAddr,
+        width: AccessWidth,
+        data: usize,
+    ) -> AxResult {
+        #[cfg(feature = "rt-shared-wait-baseline")]
+        let _ = cached_devices;
+        #[cfg(feature = "rt-shared-wait-baseline")]
+        let owned_devices = self.get_devices()?;
+        #[cfg(feature = "rt-shared-wait-baseline")]
+        let devices = owned_devices.as_ref();
+        #[cfg(not(feature = "rt-shared-wait-baseline"))]
+        let devices = cached_devices;
         if let Some(fw_cfg) = devices.fw_cfg_for_dma_addr(addr) {
             if let Some(desc_addr) = fw_cfg.write_dma_address(addr, width, data)? {
                 fw_cfg.process_dma(
@@ -1375,17 +2059,18 @@ impl AxVM {
         );
         let gpa =
             gpa.ok_or_else(|| ax_err_type!(InvalidInput, "Reserved memory GPA is required"))?;
+        let (hpa, hva) =
+            reserved_region_host_addresses(gpa, |hpa| default_host().phys_to_virt(hpa));
         self.with_resources_mut(|resources| {
             resources.address_space.map_linear(
                 gpa,
-                gpa.as_usize().into(),
+                hpa,
                 layout.size(),
                 MappingFlags::READ
                     | MappingFlags::WRITE
                     | MappingFlags::EXECUTE
                     | MappingFlags::USER,
             )?;
-            let hva = gpa.as_usize().into();
             resources.memory_regions.push(VMMemoryRegion {
                 gpa,
                 hva,
@@ -1493,6 +2178,191 @@ impl Drop for AxVM {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(feature = "rt-shared-wait-baseline"))]
+    #[test]
+    fn runtime_preallocates_one_state_per_vcpu() {
+        let runtime = VmRuntimeHandle::new(3);
+
+        assert_eq!(runtime.vcpu_states.len(), 3);
+        assert_eq!(core::mem::align_of::<VcpuRuntimeState>(), 128);
+    }
+
+    #[cfg(not(feature = "rt-shared-wait-baseline"))]
+    #[test]
+    fn interrupt_drain_transfers_the_pending_buffer() {
+        let runtime = VmRuntimeHandle::new(1);
+        let state = runtime.vcpu_state(0).unwrap();
+        state.enqueue_pending_interrupt(QueuedInterrupt {
+            interrupt: PendingInterrupt::Normal(32),
+            queued_ns: 10,
+        });
+
+        let drained = runtime.drain_pending_interrupts(0);
+        assert_eq!(drained.len(), 1);
+        assert!(drained.capacity() >= INITIAL_PENDING_INTERRUPT_CAPACITY);
+
+        let queues = state.interrupt_queues.lock();
+        assert!(queues.pending.is_empty());
+        assert_eq!(queues.pending.capacity(), 0);
+    }
+
+    #[cfg(not(feature = "rt-shared-wait-baseline"))]
+    #[test]
+    fn empty_interrupt_drain_keeps_the_preallocated_buffer_in_place() {
+        let runtime = VmRuntimeHandle::new(1);
+        let state = runtime.vcpu_state(0).unwrap();
+
+        let drained = runtime.drain_pending_interrupts(0);
+
+        assert!(drained.is_empty());
+        assert_eq!(drained.capacity(), 0);
+        let queues = state.interrupt_queues.lock();
+        assert!(queues.pending.capacity() >= INITIAL_PENDING_INTERRUPT_CAPACITY);
+    }
+
+    #[cfg(not(feature = "rt-shared-wait-baseline"))]
+    #[test]
+    fn pending_interrupt_is_visible_before_halt_wait() {
+        let runtime = VmRuntimeHandle::new(1);
+        let state = runtime.vcpu_state(0).unwrap();
+        state.enqueue_pending_interrupt(QueuedInterrupt {
+            interrupt: PendingInterrupt::Normal(32),
+            queued_ns: 10,
+        });
+
+        assert!(runtime.has_pending_interrupt(0));
+        let drained = runtime.drain_pending_interrupts(0);
+        assert!(!runtime.has_pending_interrupt(0));
+        assert_eq!(drained.len(), 1);
+    }
+
+    #[cfg(not(feature = "rt-shared-wait-baseline"))]
+    #[test]
+    fn requeue_restores_pending_interrupt_count() {
+        let runtime = VmRuntimeHandle::new(1);
+        let state = runtime.vcpu_state(0).unwrap();
+        state.enqueue_pending_interrupt(QueuedInterrupt {
+            interrupt: PendingInterrupt::Normal(32),
+            queued_ns: 10,
+        });
+
+        let drained = runtime.drain_pending_interrupts(0);
+        assert!(!runtime.has_pending_interrupt(0));
+
+        runtime.requeue_pending_interrupts(0, drained);
+
+        assert!(runtime.has_pending_interrupt(0));
+    }
+
+    #[cfg(not(feature = "rt-shared-wait-baseline"))]
+    #[test]
+    fn replay_coalescing_keeps_pending_interrupt_count_equal_to_queue_length() {
+        let runtime = VmRuntimeHandle::new(1);
+        let state = runtime.vcpu_state(0).unwrap();
+        let replay = QueuedInterrupt {
+            interrupt: PendingInterrupt::Replay(78),
+            queued_ns: 10,
+        };
+
+        state.enqueue_pending_interrupt(replay);
+        state.enqueue_pending_interrupt(QueuedInterrupt {
+            queued_ns: 20,
+            ..replay
+        });
+
+        let queues = state.interrupt_queues.lock();
+        assert_eq!(queues.pending.len(), 1);
+    }
+
+    #[cfg(not(feature = "rt-shared-wait-baseline"))]
+    #[test]
+    fn invalid_vcpu_id_is_rejected_before_interrupt_queueing() {
+        let runtime = VmRuntimeHandle::new(1);
+        let error = runtime.queue_interrupt(1, 32, 10).unwrap_err();
+
+        assert_eq!(
+            error.canonicalize(),
+            AxError::from(ax_errno::AxErrorKind::NotFound)
+        );
+    }
+
+    #[test]
+    fn reserved_region_uses_host_physical_to_virtual_translation() {
+        let gpa = GuestPhysAddr::from(0xd000_0000);
+        let direct_map_offset = 0xff00_0000_0000usize;
+
+        let (hpa, hva) = reserved_region_host_addresses(gpa, |hpa| {
+            HostVirtAddr::from(hpa.as_usize() + direct_map_offset)
+        });
+
+        assert_eq!(hpa.as_usize(), gpa.as_usize());
+        assert_eq!(hva.as_usize(), gpa.as_usize() + direct_map_offset);
+        assert_ne!(hva.as_usize(), gpa.as_usize());
+    }
+
+    #[test]
+    fn replay_interrupts_with_the_same_vector_are_coalesced() {
+        let mut queue = Vec::new();
+
+        enqueue_pending_interrupt(
+            &mut queue,
+            QueuedInterrupt {
+                interrupt: PendingInterrupt::Replay(78),
+                queued_ns: 10,
+            },
+        );
+        enqueue_pending_interrupt(
+            &mut queue,
+            QueuedInterrupt {
+                interrupt: PendingInterrupt::Replay(78),
+                queued_ns: 20,
+            },
+        );
+
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].interrupt, PendingInterrupt::Replay(78));
+        assert_eq!(queue[0].queued_ns, 10);
+    }
+
+    #[test]
+    fn replay_interrupts_with_different_vectors_remain_distinct() {
+        let mut queue = Vec::new();
+
+        for vector in [77, 78] {
+            enqueue_pending_interrupt(
+                &mut queue,
+                QueuedInterrupt {
+                    interrupt: PendingInterrupt::Replay(vector),
+                    queued_ns: vector as u64,
+                },
+            );
+        }
+
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue[0].interrupt, PendingInterrupt::Replay(77));
+        assert_eq!(queue[1].interrupt, PendingInterrupt::Replay(78));
+    }
+
+    #[test]
+    fn replay_coalescing_does_not_drop_external_interrupts() {
+        let mut queue = Vec::new();
+        let external = QueuedInterrupt {
+            interrupt: PendingInterrupt::External {
+                vector: 78,
+                physical_irq: 78,
+                priority: Some(0x80),
+            },
+            queued_ns: 10,
+        };
+
+        enqueue_pending_interrupt(&mut queue, external);
+        enqueue_pending_interrupt(&mut queue, external);
+
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue[0].interrupt, external.interrupt);
+        assert_eq!(queue[1].interrupt, external.interrupt);
+    }
 
     #[test]
     fn write_guest_bytes_to_chunks_writes_only_remaining_bytes() {

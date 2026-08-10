@@ -309,7 +309,25 @@ pub(crate) fn calculate_dtb_load_addr(vm: AxVMRef, fdt_size: usize) -> AxResult<
     Ok(dtb_addr)
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(test, target_arch = "aarch64"))]
+fn sanitize_guest_cpu_topology(tree: &mut FdtTree) {
+    tree.inner_mut().remove_by_path("/cpus/cpu-map");
+
+    let cpu_subtree_ids = tree
+        .node_paths()
+        .into_iter()
+        .filter_map(|(id, path)| path.starts_with("/cpus/cpu@").then_some(id))
+        .collect::<Vec<_>>();
+    for id in cpu_subtree_ids {
+        if let Some(node) = tree.inner_mut().node_mut(id) {
+            for prop in ["phandle", "linux,phandle", "next-level-cache"] {
+                node.remove_property(prop);
+            }
+        }
+    }
+}
+
+#[cfg(any(test, target_arch = "aarch64"))]
 pub fn update_cpu_node(
     fdt: &Fdt,
     host_fdt: Option<&Fdt>,
@@ -342,6 +360,7 @@ pub fn update_cpu_node(
         for path in cpu_paths {
             tree.inner_mut().remove_by_path(&path);
         }
+        sanitize_guest_cpu_topology(&mut tree);
         if let Some(cpus) = tree.inner_mut().node_mut(cpus_id) {
             for prop in [
                 "riscv,cbop-block-size",
@@ -359,7 +378,7 @@ pub fn update_cpu_node(
 #[cfg(test)]
 mod tests {
     use axvmconfig::AxVMCrateConfig;
-    use fdt_edit::{Fdt, Node, Property};
+    use fdt_edit::{Fdt, Node, Phandle, Property};
     use fdt_raw::RegInfo;
 
     use super::{cpu_node_id, initrd_range_from_image_config, need_cpu_node};
@@ -466,6 +485,46 @@ mod tests {
         let reparsed = Fdt::from_bytes(&patched).unwrap();
 
         assert!(reparsed.get_by_path_id("/chosen").is_some());
+    }
+
+    #[test]
+    fn copied_cpu_phandles_do_not_shadow_guest_devices() {
+        let mut guest = Fdt::new();
+        let guest_root = guest.root_id();
+        let intc = guest.add_node(guest_root, Node::new("intc"));
+        guest
+            .node_mut(intc)
+            .unwrap()
+            .set_property(prop_u32("phandle", 0x8002));
+
+        let mut host = test_fdt("cpu=2");
+        let host_cpu = host.get_by_path_id("/cpus/cpu").unwrap();
+        host.node_mut(host_cpu)
+            .unwrap()
+            .set_property(prop_u32("phandle", 0x8002));
+
+        let cfg = AxVMCrateConfig {
+            base: axvmconfig::VMBaseConfig {
+                phys_cpu_ids: Some(alloc::vec![2]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let dtb = super::update_cpu_node(&guest, Some(&host), &cfg).unwrap();
+        let reparsed = Fdt::from_bytes(&dtb).unwrap();
+
+        let provider = reparsed
+            .get_by_phandle_id(Phandle::from(0x8002))
+            .map(|id| reparsed.path_of(id));
+        assert_eq!(provider.as_deref(), Some("/intc"));
+        assert!(
+            reparsed
+                .get_by_path("/cpus/cpu")
+                .unwrap()
+                .as_node()
+                .get_property("phandle")
+                .is_none()
+        );
     }
 
     #[test]

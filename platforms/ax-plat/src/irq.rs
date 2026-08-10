@@ -40,6 +40,24 @@ pub const LOONGARCH_EIOINTC_DOMAIN: IrqDomainId = IrqDomainId(5);
 /// LoongArch PCH-PIC interrupt domain.
 pub const LOONGARCH_PCH_PIC_DOMAIN: IrqDomainId = IrqDomainId(6);
 
+/// Result of offering an acknowledged physical IRQ to a guest.
+///
+/// The distinction between software emulation and hardware forwarding is
+/// required by interrupt controllers with split EOI/deactivate handling. A
+/// software-represented event must still deactivate the physical IRQ, while a
+/// hardware-backed virtual interrupt keeps the physical active state until the
+/// guest completes it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum GuestIrqInjection {
+    /// No guest accepted the interrupt.
+    NotHandled,
+    /// The event is already represented by a software virtual interrupt.
+    Emulated,
+    /// The physical active state is owned by a hardware virtual interrupt.
+    HardwareForwarded,
+}
+
 /// Creates a legacy IRQ id without truncating the raw IRQ number.
 pub fn try_legacy_irq(raw: usize) -> Result<IrqId, IrqError> {
     let hwirq = u32::try_from(raw).map_err(|_| IrqError::InvalidIrq)?;
@@ -311,6 +329,13 @@ pub trait IrqIf {
     /// `None` if the IRQ is spurious.
     fn handle(vector: TrapVector) -> Option<IrqId>;
 
+    /// Handles an AArch64 FIQ or the platform-equivalent high-priority
+    /// interrupt class.
+    ///
+    /// Platforms without a distinct FIQ acknowledge path may implement this
+    /// identically to [`Self::handle`].
+    fn handle_fiq(vector: TrapVector) -> Option<IrqId>;
+
     /// Sends an inter-processor interrupt (IPI) to the specified target CPU or all CPUs.
     fn send_ipi(irq_num: IrqId, target: IpiTarget);
 
@@ -351,6 +376,10 @@ mod tests {
         }
 
         fn handle(_vector: TrapVector) -> Option<IrqId> {
+            None
+        }
+
+        fn handle_fiq(_vector: TrapVector) -> Option<IrqId> {
             None
         }
 

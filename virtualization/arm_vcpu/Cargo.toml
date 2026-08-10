@@ -18,6 +18,10 @@ license = "Apache-2.0"
 [package.metadata.docs.rs]
 targets = ["aarch64-unknown-none-softfloat"]
 
+[features]
+default = []
+rt-trace = []
+
 [dependencies]
 log = "0.4"
 spin = { workspace = true }

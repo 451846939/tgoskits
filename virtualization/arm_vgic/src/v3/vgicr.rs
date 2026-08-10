@@ -45,6 +45,8 @@ pub struct VGicR {
 
     /// CPU ID associated with this redistributor.
     pub cpu_id: usize,
+    /// Whether this is the last redistributor exposed to the guest.
+    pub is_last: bool,
     /// Host physical base address of GICR for this CPU.
     pub host_gicr_base_this_cpu: HostPhysAddr,
 
@@ -64,7 +66,7 @@ impl VGicR {
     }
 
     /// Creates a new VGicR instance.
-    pub fn new(addr: GuestPhysAddr, size: Option<usize>, cpu_id: usize) -> Self {
+    pub fn new(addr: GuestPhysAddr, size: Option<usize>, cpu_id: usize, is_last: bool) -> Self {
         let size = size.unwrap_or(DEFAULT_SIZE_PER_GICR);
         let host_gicr_base_this_cpu = crate::api_reexp::get_host_gicr_base() + cpu_id * size;
 
@@ -72,6 +74,7 @@ impl VGicR {
             addr,
             size,
             cpu_id,
+            is_last,
             host_gicr_base_this_cpu,
             regs: SpinNoIrq::new(VGicRRegs { propbaser: 0 }),
         }
@@ -107,10 +110,10 @@ impl BaseDeviceOps<GuestPhysAddrRange> for VGicR {
             }
             GICR_TYPER => {
                 let mut value = perform_mmio_read(gicr_base + reg, width)?;
-
-                // TODO: set GICR_TYPER_LAST if it is the last redistributor of a VM.
-                if true {
+                if self.is_last {
                     value |= GICR_TYPER_LAST;
+                } else {
+                    value &= !GICR_TYPER_LAST;
                 }
 
                 Ok(value)

@@ -38,6 +38,7 @@ tls = ["ax-hal/tls", "ax-runtime/tls", "ax-task?/tls"]
 dma = ["paging"]
 
 # Multi-threading and scheduler
+preempt = ["ax-task/preempt", "irq"]
 multitask = [
     "ax-task/multitask",
     "ax-sync/multitask",

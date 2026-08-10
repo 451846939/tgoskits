@@ -14,7 +14,7 @@ use axdevice_base::{BaseDeviceOps, DeviceRegistry as _, PortDeviceAdapter};
 
 use super::super::{AxVM, AxVMResources};
 #[cfg(target_arch = "aarch64")]
-use crate::config::VMInterruptMode;
+use crate::config::{VMInterruptMode, singleton_cpu_from_mask};
 use crate::irq::InterruptFabric;
 
 pub(super) struct PreparedDevices {
@@ -28,6 +28,8 @@ impl PreparedDevices {
         factories: &DeviceFactoryRegistry,
         interrupt_fabric: &InterruptFabric,
     ) -> AxResult<Self> {
+        resources.config.validate_gppt_redistributor_topology()?;
+
         let build_context = DeviceBuildContext::new(interrupt_fabric);
         let mut devices = AxVmDevices::build_with_factories(
             AxVmDeviceConfig {
@@ -76,7 +78,33 @@ impl PreparedDevices {
         let passthrough = resources.config.interrupt_mode() == VMInterruptMode::Passthrough;
         if passthrough {
             let spis = resources.config.pass_through_spis();
-            let cpu_id = vm.id() - 1; // FIXME: get the real CPU id.
+            let mappings = resources.config.phys_cpu_ls.get_vcpu_affinities_pcpu_ids();
+            let (_, primary_pcpu_set, primary_phys_cpu_id) =
+                mappings.first().copied().ok_or_else(|| {
+                    ax_err_type!(
+                        InvalidInput,
+                        format!("VM[{}] has no vCPU-to-pCPU mapping", vm.id())
+                    )
+                })?;
+            let primary_host_cpu = match primary_pcpu_set {
+                Some(mask) => singleton_cpu_from_mask(mask).ok_or_else(|| {
+                    ax_err_type!(
+                        InvalidInput,
+                        format!(
+                            "VM[{}] primary vCPU must have a single-pCPU affinity for IRQ \
+                             routing, got mask {mask:#x}",
+                            vm.id()
+                        )
+                    )
+                })?,
+                None => primary_phys_cpu_id,
+            };
+            let target_affinity = (
+                ((primary_phys_cpu_id >> 32) & 0xff) as u8,
+                ((primary_phys_cpu_id >> 16) & 0xff) as u8,
+                ((primary_phys_cpu_id >> 8) & 0xff) as u8,
+                (primary_phys_cpu_id & 0xff) as u8,
+            );
             let mut gicd_found = false;
 
             for device in devices.devices() {
@@ -84,7 +112,7 @@ impl PreparedDevices {
                     debug!("VGicD found, assigning SPIs...");
 
                     for spi in spis {
-                        gicd.assign_irq(*spi + 32, cpu_id, (0, 0, 0, cpu_id as _))
+                        gicd.assign_irq(spi.spi + 32, primary_host_cpu, target_affinity)
                     }
 
                     gicd_found = true;

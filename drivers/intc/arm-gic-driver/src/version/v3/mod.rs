@@ -817,6 +817,19 @@ impl Gic {
         }
     }
 
+    /// Routes an SPI to Group 0 or Group 1.
+    ///
+    /// Private interrupts are per-CPU and must be configured through the
+    /// corresponding [`CpuInterface`].
+    pub fn set_irq_group(&self, id: IntId, group1: bool) {
+        assert!(
+            !id.is_private(),
+            "Cannot set a global group for private interrupt: {id:?}"
+        );
+        self.gicd()
+            .set_interrupt_group(id.to_u32(), u32::from(group1), false);
+    }
+
     /// If `affinity` is `None`, interrupts routed to any PE defined as a participating node.
     pub fn set_target_cpu(&self, id: IntId, affinity: Option<Affinity>) {
         // Only SPIs (Shared Peripheral Interrupts) can have their target CPU set
@@ -974,6 +987,16 @@ impl CpuInterface {
             "Cannot enable non-private interrupt: {id:?}"
         );
         self.rd().sgi.set_enable_interrupt(id, enable);
+    }
+
+    /// Routes an SGI/PPI on the current CPU to Group 0 or Group 1.
+    pub fn set_irq_group(&self, id: IntId, group1: bool) {
+        assert!(
+            id.is_private(),
+            "Cannot set a private group for non-private interrupt: {id:?}"
+        );
+        self.rd().sgi.set_group(id, group1);
+        self.rd().sgi.set_group_modifier(id, false);
     }
 
     pub fn is_irq_enable(&self, id: IntId) -> bool {
@@ -1150,13 +1173,13 @@ pub fn send_sgi(sgi_id: IntId, target: SGITarget) {
         }
         SGITarget::List(val) => {
             trace!("Sending SGI {sgi_num} to CPUs with affinity: {val:#x?}");
-            // Send to specific CPUs identified by affinity and target list
-            let value = ICC_SGI1R_EL1::INTID.val(sgi_num as u64)
-                + ICC_SGI1R_EL1::AFF3.val(val.aff3 as u64)
-                + ICC_SGI1R_EL1::AFF2.val(val.aff2 as u64)
-                + ICC_SGI1R_EL1::AFF1.val(val.aff1 as u64)
-                + ICC_SGI1R_EL1::TARGETLIST.val(val.target_list as u64);
-            ICC_SGI1R_EL1.write(value);
+            ICC_SGI1R_EL1.write(
+                ICC_SGI1R_EL1::INTID.val(sgi_num as u64)
+                    + ICC_SGI1R_EL1::AFF3.val(val.aff3 as u64)
+                    + ICC_SGI1R_EL1::AFF2.val(val.aff2 as u64)
+                    + ICC_SGI1R_EL1::AFF1.val(val.aff1 as u64)
+                    + ICC_SGI1R_EL1::TARGETLIST.val(val.target_list as u64),
+            );
         }
     }
     barrier::isb(barrier::SY);

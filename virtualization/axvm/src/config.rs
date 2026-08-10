@@ -16,10 +16,11 @@
 
 use alloc::{string::String, vec::Vec};
 
+use ax_errno::{AxResult, ax_err_type};
 pub use axvm_types::{
-    AddressSpacePolicy, EmulatedDeviceConfig, GuestPhysAddr, PassThroughAddressConfig,
-    PassThroughDeviceConfig, PassThroughPortConfig, ReservedAddressConfig, VMBootProtocol,
-    VMInterruptMode, VMType, VmMemConfig, VmMemMappingType,
+    AddressSpacePolicy, EmulatedDeviceConfig, EmulatedDeviceType, GuestPhysAddr,
+    InterruptTriggerMode, PassThroughAddressConfig, PassThroughDeviceConfig, PassThroughPortConfig,
+    ReservedAddressConfig, VMBootProtocol, VMInterruptMode, VMType, VmMemConfig, VmMemMappingType,
 };
 
 use crate::arch::{ArchOps, CurrentArch};
@@ -33,6 +34,15 @@ pub enum GuestBootPolicy {
     /// Adjust the kernel load address for boot protocols that require a
     /// reserved area inside the primary guest memory region.
     AdjustKernelForBootProtocol { protocol: VMBootProtocol },
+}
+
+/// One passthrough GIC SPI and the trigger mode declared by its device tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PassThroughSpiConfig {
+    /// SPI number in the GIC device-tree namespace, excluding the SGI/PPI offset.
+    pub spi: u32,
+    /// Trigger mode declared by the GIC interrupt specifier.
+    pub trigger: InterruptTriggerMode,
 }
 
 /// A part of `AxVMConfig`, which represents a `VCpu`.
@@ -89,8 +99,7 @@ pub struct AxVMConfig {
     address_space_policy: AddressSpacePolicy,
     memory_regions: Vec<VmMemConfig>,
     boot_policy: GuestBootPolicy,
-    // TODO: improve interrupt passthrough
-    spi_list: Vec<u32>,
+    spi_list: Vec<PassThroughSpiConfig>,
     interrupt_mode: VMInterruptMode,
 }
 
@@ -271,18 +280,122 @@ impl AxVMConfig {
     }
 
     /// Adds a passthrough SPI to the VM configuration.
-    pub fn add_pass_through_spi(&mut self, spi: u32) {
-        self.spi_list.push(spi);
+    pub fn add_pass_through_spi(&mut self, config: PassThroughSpiConfig) -> AxResult<bool> {
+        if let Some(existing) = self
+            .spi_list
+            .iter()
+            .find(|existing| existing.spi == config.spi)
+        {
+            if existing.trigger != config.trigger {
+                return Err(ax_err_type!(
+                    InvalidData,
+                    alloc::format!(
+                        "GIC SPI {} has conflicting trigger modes {:?} and {:?}",
+                        config.spi,
+                        existing.trigger,
+                        config.trigger
+                    )
+                ));
+            }
+            return Ok(false);
+        }
+        self.spi_list.push(config);
+        Ok(true)
     }
 
     /// Returns the list of passthrough SPIs.
-    pub fn pass_through_spis(&self) -> &Vec<u32> {
+    pub fn pass_through_spis(&self) -> &[PassThroughSpiConfig] {
         &self.spi_list
     }
 
     /// Returns the interrupt mode of the VM.
     pub fn interrupt_mode(&self) -> VMInterruptMode {
         self.interrupt_mode
+    }
+
+    pub(crate) fn validate_gppt_redistributor_topology(&self) -> AxResult<()> {
+        if self.interrupt_mode != VMInterruptMode::Passthrough {
+            return Ok(());
+        }
+
+        let mappings = self.phys_cpu_ls.get_vcpu_affinities_pcpu_ids();
+        let mut mapped_vcpu_count = 0usize;
+        let mut has_gppt_redistributor = false;
+
+        for device in self
+            .emu_devices
+            .iter()
+            .filter(|device| device.emu_type == EmulatedDeviceType::GPPTRedistributor)
+        {
+            has_gppt_redistributor = true;
+            let [cpu_count, _, first_host_cpu, ..] = device.cfg_list.as_slice() else {
+                return Err(ax_err_type!(
+                    InvalidInput,
+                    alloc::format!(
+                        "VM[{}] GPPT redistributor requires (cpu_num, stride, pcpu_id)",
+                        self.id
+                    )
+                ));
+            };
+
+            for offset in 0..*cpu_count {
+                let (vcpu_id, affinity, _) = mappings.get(mapped_vcpu_count).ok_or_else(|| {
+                    ax_err_type!(
+                        InvalidInput,
+                        alloc::format!(
+                            "VM[{}] GPPT redistributor exposes more CPUs than configured vCPUs",
+                            self.id
+                        )
+                    )
+                })?;
+                let expected_host_cpu = first_host_cpu.checked_add(offset).ok_or_else(|| {
+                    ax_err_type!(InvalidInput, "GPPT redistributor CPU index overflow")
+                })?;
+
+                if let Some(mask) = affinity {
+                    let actual_host_cpu = singleton_cpu_from_mask(*mask).ok_or_else(|| {
+                        ax_err_type!(
+                            InvalidInput,
+                            alloc::format!(
+                                "VM[{}] vCPU[{}] must have a single-pCPU affinity for GPPT GICR, \
+                                 got mask {:#x}",
+                                self.id,
+                                vcpu_id,
+                                mask
+                            )
+                        )
+                    })?;
+                    if actual_host_cpu != expected_host_cpu {
+                        return Err(ax_err_type!(
+                            InvalidInput,
+                            alloc::format!(
+                                "VM[{}] vCPU[{}] runs on pCPU{} but GPPT GICR maps pCPU{}",
+                                self.id,
+                                vcpu_id,
+                                actual_host_cpu,
+                                expected_host_cpu
+                            )
+                        ));
+                    }
+                }
+
+                mapped_vcpu_count += 1;
+            }
+        }
+
+        if has_gppt_redistributor && mapped_vcpu_count != mappings.len() {
+            return Err(ax_err_type!(
+                InvalidInput,
+                alloc::format!(
+                    "VM[{}] GPPT redistributor exposes {} CPUs for {} configured vCPUs",
+                    self.id,
+                    mapped_vcpu_count,
+                    mappings.len()
+                )
+            ));
+        }
+
+        Ok(())
     }
 
     /// Relocate the guest kernel image while preserving the configured
@@ -382,6 +495,10 @@ impl PhysCpuList {
     }
 }
 
+pub(crate) fn singleton_cpu_from_mask(mask: usize) -> Option<usize> {
+    (mask.count_ones() == 1).then_some(mask.trailing_zeros() as usize)
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::vec;
@@ -413,5 +530,47 @@ mod tests {
         assert_eq!(regions[1].gpa, 0x110000);
         assert_eq!(regions[1].size, 0x10000);
         assert_eq!(regions[1].map_type, VmMemMappingType::MapReserved);
+    }
+
+    #[test]
+    fn gppt_redistributor_rejects_cpu_affinity_mismatch() {
+        let config = AxVMConfig::new(AxVMConfigParams {
+            id: 1,
+            name: "linux".into(),
+            phys_cpu_ls: PhysCpuList::new(2, Some(vec![1, 2]), Some(vec![0b0100, 0b1000])),
+            emu_devices: vec![EmulatedDeviceConfig {
+                name: "gppt-gicr".into(),
+                base_gpa: 0x080a_0000,
+                length: 0x2_0000,
+                emu_type: EmulatedDeviceType::GPPTRedistributor,
+                cfg_list: vec![2, 0x2_0000, 1],
+                ..Default::default()
+            }],
+            interrupt_mode: VMInterruptMode::Passthrough,
+            ..Default::default()
+        });
+
+        assert!(config.validate_gppt_redistributor_topology().is_err());
+    }
+
+    #[test]
+    fn gppt_redistributor_accepts_matching_cpu_affinity() {
+        let config = AxVMConfig::new(AxVMConfigParams {
+            id: 1,
+            name: "linux".into(),
+            phys_cpu_ls: PhysCpuList::new(2, Some(vec![2, 3]), Some(vec![0b0100, 0b1000])),
+            emu_devices: vec![EmulatedDeviceConfig {
+                name: "gppt-gicr".into(),
+                base_gpa: 0x080a_0000,
+                length: 0x2_0000,
+                emu_type: EmulatedDeviceType::GPPTRedistributor,
+                cfg_list: vec![2, 0x2_0000, 2],
+                ..Default::default()
+            }],
+            interrupt_mode: VMInterruptMode::Passthrough,
+            ..Default::default()
+        });
+
+        config.validate_gppt_redistributor_topology().unwrap();
     }
 }

@@ -228,6 +228,7 @@ impl AxVmDevices {
                                     addr.into(),
                                     Some(size),
                                     pcpu_id + i,
+                                    i + 1 == cpu_num,
                                 ),
                             )) as Arc<dyn Device>)
                                 .map_err(|e| {

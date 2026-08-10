@@ -22,6 +22,7 @@ impl PreparedVcpus {
         dtb_addr: Option<GuestPhysAddr>,
     ) -> AxResult<Self> {
         let vcpu_id_pcpu_sets = resources.config.phys_cpu_ls.get_vcpu_affinities_pcpu_ids();
+        #[allow(clippy::let_unit_value)]
         let create_state = CurrentArch::new_vcpu_create_state(&vcpu_id_pcpu_sets)?;
         let firmware_boot = guest_uses_firmware_boot(resources);
 

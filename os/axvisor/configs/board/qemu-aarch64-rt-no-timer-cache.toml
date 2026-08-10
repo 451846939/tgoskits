@@ -1,7 +1,8 @@
 features = [
     "ax-driver/virtio-blk",
     "fs",
+    "rt-disable-timer-cache",
 ]
 log = "Info"
 target = "aarch64-unknown-none-softfloat"
-vm_configs = ["os/axvisor/configs/vms/qemu/aarch64/linux-smp2-ai.toml"]
+vm_configs = []

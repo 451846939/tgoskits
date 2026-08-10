@@ -29,7 +29,10 @@ use fdt_edit::{Fdt, Node, NodeType, PciRange, PciSpace};
 
 #[cfg(target_arch = "aarch64")]
 use crate::boot::fdt::create::update_cpu_node;
-use crate::{MappingFlags, config::AxVMConfig};
+use crate::{
+    InterruptTriggerMode, MappingFlags,
+    config::{AxVMConfig, PassThroughSpiConfig},
+};
 
 const PAGE_SIZE_4K: usize = 0x1000;
 
@@ -395,7 +398,8 @@ pub fn set_phys_cpu_sets(
         .collect();
     info!("Found {} host CPU nodes", cpu_nodes_info.len());
 
-    let mut new_phys_cpu_sets = Vec::new();
+    let derive_cpu_sets = crate_config.base.phys_cpu_sets.is_none();
+    let mut derived_phys_cpu_sets = Vec::new();
     let mut guest_phys_cpu_ids = Vec::new();
     for phys_cpu_id in phys_cpu_ids {
         if let Some((cpu_index, (_, guest_cpu_id))) = cpu_nodes_info
@@ -404,7 +408,7 @@ pub fn set_phys_cpu_sets(
             .find(|(_, (node_id, _))| node_id == phys_cpu_id)
         {
             let cpu_mask = 1usize << cpu_index;
-            new_phys_cpu_sets.push(cpu_mask);
+            derived_phys_cpu_sets.push(cpu_mask);
             guest_phys_cpu_ids.push(*guest_cpu_id);
         } else {
             error!(
@@ -416,7 +420,9 @@ pub fn set_phys_cpu_sets(
     }
 
     let phys_cpu_ls = vm_cfg.phys_cpu_ls_mut();
-    phys_cpu_ls.set_guest_cpu_sets(new_phys_cpu_sets);
+    if derive_cpu_sets {
+        phys_cpu_ls.set_guest_cpu_sets(derived_phys_cpu_sets);
+    }
     phys_cpu_ls.set_guest_phys_cpu_ids(guest_phys_cpu_ids);
     Ok(())
 }
@@ -529,6 +535,13 @@ pub fn parse_passthrough_devices_address(
         )
     })?;
 
+    let selected_device_paths =
+        if devices.is_empty() || devices.iter().any(|device| device.name == "/") {
+            None
+        } else {
+            Some(super::device::find_all_passthrough_devices(vm_cfg, &fdt))
+        };
+
     vm_cfg.clear_pass_through_devices();
     let reserved_regions: Vec<VmMemConfig> = reserved_memory_regions(crate_cfg).cloned().collect();
 
@@ -537,6 +550,13 @@ pub fn parse_passthrough_devices_address(
             continue;
         };
         let node_path = fdt.path_of(node_id);
+
+        if selected_device_paths
+            .as_ref()
+            .is_some_and(|paths| !paths.contains(&node_path))
+        {
+            continue;
+        }
 
         if node_path == "/"
             || node.name().starts_with("memory")
@@ -584,6 +604,193 @@ pub fn parse_passthrough_devices_address(
 }
 
 #[cfg(target_arch = "aarch64")]
+fn is_gic_interrupt_controller(node: &Node) -> bool {
+    node.compatibles()
+        .any(|compat| compat.starts_with("arm,gic-") || compat == "arm,cortex-a15-gic")
+}
+
+#[cfg(target_arch = "aarch64")]
+fn node_id_by_phandle(fdt: &Fdt, phandle: u32) -> Option<usize> {
+    fdt.get_by_phandle_id(phandle.into()).or_else(|| {
+        fdt.iter_node_ids().find(|node_id| {
+            fdt.node(*node_id).is_some_and(|node| {
+                node.get_property("phandle")
+                    .or_else(|| node.get_property("linux,phandle"))
+                    .and_then(|prop| prop.get_u32())
+                    == Some(phandle)
+            })
+        })
+    })
+}
+
+#[cfg(target_arch = "aarch64")]
+fn effective_interrupt_parent(fdt: &Fdt, node_id: usize) -> Option<usize> {
+    let mut current = Some(node_id);
+    while let Some(id) = current {
+        let node = fdt.node(id)?;
+        if let Some(phandle) = node
+            .get_property("interrupt-parent")
+            .and_then(|prop| prop.get_u32())
+        {
+            return node_id_by_phandle(fdt, phandle);
+        }
+        current = fdt.parent_of(id);
+    }
+    None
+}
+
+#[cfg(target_arch = "aarch64")]
+fn interrupt_cells(node: &Node) -> Option<usize> {
+    node.get_property("#interrupt-cells")
+        .and_then(|prop| prop.get_u32())
+        .and_then(|cells| usize::try_from(cells).ok())
+        .filter(|cells| *cells > 0)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn gic_trigger_from_flags(flags: u32) -> AxResult<InterruptTriggerMode> {
+    match flags & 0xf {
+        1 | 2 => Ok(InterruptTriggerMode::EdgeTriggered),
+        4 | 8 => Ok(InterruptTriggerMode::LevelTriggered),
+        trigger => Err(ax_err_type!(
+            InvalidData,
+            format!("unsupported GIC interrupt trigger flags {trigger:#x}")
+        )),
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn push_gic_spi(specifier: &[u32], spis: &mut Vec<PassThroughSpiConfig>) -> AxResult {
+    if specifier.first().copied() != Some(0) {
+        return Ok(());
+    }
+    let (Some(spi), Some(flags)) = (specifier.get(1).copied(), specifier.get(2).copied()) else {
+        return Err(ax_err_type!(
+            InvalidData,
+            "incomplete three-cell GIC interrupt specifier"
+        ));
+    };
+    let config = PassThroughSpiConfig {
+        spi,
+        trigger: gic_trigger_from_flags(flags)?,
+    };
+    if let Some(existing) = spis.iter().find(|existing| existing.spi == spi) {
+        if existing.trigger != config.trigger {
+            return Err(ax_err_type!(
+                InvalidData,
+                format!(
+                    "GIC SPI {spi} has conflicting trigger modes {:?} and {:?}",
+                    existing.trigger, config.trigger
+                )
+            ));
+        }
+    } else {
+        spis.push(config);
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "aarch64")]
+fn node_gic_spis(fdt: &Fdt, node_id: usize) -> AxResult<Vec<PassThroughSpiConfig>> {
+    let Some(node) = fdt.node(node_id) else {
+        return Ok(Vec::new());
+    };
+    let mut spis = Vec::new();
+
+    if let Some(prop) = node.get_property("interrupts-extended") {
+        let mut reader = prop.as_reader();
+        while let Some(phandle) = reader.read_u32() {
+            let parent_id = node_id_by_phandle(fdt, phandle).ok_or_else(|| {
+                ax_err_type!(
+                    InvalidData,
+                    format!("unknown interrupt parent phandle {phandle}")
+                )
+            })?;
+            let parent = fdt.node(parent_id).ok_or_else(|| {
+                ax_err_type!(
+                    InvalidData,
+                    format!("missing interrupt parent node {parent_id}")
+                )
+            })?;
+            let cells = interrupt_cells(parent).ok_or_else(|| {
+                ax_err_type!(
+                    InvalidData,
+                    "interrupt parent has no valid #interrupt-cells"
+                )
+            })?;
+            let mut specifier = Vec::with_capacity(cells);
+            for _ in 0..cells {
+                let cell = reader.read_u32().ok_or_else(|| {
+                    ax_err_type!(InvalidData, "truncated interrupts-extended property")
+                })?;
+                specifier.push(cell);
+            }
+            if is_gic_interrupt_controller(parent) || cells == 3 {
+                push_gic_spi(&specifier, &mut spis)?;
+            }
+        }
+    }
+
+    if let Some(prop) = node.get_property("interrupts") {
+        let values: Vec<u32> = prop.get_u32_iter().collect();
+        let cells = effective_interrupt_parent(fdt, node_id)
+            .and_then(|parent_id| fdt.node(parent_id))
+            .and_then(|parent| {
+                let cells = interrupt_cells(parent)?;
+                (is_gic_interrupt_controller(parent) || cells == 3).then_some(cells)
+            })
+            // The AArch64 GIC binding uses three cells: type, number and flags.
+            // Some provided DTBs cannot resolve the interrupt-parent phandle via
+            // the typed FDT view, so retain a standards-based raw fallback.
+            .or_else(|| (values.len() >= 3).then_some(3));
+
+        let Some(cells) = cells else {
+            return Ok(spis);
+        };
+        if !values.len().is_multiple_of(cells) {
+            return Err(ax_err_type!(
+                InvalidData,
+                "interrupts property does not contain complete specifiers"
+            ));
+        }
+        for specifier in values.chunks_exact(cells) {
+            push_gic_spi(specifier, &mut spis)?;
+        }
+    }
+
+    Ok(spis)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn node_is_passthrough_device(fdt: &Fdt, node_id: usize, vm_cfg: &AxVMConfig) -> bool {
+    let Some(node) = fdt.node(node_id) else {
+        return false;
+    };
+    let node_path = fdt.path_of(node_id);
+    if vm_cfg
+        .pass_through_devices()
+        .iter()
+        .any(|device| device.name == node_path || device.name == node.name())
+    {
+        return true;
+    }
+
+    let regs = node_regs(fdt, node_id);
+    vm_cfg.pass_through_devices().iter().any(|device| {
+        if device.length == 0 {
+            return false;
+        }
+        let device_start = device.base_gpa;
+        let device_end = device_start.saturating_add(device.length);
+        regs.iter().any(|reg| {
+            let reg_start = reg.address as usize;
+            let reg_end = reg_start.saturating_add(reg.size.unwrap_or(0) as usize);
+            reg_start < device_end && device_start < reg_end
+        })
+    })
+}
+
+#[cfg(target_arch = "aarch64")]
 pub fn parse_vm_interrupt(vm_cfg: &mut AxVMConfig, dtb: &[u8]) -> AxResult {
     let fdt = Fdt::from_bytes(dtb).map_err(|e| {
         ax_err_type!(
@@ -592,29 +799,29 @@ pub fn parse_vm_interrupt(vm_cfg: &mut AxVMConfig, dtb: &[u8]) -> AxResult {
         )
     })?;
 
+    info!(
+        "VM[{}] scanning {} passthrough MMIO device(s) for AArch64 GIC SPI ownership: {:?}",
+        vm_cfg.id(),
+        vm_cfg.pass_through_devices().len(),
+        vm_cfg.pass_through_devices()
+    );
+
     for node_id in fdt.iter_node_ids() {
-        let Some(node) = fdt.node(node_id) else {
-            continue;
-        };
-        let name = node.name();
-        if name.starts_with("memory")
-            || name.starts_with("interrupt-controller")
-            || name.starts_with("intc")
-            || name.starts_with("its")
-        {
+        if !node_is_passthrough_device(&fdt, node_id, vm_cfg) {
             continue;
         }
 
-        let Some(view) = fdt.view_typed(node_id) else {
-            continue;
-        };
-        for interrupt in view.interrupts() {
-            if interrupt.specifier.first().copied() == Some(0)
-                && let Some(irq) = interrupt.specifier.get(1)
-            {
-                trace!("node: {name}, GIC_SPI interrupt id: 0x{irq:x}");
-                vm_cfg.add_pass_through_spi(*irq);
-            }
+        let node_path = fdt.path_of(node_id);
+        for spi in node_gic_spis(&fdt, node_id)? {
+            info!(
+                "VM[{}] passthrough node {} owns GIC SPI {} (physical INTID {}, {:?})",
+                vm_cfg.id(),
+                node_path,
+                spi.spi,
+                spi.spi.saturating_add(32),
+                spi.trigger
+            );
+            vm_cfg.add_pass_through_spi(spi)?;
         }
     }
 
@@ -653,18 +860,92 @@ pub fn update_provided_fdt(
 
 #[cfg(test)]
 mod tests {
+    use alloc::{string::ToString, vec, vec::Vec};
+
     use axvm_types::AddressSpacePolicy;
-    use axvmconfig::{AxVMCrateConfig, VMDevicesConfig};
+    use axvmconfig::{
+        AxVMCrateConfig, PassThroughDeviceConfig, VMDevicesConfig, VmMemConfig, VmMemMappingType,
+    };
     use fdt_edit::{Fdt, Node};
     use fdt_raw::RegInfo;
 
-    use super::{align_reserved_region_4k, reserve_excluded_device_ranges};
+    use super::{align_reserved_region_4k, reserve_excluded_device_ranges, set_phys_cpu_sets};
     use crate::config::{AxVMConfig, AxVMConfigParams, PhysCpuList};
 
     fn prop_u32(name: &str, value: u32) -> fdt_edit::Property {
         let mut prop = fdt_edit::Property::new(name, alloc::vec![]);
         prop.set_u32_ls(&[value]);
         prop
+    }
+
+    fn prop_u32_list(name: &str, values: &[u32]) -> fdt_edit::Property {
+        let mut prop = fdt_edit::Property::new(name, alloc::vec![]);
+        prop.set_u32_ls(values);
+        prop
+    }
+
+    fn prop_string(name: &str, value: &str) -> fdt_edit::Property {
+        let mut prop = fdt_edit::Property::new(name, alloc::vec![]);
+        prop.set_string(value);
+        prop
+    }
+
+    fn add_reg_device(
+        fdt: &mut Fdt,
+        parent: usize,
+        name: &str,
+        base: u64,
+        size: u64,
+        interrupts: &[u32],
+    ) {
+        let id = fdt.add_node(parent, Node::new(name));
+        fdt.view_typed_mut(id)
+            .unwrap()
+            .set_regs(&[RegInfo::new(base, Some(size))]);
+        if !interrupts.is_empty() {
+            fdt.node_mut(id)
+                .unwrap()
+                .set_property(prop_u32_list("interrupts", interrupts));
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn fdt_with_gic_devices() -> Vec<u8> {
+        let mut fdt = Fdt::new();
+        let root = fdt.root_id();
+        fdt.node_mut(root)
+            .unwrap()
+            .set_property(prop_u32("#address-cells", 2));
+        fdt.node_mut(root)
+            .unwrap()
+            .set_property(prop_u32("#size-cells", 2));
+        fdt.node_mut(root)
+            .unwrap()
+            .set_property(prop_u32("interrupt-parent", 1));
+
+        let intc = fdt.add_node(root, Node::new("intc@8000000"));
+        let intc_node = fdt.node_mut(intc).unwrap();
+        intc_node.set_property(prop_u32("phandle", 1));
+        intc_node.set_property(prop_u32("#interrupt-cells", 3));
+        intc_node.set_property(prop_string("compatible", "arm,gic-v3"));
+        intc_node.set_property(fdt_edit::Property::new(
+            "interrupt-controller",
+            alloc::vec![],
+        ));
+
+        add_reg_device(&mut fdt, root, "net@1000", 0x1000, 0x100, &[0, 45, 1]);
+        add_reg_device(
+            &mut fdt,
+            root,
+            "net-shadow@1800",
+            0x1800,
+            0x100,
+            &[0, 45, 1],
+        );
+        add_reg_device(&mut fdt, root, "ppi@1c00", 0x1c00, 0x100, &[1, 7, 4]);
+        add_reg_device(&mut fdt, root, "broken@1d00", 0x1d00, 0x100, &[0, 99]);
+        add_reg_device(&mut fdt, root, "uart@3000", 0x3000, 0x100, &[0, 1, 4]);
+        fdt.encode().as_ref().to_vec()
     }
 
     fn fdt_with_excluded_devices() -> Vec<u8> {
@@ -688,6 +969,77 @@ mod tests {
         }
 
         fdt.encode().as_ref().to_vec()
+    }
+
+    fn fdt_with_cpu_nodes(cpu_count: usize) -> Fdt {
+        let mut fdt = Fdt::new();
+        let root = fdt.root_id();
+        let cpus = fdt.add_node(root, Node::new("cpus"));
+        fdt.node_mut(cpus)
+            .unwrap()
+            .set_property(prop_u32("#address-cells", 2));
+        fdt.node_mut(cpus)
+            .unwrap()
+            .set_property(prop_u32("#size-cells", 0));
+
+        for cpu_id in 0..cpu_count {
+            let cpu = fdt.add_node(cpus, Node::new(&alloc::format!("cpu@{cpu_id:x}")));
+            fdt.view_typed_mut(cpu)
+                .unwrap()
+                .set_regs(&[RegInfo::new(cpu_id as u64, None)]);
+        }
+        fdt
+    }
+
+    #[test]
+    fn explicit_cpu_affinity_is_not_overwritten_by_fdt_mapping() {
+        let host_fdt = fdt_with_cpu_nodes(4);
+        let mut crate_cfg = AxVMCrateConfig::default();
+        crate_cfg.base.cpu_num = 1;
+        crate_cfg.base.phys_cpu_ids = Some(vec![0]);
+        crate_cfg.base.phys_cpu_sets = Some(vec![0b1000]);
+        let mut vm_cfg = AxVMConfig::new(AxVMConfigParams {
+            id: 0,
+            name: "test".to_string(),
+            phys_cpu_ls: PhysCpuList::new(
+                1,
+                crate_cfg.base.phys_cpu_ids.clone(),
+                crate_cfg.base.phys_cpu_sets.clone(),
+            ),
+            ..Default::default()
+        });
+
+        set_phys_cpu_sets(&mut vm_cfg, &host_fdt, &crate_cfg).unwrap();
+
+        assert_eq!(
+            vm_cfg.phys_cpu_ls.get_vcpu_affinities_pcpu_ids(),
+            vec![(0, Some(0b1000), 0)]
+        );
+    }
+
+    #[test]
+    fn missing_cpu_affinity_is_derived_from_fdt_mapping() {
+        let host_fdt = fdt_with_cpu_nodes(4);
+        let mut crate_cfg = AxVMCrateConfig::default();
+        crate_cfg.base.cpu_num = 2;
+        crate_cfg.base.phys_cpu_ids = Some(vec![1, 3]);
+        let mut vm_cfg = AxVMConfig::new(AxVMConfigParams {
+            id: 0,
+            name: "test".to_string(),
+            phys_cpu_ls: PhysCpuList::new(
+                2,
+                crate_cfg.base.phys_cpu_ids.clone(),
+                crate_cfg.base.phys_cpu_sets.clone(),
+            ),
+            ..Default::default()
+        });
+
+        set_phys_cpu_sets(&mut vm_cfg, &host_fdt, &crate_cfg).unwrap();
+
+        assert_eq!(
+            vm_cfg.phys_cpu_ls.get_vcpu_affinities_pcpu_ids(),
+            vec![(0, Some(0b0010), 1), (1, Some(0b1000), 3)]
+        );
     }
 
     #[test]
@@ -777,5 +1129,98 @@ mod tests {
         assert_eq!(ranges.len(), 1);
         assert_eq!(ranges[0].base_gpa, 0x1000_1000);
         assert_eq!(ranges[0].length, 0x1000);
+    }
+
+    #[test]
+    fn explicit_passthrough_path_limits_discovered_mmio_devices() {
+        let dtb = fdt_with_excluded_devices();
+        let mut vm_cfg = AxVMConfig::new(AxVMConfigParams {
+            id: 0,
+            name: "test".to_string(),
+            phys_cpu_ls: PhysCpuList::new(1, None, None),
+            pass_through_devices: vec![PassThroughDeviceConfig {
+                name: "/serial@10001234".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        super::parse_passthrough_devices_address(&mut vm_cfg, &AxVMCrateConfig::default(), &dtb)
+            .unwrap();
+
+        assert_eq!(vm_cfg.pass_through_devices().len(), 1);
+        assert_eq!(vm_cfg.pass_through_devices()[0].base_gpa, 0x1000_1234);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn passthrough_irq_parser_only_collects_owned_gic_spis() {
+        let dtb = fdt_with_gic_devices();
+        let mut vm_cfg = AxVMConfig::new(AxVMConfigParams {
+            id: 0,
+            name: "test".to_string(),
+            phys_cpu_ls: PhysCpuList::new(1, None, None),
+            pass_through_devices: vec![PassThroughDeviceConfig {
+                name: "net".to_string(),
+                base_gpa: 0x1000,
+                base_hpa: 0x1000,
+                length: 0x100,
+                irq_id: 0,
+            }],
+            ..Default::default()
+        });
+
+        super::parse_vm_interrupt(&mut vm_cfg, &dtb).unwrap();
+
+        assert_eq!(vm_cfg.pass_through_spis().len(), 1);
+        assert_eq!(vm_cfg.pass_through_spis()[0].spi, 45);
+        assert_eq!(
+            vm_cfg.pass_through_spis()[0].trigger,
+            axvm_types::InterruptTriggerMode::EdgeTriggered
+        );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn passthrough_irq_parser_preserves_level_trigger_from_node_name() {
+        let dtb = fdt_with_gic_devices();
+        let mut vm_cfg = AxVMConfig::new(AxVMConfigParams {
+            id: 0,
+            name: "test".to_string(),
+            phys_cpu_ls: PhysCpuList::new(1, None, None),
+            pass_through_devices: vec![PassThroughDeviceConfig {
+                name: "uart@3000".to_string(),
+                base_gpa: 0xdead_0000,
+                base_hpa: 0xdead_0000,
+                length: 0x1000,
+                irq_id: 0,
+            }],
+            ..Default::default()
+        });
+
+        super::parse_vm_interrupt(&mut vm_cfg, &dtb).unwrap();
+
+        assert_eq!(vm_cfg.pass_through_spis().len(), 1);
+        assert_eq!(vm_cfg.pass_through_spis()[0].spi, 1);
+        assert_eq!(
+            vm_cfg.pass_through_spis()[0].trigger,
+            axvm_types::InterruptTriggerMode::LevelTriggered
+        );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn gic_trigger_parser_rejects_unspecified_or_mixed_flags() {
+        assert!(super::gic_trigger_from_flags(0).is_err());
+        assert!(super::gic_trigger_from_flags(1 | 4).is_err());
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn duplicate_gic_spi_rejects_conflicting_trigger_modes() {
+        let mut spis = Vec::new();
+        super::push_gic_spi(&[0, 45, 1], &mut spis).unwrap();
+        assert!(super::push_gic_spi(&[0, 45, 4], &mut spis).is_err());
+        assert_eq!(spis.len(), 1);
     }
 }
