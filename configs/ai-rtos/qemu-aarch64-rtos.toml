@@ -1,0 +1,31 @@
+# AI/RTOS contest example: RTOS control guest pinned away from Linux vCPUs.
+
+[base]
+id = 2
+name = "rtos-control"
+vm_type = 1
+cpu_num = 1
+phys_cpu_ids = [2]
+phys_cpu_sets = [4]
+
+[kernel]
+image_location = "fs"
+kernel_path = "/guest/images/rtthread.bin"
+kernel_load_addr = 0x90200000
+entry_point = 0x90200000
+dtb_load_addr = 0x98000000
+memory_regions = [
+  { gpa = 0x90000000, size = 0x08000000, flags = 0x7, map_type = 1 },
+]
+cmdline = "rtos_role=control ip=192.168.70.20 gateway=192.168.70.1 netmask=255.255.255.0 aicp_port=8800"
+
+[devices]
+emu_devices = [
+  "virtio-net@0xa101000",
+  "virtio-console@0xa102000",
+]
+passthrough_devices = []
+excluded_devices = []
+passthrough_addresses = []
+pass_through_ports = []
+interrupt_mode = "auto"

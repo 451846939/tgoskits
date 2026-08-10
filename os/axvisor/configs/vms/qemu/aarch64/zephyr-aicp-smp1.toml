@@ -1,0 +1,33 @@
+[base]
+id = 2
+name = "zephyr-aicp-qemu"
+vm_type = 1
+cpu_num = 1
+phys_cpu_ids = [0]
+
+[kernel]
+entry_point = 0xD000_1104
+image_location = "memory"
+kernel_path = "/path/to/zephyr.bin"
+kernel_load_addr = 0xD000_0000
+memory_regions = [
+  # The passthrough virtio device consumes guest physical DMA addresses.
+  # Keep the guest RAM identity-mapped inside the host reserved-memory range.
+  [0xD000_0000, 0x0800_0000, 0x7, 2],
+]
+
+[devices]
+interrupt_mode = "passthrough"
+passthrough_devices = [
+  ["/virtio_mmio@a003a00"],
+  ["/pl011@9000000"],
+]
+passthrough_addresses = []
+excluded_devices = []
+emu_devices = [
+  # Zephyr owns architectural IRQ 77 (SPI 45) for its virtio-net device.
+  ["gppt-gicd", 0x0800_0000, 0x1_0000, 0, 0x21, []],
+  # Zephyr's qemu_cortex_a53 board uses GICv3 and accesses the first
+  # redistributor frame at 0x080a_0000. Bind it to Zephyr's pCPU 0.
+  ["gppt-gicr", 0x080a_0000, 0x2_0000, 0, 0x20, [1, 0x2_0000, 0]],
+]

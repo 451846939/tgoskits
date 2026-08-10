@@ -1,0 +1,9 @@
+target = "aarch64-unknown-none-softfloat"
+log = "Info"
+features = [
+  "qemu",
+  "smp",
+  "ax-driver/virtio-blk",
+  "ax-driver/virtio-net",
+]
+max_cpu_num = 2
