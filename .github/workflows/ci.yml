@@ -488,7 +488,11 @@ jobs:
             use_container: false
             runs_on: '["self-hosted","linux","qcs"]'
             self_hosted_owner: rcore-os
-            command: cargo xtask axvisor test qemu --arch riscv64 --test-case smoke
+            command: |
+              cargo xtask cross-test --arch riscv64 \
+                --package riscv_vcpu --package axvm \
+                --features axvm/host-test --no-default-features --lib ipi
+              cargo xtask axvisor test qemu --arch riscv64 --test-case smoke
             cache_key: ""
             container_image: base
             limit_to_owner: ""
