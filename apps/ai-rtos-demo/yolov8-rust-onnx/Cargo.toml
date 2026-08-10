@@ -1,0 +1,16 @@
+[package]
+name = "aicp-yolov8-rust-onnx"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[workspace]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[dependencies]
+aicp-rust-protocol = { path = "../../../components/aicp-protocol", features = ["std"] }

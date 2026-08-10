@@ -1,0 +1,21 @@
+[package]
+name = "aicp-rust-client"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace]
+
+[features]
+default = []
+guest-init = []
+
+[dependencies]
+aicp-rust-protocol = { path = "../../../components/aicp-protocol", features = ["std"] }
+
+[profile.release]
+panic = "abort"
+
+[[bin]]
+name = "aicp_rust_client"
+path = "src/main.rs"

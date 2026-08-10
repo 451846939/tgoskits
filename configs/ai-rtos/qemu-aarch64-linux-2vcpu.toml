@@ -1,0 +1,35 @@
+# AI/RTOS contest example: Linux/Starry guest with two vCPUs.
+# Copy this file into the AxVisor vm_default directory or pass it through the
+# normal axvisor QEMU config flow after replacing image paths.
+
+[base]
+id = 1
+name = "linux-ai"
+vm_type = 1
+cpu_num = 2
+phys_cpu_ids = [0, 1]
+phys_cpu_sets = [1, 2]
+
+[kernel]
+image_location = "fs"
+kernel_path = "/guest/images/Image"
+kernel_load_addr = 0x80200000
+entry_point = 0x80200000
+dtb_load_addr = 0x88000000
+ramdisk_load_addr = 0x89000000
+memory_regions = [
+  { gpa = 0x80000000, size = 0x20000000, flags = 0x7, map_type = 1 },
+]
+cmdline = "console=ttyAMA0 earlycon root=/dev/vda rw ip=192.168.70.10::192.168.70.1:255.255.255.0::eth0:off isolcpus=1 nohz_full=1 rcu_nocbs=1"
+
+[devices]
+emu_devices = [
+  "virtio-blk@0xa000000",
+  "virtio-net@0xa001000",
+  "virtio-console@0xa002000",
+]
+passthrough_devices = []
+excluded_devices = []
+passthrough_addresses = []
+pass_through_ports = []
+interrupt_mode = "auto"

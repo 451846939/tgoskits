@@ -1,0 +1,47 @@
+/*
+ * Copyright 2026 The TGOSKits Authors
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/*
+ * Keep the virtqueue DMA addresses identical between Zephyr, AxVisor and QEMU.
+ * The host device-tree reserves this range before AxVisor starts the guest.
+ */
+&{/soc} {
+	/delete-node/ memory@40000000;
+
+	sram0: memory@d0000000 {
+		compatible = "mmio-sram";
+		reg = <0x0 0xd0000000 0x0 0x08000000>;
+	};
+};
+
+&eth0 {
+	status = "disabled";
+};
+
+&pcie {
+	status = "disabled";
+};
+
+/* PCI/MSI is not part of this virtio-mmio Guest profile. */
+&its {
+	status = "disabled";
+};
+
+/*
+ * QEMU allocates virtio-mmio slots from high to low. In the dual-guest setup:
+ *   slot 31 (0x0a003e00): host virtio-blk
+ *   slot 30 (0x0a003c00): Linux virtio-net
+ *   slot 29 (0x0a003a00): Zephyr virtio-net
+ */
+&virtio_mmio29 {
+	status = "okay";
+
+	virtio_net: virtio-net {
+		compatible = "virtio,net";
+		status = "okay";
+		local-mac-address = [52 54 00 aa 03 02];
+	};
+};

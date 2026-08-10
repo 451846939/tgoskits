@@ -8,6 +8,8 @@ use alloc::{borrow::ToOwned, vec::Vec};
 
 use ax_std as _;
 
+mod native_aicp;
+
 #[cfg(feature = "nixos")]
 pub const CMDLINE: &[&str] = &["/init"];
 
@@ -22,6 +24,16 @@ const ENVIRON: &[&str] = &[];
 
 #[unsafe(no_mangle)]
 extern "C" fn main() {
+    ax_log::ax_println!(
+        "AICP_STARRY_MAIN_ENTER native={} target_os_none={}",
+        option_env!("AICP_STARRY_NATIVE").unwrap_or("unset"),
+        cfg!(target_os = "none")
+    );
+    if native_aicp::maybe_run() {
+        ax_log::ax_println!("AICP_STARRY_NATIVE_EXIT");
+        ax_std::process::exit(0);
+    }
+
     let args = CMDLINE
         .iter()
         .copied()

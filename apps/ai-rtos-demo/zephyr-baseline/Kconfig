@@ -1,0 +1,7 @@
+mainmenu "TGOSKits AI/RTOS Zephyr baseline"
+
+source "Kconfig.zephyr"
+
+config AICP_BASELINE_STRESS
+	bool "Enable background CPU stress workers"
+	default n
