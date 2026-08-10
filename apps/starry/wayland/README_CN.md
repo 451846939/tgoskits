@@ -13,7 +13,7 @@
 
 ```bash
 brew install e2fsprogs
-export PATH="/opt/homebrew/opt/e2fsprogs/sbin:$PATH"
+export PATH="$(brew --prefix e2fsprogs)/sbin:$PATH"
 ```
 
 以下命令都在仓库根目录执行。
@@ -68,7 +68,7 @@ rootfs。这样可以在 StarryOS shell 中手动输入命令，并通过 VNC �
 不需要客体内网络。
 
 ```bash
-export PATH="/opt/homebrew/opt/e2fsprogs/sbin:$PATH"
+export PATH="$(brew --prefix e2fsprogs)/sbin:$PATH"
 ARCH=riscv64   # 或：x86_64
 cargo xtask starry app qemu -t wayland --arch "$ARCH"
 ```

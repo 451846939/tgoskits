@@ -7,6 +7,8 @@
 //! - Patch QEMU arguments so a selected rootfs image is attached correctly in
 //!   [`qemu`]
 
+/// Host-side tool discovery shared by rootfs operations.
+mod host_tool;
 /// Rootfs image content extraction and overlay injection helpers.
 pub(crate) mod inject;
 /// QEMU argument patch helpers for wiring a rootfs image into runner configs.

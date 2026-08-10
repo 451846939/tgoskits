@@ -30,15 +30,50 @@ for arg in "$@"; do
     esac
 done
 
-DBSBIN="/opt/homebrew/opt/e2fsprogs/sbin"
-export PATH="$DBSBIN:/opt/homebrew/bin:/usr/local/bin:$PATH"
-
 require_tool() {
-    if ! command -v "$1" >/dev/null 2>&1; then
-        echo "error: missing required host tool: $1" >&2
+    local command_name="$1"
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+        echo "error: missing required host tool: $command_name" >&2
         exit 1
     fi
 }
+
+resolve_tool() {
+    local env_name="$1"
+    local name="$2"
+    local formula="${3:-}"
+    local configured="${!env_name:-}"
+    local prefix candidate
+
+    if [[ -n "$configured" ]]; then
+        if command -v "$configured" >/dev/null 2>&1; then
+            command -v "$configured"
+            return 0
+        fi
+        echo "error: $env_name points to an unavailable command: $configured" >&2
+        return 1
+    fi
+    if command -v "$name" >/dev/null 2>&1; then
+        command -v "$name"
+        return 0
+    fi
+    if [[ -n "$formula" ]] && command -v brew >/dev/null 2>&1; then
+        prefix="$(brew --prefix "$formula" 2>/dev/null || true)"
+        for candidate in "${prefix:+${prefix}/bin/${name}}" "${prefix:+${prefix}/sbin/${name}}"; do
+            if [[ -n "$candidate" && -x "$candidate" ]]; then
+                printf '%s\n' "$candidate"
+                return 0
+            fi
+        done
+    fi
+    echo "error: missing required host tool: $name; set $env_name or update PATH" >&2
+    return 1
+}
+
+DEBUGFS_BIN="$(resolve_tool DEBUGFS debugfs e2fsprogs)"
+E2FSCK_BIN="$(resolve_tool E2FSCK e2fsck e2fsprogs)"
+RESIZE2FS_BIN="$(resolve_tool RESIZE2FS resize2fs e2fsprogs)"
+QEMU_BIN="$(resolve_tool QEMU qemu-system-aarch64)"
 
 run_provision_qemu() {
     local provision_log="$1"
@@ -52,7 +87,7 @@ run_provision_qemu() {
     mkfifo "$input_fifo"
 
     (
-        qemu-system-aarch64 \
+        "$QEMU_BIN" \
             -machine virt \
             -cpu cortex-a53 \
             -smp 4 -m 2048M \
@@ -138,7 +173,7 @@ inject_overlay() {
         done
     } >"$commands"
 
-    if ! debugfs -w -f "$commands" "$rootfs_img" 2>&1 | tee "$log"; then
+    if ! "$DEBUGFS_BIN" -w -f "$commands" "$rootfs_img" 2>&1 | tee "$log"; then
         rm -f "$commands"
         echo "error: debugfs overlay injection failed; see $log" >&2
         exit 1
@@ -166,7 +201,7 @@ resize_rootfs() {
 
     echo "==> Expanding manual rootfs to ${target_mb} MiB..."
     set +e
-    e2fsck -fy "$rootfs_img" >/dev/null
+    "$E2FSCK_BIN" -fy "$rootfs_img" >/dev/null
     fsck_status=$?
     set -e
     if [ "$fsck_status" -gt 1 ]; then
@@ -178,14 +213,14 @@ resize_rootfs() {
     else
         dd if=/dev/zero bs=1m count=0 seek="$target_mb" of="$rootfs_img" 2>/dev/null
     fi
-    resize2fs "$rootfs_img" >/dev/null
+    "$RESIZE2FS_BIN" "$rootfs_img" >/dev/null
 }
 
 rootfs_path_exists() {
     local guest_path="$1"
     local stat_output
 
-    stat_output="$(debugfs -R "stat $guest_path" "$ROOTFS_APP" 2>&1 || true)"
+    stat_output="$("$DEBUGFS_BIN" -R "stat $guest_path" "$ROOTFS_APP" 2>&1 || true)"
     printf '%s\n' "$stat_output" | grep -q '^Inode:' \
         && ! printf '%s\n' "$stat_output" | grep -q 'File not found'
 }
@@ -195,16 +230,12 @@ marker_exists() {
 }
 
 installed_packages() {
-    debugfs -R "cat /lib/apk/db/installed" "$ROOTFS_APP" 2>/dev/null \
+    "$DEBUGFS_BIN" -R "cat /lib/apk/db/installed" "$ROOTFS_APP" 2>/dev/null \
         | sed -n 's/^P://p' \
         | tr '\n' ' '
 }
 
-require_tool debugfs
-require_tool e2fsck
-require_tool resize2fs
 require_tool python3
-require_tool qemu-system-aarch64
 
 # ---- Build ----
 if [ "$NO_BUILD" = false ]; then
@@ -229,7 +260,7 @@ if [ ! -f "$ROOTFS_APP" ] || [ "$REPROVISION" = true ]; then
     chmod 0644 "$ROOTFS_APP"
     resize_rootfs "$ROOTFS_APP" "$WAYLAND_ROOTFS_MB"
     echo "nameserver 10.0.2.3" | \
-        debugfs -w "$ROOTFS_APP" -R "cd /etc; rm resolv.conf; write /dev/stdin resolv.conf" 2>/dev/null || true
+        "$DEBUGFS_BIN" -w "$ROOTFS_APP" -R "cd /etc; rm resolv.conf; write /dev/stdin resolv.conf" 2>/dev/null || true
 fi
 
 if ! marker_exists || [ "$REPROVISION" = true ]; then
@@ -339,4 +370,4 @@ if [ "$USE_COCOA" != false ]; then
     QEMU_ARGS+=(-serial stdio)
 fi
 QEMU_ARGS+=(-kernel "$KERNEL")
-exec qemu-system-aarch64 "${QEMU_ARGS[@]}"
+exec "$QEMU_BIN" "${QEMU_ARGS[@]}"

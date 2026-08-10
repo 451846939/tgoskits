@@ -211,20 +211,22 @@ prepend_rust_objcopy_dir() {
 
 find_llvm_tool() {
     local name="$1"
+    local formula prefix candidate
     if command -v "$name" >/dev/null 2>&1; then
         command -v "$name"
         return
     fi
 
-    for candidate in \
-        "/opt/homebrew/opt/llvm/bin/$name" \
-        "/opt/homebrew/opt/llvm@21/bin/$name" \
-        "/opt/homebrew/opt/llvm@20/bin/$name"; do
-        if [[ -x "$candidate" ]]; then
-            printf '%s\n' "$candidate"
-            return
-        fi
-    done
+    if command -v brew >/dev/null 2>&1; then
+        for formula in llvm llvm@21 llvm@20; do
+            prefix="$(brew --prefix "$formula" 2>/dev/null || true)"
+            candidate="${prefix:+${prefix}/bin/${name}}"
+            if [[ -n "$candidate" && -x "$candidate" ]]; then
+                printf '%s\n' "$candidate"
+                return
+            fi
+        done
+    fi
 }
 
 ensure_rust_binutils_wrappers() {

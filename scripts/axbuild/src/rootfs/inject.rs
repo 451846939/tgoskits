@@ -18,6 +18,8 @@ use std::{
 
 use anyhow::{Context, bail, ensure};
 
+use super::host_tool;
+
 /// Reads a text file from a rootfs image with `debugfs`.
 ///
 /// Returns `Ok(None)` when the image is readable but the guest path does not
@@ -31,7 +33,8 @@ pub(crate) fn read_text_file(
         "guest path must be absolute: `{guest_path}`"
     );
 
-    let output = Command::new("debugfs")
+    let debugfs = host_tool::resolve("DEBUGFS", "debugfs")?;
+    let output = Command::new(&debugfs)
         .arg("-R")
         .arg(format!("cat {guest_path}"))
         .arg(rootfs_img)
@@ -95,7 +98,8 @@ pub(crate) fn replace_file(
 
 /// Extracts the contents of a rootfs image into a host staging directory.
 pub(crate) fn extract_rootfs(rootfs_img: &Path, output_dir: &Path) -> anyhow::Result<()> {
-    Command::new("debugfs")
+    let debugfs = host_tool::resolve("DEBUGFS", "debugfs")?;
+    Command::new(&debugfs)
         .arg("-R")
         .arg(format!("rdump / {}", output_dir.display()))
         .arg(rootfs_img)
@@ -247,8 +251,9 @@ fn run_debugfs_script(
     commands: &[String],
     context_message: &str,
 ) -> anyhow::Result<()> {
-    eprintln!("debugfs -w {}", rootfs_img.display());
-    let mut child = Command::new("debugfs")
+    let debugfs = host_tool::resolve("DEBUGFS", "debugfs")?;
+    eprintln!("{} -w {}", debugfs.display(), rootfs_img.display());
+    let mut child = Command::new(&debugfs)
         .arg("-w")
         .arg(rootfs_img)
         .stdin(Stdio::piped())

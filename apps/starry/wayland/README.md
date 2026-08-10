@@ -14,7 +14,7 @@ interactively.
 
 ```bash
 brew install e2fsprogs
-export PATH="/opt/homebrew/opt/e2fsprogs/sbin:$PATH"
+export PATH="$(brew --prefix e2fsprogs)/sbin:$PATH"
 ```
 
 Run all commands from the repository root.
@@ -74,7 +74,7 @@ also installs the prefetched Weston dependency closure into that rootfs, so the
 manual session does not need guest networking.
 
 ```bash
-export PATH="/opt/homebrew/opt/e2fsprogs/sbin:$PATH"
+export PATH="$(brew --prefix e2fsprogs)/sbin:$PATH"
 ARCH=riscv64   # or: x86_64
 cargo xtask starry app qemu -t wayland --arch "$ARCH"
 ```

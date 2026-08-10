@@ -176,12 +176,14 @@ fn replace_drive_file_arg(drive_arg: &str, rootfs_path: &Path) -> String {
 fn replace_drive_arg(args: &mut Vec<String>, rootfs_path: &Path) {
     let wiring = DEFAULT_ROOTFS_WIRING;
     let replacement = wiring.drive_arg(rootfs_path);
-    let drive_prefix = wiring.drive_prefix();
     let mut replaced = false;
 
     for arg in args.iter_mut() {
-        if arg.starts_with(&drive_prefix) {
-            *arg = replacement.clone();
+        if drive_id_value(arg) == Some(wiring.disk_id)
+            && drive_if_value(arg) == Some("none")
+            && drive_file_value(arg).is_some()
+        {
+            *arg = replace_drive_file_arg(arg, rootfs_path);
             replaced = true;
         }
     }
@@ -372,6 +374,32 @@ mod tests {
                 "id=usbdisk,if=none,format=raw,snapshot=on,file=/cache/rootfs.img".to_string(),
                 "-netdev".to_string(),
                 "user,id=net0,file=/tmp/not-a-drive.img".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn replace_drive_only_preserves_existing_drive_options() {
+        let rootfs = Path::new("/tmp/new-rootfs.img");
+        let mut qemu = QemuConfig {
+            args: vec![
+                "-device".to_string(),
+                "virtio-blk-device,drive=disk0".to_string(),
+                "-drive".to_string(),
+                "id=disk0,if=none,format=raw,snapshot=on,file=/tmp/old-rootfs.img".to_string(),
+            ],
+            ..Default::default()
+        };
+
+        patch_rootfs(&mut qemu, rootfs, RootfsPatchMode::ReplaceDriveOnly);
+
+        assert_eq!(
+            qemu.args,
+            vec![
+                "-device".to_string(),
+                "virtio-blk-device,drive=disk0".to_string(),
+                "-drive".to_string(),
+                "id=disk0,if=none,format=raw,snapshot=on,file=/tmp/new-rootfs.img".to_string(),
             ]
         );
     }

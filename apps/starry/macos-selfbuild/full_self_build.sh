@@ -21,6 +21,8 @@ Environment:
   ROOTFS_SIZE_MIB   Final app runner rootfs size in MiB (default: 16384)
   ARTIFACT_OUT_DIR  Host output directory for extracted artifacts
   ARTIFACT_EXTRACT  1|0, extract artifacts after app qemu succeeds (default: 1)
+  DEBUGFS            debugfs executable path or command name
+  E2FSCK             e2fsck executable path or command name
 USAGE
 }
 
@@ -39,14 +41,15 @@ rootfs_path_file="$repo_root/target/starry-macos-selfbuild/rootfs.path"
 find_tool() {
     local override="$1"
     local name="$2"
-    shift 2
+    local formula="${3:-}"
+    local prefix candidate
 
     if [[ -n "$override" ]]; then
-        if [[ -x "$override" ]]; then
-            printf '%s\n' "$override"
+        if command -v "$override" >/dev/null 2>&1; then
+            command -v "$override"
             return 0
         fi
-        echo "$name override is not executable: $override" >&2
+        echo "$name override is unavailable: $override" >&2
         return 1
     fi
 
@@ -55,13 +58,15 @@ find_tool() {
         return 0
     fi
 
-    local candidate
-    for candidate in "$@"; do
-        if [[ -x "$candidate" ]]; then
-            printf '%s\n' "$candidate"
-            return 0
-        fi
-    done
+    if [[ -n "$formula" ]] && command -v brew >/dev/null 2>&1; then
+        prefix="$(brew --prefix "$formula" 2>/dev/null || true)"
+        for candidate in "${prefix:+${prefix}/bin/${name}}" "${prefix:+${prefix}/sbin/${name}}"; do
+            if [[ -n "$candidate" && -x "$candidate" ]]; then
+                printf '%s\n' "$candidate"
+                return 0
+            fi
+        done
+    fi
 
     echo "$name not found; install e2fsprogs or set ${name^^}" >&2
     return 1
@@ -70,9 +75,7 @@ find_tool() {
 fsck_rootfs() {
     local rootfs="$1"
     local e2fsck rc
-    e2fsck="$(find_tool "${E2FSCK:-}" e2fsck \
-        /opt/homebrew/opt/e2fsprogs/sbin/e2fsck \
-        /usr/local/opt/e2fsprogs/sbin/e2fsck)"
+    e2fsck="$(find_tool "${E2FSCK:-}" e2fsck e2fsprogs)"
 
     set +e
     "$e2fsck" -fy "$rootfs"
@@ -112,9 +115,7 @@ extract_guest_artifacts() {
         return 1
     fi
 
-    debugfs="$(find_tool "${DEBUGFS:-}" debugfs \
-        /opt/homebrew/opt/e2fsprogs/sbin/debugfs \
-        /usr/local/opt/e2fsprogs/sbin/debugfs)"
+    debugfs="$(find_tool "${DEBUGFS:-}" debugfs e2fsprogs)"
 
     target="aarch64-unknown-none-softfloat"
     stem="starryos-${target}"

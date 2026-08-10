@@ -12,6 +12,8 @@ use std::{
 
 use anyhow::Context;
 
+use super::host_tool;
+
 pub(crate) struct ResizeOptions {
     pub(crate) input: PathBuf,
     pub(crate) output: Option<PathBuf>,
@@ -64,14 +66,7 @@ fn prepare_resize_target(input: &Path, output: Option<&Path>) -> anyhow::Result<
 }
 
 fn run_e2fsck(image: &Path) -> anyhow::Result<()> {
-    let e2fsck = find_host_tool(
-        "E2FSCK",
-        "e2fsck",
-        &[
-            "/opt/homebrew/opt/e2fsprogs/sbin/e2fsck",
-            "/usr/local/opt/e2fsprogs/sbin/e2fsck",
-        ],
-    )?;
+    let e2fsck = host_tool::resolve("E2FSCK", "e2fsck")?;
     let status = Command::new(&e2fsck)
         .arg("-fy")
         .arg(image)
@@ -85,14 +80,7 @@ fn run_e2fsck(image: &Path) -> anyhow::Result<()> {
 }
 
 fn run_resize2fs(image: &Path) -> anyhow::Result<()> {
-    let resize2fs = find_host_tool(
-        "RESIZE2FS",
-        "resize2fs",
-        &[
-            "/opt/homebrew/opt/e2fsprogs/sbin/resize2fs",
-            "/usr/local/opt/e2fsprogs/sbin/resize2fs",
-        ],
-    )?;
+    let resize2fs = host_tool::resolve("RESIZE2FS", "resize2fs")?;
     let status = Command::new(&resize2fs)
         .arg(image)
         .status()
@@ -101,37 +89,4 @@ fn run_resize2fs(image: &Path) -> anyhow::Result<()> {
         anyhow::bail!("{} failed with {status}", resize2fs.display());
     }
     Ok(())
-}
-
-fn find_host_tool(env_name: &str, tool_name: &str, fallbacks: &[&str]) -> anyhow::Result<PathBuf> {
-    if let Some(configured) = std::env::var_os(env_name).filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(configured));
-    }
-    if let Some(tool) = find_in_path(tool_name) {
-        return Ok(tool);
-    }
-    for fallback in fallbacks {
-        let path = PathBuf::from(fallback);
-        if path.is_file() {
-            return Ok(path);
-        }
-    }
-    anyhow::bail!(
-        "{} not found; install it or set {}=/path/to/{}",
-        tool_name,
-        env_name,
-        tool_name
-    )
-}
-
-fn find_in_path(tool_name: &str) -> Option<PathBuf> {
-    let path = Path::new(tool_name);
-    if path.components().count() > 1 && path.is_file() {
-        return Some(path.to_path_buf());
-    }
-    std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths)
-            .map(|dir| dir.join(tool_name))
-            .find(|candidate| candidate.is_file())
-    })
 }
