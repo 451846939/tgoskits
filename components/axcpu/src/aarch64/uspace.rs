@@ -194,7 +194,20 @@ impl UserContext {
                 let iss = esr.read(ESR_EL1::ISS);
 
                 match esr.read_as_enum(ESR_EL1::EC) {
-                    Some(ESR_EL1::EC::Value::SVC64) => ReturnReason::Syscall,
+                    Some(ESR_EL1::EC::Value::SVC64) => {
+                        use core::sync::atomic::{AtomicUsize, Ordering};
+                        static AICP_SVC_LOGS: AtomicUsize = AtomicUsize::new(0);
+                        let sysno = self.tf.x[8];
+                        let n = AICP_SVC_LOGS.fetch_add(1, Ordering::Relaxed);
+                        if n < 256 {
+                            warn!(
+                                "AICP_AARCH64_SVC64 n={} sysno={} x0={:#x} x1={:#x} x2={:#x} \
+                                 elr={:#x}",
+                                n, sysno, self.tf.x[0], self.tf.x[1], self.tf.x[2], self.tf.elr
+                            );
+                        }
+                        ReturnReason::Syscall
+                    }
                     Some(ESR_EL1::EC::Value::InstrAbortLowerEL) if is_valid_page_fault(iss) => {
                         ReturnReason::PageFault(
                             va!(far),

@@ -1,0 +1,28 @@
+// Copyright 2026 The TGOSKits Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
+/dts-v1/;
+/plugin/;
+
+/ {
+    fragment@0 {
+        target-path = "/";
+
+        __overlay__ {
+            #address-cells = <2>;
+            #size-cells = <2>;
+
+            reserved-memory {
+                #address-cells = <2>;
+                #size-cells = <2>;
+                ranges;
+
+                freertos@d0000000 {
+                    reg = <0x0 0xd0000000 0x0 0x08000000>;
+                    no-map;
+                };
+            };
+        };
+    };
+};
