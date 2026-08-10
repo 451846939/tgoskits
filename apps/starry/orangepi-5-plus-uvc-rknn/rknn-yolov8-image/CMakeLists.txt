@@ -10,6 +10,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_INSTALL_RPATH "$ORIGIN/lib")
 
 set(RKNN_IMAGE_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
+set(AICP_INCLUDE_DIR ${RKNN_IMAGE_ROOT}/../../../ai-rtos-demo/aicp)
+set(AICP_CLIENT_SOURCE ${AICP_INCLUDE_DIR}/aicp_client.c)
 set(TARGET_SOC rk3588 CACHE STRING "Rockchip target SoC")
 
 add_subdirectory(3rdparty)
@@ -47,6 +49,15 @@ add_executable(uvc_capture_mjpeg_selftest
     cpp/uvc_capture.cc
     cpp/uvc_capture_layout.cc
     cpp/uvc_capture_mjpeg_selftest.cc
+)
+
+add_executable(rknn_yolov8_aicp
+    ${AICP_CLIENT_SOURCE}
+    cpp/aicp_main.cc
+    cpp/aicp_bridge.cc
+    cpp/detection_validation.cc
+    cpp/postprocess.cc
+    cpp/rknpu2/yolov8.cc
 )
 
 target_include_directories(rknn_yolov8_image PRIVATE
@@ -93,6 +104,14 @@ endif()
 add_test(NAME uvc_capture_layout_selftest COMMAND uvc_capture_layout_selftest)
 add_test(NAME uvc_capture_mjpeg_selftest COMMAND uvc_capture_mjpeg_selftest)
 
+target_include_directories(rknn_yolov8_aicp PRIVATE
+    ${RKNN_IMAGE_ROOT}/cpp
+    ${RKNN_IMAGE_ROOT}/utils
+    ${AICP_INCLUDE_DIR}
+    ${LIBRKNNRT_INCLUDES}
+    ${LIBJPEG_INCLUDES}
+)
+
 target_link_libraries(rknn_yolov8_image
     imageutils
     fileutils
@@ -117,6 +136,14 @@ target_link_libraries(rknn_yolov8_bench
     dl
 )
 
+target_link_libraries(rknn_yolov8_aicp
+    imageutils
+    fileutils
+    ${LIBRKNNRT}
+    ${LIBJPEG}
+    dl
+)
+
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set(THREADS_PREFER_PTHREAD_FLAG ON)
     find_package(Threads REQUIRED)
@@ -124,10 +151,12 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_libraries(rknn_yolov8_stream Threads::Threads)
     target_link_libraries(rknn_yolov8_bench Threads::Threads)
     target_link_libraries(uvc_capture_mjpeg_selftest PRIVATE dl)
+    target_link_libraries(rknn_yolov8_aicp Threads::Threads)
 endif()
 
 install(TARGETS rknn_yolov8_image DESTINATION .)
 install(TARGETS rknn_yolov8_stream DESTINATION .)
 install(TARGETS rknn_yolov8_bench DESTINATION .)
+install(TARGETS rknn_yolov8_aicp DESTINATION .)
 install(DIRECTORY model DESTINATION .)
 install(DIRECTORY validation DESTINATION . OPTIONAL)

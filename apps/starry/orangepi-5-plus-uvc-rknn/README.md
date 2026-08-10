@@ -18,6 +18,7 @@ The board rootfs must contain:
 - `/rknn_yolov8_image/rknn_yolov8_image`
 - `/rknn_yolov8_image/rknn_yolov8_stream`
 - `/rknn_yolov8_image/rknn_yolov8_bench`
+- `/rknn_yolov8_image/rknn_yolov8_aicp`
 - `/rknn_yolov8_image/lib/librknnrt.so`
 - `/rknn_yolov8_image/lib/librga.so`
 - `/rknn_yolov8_image/model/yolov8.rknn`
@@ -48,6 +49,12 @@ Build the image runner:
 
 ```bash
 apps/starry/orangepi-5-plus-uvc-rknn/build-image-runner.sh
+```
+
+如果 macOS 本机没有 glibc 版 aarch64 交叉工具链，推荐直接用 Docker 构建。脚本会优先使用本机已有的 `clion-ubuntu:24.04`，否则回退到 `ubuntu:24.04` 并在容器内安装最小交叉编译依赖：
+
+```bash
+apps/starry/orangepi-5-plus-uvc-rknn/build-image-runner-docker.sh
 ```
 
 Install it into the board Linux rootfs:
@@ -95,6 +102,25 @@ The validation command must print:
 
 ```text
 UVC_RKNN_VALIDATE_PASS images=3
+```
+
+使用固定 YOLOv8 验证图片运行 AI/RTOS AICP 控制演示：
+
+```bash
+ssh orangepi@${BOARD_IP} '
+  cd /rknn_yolov8_image &&
+  export LD_LIBRARY_PATH=/rknn_yolov8_image/lib:/usr/local/lib:/usr/lib/aarch64-linux-gnu:$LD_LIBRARY_PATH &&
+  printf "%s\n" orangepi | sudo -E -S \
+    ./rknn_yolov8_aicp --model model/yolov8.rknn --label model/coco_80_labels_list.txt \
+      --image-list validation/images.txt --aicp-host 10.0.3.2 --aicp-port 8800 \
+      --target-class 32 --min-confidence 25
+'
+```
+
+使用 `--dry-run` 可以只验证 YOLOv8 检测和控制参数映射，不向 RTOS AICP 服务端发送网络流量：
+
+```bash
+./rknn_yolov8_aicp --image-list validation/images.txt --target-class 32 --dry-run
 ```
 
 Linux-side 60-second benchmark smoke can be shortened during setup:
