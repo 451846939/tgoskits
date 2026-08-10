@@ -415,9 +415,7 @@ mod tests {
     };
     use crate::{
         GuestPhysAddr,
-        config::{
-            AxVMConfig, AxVMConfigParams, HostDeviceAssignment, PhysCpuList, RamdiskInfo,
-        },
+        config::{AxVMConfig, AxVMConfigParams, HostDeviceAssignment, PhysCpuList, RamdiskInfo},
     };
 
     fn prop_u32(name: &str, value: u32) -> Property {
