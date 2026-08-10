@@ -24,7 +24,7 @@ use axpoll::PollSet;
 use smoltcp::{
     storage::PacketBuffer,
     time::Instant,
-    wire::{IpAddress, Ipv4Cidr},
+    wire::{EthernetAddress, IpAddress, Ipv4Cidr},
 };
 
 use crate::config::InterfaceId;
@@ -85,6 +85,9 @@ pub trait Device: Send + Sync {
     fn arp_entries(&self, _timestamp: Instant) -> Vec<ArpEntry> {
         Vec::new()
     }
+
+    /// Installs a static IPv4 neighbor entry on link-layer devices.
+    fn set_static_arp(&mut self, _ip: IpAddress, _mac: EthernetAddress, _timestamp: Instant) {}
 
     /// Returns the device readiness poll set when the device has a wake source.
     ///

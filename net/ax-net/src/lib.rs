@@ -76,7 +76,7 @@ use core::{
     time::Duration,
 };
 
-use ax_errno::{AxError, AxResult, ax_err_type};
+use ax_errno::{AxError, AxResult, ax_err, ax_err_type};
 use ax_sync::Mutex;
 use ax_task::{IrqNotify, WaitQueue};
 use axpoll::{IoEvents, PollSet};
@@ -228,8 +228,15 @@ pub fn init_network(mut net_devs: EthernetDeviceList, config: NetworkConfig) {
         let gateway = static_ip.and_then(|cfg| {
             (!cfg.gateway.is_unspecified()).then(|| Ipv4Address::from(cfg.gateway.octets()))
         });
-        let dhcp_enabled = cfg.is_none_or(|cfg| cfg.dhcp);
-        let eth_dev = router.add_device(id, Box::new(EthernetDevice::new(name.clone(), dev, ipv4)));
+        let dhcp_enabled = cfg.map_or(!config.strict_unmatched, |cfg| cfg.dhcp);
+        let eth_dev = if config.poll_only {
+            router.add_device(
+                id,
+                Box::new(EthernetDevice::new_polling(name.clone(), dev, ipv4)),
+            )
+        } else {
+            router.add_device(id, Box::new(EthernetDevice::new(name.clone(), dev, ipv4)))
+        };
 
         info!("{name}:");
         info!("  id:   {}", id.get());
@@ -308,6 +315,9 @@ pub fn init_network(mut net_devs: EthernetDeviceList, config: NetworkConfig) {
     NET_CONTROL.call_once(|| control);
     SERVICE.call_once(|| Mutex::new(service));
     get_service().register_device_waker(&NET_POLL_DEVICE_WAKER);
+    if config.poll_only {
+        get_service().wake_all_devices();
+    }
     ax_task::spawn_with_name(net_poll_worker, "net-poll".to_owned());
     if dhcp_enabled {
         wait_for_dhcp_bootstrap();
@@ -530,6 +540,49 @@ pub fn interface_by_id(id: InterfaceId) -> Option<InterfaceInfo> {
 /// Returns the IPv4 configuration for an interface by name.
 pub fn ipv4_config(name: &str) -> Option<Ipv4InterfaceConfig> {
     get_control().ipv4_config(name)
+}
+
+/// Assigns a static IPv4 address to an existing interface at runtime.
+pub fn configure_static_ipv4(
+    name: &str,
+    ip: [u8; 4],
+    prefix_len: u8,
+    gateway: Option<[u8; 4]>,
+) -> AxResult<()> {
+    if prefix_len > 32 {
+        return ax_err!(InvalidInput, "invalid IPv4 prefix length");
+    }
+    {
+        let mut service = get_service();
+        service.configure_static_ipv4(
+            name,
+            Ipv4Address::from(ip),
+            prefix_len,
+            gateway.map(Ipv4Address::from),
+        )?;
+    }
+    request_poll();
+    Ok(())
+}
+
+/// Updates the administrative UP/RUNNING state of an existing interface.
+pub fn set_interface_up(name: &str, up: bool) -> AxResult<()> {
+    {
+        let mut service = get_service();
+        service.set_interface_up(name, up)?;
+    }
+    request_poll();
+    Ok(())
+}
+
+/// Installs a static ARP/neighbor entry on an Ethernet interface.
+pub fn configure_static_arp(name: &str, ip: [u8; 4], mac: [u8; 6]) -> AxResult<()> {
+    {
+        let mut service = get_service();
+        service.set_static_arp(name, Ipv4Address::from(ip), EthernetAddress(mac))?;
+    }
+    request_poll();
+    Ok(())
 }
 
 /// Returns public snapshots of configured IPv4 default routes.

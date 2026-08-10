@@ -35,6 +35,17 @@ impl UdpSocket {
         api::ax_udp_peer_addr(&self.0)
     }
 
+    /// Moves this UDP socket into or out of nonblocking mode.
+    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        api::ax_udp_set_nonblocking(&self.0, nonblocking)
+    }
+
+    /// Returns whether this UDP socket is currently readable or writable.
+    pub fn poll_readiness(&self) -> io::Result<(bool, bool)> {
+        let state = api::ax_udp_poll(&self.0)?;
+        Ok((state.readable, state.writable))
+    }
+
     /// Receives a single datagram message on the socket. On success, returns
     /// the number of bytes read and the origin.
     pub fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {

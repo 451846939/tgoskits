@@ -103,6 +103,11 @@ pub struct NetworkConfig {
     pub interfaces: Vec<InterfaceConfig>,
     /// DNS servers used when no interface-level DNS server is available.
     pub default_dns_servers: Vec<Ipv4Addr>,
+    /// If true, devices without a matching interface config stay unconfigured.
+    pub strict_unmatched: bool,
+    /// If true, Ethernet devices are driven by the net worker's polling wakeup
+    /// path instead of platform Ethernet IRQ registration.
+    pub poll_only: bool,
 }
 
 /// Per-interface network configuration.

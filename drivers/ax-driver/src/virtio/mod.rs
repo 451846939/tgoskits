@@ -23,6 +23,34 @@ pub const MMIO_DEVICE_NAME: &str = "virtio-mmio";
 
 pub struct VirtIoHalImpl(PhantomData<()>);
 
+fn sync_shared_buffer(buffer: NonNull<[u8]>, direction: BufferDirection, for_device: bool) {
+    let ptr = buffer.as_ptr() as *mut u8;
+    let len = buffer.len();
+    if len == 0 {
+        return;
+    }
+
+    let Some(ptr) = NonNull::new(ptr) else {
+        return;
+    };
+
+    match (direction, for_device) {
+        (BufferDirection::DriverToDevice, true) => {
+            dma_api::DmaOp::flush(axklib::dma::op(), ptr, len);
+        }
+        (BufferDirection::DeviceToDriver, true) => {
+            dma_api::DmaOp::invalidate(axklib::dma::op(), ptr, len);
+        }
+        (BufferDirection::Both, true) => {
+            dma_api::DmaOp::flush_invalidate(axklib::dma::op(), ptr, len);
+        }
+        (BufferDirection::DeviceToDriver | BufferDirection::Both, false) => {
+            dma_api::DmaOp::invalidate(axklib::dma::op(), ptr, len);
+        }
+        (BufferDirection::DriverToDevice, false) => {}
+    }
+}
+
 pub const fn has_static_mmio_drivers() -> bool {
     cfg!(any(
         feature = "virtio-blk",
@@ -57,12 +85,15 @@ unsafe impl VirtIoHal for VirtIoHalImpl {
             .expect("failed to map VirtIO MMIO")
     }
 
-    unsafe fn share(buffer: NonNull<[u8]>, _direction: BufferDirection) -> VirtIoPhysAddr {
+    unsafe fn share(buffer: NonNull<[u8]>, direction: BufferDirection) -> VirtIoPhysAddr {
         let vaddr = buffer.as_ptr() as *mut u8 as usize;
-        axklib::mem::virt_to_phys(vaddr.into()).as_usize() as VirtIoPhysAddr
+        let paddr = axklib::mem::virt_to_phys(vaddr.into()).as_usize() as VirtIoPhysAddr;
+        sync_shared_buffer(buffer, direction, true);
+        paddr
     }
 
-    unsafe fn unshare(_paddr: VirtIoPhysAddr, _buffer: NonNull<[u8]>, _direction: BufferDirection) {
+    unsafe fn unshare(_paddr: VirtIoPhysAddr, buffer: NonNull<[u8]>, direction: BufferDirection) {
+        sync_shared_buffer(buffer, direction, false);
     }
 }
 

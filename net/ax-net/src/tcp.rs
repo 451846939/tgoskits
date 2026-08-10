@@ -497,6 +497,7 @@ impl SocketOps for TcpSocket {
         let remote_addr = remote_addr.into_ip()?;
         self.start_connect(remote_addr)?;
         request_poll();
+        crate::poll_until_idle();
 
         // Here our state must be `CONNECTING`, and only one thread can run here.
         self.general.send_poller(self, || {
@@ -905,6 +906,8 @@ const fn empty_endpoint() -> IpListenEndpoint {
 impl TcpSocket {
     /// Starts an active open and leaves completion to the net-poll worker.
     fn start_connect(&self, remote_addr: SocketAddr) -> AxResult {
+        info!("AICP_TCP start_connect_enter remote={remote_addr}");
+        warn!("AICP_TCP start_connect_enter remote={remote_addr}");
         self.state
             .lock(State::Idle)
             .map_err(|state| {
@@ -929,14 +932,48 @@ impl TcpSocket {
 
                 // Fill source address if unbound or bound to 0.0.0.0
                 if bound_endpoint.addr.is_none_or(|addr| addr.is_unspecified()) {
-                    bound_endpoint.addr = Some(
-                        get_control()
-                            .select_route_with_binding(
-                                &remote_endpoint.addr,
-                                self.general.device_binding(),
-                            )?
-                            .source,
+                    info!(
+                        "AICP_TCP route_lookup remote={} binding={:?}",
+                        remote_endpoint,
+                        self.general.device_binding()
                     );
+                    warn!(
+                        "AICP_TCP route_lookup remote={} binding={:?}",
+                        remote_endpoint,
+                        self.general.device_binding()
+                    );
+                    match get_control().select_route_with_binding(
+                        &remote_endpoint.addr,
+                        self.general.device_binding(),
+                    ) {
+                        Ok(route) => {
+                            info!(
+                                "AICP_TCP route_ok remote={} source={} next_hop={} if={:?} dev={} \
+                                 metric={}",
+                                remote_endpoint,
+                                route.source,
+                                route.next_hop,
+                                route.interface_id,
+                                route.dev,
+                                route.metric
+                            );
+                            warn!(
+                                "AICP_TCP route_ok remote={} source={} next_hop={} if={:?} dev={} \
+                                 metric={}",
+                                remote_endpoint,
+                                route.source,
+                                route.next_hop,
+                                route.interface_id,
+                                route.dev,
+                                route.metric
+                            );
+                            bound_endpoint.addr = Some(route.source);
+                        }
+                        Err(err) => {
+                            warn!("AICP_TCP route_err remote={} err={err:?}", remote_endpoint);
+                            return Err(err);
+                        }
+                    }
                 }
                 if bound_endpoint.port == 0 {
                     bound_endpoint.port = get_ephemeral_port()?;
@@ -962,6 +999,14 @@ impl TcpSocket {
                         Ok::<(), AxError>(())
                     })
                 })?;
+                info!(
+                    "AICP_TCP start_connect_armed local={} remote={}",
+                    bound_endpoint, remote_endpoint
+                );
+                warn!(
+                    "AICP_TCP start_connect_armed local={} remote={}",
+                    bound_endpoint, remote_endpoint
+                );
                 *self.bound_endpoint.lock() = bound_endpoint;
 
                 // Only set device binding if was originally unbound or bound to 0.0.0.0

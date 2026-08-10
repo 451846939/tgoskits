@@ -8,22 +8,21 @@ use core::{
 };
 
 use ax_kernel_guard::NoPreemptIrqSave;
-use rd_net::{DmaBuffer, Event, IRxQueue, ITxQueue, NetError, QueueConfig};
+use rd_net::{DmaBuffer, Event, IRxQueue, ITxQueue, Interface, NetError, QueueConfig};
 use rdrive::{DriverGeneric, PlatformDevice, probe::OnProbeError};
-#[cfg(feature = "pci")]
-use virtio_drivers::transport::DeviceType;
 use virtio_drivers::{
     Error as VirtIoError,
     device::net::VirtIONetRaw,
-    transport::{InterruptStatus, Transport},
+    transport::{DeviceType, InterruptStatus, Transport},
 };
 
-#[cfg(feature = "pci")]
-use crate::{PciIrqRequirement, binding_info_from_pci};
 use crate::{
+    BindingInfo, binding_info_from_fdt,
     net::PlatformDeviceNet,
     virtio::{self, VirtIoHalImpl, VirtIoTransport},
 };
+#[cfg(feature = "pci")]
+use crate::{PciIrqRequirement, binding_info_from_pci};
 
 const QUEUE_SIZE: usize = 64;
 const BUFFER_SIZE: usize = 2048;
@@ -35,6 +34,16 @@ crate::model_register!(
     priority: ProbePriority::DEFAULT,
     probe_kinds: &[ProbeKind::Pci {
         on_probe: probe_pci,
+    }],
+);
+
+crate::model_register!(
+    name: "VirtIO MMIO Net",
+    level: ProbeLevel::PostKernel,
+    priority: ProbePriority::DEFAULT,
+    probe_kinds: &[ProbeKind::Fdt {
+        compatibles: &["virtio,mmio"],
+        on_probe: probe_fdt,
     }],
 );
 
@@ -303,7 +312,7 @@ impl<T: VirtIoTransport> NetInner<T> {
         Some((inflight.bus_addr, packet_len))
     }
 
-    fn raw_header_len(&mut self) -> Result<usize, NetError> {
+    fn raw_header_len(&self) -> Result<usize, NetError> {
         let mut header = [0_u8; 16];
         self.raw
             .fill_buffer_header(&mut header)
@@ -372,12 +381,30 @@ fn probe_pci(mut probe: rdrive::probe::pci::ProbePci<'_>) -> Result<(), OnProbeE
     register_pci_transport(probe, transport)
 }
 
+fn probe_fdt(probe: rdrive::register::ProbeFdt<'_>) -> Result<(), OnProbeError> {
+    let (info, plat_dev) = probe.into_parts();
+    let binding = binding_info_from_fdt(&info)?;
+    let (ty, transport) = crate::virtio::probe_fdt_mmio_device(&info)?;
+    if ty != DeviceType::Network {
+        return Err(OnProbeError::NotMatch);
+    }
+    register_transport_with_info(plat_dev, transport, binding)
+}
+
 pub fn register_transport<T: Transport + 'static>(
     plat_dev: PlatformDevice,
     transport: T,
 ) -> Result<(), OnProbeError> {
+    register_transport_with_info(plat_dev, transport, BindingInfo::empty())
+}
+
+fn register_transport_with_info<T: Transport + 'static>(
+    plat_dev: PlatformDevice,
+    transport: T,
+    info: BindingInfo,
+) -> Result<(), OnProbeError> {
     let net = make_net(transport)?;
-    let irq = plat_dev.register_net("virtio-net", net);
+    let irq = plat_dev.register_net_with_info("virtio-net", net, info);
     log::info!("registered virtio network device irq={irq:?}");
     Ok(())
 }
@@ -397,11 +424,53 @@ fn register_pci_transport<T: Transport + 'static>(
 }
 
 fn make_net<T: Transport + 'static>(transport: T) -> Result<VirtIoNetDevice<T>, OnProbeError> {
-    VirtIoNetDevice::new(transport).map_err(|err| {
+    let net = VirtIoNetDevice::new(transport).map_err(|err| {
         OnProbeError::other(format!(
             "failed to initialize static VirtIO net device: {err:?}"
         ))
-    })
+    })?;
+    let mac = net.mac_address();
+    if option_env!("AX_NET_DRIVER_MAC_FILTER").is_some_and(|value| value == "1") {
+        if let Some(expected) = option_env!("AX_NET_MAC").and_then(parse_mac_filter) {
+            if mac != expected {
+                log::info!(
+                    "skip virtio network device mac={:02x?}; expected AX_NET_MAC={:02x?}",
+                    mac,
+                    expected
+                );
+                return Err(OnProbeError::NotMatch);
+            }
+        }
+    }
+    log::info!("accepted virtio network device mac={:02x?}", mac);
+    Ok(net)
+}
+
+fn parse_mac_filter(value: &str) -> Option<[u8; 6]> {
+    let mut octets = [0u8; 6];
+    let mut count = 0usize;
+    for part in value.split([':', '-']) {
+        if count >= octets.len() || part.is_empty() || part.len() > 2 {
+            return None;
+        }
+        octets[count] = parse_hex_u8(part)?;
+        count += 1;
+    }
+    (count == octets.len()).then_some(octets)
+}
+
+fn parse_hex_u8(value: &str) -> Option<u8> {
+    let mut out = 0u8;
+    for byte in value.bytes() {
+        let nibble = match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            b'A'..=b'F' => byte - b'A' + 10,
+            _ => return None,
+        };
+        out = out.checked_mul(16)?.checked_add(nibble)?;
+    }
+    Some(out)
 }
 
 fn map_net_error(err: VirtIoError) -> NetError {

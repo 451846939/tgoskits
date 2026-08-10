@@ -118,7 +118,137 @@ fn register_unix_namespace() {
 
 #[cfg(feature = "net")]
 fn parse_network_config() -> ax_net::NetworkConfig {
-    ax_net::NetworkConfig::default()
+    let Some(ip) = option_env!("AX_IP").and_then(parse_ipv4_addr) else {
+        return ax_net::NetworkConfig::default();
+    };
+    let mac_matcher = option_env!("AX_NET_MAC").and_then(parse_ethernet_addr);
+    let match_by = mac_matcher
+        .map(ax_net::InterfaceMatcher::ByMac)
+        .unwrap_or_else(|| {
+            ax_net::InterfaceMatcher::ByOrder(parse_usize(
+                option_env!("AX_NET_ORDER").unwrap_or("0"),
+                0,
+            ))
+        });
+    let name = option_env!("AX_IFACE_NAME")
+        .unwrap_or(if mac_matcher.is_some() {
+            "aicp0"
+        } else {
+            "eth0"
+        })
+        .into();
+
+    let gateway = option_env!("AX_GW")
+        .and_then(parse_ipv4_addr)
+        .unwrap_or(core::net::Ipv4Addr::UNSPECIFIED);
+    let prefix_len = option_env!("AX_PREFIX_LEN")
+        .and_then(parse_prefix_len)
+        .unwrap_or(24);
+
+    ax_net::NetworkConfig {
+        interfaces: alloc::vec![ax_net::InterfaceConfig {
+            name,
+            match_by,
+            static_ip: Some(ax_net::StaticIpConfig {
+                ip,
+                prefix_len,
+                gateway,
+            }),
+            dhcp: false,
+            metric: 100,
+            dns_servers: alloc::vec![],
+        }],
+        default_dns_servers: alloc::vec![],
+        strict_unmatched: option_env!("AX_NET_STRICT_CONFIG").is_some_and(|value| value == "1"),
+        poll_only: option_env!("AX_NET_POLL_ONLY").is_some_and(|value| value == "1"),
+    }
+}
+
+#[cfg(feature = "net")]
+fn parse_ethernet_addr(value: &str) -> Option<smoltcp::wire::EthernetAddress> {
+    let mut octets = [0u8; 6];
+    let mut count = 0usize;
+    for part in value.split([':', '-']) {
+        if count >= octets.len() || part.is_empty() || part.len() > 2 {
+            return None;
+        }
+        octets[count] = parse_u8_hex(part)?;
+        count += 1;
+    }
+    (count == octets.len()).then_some(smoltcp::wire::EthernetAddress(octets))
+}
+
+#[cfg(feature = "net")]
+fn parse_ipv4_addr(value: &str) -> Option<core::net::Ipv4Addr> {
+    let mut octets = [0u8; 4];
+    let mut count = 0usize;
+    for part in value.split('.') {
+        if count >= octets.len() {
+            return None;
+        }
+        octets[count] = parse_u8_decimal(part)?;
+        count += 1;
+    }
+    (count == octets.len()).then(|| core::net::Ipv4Addr::from(octets))
+}
+
+#[cfg(feature = "net")]
+fn parse_prefix_len(value: &str) -> Option<u8> {
+    let prefix = parse_u8_decimal(value)?;
+    (prefix <= 32).then_some(prefix)
+}
+
+#[cfg(feature = "net")]
+fn parse_usize(value: &str, default: usize) -> usize {
+    let mut out = 0usize;
+    if value.is_empty() {
+        return default;
+    }
+    for byte in value.as_bytes() {
+        if !byte.is_ascii_digit() {
+            return default;
+        }
+        out = out
+            .saturating_mul(10)
+            .saturating_add(usize::from(byte - b'0'));
+    }
+    out
+}
+
+#[cfg(feature = "net")]
+fn parse_u8_hex(value: &str) -> Option<u8> {
+    let mut out = 0u8;
+    if value.is_empty() {
+        return None;
+    }
+    for byte in value.bytes() {
+        let nibble = match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            b'A'..=b'F' => byte - b'A' + 10,
+            _ => return None,
+        };
+        out = out.checked_mul(16)?.checked_add(nibble)?;
+    }
+    Some(out)
+}
+
+#[cfg(feature = "net")]
+fn parse_u8_decimal(value: &str) -> Option<u8> {
+    let mut out = 0u16;
+    if value.is_empty() {
+        return None;
+    }
+    for byte in value.as_bytes() {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        out = out * 10 + u16::from(byte - b'0');
+        if out > u16::from(u8::MAX) {
+            return None;
+        }
+    }
+    Some(out as u8)
 }
 
 /// A wireless device that registers *after* `init_network`: its already-wrapped

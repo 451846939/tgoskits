@@ -62,7 +62,7 @@ use core::{
     task::{Context, Waker},
 };
 
-use ax_errno::{AxResult, ax_err_type};
+use ax_errno::{AxError, AxResult, ax_err_type};
 use ax_hal::time::{NANOS_PER_MICROS, TimeValue, monotonic_time_nanos, wall_time_nanos};
 use ax_kspin::SpinRwLock as RwLock;
 use ax_task::future::sleep_until;
@@ -687,6 +687,60 @@ impl Service {
         }
     }
 
+    pub fn configure_static_ipv4(
+        &mut self,
+        name: &str,
+        ip: Ipv4Address,
+        prefix_len: u8,
+        gateway: Option<Ipv4Address>,
+    ) -> AxResult<()> {
+        let dev = self.device_index(name).ok_or(AxError::NoSuchDevice)?;
+        let interface = self.interface_for_dev(dev).ok_or(AxError::NoSuchDevice)?;
+        let old_ipv4 = self
+            .dhcp
+            .iter()
+            .find(|state| state.dev == dev)
+            .and_then(|state| state.address)
+            .or(interface.ipv4);
+        self.dhcp.retain(|state| state.dev != dev);
+
+        self.commit_network_state(NetworkStateUpdate {
+            interface_id: interface.id,
+            dev,
+            metric: interface.metric,
+            old_ipv4,
+            ipv4: Some(Ipv4Cidr::new(ip, prefix_len)),
+            gateway,
+            dns_source: DnsSource::Static,
+            dns_servers: Vec::new(),
+        });
+        Ok(())
+    }
+
+    pub fn set_interface_up(&mut self, name: &str, up: bool) -> AxResult<()> {
+        let dev = self.device_index(name).ok_or(AxError::NoSuchDevice)?;
+        let interface_id = self
+            .router
+            .interface_id_for_dev(dev)
+            .ok_or(AxError::NoSuchDevice)?;
+        let mut state = self.control.state.write();
+        let interface = state
+            .interfaces
+            .iter_mut()
+            .find(|interface| interface.id == interface_id)
+            .ok_or(AxError::NoSuchDevice)?;
+        if up {
+            interface
+                .flags
+                .insert(InterfaceFlags::UP | InterfaceFlags::RUNNING);
+        } else if !interface.flags.contains(InterfaceFlags::LOOPBACK) {
+            interface
+                .flags
+                .remove(InterfaceFlags::UP | InterfaceFlags::RUNNING);
+        }
+        Ok(())
+    }
+
     /// Reconfigures one wireless device as STA and restarts DHCP on it.
     pub fn reconfigure_as_sta(&mut self, dev: usize, mac: EthernetAddress) {
         let Some(interface) = self.interface_for_dev(dev) else {
@@ -769,7 +823,8 @@ impl Service {
         // Reap orphaned TCP sockets using the SocketSet already held by poll_until_idle().
         crate::orphan::reap_orphans(timestamp, sockets);
 
-        self.router.dispatch(timestamp, sockets)
+        let dispatch_pending = self.router.dispatch(timestamp, sockets);
+        dispatch_pending
             || dhcp_poll_next
             || dhcp_server_sent
             || socket_state_changed
@@ -915,6 +970,16 @@ impl Service {
 
     pub fn arp_entries(&self) -> Vec<ArpEntry> {
         self.router.arp_entries(now())
+    }
+
+    pub fn set_static_arp(
+        &mut self,
+        name: &str,
+        ip: Ipv4Address,
+        mac: EthernetAddress,
+    ) -> AxResult<()> {
+        self.router
+            .set_static_arp(name, IpAddress::Ipv4(ip), mac, now())
     }
 
     pub fn wake_all_devices(&self) {

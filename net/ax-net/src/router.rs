@@ -48,6 +48,7 @@ use core::{
     time::Duration,
 };
 
+use ax_errno::{AxError, AxResult};
 use ax_hal::time::{NANOS_PER_MICROS, monotonic_time_nanos};
 use ax_kspin::SpinRwLock as RwLock;
 use ax_sync::Mutex;
@@ -59,8 +60,8 @@ use smoltcp::{
     storage::PacketMetadata,
     time::Instant,
     wire::{
-        IpAddress, IpCidr, IpProtocol, IpVersion, Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Packet,
-        TcpPacket,
+        EthernetAddress, IpAddress, IpCidr, IpProtocol, IpVersion, Ipv4Address, Ipv4Cidr,
+        Ipv4Packet, Ipv6Packet, TcpPacket,
     },
 };
 
@@ -75,7 +76,6 @@ use crate::{
 
 const DEVICE_RX_WORKER_BATCH: usize = 16;
 const DEVICE_RX_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(10);
-
 #[derive(Debug)]
 pub struct Rule {
     /// Destination prefix matched by this route.
@@ -688,6 +688,22 @@ impl Router {
         entries
     }
 
+    /// Installs a static ARP/neighbor entry on one named device.
+    pub fn set_static_arp(
+        &self,
+        name: &str,
+        ip: IpAddress,
+        mac: EthernetAddress,
+        timestamp: Instant,
+    ) -> AxResult<()> {
+        let dev = self.device_index(name).ok_or(AxError::NoSuchDevice)?;
+        self.devices[dev]
+            .inner
+            .lock()
+            .set_static_arp(ip, mac, timestamp);
+        Ok(())
+    }
+
     /// Registers a global device-readiness waker for all devices.
     pub fn register_device_waker(&self, waker: &core::task::Waker) {
         for device in &self.devices {
@@ -798,10 +814,6 @@ fn dispatch_unicast_packet(
 ) -> bool {
     let routes = table.read();
     let Some(route) = routes.select_route_for_source(&dst_addr, &src_addr) else {
-        warn!(
-            "No route found for source {} destination {}",
-            src_addr, dst_addr
-        );
         return false;
     };
 
@@ -809,9 +821,11 @@ fn dispatch_unicast_packet(
     if dev.interface_id == InterfaceId::LOOPBACK {
         // Loopback packets are copied directly from the TX buffer into the RX
         // buffer, bypassing per-device workers and the shared RX queue.
-        inject_loopback_rx_direct(rx_buffer, dst_addr, packet, sockets)
+        let queued = inject_loopback_rx_direct(rx_buffer, dst_addr, packet, sockets);
+        queued
     } else {
-        dev.enqueue_tx(route.next_hop, packet)
+        let queued = dev.enqueue_tx(route.next_hop, packet);
+        queued
     }
 }
 

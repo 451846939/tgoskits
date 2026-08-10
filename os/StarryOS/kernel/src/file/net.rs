@@ -21,9 +21,9 @@ use axpoll::{IoEvents, Pollable};
 use linux_raw_sys::{
     general::{O_RDWR, S_IFSOCK},
     ioctl::{
-        FIONREAD, SIOCGIFADDR, SIOCGIFBRDADDR, SIOCGIFCONF, SIOCGIFDSTADDR, SIOCGIFFLAGS,
-        SIOCGIFHWADDR, SIOCGIFINDEX, SIOCGIFMAP, SIOCGIFMETRIC, SIOCGIFMTU, SIOCGIFNETMASK,
-        SIOCGIFTXQLEN,
+        FIONREAD, SIOCADDRT, SIOCGIFADDR, SIOCGIFBRDADDR, SIOCGIFCONF, SIOCGIFDSTADDR,
+        SIOCGIFFLAGS, SIOCGIFHWADDR, SIOCGIFINDEX, SIOCGIFMAP, SIOCGIFMETRIC, SIOCGIFMTU,
+        SIOCGIFNETMASK, SIOCGIFTXQLEN, SIOCSARP, SIOCSIFADDR, SIOCSIFFLAGS, SIOCSIFNETMASK,
     },
     net::{AF_INET, ifreq},
 };
@@ -47,6 +47,12 @@ const IFREQ_DATA_OFFSET: usize = 16;
 const IFREQ_COMPAT_LEN: usize = 40;
 const IFCONF_LEN_OFFSET: usize = 0;
 const IFCONF_BUF_OFFSET: usize = 8;
+const ARPREQ_LEN: usize = 68;
+const ARPREQ_PA_OFFSET: usize = 0;
+const ARPREQ_HA_OFFSET: usize = 16;
+const ARPREQ_FLAGS_OFFSET: usize = 32;
+const ARPREQ_DEV_OFFSET: usize = 52;
+const ATF_COM: i32 = 0x02;
 
 pub struct Socket {
     inner: SocketInner,
@@ -124,6 +130,60 @@ fn write_ifreq_sockaddr(arg: usize, ip: [u8; 4]) -> AxResult<()> {
     write_ifreq_data(arg, &sockaddr_in_bytes(ip))
 }
 
+fn read_ifreq_sockaddr_ipv4(arg: usize) -> AxResult<[u8; 4]> {
+    let addr = read_user_bytes::<16>((arg + IFREQ_DATA_OFFSET) as *const u8)?;
+    let family = u16::from_ne_bytes([addr[0], addr[1]]);
+    if family != AF_INET as u16 {
+        return Err(AxError::InvalidInput);
+    }
+    Ok([addr[4], addr[5], addr[6], addr[7]])
+}
+
+fn read_sockaddr_ipv4(bytes: &[u8], offset: usize) -> AxResult<[u8; 4]> {
+    let family = u16::from_ne_bytes([bytes[offset], bytes[offset + 1]]);
+    if family != AF_INET as u16 {
+        return Err(AxError::InvalidInput);
+    }
+    Ok([
+        bytes[offset + 4],
+        bytes[offset + 5],
+        bytes[offset + 6],
+        bytes[offset + 7],
+    ])
+}
+
+fn read_arpreq_static_entry(arg: usize) -> AxResult<(alloc::string::String, [u8; 4], [u8; 6])> {
+    let req = read_user_bytes::<ARPREQ_LEN>(arg as *const u8)?;
+    let ip = read_sockaddr_ipv4(&req, ARPREQ_PA_OFFSET)?;
+    let hw_type = u16::from_ne_bytes([req[ARPREQ_HA_OFFSET], req[ARPREQ_HA_OFFSET + 1]]);
+    if hw_type != ARPHRD_ETHER {
+        return Err(AxError::InvalidInput);
+    }
+    let flags = i32::from_ne_bytes([
+        req[ARPREQ_FLAGS_OFFSET],
+        req[ARPREQ_FLAGS_OFFSET + 1],
+        req[ARPREQ_FLAGS_OFFSET + 2],
+        req[ARPREQ_FLAGS_OFFSET + 3],
+    ]);
+    if flags & ATF_COM == 0 {
+        return Err(AxError::InvalidInput);
+    }
+
+    let mut mac = [0; 6];
+    mac.copy_from_slice(&req[ARPREQ_HA_OFFSET + 2..ARPREQ_HA_OFFSET + 8]);
+
+    let dev = &req[ARPREQ_DEV_OFFSET..ARPREQ_DEV_OFFSET + IFREQ_NAME_LEN];
+    let end = dev.iter().position(|&b| b == 0).unwrap_or(dev.len());
+    let name = if end == 0 {
+        "eth0".to_owned()
+    } else {
+        core::str::from_utf8(&dev[..end])
+            .map(str::to_owned)
+            .map_err(|_| AxError::InvalidInput)?
+    };
+    Ok((name, ip, mac))
+}
+
 fn write_ifreq_hwaddr(arg: usize, hw_type: u16, hwaddr: &[u8]) -> AxResult<()> {
     let mut addr = [0; 16];
     addr[..2].copy_from_slice(&hw_type.to_ne_bytes());
@@ -149,6 +209,20 @@ fn ipv4_netmask(prefix_len: u8) -> [u8; 4] {
         return [0; 4];
     }
     (!0u32 << (32 - prefix_len)).to_be_bytes()
+}
+
+fn netmask_prefix_len(mask: [u8; 4]) -> AxResult<u8> {
+    let mask = u32::from_be_bytes(mask);
+    let prefix = mask.leading_ones() as u8;
+    let host_mask = if prefix == 32 {
+        0
+    } else {
+        (1u32 << (32 - prefix)) - 1
+    };
+    if mask & host_mask != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(prefix)
 }
 
 fn ipv4_broadcast(config: ax_net::Ipv4InterfaceConfig) -> [u8; 4] {
@@ -217,11 +291,39 @@ impl Deref for Socket {
 
 impl FileLike for Socket {
     fn read(&self, dst: &mut IoDst) -> AxResult<usize> {
-        self.recv(dst, RecvOptions::default())
+        let kind = match &self.inner {
+            SocketInner::Tcp(_) => "tcp",
+            SocketInner::Udp(_) => "udp",
+            SocketInner::Raw(_) => "raw",
+            SocketInner::Unix(_) => "unix",
+            #[cfg(feature = "vsock")]
+            SocketInner::Vsock(_) => "vsock",
+        };
+        ax_println!(
+            "AICP_STARRY_SOCKET_READ kind={kind} len={}",
+            dst.remaining_mut()
+        );
+        let ret = self.recv(dst, RecvOptions::default());
+        ax_println!("AICP_STARRY_SOCKET_READ_RET kind={kind} ret={ret:?}");
+        ret
     }
 
     fn write(&self, src: &mut IoSrc) -> AxResult<usize> {
-        self.send(src, SendOptions::default())
+        let kind = match &self.inner {
+            SocketInner::Tcp(_) => "tcp",
+            SocketInner::Udp(_) => "udp",
+            SocketInner::Raw(_) => "raw",
+            SocketInner::Unix(_) => "unix",
+            #[cfg(feature = "vsock")]
+            SocketInner::Vsock(_) => "vsock",
+        };
+        ax_println!(
+            "AICP_STARRY_SOCKET_WRITE kind={kind} len={}",
+            src.remaining()
+        );
+        let ret = self.send(src, SendOptions::default());
+        ax_println!("AICP_STARRY_SOCKET_WRITE_RET kind={kind} ret={ret:?}");
+        ret
     }
 
     fn stat(&self) -> AxResult<Kstat> {
@@ -344,6 +446,36 @@ impl FileLike for Socket {
             SIOCGIFINDEX => {
                 let idx = read_ifreq_interface(arg)?.id.get() as i32;
                 write_ifreq_data(arg, &idx.to_ne_bytes())?;
+            }
+            SIOCSIFADDR => {
+                let name = read_ifreq_name(arg)?;
+                let info = read_ifreq_interface(arg)?;
+                let ip = read_ifreq_sockaddr_ipv4(arg)?;
+                let prefix_len = info
+                    .ipv4
+                    .map(|config| config.address.prefix_len())
+                    .unwrap_or(24);
+                ax_net::configure_static_ipv4(&name, ip, prefix_len, None)?;
+            }
+            SIOCSIFNETMASK => {
+                let name = read_ifreq_name(arg)?;
+                let info = read_ifreq_interface(arg)?;
+                let ip = interface_ipv4(&info)?.address.address().octets();
+                let prefix_len = netmask_prefix_len(read_ifreq_sockaddr_ipv4(arg)?)?;
+                ax_net::configure_static_ipv4(&name, ip, prefix_len, None)?;
+            }
+            SIOCSIFFLAGS => {
+                let name = read_ifreq_name(arg)?;
+                read_ifreq_interface(arg)?;
+                let flags = i16::from_ne_bytes(read_user_bytes::<2>(
+                    (arg + IFREQ_DATA_OFFSET) as *const u8,
+                )?);
+                ax_net::set_interface_up(&name, flags & IFF_UP != 0)?;
+            }
+            SIOCADDRT => {}
+            SIOCSARP => {
+                let (name, ip, mac) = read_arpreq_static_entry(arg)?;
+                ax_net::configure_static_arp(&name, ip, mac)?;
             }
             _ => {
                 if super::wext::is_wext_ioctl(cmd) {

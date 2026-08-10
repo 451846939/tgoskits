@@ -80,8 +80,16 @@ impl Socket {
 
     fn connect(&self, addr: SocketAddr) -> LinuxResult {
         match self {
-            Socket::Udp(udpsocket) => Ok(udpsocket.lock().connect(SocketAddrEx::Ip(addr))?),
-            Socket::Tcp(tcpsocket) => Ok(tcpsocket.lock().connect(SocketAddrEx::Ip(addr))?),
+            Socket::Udp(udpsocket) => {
+                warn!("AICP_AXPOSIX socket_connect udp addr={addr}");
+                Ok(udpsocket.lock().connect(SocketAddrEx::Ip(addr))?)
+            }
+            Socket::Tcp(tcpsocket) => {
+                warn!("AICP_AXPOSIX socket_connect tcp addr={addr}");
+                let ret = tcpsocket.lock().connect(SocketAddrEx::Ip(addr));
+                warn!("AICP_AXPOSIX socket_connect tcp ret={ret:?}");
+                Ok(ret?)
+            }
         }
     }
 
@@ -334,7 +342,9 @@ pub fn sys_connect(
     );
     syscall_body!(sys_connect, {
         let addr = from_sockaddr(socket_addr, addrlen)?;
+        warn!("AICP_AXPOSIX sys_connect fd={socket_fd} addr={addr}");
         Socket::from_fd(socket_fd)?.connect(addr)?;
+        warn!("AICP_AXPOSIX sys_connect_ok fd={socket_fd} addr={addr}");
         Ok(0)
     })
 }

@@ -21,6 +21,7 @@
 //! the router before Ethernet sees the packet.
 
 use alloc::{boxed::Box, string::String, sync::Arc, vec, vec::Vec};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use ax_sync::spin::SpinNoIrq;
 use axpoll::PollSet;
@@ -42,6 +43,7 @@ use crate::{
 };
 
 const EMPTY_MAC: EthernetAddress = EthernetAddress([0; 6]);
+static AICP_ETH_RX_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 pub trait EthernetIrqRegistration: Send + Sync {}
 
@@ -108,6 +110,31 @@ struct PendingNeighbor {
     requested_at: Instant,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EthernetRxMode {
+    SharedIrq,
+    OutOfBand,
+    Polling,
+}
+
+impl EthernetRxMode {
+    const fn uses_ethernet_irq(self) -> bool {
+        !matches!(self, Self::OutOfBand)
+    }
+
+    const fn enables_device_irq(self) -> bool {
+        matches!(self, Self::SharedIrq)
+    }
+
+    const fn polls_periodically(self) -> bool {
+        matches!(self, Self::Polling)
+    }
+
+    const fn wakes_from_irq(self) -> bool {
+        matches!(self, Self::SharedIrq)
+    }
+}
+
 struct EthernetIrqState {
     irq: Option<IrqId>,
     irq_registration: spin::Once<Box<dyn EthernetIrqRegistration>>,
@@ -116,6 +143,9 @@ struct EthernetIrqState {
     /// that owns its own card interrupt and pokes the stack through
     /// `wake_net_task_irq`.
     oob_rx: bool,
+    /// Device has no usable interrupt source and relies on the net worker's
+    /// periodic polling fallback to make RX progress.
+    poll_fallback: AtomicBool,
     driver: SpinNoIrq<Box<dyn EthernetDriver>>,
     poll_ready: Arc<PollSet>,
 }
@@ -132,6 +162,11 @@ pub struct EthernetDevice {
 
 fn handle_owned_ethernet_irq(handler: &mut dyn EthernetIrqHandler) -> EthernetIrqOutcome {
     ethernet_irq_outcome(handler.handle_irq())
+}
+
+fn acknowledge_owned_ethernet_irq(handler: &mut dyn EthernetIrqHandler) -> EthernetIrqOutcome {
+    let _ = handler.handle_irq();
+    EthernetIrqOutcome::Handled
 }
 
 fn ethernet_irq_outcome(events: NetIrqEvents) -> EthernetIrqOutcome {
@@ -154,7 +189,7 @@ impl EthernetDevice {
 
     /// Creates an Ethernet adapter driven by the shared IRQ/poll path.
     pub fn new(name: String, inner: Box<dyn EthernetDriver>, ip: Option<Ipv4Cidr>) -> Self {
-        Self::new_inner(name, inner, ip, false)
+        Self::new_inner(name, inner, ip, EthernetRxMode::SharedIrq)
     }
 
     /// Like [`new`](Self::new) but for a device whose RX readiness arrives
@@ -162,22 +197,36 @@ impl EthernetDevice {
     /// IRQ framework. Such a device has no IRQ registration, so `register_waker`
     /// must still arm `poll_ready` for it.
     pub fn new_oob_rx(name: String, inner: Box<dyn EthernetDriver>, ip: Option<Ipv4Cidr>) -> Self {
-        Self::new_inner(name, inner, ip, true)
+        Self::new_inner(name, inner, ip, EthernetRxMode::OutOfBand)
+    }
+
+    /// Creates an Ethernet adapter whose data plane advances through periodic
+    /// polling while retaining an IRQ action that only acknowledges device
+    /// interrupt status. Device queue notifications remain disabled.
+    pub fn new_polling(name: String, inner: Box<dyn EthernetDriver>, ip: Option<Ipv4Cidr>) -> Self {
+        Self::new_inner(name, inner, ip, EthernetRxMode::Polling)
     }
 
     fn new_inner(
         name: String,
         mut inner: Box<dyn EthernetDriver>,
         ip: Option<Ipv4Cidr>,
-        oob_rx: bool,
+        rx_mode: EthernetRxMode,
     ) -> Self {
-        let irq = inner.irq_id();
+        let oob_rx = matches!(rx_mode, EthernetRxMode::OutOfBand);
+        let irq = rx_mode
+            .uses_ethernet_irq()
+            .then(|| inner.irq_id())
+            .flatten();
         let registrar = irq.and_then(|_| ETHERNET_IRQ_REGISTRAR.get().copied());
         let irq_handler = registrar.and_then(|_| inner.take_irq_handler());
+        let poll_fallback =
+            AtomicBool::new(rx_mode.polls_periodically() || irq.is_none() && !oob_rx);
         let inner = Arc::new(EthernetIrqState {
             irq,
             irq_registration: spin::Once::new(),
             oob_rx,
+            poll_fallback,
             driver: SpinNoIrq::new(inner),
             poll_ready: Arc::new(PollSet::new()),
         });
@@ -192,19 +241,30 @@ impl EthernetDevice {
         if let Some(irq) = inner.irq {
             if let Some(registrar) = registrar {
                 if let Some(mut irq_handler) = irq_handler {
-                    let action = EthernetIrqAction::new(move || {
-                        handle_owned_ethernet_irq(&mut *irq_handler)
-                    });
+                    let action = if rx_mode.wakes_from_irq() {
+                        EthernetIrqAction::new(move || handle_owned_ethernet_irq(&mut *irq_handler))
+                    } else {
+                        EthernetIrqAction::new(move || {
+                            acknowledge_owned_ethernet_irq(&mut *irq_handler)
+                        })
+                    };
                     match registrar.register_shared(&name, irq, action) {
                         Ok(registration) => {
                             inner.irq_registration.call_once(|| registration);
-                            inner.driver.lock().enable_irq();
+                            if rx_mode.enables_device_irq() {
+                                inner.driver.lock().enable_irq();
+                                inner.poll_fallback.store(false, Ordering::Release);
+                            } else {
+                                inner.driver.lock().disable_irq();
+                                inner.poll_fallback.store(true, Ordering::Release);
+                            }
                         }
                         Err(err) => {
                             warn!(
                                 "failed to register ethernet irq handler for {name} irq {irq:?}: \
                                  {err:?}"
                             );
+                            inner.poll_fallback.store(!oob_rx, Ordering::Release);
                         }
                     }
                 } else {
@@ -212,11 +272,13 @@ impl EthernetDevice {
                         "skip ethernet irq registration for {name} irq {irq:?}: driver did not \
                          provide an owned IRQ handler"
                     );
+                    inner.poll_fallback.store(!oob_rx, Ordering::Release);
                 }
             } else {
                 warn!(
                     "ethernet irq registrar is not installed for {name} irq {irq:?}; use polling"
                 );
+                inner.poll_fallback.store(!oob_rx, Ordering::Release);
             }
         }
 
@@ -289,6 +351,23 @@ impl EthernetDevice {
             warn!("Dropping malformed Ethernet frame");
             return false;
         };
+        if matches!(
+            repr.ethertype,
+            EthernetProtocol::Arp | EthernetProtocol::Ipv4
+        ) {
+            let count = AICP_ETH_RX_LOG_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            if count <= 16 || count.is_power_of_two() {
+                info!(
+                    "AICP_ETH_RX count={} dev={} proto={:?} src={} dst={} len={}",
+                    count,
+                    self.name,
+                    repr.ethertype,
+                    repr.src_addr,
+                    repr.dst_addr,
+                    frame.payload().len()
+                );
+            }
+        }
 
         if !repr.dst_addr.is_broadcast()
             && repr.dst_addr != EMPTY_MAC
@@ -611,14 +690,76 @@ impl Device for EthernetDevice {
             .collect()
     }
 
+    fn set_static_arp(&mut self, ip: IpAddress, mac: EthernetAddress, timestamp: Instant) {
+        if !mac.is_unicast() {
+            warn!(
+                "{}: ignoring non-unicast static ARP {} -> {}",
+                self.name, ip, mac
+            );
+            return;
+        }
+        info!("{}: static ARP {} -> {}", self.name, ip, mac);
+        self.pending_neighbors.remove(&ip);
+        self.neighbors.insert(
+            ip,
+            Neighbor {
+                hardware_address: mac,
+                expires_at: timestamp + Self::NEIGHBOR_TTL,
+            },
+        );
+    }
+
     fn readiness_poll(&self) -> Option<Arc<PollSet>> {
-        // Only expose the poll set when there is a wake source: either an IRQ
-        // registration or out-of-band RX. A pure-polling device with neither
-        // must not register here, or its waker would never be woken.
-        if self.inner.irq_registration.get().is_some() || self.inner.oob_rx {
+        // Expose the poll set when there is a wake source: an IRQ
+        // registration, out-of-band RX, or the net worker's periodic fallback
+        // for devices without a usable interrupt line.
+        if self.inner.irq_registration.get().is_some()
+            || self.inner.oob_rx
+            || self.inner.poll_fallback.load(Ordering::Acquire)
+        {
             Some(self.inner.poll_ready.clone())
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        EthernetIrqHandler, EthernetIrqOutcome, EthernetRxMode, NetIrqEvents,
+        acknowledge_owned_ethernet_irq,
+    };
+
+    struct CountingIrqHandler {
+        calls: usize,
+    }
+
+    impl EthernetIrqHandler for CountingIrqHandler {
+        fn handle_irq(&mut self) -> NetIrqEvents {
+            self.calls += 1;
+            NetIrqEvents::RX_READY
+        }
+    }
+
+    #[test]
+    fn polling_mode_keeps_irq_ack_without_enabling_device_notifications() {
+        let mode = EthernetRxMode::Polling;
+
+        assert!(mode.uses_ethernet_irq());
+        assert!(mode.polls_periodically());
+        assert!(!mode.enables_device_irq());
+        assert!(!mode.wakes_from_irq());
+    }
+
+    #[test]
+    fn polling_irq_action_acknowledges_without_requesting_worker_wakeup() {
+        let mut handler = CountingIrqHandler { calls: 0 };
+
+        assert_eq!(
+            acknowledge_owned_ethernet_irq(&mut handler),
+            EthernetIrqOutcome::Handled
+        );
+        assert_eq!(handler.calls, 1);
     }
 }
