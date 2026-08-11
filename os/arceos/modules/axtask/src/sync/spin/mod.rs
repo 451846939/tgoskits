@@ -1,12 +1,21 @@
 //! Public spin-lock types whose acquisition methods express context policy.
 
+mod base;
+#[cfg(feature = "lockdep")]
+pub(crate) mod lockdep;
+#[cfg(feature = "lock-api")]
+mod raw;
+pub(crate) mod rwlock;
+
 use core::{fmt, ptr};
 
-use crate::{
-    context::{PreemptIrqSaveState, PreemptState, RawState},
-    spin_base::{BaseSpinLock, BaseSpinLockGuard},
-    spin_rwlock::{BaseSpinRwLock, BaseSpinRwLockReadGuard, BaseSpinRwLockWriteGuard},
+#[cfg(feature = "lock-api")]
+pub use self::raw::*;
+use self::{
+    base::{BaseSpinLock, BaseSpinLockGuard},
+    rwlock::{BaseSpinRwLock, BaseSpinRwLockReadGuard, BaseSpinRwLockWriteGuard},
 };
+use crate::sync::context::{PreemptIrqSaveState, PreemptState, RawState};
 
 /// A non-sleeping mutual-exclusion lock.
 ///
@@ -17,6 +26,11 @@ use crate::{
 pub struct SpinLock<T: ?Sized>(BaseSpinLock<RawState, T>);
 
 /// A guard returned by [`SpinLock::lock`].
+///
+/// ```compile_fail
+/// fn require_send<T: Send>() {}
+/// require_send::<ax_task::sync::SpinLockGuard<'static, ()>>();
+/// ```
 pub type SpinLockGuard<'a, T> = BaseSpinLockGuard<'a, PreemptState, T>;
 
 /// A guard returned by [`SpinLock::lock_irqsave`].
@@ -42,7 +56,7 @@ impl<T> SpinLock<T> {
 
 impl<T: ?Sized> SpinLock<T> {
     #[inline(always)]
-    fn with_state<G: crate::context::GuardState>(&self) -> &BaseSpinLock<G, T> {
+    fn with_state<G: crate::sync::context::GuardState>(&self) -> &BaseSpinLock<G, T> {
         // SAFETY: `BaseSpinLock` has a stable C layout, and its guard-state
         // parameter is represented only by `PhantomData`. The atomic state,
         // lockdep map, and protected value therefore have identical addresses
@@ -51,7 +65,7 @@ impl<T: ?Sized> SpinLock<T> {
     }
 
     #[inline(always)]
-    fn with_state_mut<G: crate::context::GuardState>(&mut self) -> &mut BaseSpinLock<G, T> {
+    fn with_state_mut<G: crate::sync::context::GuardState>(&mut self) -> &mut BaseSpinLock<G, T> {
         // SAFETY: see `with_state`; the exclusive borrow prevents aliases.
         unsafe { &mut *(ptr::from_mut(&mut self.0) as *mut BaseSpinLock<G, T>) }
     }
@@ -181,9 +195,19 @@ impl<T: fmt::Debug> fmt::Debug for SpinLock<T> {
 pub struct SpinRwLock<T: ?Sized>(BaseSpinRwLock<RawState, T>);
 
 /// A read guard returned by [`SpinRwLock::read`].
+///
+/// ```compile_fail
+/// fn require_send<T: Send>() {}
+/// require_send::<ax_task::sync::SpinRwLockReadGuard<'static, ()>>();
+/// ```
 pub type SpinRwLockReadGuard<'a, T> = BaseSpinRwLockReadGuard<'a, PreemptState, T>;
 
 /// A write guard returned by [`SpinRwLock::write`].
+///
+/// ```compile_fail
+/// fn require_send<T: Send>() {}
+/// require_send::<ax_task::sync::SpinRwLockWriteGuard<'static, ()>>();
+/// ```
 pub type SpinRwLockWriteGuard<'a, T> = BaseSpinRwLockWriteGuard<'a, PreemptState, T>;
 
 /// An IRQ-save read guard.
@@ -215,14 +239,14 @@ impl<T> SpinRwLock<T> {
 
 impl<T: ?Sized> SpinRwLock<T> {
     #[inline(always)]
-    fn with_state<G: crate::context::GuardState>(&self) -> &BaseSpinRwLock<G, T> {
+    fn with_state<G: crate::sync::context::GuardState>(&self) -> &BaseSpinRwLock<G, T> {
         // SAFETY: identical to `SpinLock::with_state`; the generic parameter
         // is represented only by `PhantomData` in a stable C layout.
         unsafe { &*(ptr::from_ref(&self.0) as *const BaseSpinRwLock<G, T>) }
     }
 
     #[inline(always)]
-    fn with_state_mut<G: crate::context::GuardState>(&mut self) -> &mut BaseSpinRwLock<G, T> {
+    fn with_state_mut<G: crate::sync::context::GuardState>(&mut self) -> &mut BaseSpinRwLock<G, T> {
         // SAFETY: see `with_state`; the exclusive borrow prevents aliases.
         unsafe { &mut *(ptr::from_mut(&mut self.0) as *mut BaseSpinRwLock<G, T>) }
     }
@@ -385,7 +409,7 @@ mod tests {
     };
 
     use super::{SpinLock, SpinRwLock};
-    use crate::context::host_context_snapshot;
+    use crate::sync::context::host_context_snapshot;
 
     #[test]
     fn spin_lock_acquisition_method_selects_context_policy() {
