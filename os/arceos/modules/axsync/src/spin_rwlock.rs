@@ -8,12 +8,12 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use ax_kernel_guard::BaseGuard;
 #[cfg(feature = "lockdep")]
-use ax_kernel_guard::IrqSave;
+use crate::IrqSaveGuard;
+use crate::context::GuardState;
 
 #[cfg(feature = "lockdep")]
-type LockdepAcquire = crate::lockdep::Lockdep;
+type LockdepAcquire = crate::spin_lockdep::Lockdep;
 
 #[cfg(not(feature = "lockdep"))]
 #[derive(Clone, Copy)]
@@ -23,7 +23,7 @@ struct LockdepAcquire;
 impl LockdepAcquire {
     #[inline(always)]
     #[track_caller]
-    fn prepare<G: BaseGuard, T: ?Sized>(_lock: &BaseSpinRwLock<G, T>, _is_try: bool) -> Self {
+    fn prepare<G: GuardState, T: ?Sized>(_lock: &BaseSpinRwLock<G, T>, _is_try: bool) -> Self {
         Self
     }
 
@@ -41,16 +41,17 @@ const MAX_READER: usize = 1 << (usize::BITS - 2);
 /// lock never sleeps; failed acquisitions spin until the state changes. The
 /// guard `G` controls the atomic context used while the lock is held, matching
 /// [`BaseSpinLock`](crate::BaseSpinLock).
-pub struct BaseSpinRwLock<G: BaseGuard, T: ?Sized> {
+#[repr(C)]
+pub struct BaseSpinRwLock<G: GuardState, T: ?Sized> {
     _phantom: PhantomData<G>,
     state: AtomicUsize,
     #[cfg(feature = "lockdep")]
-    lockdep: crate::lockdep::LockdepMap,
+    lockdep: crate::spin_lockdep::LockdepMap,
     data: UnsafeCell<T>,
 }
 
 /// A guard that provides shared data access.
-pub struct BaseSpinRwLockReadGuard<'a, G: BaseGuard, T: ?Sized + 'a> {
+pub struct BaseSpinRwLockReadGuard<'a, G: GuardState, T: ?Sized + 'a> {
     _phantom: &'a PhantomData<G>,
     guard_state: G::State,
     #[cfg(feature = "lockdep")]
@@ -60,7 +61,7 @@ pub struct BaseSpinRwLockReadGuard<'a, G: BaseGuard, T: ?Sized + 'a> {
 }
 
 /// A guard that provides exclusive data access.
-pub struct BaseSpinRwLockWriteGuard<'a, G: BaseGuard, T: ?Sized + 'a> {
+pub struct BaseSpinRwLockWriteGuard<'a, G: GuardState, T: ?Sized + 'a> {
     _phantom: &'a PhantomData<G>,
     guard_state: G::State,
     #[cfg(feature = "lockdep")]
@@ -69,10 +70,10 @@ pub struct BaseSpinRwLockWriteGuard<'a, G: BaseGuard, T: ?Sized + 'a> {
     state: &'a AtomicUsize,
 }
 
-unsafe impl<G: BaseGuard, T: ?Sized + Send> Send for BaseSpinRwLock<G, T> {}
-unsafe impl<G: BaseGuard, T: ?Sized + Send + Sync> Sync for BaseSpinRwLock<G, T> {}
+unsafe impl<G: GuardState, T: ?Sized + Send> Send for BaseSpinRwLock<G, T> {}
+unsafe impl<G: GuardState, T: ?Sized + Send + Sync> Sync for BaseSpinRwLock<G, T> {}
 
-impl<G: BaseGuard, T> BaseSpinRwLock<G, T> {
+impl<G: GuardState, T> BaseSpinRwLock<G, T> {
     /// Creates a new [`BaseSpinRwLock`] wrapping the supplied data.
     #[inline(always)]
     #[track_caller]
@@ -81,7 +82,7 @@ impl<G: BaseGuard, T> BaseSpinRwLock<G, T> {
             _phantom: PhantomData,
             state: AtomicUsize::new(0),
             #[cfg(feature = "lockdep")]
-            lockdep: crate::lockdep::LockdepMap::new(),
+            lockdep: crate::spin_lockdep::LockdepMap::new(),
             data: UnsafeCell::new(data),
         }
     }
@@ -94,10 +95,10 @@ impl<G: BaseGuard, T> BaseSpinRwLock<G, T> {
     }
 }
 
-impl<G: BaseGuard, T: ?Sized> BaseSpinRwLock<G, T> {
+impl<G: GuardState, T: ?Sized> BaseSpinRwLock<G, T> {
     #[cfg(feature = "lockdep")]
     #[inline(always)]
-    pub(crate) fn lockdep_map(&self) -> &crate::lockdep::LockdepMap {
+    pub(crate) fn lockdep_map(&self) -> &crate::spin_lockdep::LockdepMap {
         &self.lockdep
     }
 
@@ -121,7 +122,7 @@ impl<G: BaseGuard, T: ?Sized> BaseSpinRwLock<G, T> {
                 "spin-rwlock",
                 self.lock_addr(),
                 is_try,
-                crate::lockdep::DEFAULT_LOCK_SUBCLASS,
+                crate::spin_lockdep::DEFAULT_LOCK_SUBCLASS,
                 track_task_lock,
             )
         }
@@ -136,7 +137,7 @@ impl<G: BaseGuard, T: ?Sized> BaseSpinRwLock<G, T> {
     fn finish_lockdep(lockdep: LockdepAcquire, acquired: bool) {
         #[cfg(feature = "lockdep")]
         {
-            let _lockdep_irq_guard = IrqSave::new();
+            let _lockdep_irq_guard = IrqSaveGuard::new();
             lockdep.finish(acquired);
         }
 
@@ -262,26 +263,6 @@ impl<G: BaseGuard, T: ?Sized> BaseSpinRwLock<G, T> {
         self.state.load(Ordering::Acquire) & WRITER != 0
     }
 
-    /// Returns the current reader count.
-    ///
-    /// This is only a heuristic; the value can change immediately after it is
-    /// loaded and must not be used for synchronization.
-    #[inline(always)]
-    pub fn reader_count(&self) -> usize {
-        // sync-lint: ignore suspicious_relaxed_mixed_ordering
-        self.state.load(Ordering::Relaxed) & !(WRITER | MAX_READER)
-    }
-
-    /// Returns the current writer count, which can only be 0 or 1.
-    ///
-    /// This is only a heuristic; the value can change immediately after it is
-    /// loaded and must not be used for synchronization.
-    #[inline(always)]
-    pub fn writer_count(&self) -> usize {
-        // sync-lint: ignore suspicious_relaxed_mixed_ordering
-        usize::from(self.state.load(Ordering::Relaxed) & WRITER != 0)
-    }
-
     /// Force decrement the reader count.
     ///
     /// # Safety
@@ -309,31 +290,17 @@ impl<G: BaseGuard, T: ?Sized> BaseSpinRwLock<G, T> {
                 Ok(_) => {
                     #[cfg(feature = "lockdep")]
                     {
-                        let _lockdep_irq_guard = IrqSave::new();
-                        crate::lockdep::release_trace_only::<G>("spin-rwlock", self.lock_addr());
+                        let _lockdep_irq_guard = IrqSaveGuard::new();
+                        crate::spin_lockdep::release_trace_only::<G>(
+                            "spin-rwlock",
+                            self.lock_addr(),
+                        );
                     }
                     return;
                 }
                 Err(observed) => state = observed,
             }
         }
-    }
-
-    /// Force unlock exclusive write access.
-    ///
-    /// # Safety
-    ///
-    /// This is unsafe if called without a corresponding leaked write guard or
-    /// while readers are present.
-    #[inline(always)]
-    pub unsafe fn force_write_unlock(&self) {
-        debug_assert_eq!(self.state.load(Ordering::Relaxed), WRITER);
-        #[cfg(feature = "lockdep")]
-        {
-            let _lockdep_irq_guard = IrqSave::new();
-            crate::lockdep::release_kind::<G>("spin-rwlock", self.lock_addr());
-        }
-        self.state.fetch_and(!WRITER, Ordering::Release);
     }
 
     /// Returns a mutable reference to the underlying data.
@@ -343,21 +310,21 @@ impl<G: BaseGuard, T: ?Sized> BaseSpinRwLock<G, T> {
     }
 }
 
-impl<G: BaseGuard, T: Default> Default for BaseSpinRwLock<G, T> {
+impl<G: GuardState, T: Default> Default for BaseSpinRwLock<G, T> {
     #[inline(always)]
     fn default() -> Self {
         Self::new(Default::default())
     }
 }
 
-impl<G: BaseGuard, T> From<T> for BaseSpinRwLock<G, T> {
+impl<G: GuardState, T> From<T> for BaseSpinRwLock<G, T> {
     #[inline(always)]
     fn from(value: T) -> Self {
         Self::new(value)
     }
 }
 
-impl<G: BaseGuard, T: ?Sized + fmt::Debug> fmt::Debug for BaseSpinRwLock<G, T> {
+impl<G: GuardState, T: ?Sized + fmt::Debug> fmt::Debug for BaseSpinRwLock<G, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.try_read() {
             Some(guard) => f
@@ -369,7 +336,7 @@ impl<G: BaseGuard, T: ?Sized + fmt::Debug> fmt::Debug for BaseSpinRwLock<G, T> {
     }
 }
 
-impl<G: BaseGuard, T: ?Sized> Deref for BaseSpinRwLockReadGuard<'_, G, T> {
+impl<G: GuardState, T: ?Sized> Deref for BaseSpinRwLockReadGuard<'_, G, T> {
     type Target = T;
 
     #[inline(always)]
@@ -378,26 +345,26 @@ impl<G: BaseGuard, T: ?Sized> Deref for BaseSpinRwLockReadGuard<'_, G, T> {
     }
 }
 
-impl<G: BaseGuard, T: ?Sized + fmt::Debug> fmt::Debug for BaseSpinRwLockReadGuard<'_, G, T> {
+impl<G: GuardState, T: ?Sized + fmt::Debug> fmt::Debug for BaseSpinRwLockReadGuard<'_, G, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(&**self, f)
     }
 }
 
-impl<G: BaseGuard, T: ?Sized> Drop for BaseSpinRwLockReadGuard<'_, G, T> {
+impl<G: GuardState, T: ?Sized> Drop for BaseSpinRwLockReadGuard<'_, G, T> {
     #[inline(always)]
     fn drop(&mut self) {
         #[cfg(feature = "lockdep")]
         {
-            let _lockdep_irq_guard = IrqSave::new();
-            crate::lockdep::release_trace_only::<G>("spin-rwlock", self.lock_addr);
+            let _lockdep_irq_guard = IrqSaveGuard::new();
+            crate::spin_lockdep::release_trace_only::<G>("spin-rwlock", self.lock_addr);
         }
         self.state.fetch_sub(READER, Ordering::Release);
         G::release(self.guard_state);
     }
 }
 
-impl<G: BaseGuard, T: ?Sized> Deref for BaseSpinRwLockWriteGuard<'_, G, T> {
+impl<G: GuardState, T: ?Sized> Deref for BaseSpinRwLockWriteGuard<'_, G, T> {
     type Target = T;
 
     #[inline(always)]
@@ -406,26 +373,26 @@ impl<G: BaseGuard, T: ?Sized> Deref for BaseSpinRwLockWriteGuard<'_, G, T> {
     }
 }
 
-impl<G: BaseGuard, T: ?Sized> DerefMut for BaseSpinRwLockWriteGuard<'_, G, T> {
+impl<G: GuardState, T: ?Sized> DerefMut for BaseSpinRwLockWriteGuard<'_, G, T> {
     #[inline(always)]
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe { &mut *self.data }
     }
 }
 
-impl<G: BaseGuard, T: ?Sized + fmt::Debug> fmt::Debug for BaseSpinRwLockWriteGuard<'_, G, T> {
+impl<G: GuardState, T: ?Sized + fmt::Debug> fmt::Debug for BaseSpinRwLockWriteGuard<'_, G, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(&**self, f)
     }
 }
 
-impl<G: BaseGuard, T: ?Sized> Drop for BaseSpinRwLockWriteGuard<'_, G, T> {
+impl<G: GuardState, T: ?Sized> Drop for BaseSpinRwLockWriteGuard<'_, G, T> {
     #[inline(always)]
     fn drop(&mut self) {
         #[cfg(feature = "lockdep")]
         {
-            let _lockdep_irq_guard = IrqSave::new();
-            crate::lockdep::release_kind::<G>("spin-rwlock", self.lock_addr);
+            let _lockdep_irq_guard = IrqSaveGuard::new();
+            crate::spin_lockdep::release_kind::<G>("spin-rwlock", self.lock_addr);
         }
         self.state.fetch_and(!WRITER, Ordering::Release);
         G::release(self.guard_state);
@@ -442,7 +409,7 @@ mod tests {
         thread,
     };
 
-    type RwLock<T> = crate::SpinRawRwLock<T>;
+    type RwLock<T> = crate::SpinRwLock<T>;
 
     #[test]
     fn readers_can_share() {
@@ -462,7 +429,17 @@ mod tests {
         *writer = 2;
 
         assert!(lock.try_read().is_none());
-        assert!(lock.try_write().is_none());
+        #[cfg(feature = "lockdep")]
+        {
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lock.try_write()))
+                    .is_err()
+            );
+        }
+        #[cfg(not(feature = "lockdep"))]
+        {
+            assert!(lock.try_write().is_none());
+        }
         drop(writer);
 
         assert_eq!(*lock.read(), 2);
@@ -482,30 +459,16 @@ mod tests {
     }
 
     #[test]
-    fn force_read_decrement_releases_leaked_reader() {
+    fn force_read_decrement_raw_releases_leaked_reader_without_changing_context() {
         let lock = RwLock::new(());
-        let guard = lock.read();
+        let guard = unsafe { lock.read_raw() };
         core::mem::forget(guard);
 
-        assert_eq!(lock.reader_count(), 1);
         assert!(lock.try_write().is_none());
+        assert_eq!(crate::host_preempt_depth(), 0);
 
-        unsafe { lock.force_read_decrement() };
-        assert_eq!(lock.reader_count(), 0);
-        assert!(lock.try_write().is_some());
-    }
-
-    #[test]
-    fn force_read_decrement_without_reader_does_not_poison_state() {
-        let lock = RwLock::new(());
-        let guard = lock.read();
-        core::mem::forget(guard);
-
-        unsafe { lock.force_read_decrement() };
-        assert_eq!(lock.reader_count(), 0);
-
-        unsafe { lock.force_read_decrement() };
-        assert_eq!(lock.reader_count(), 0);
+        unsafe { lock.force_read_decrement_raw() };
+        assert_eq!(crate::host_preempt_depth(), 0);
         assert!(lock.try_write().is_some());
     }
 
@@ -644,7 +607,7 @@ pub(crate) fn rwlock_lockdep_and_feature_config_hold_for_test() -> bool {
     // Test LockdepAcquire behavior based on feature flag
     #[cfg(feature = "lockdep")]
     {
-        // With lockdep feature, LockdepAcquire is crate::lockdep::Lockdep
+        // With lockdep feature, LockdepAcquire is crate::spin_lockdep::Lockdep
         let _acquire = LockdepAcquire;
     }
 

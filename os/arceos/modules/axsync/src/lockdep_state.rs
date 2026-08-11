@@ -5,16 +5,11 @@ use core::{
     ptr,
     sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering},
 };
-#[cfg(any(
-    test,
-    doctest,
-    all(not(target_os = "none"), not(feature = "task-context"))
-))]
+#[cfg(any(test, doctest, all(feature = "host-test", not(target_os = "none"))))]
 use std::cell::RefCell;
 
-#[cfg(feature = "task-context")]
+#[cfg(not(any(test, doctest, all(feature = "host-test", not(target_os = "none")))))]
 use ax_crate_interface::call_interface;
-use ax_kernel_guard::IrqSave;
 
 const MAX_LOCK_CLASSES: usize = 1024;
 const MAX_HELD_LOCKS: usize = 32;
@@ -324,17 +319,15 @@ impl fmt::Display for HeldLockStackDisplay<'_> {
     }
 }
 
-#[cfg(any(
-    test,
-    doctest,
-    all(not(target_os = "none"), not(feature = "task-context"))
-))]
+#[cfg(any(test, doctest, all(feature = "host-test", not(target_os = "none"))))]
 std::thread_local! {
     static HELD_LOCKS: RefCell<HeldLockStack> = const { RefCell::new(HeldLockStack::new()) };
 }
 
 #[ax_crate_interface::def_interface]
-pub trait KspinLockdepIf {
+pub trait LockdepOps {
+    fn irq_save_and_disable() -> usize;
+    fn irq_restore(state: usize);
     fn collect_current_task_held_locks(snapshot: &mut HeldLockSnapshot);
     fn push_current_task_held_lock(held: HeldLock);
     fn pop_current_task_held_lock(lock_addr: usize);
@@ -517,6 +510,7 @@ impl LockGraph {
         }
     }
 
+    #[cfg(test)]
     fn record_acquire(
         &mut self,
         held_before: &HeldLockSnapshot,
@@ -544,12 +538,14 @@ struct GraphState {
 unsafe impl Sync for GraphState {}
 
 struct GraphGuard {
-    _irq_guard: IrqSave,
+    #[cfg(not(any(test, doctest, all(feature = "host-test", not(target_os = "none")))))]
+    irq_state: usize,
 }
 
 impl GraphGuard {
     fn acquire() -> Self {
-        let irq_guard = IrqSave::new();
+        #[cfg(not(any(test, doctest, all(feature = "host-test", not(target_os = "none")))))]
+        let irq_state = call_interface!(LockdepOps::irq_save_and_disable);
         while GRAPH_STATE
             .lock
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -560,7 +556,8 @@ impl GraphGuard {
             }
         }
         Self {
-            _irq_guard: irq_guard,
+            #[cfg(not(any(test, doctest, all(feature = "host-test", not(target_os = "none")))))]
+            irq_state,
         }
     }
 }
@@ -568,6 +565,8 @@ impl GraphGuard {
 impl Drop for GraphGuard {
     fn drop(&mut self) {
         GRAPH_STATE.lock.store(false, Ordering::Release);
+        #[cfg(not(any(test, doctest, all(feature = "host-test", not(target_os = "none")))))]
+        call_interface!(LockdepOps::irq_restore, self.irq_state);
     }
 }
 
@@ -680,67 +679,47 @@ fn class_key_to_location(class_key: *const Location<'static>) -> &'static Locati
     unsafe { &*class_key }
 }
 
-#[cfg(any(
-    test,
-    doctest,
-    all(not(target_os = "none"), not(feature = "task-context"))
-))]
+#[cfg(any(test, doctest, all(feature = "host-test", not(target_os = "none"))))]
 fn with_current_task_held_locks<R>(f: impl FnOnce(&HeldLockStack) -> R) -> R {
     HELD_LOCKS.with(|held_locks| f(&held_locks.borrow()))
 }
 
-#[cfg(any(
-    test,
-    doctest,
-    all(not(target_os = "none"), not(feature = "task-context"))
-))]
+#[cfg(any(test, doctest, all(feature = "host-test", not(target_os = "none"))))]
 fn with_current_task_held_locks_mut<R>(f: impl FnOnce(&mut HeldLockStack) -> R) -> R {
     HELD_LOCKS.with(|held_locks| f(&mut held_locks.borrow_mut()))
 }
 
-#[cfg(all(feature = "task-context", not(any(test, doctest))))]
+#[cfg(not(any(test, doctest, all(feature = "host-test", not(target_os = "none")))))]
 fn collect_current_task_held_locks(snapshot: &mut HeldLockSnapshot) {
-    call_interface!(KspinLockdepIf::collect_current_task_held_locks, snapshot);
+    call_interface!(LockdepOps::collect_current_task_held_locks, snapshot);
 }
 
-#[cfg(any(
-    test,
-    doctest,
-    all(not(target_os = "none"), not(feature = "task-context"))
-))]
+#[cfg(any(test, doctest, all(feature = "host-test", not(target_os = "none"))))]
 fn collect_current_task_held_locks(snapshot: &mut HeldLockSnapshot) {
     with_current_task_held_locks(|stack| snapshot.extend(stack));
 }
 
-#[cfg(all(feature = "task-context", not(any(test, doctest))))]
+#[cfg(not(any(test, doctest, all(feature = "host-test", not(target_os = "none")))))]
 fn push_current_task_held_lock(held: HeldLock) {
-    call_interface!(KspinLockdepIf::push_current_task_held_lock, held);
+    call_interface!(LockdepOps::push_current_task_held_lock, held);
 }
 
-#[cfg(any(
-    test,
-    doctest,
-    all(not(target_os = "none"), not(feature = "task-context"))
-))]
+#[cfg(any(test, doctest, all(feature = "host-test", not(target_os = "none"))))]
 fn push_current_task_held_lock(held: HeldLock) {
     with_current_task_held_locks_mut(|stack| stack.push(held));
 }
 
-#[cfg(all(feature = "task-context", not(any(test, doctest))))]
+#[cfg(not(any(test, doctest, all(feature = "host-test", not(target_os = "none")))))]
 fn pop_current_task_held_lock(lock_addr: usize) {
-    call_interface!(KspinLockdepIf::pop_current_task_held_lock, lock_addr);
+    call_interface!(LockdepOps::pop_current_task_held_lock, lock_addr);
 }
 
-#[cfg(any(
-    test,
-    doctest,
-    all(not(target_os = "none"), not(feature = "task-context"))
-))]
+#[cfg(any(test, doctest, all(feature = "host-test", not(target_os = "none"))))]
 fn pop_current_task_held_lock(lock_addr: usize) {
     with_current_task_held_locks_mut(|stack| stack.pop_checked(lock_addr));
 }
 
-#[cfg(all(feature = "task-context", not(any(test, doctest))))]
+#[cfg(not(any(test, doctest, all(feature = "host-test", not(target_os = "none")))))]
 fn lockdep_fatal(message: fmt::Arguments<'_>) -> ! {
     let _oops_guard = axpanic::enter_oops();
 
@@ -757,12 +736,11 @@ fn lockdep_fatal(message: fmt::Arguments<'_>) -> ! {
     let _ = fmt::Write::write_fmt(&mut writer, message);
     let _ = fmt::Write::write_str(&mut writer, "\n");
     emergency_write_str("lockdep fatal violation\n");
-    call_interface!(KspinLockdepIf::fatal)
+    call_interface!(LockdepOps::fatal)
 }
 
 #[cfg(all(
-    feature = "task-context",
-    not(any(test, doctest)),
+    not(any(test, doctest, all(feature = "host-test", not(target_os = "none")))),
     target_arch = "riscv64"
 ))]
 fn emergency_write_str(s: &str) {
@@ -775,19 +753,14 @@ fn emergency_write_str(s: &str) {
 }
 
 #[cfg(all(
-    feature = "task-context",
-    not(any(test, doctest)),
+    not(any(test, doctest, all(feature = "host-test", not(target_os = "none")))),
     not(target_arch = "riscv64")
 ))]
 fn emergency_write_str(s: &str) {
-    call_interface!(KspinLockdepIf::console_write_str, s);
+    call_interface!(LockdepOps::console_write_str, s);
 }
 
-#[cfg(any(
-    test,
-    doctest,
-    all(not(target_os = "none"), not(feature = "task-context"))
-))]
+#[cfg(any(test, doctest, all(feature = "host-test", not(target_os = "none"))))]
 fn lockdep_fatal(message: fmt::Arguments<'_>) -> ! {
     panic!("{message}")
 }
@@ -796,23 +769,6 @@ pub fn current_task_held_lock_snapshot() -> HeldLockSnapshot {
     let mut snapshot = HeldLockSnapshot::new();
     collect_current_task_held_locks(&mut snapshot);
     snapshot
-}
-
-pub fn prepare_acquire_with_snapshot(
-    map: &LockdepMap,
-    lock_kind: &'static str,
-    addr: usize,
-    caller: &'static Location<'static>,
-    held_before: HeldLockSnapshot,
-) -> PreparedAcquire {
-    prepare_acquire_with_snapshot_nested(
-        map,
-        lock_kind,
-        addr,
-        caller,
-        held_before,
-        DEFAULT_LOCK_SUBCLASS,
-    )
 }
 
 pub fn prepare_acquire_with_snapshot_nested(
@@ -857,6 +813,7 @@ pub fn prepare_acquire_with_snapshot_nested_with_sleep(
     })
 }
 
+#[cfg(test)]
 pub fn prepare_acquire_with_snapshot_checked(
     map: &LockdepMap,
     _lock_kind: &'static str,
@@ -874,6 +831,7 @@ pub fn prepare_acquire_with_snapshot_checked(
     )
 }
 
+#[cfg(test)]
 pub fn prepare_acquire_with_snapshot_checked_nested(
     map: &LockdepMap,
     _lock_kind: &'static str,
@@ -987,6 +945,7 @@ fn conflicting_held_lock(
     lockdep_fatal(format_args!("{empty_message}"))
 }
 
+#[cfg(test)]
 pub fn finish_acquire_with_stack(
     prepared: PreparedAcquire,
     addr: usize,
@@ -1006,6 +965,7 @@ pub fn finish_acquire_task(prepared: PreparedAcquire, addr: usize) {
     });
 }
 
+#[cfg(test)]
 pub fn release_from_stack(lock_addr: usize, held_locks: &mut HeldLockStack) {
     held_locks.pop_checked(lock_addr);
 }
