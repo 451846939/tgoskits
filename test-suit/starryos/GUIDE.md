@@ -80,6 +80,15 @@ test-suit/starryos/
 `qemu/system` 是统一的 SMP4 聚合 QEMU case。`qemu/` 根目录只放四架构 build
 config，不放 `qemu-*.toml`。
 
+### AArch64 CI 启动 smoke
+
+AArch64 CI 在运行 `cargo xtask starry test qemu --arch aarch64` 前，会先执行一次
+带 `--smp 4` 的普通 `starry qemu` 启动，并通过
+`os/StarryOS/configs/qemu/qemu-aarch64-gicv2-boot.toml` 显式选择 GICv2 和 SMP4。
+这个 smoke 等待四个 CPU 完成启动并进入 shell 后输出唯一成功标记，用来
+覆盖 test-suit 的 GICv3/SMP4 配置没有覆盖到的普通 GICv2 启动路径；它不是
+`test-suit/starryos/` 下的可发现 case。
+
 ## qemu/system 聚合
 
 `qemu/system/qemu-*.toml` 共用一次 StarryOS 启动，在 SMP4 配置下运行所有系统类
