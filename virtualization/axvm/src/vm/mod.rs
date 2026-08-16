@@ -365,7 +365,7 @@ impl VmRuntimeHandle {
     ) -> AxVmResult {
         dispatch_vcpu_interrupt_with(
             || self.irq_dispatcher.enqueue(vcpu_id, interrupt),
-            || self.notify_all(),
+            || self.notify_vcpu(vcpu_id),
             crate::host::task::send_ipi,
         )
     }
@@ -392,6 +392,15 @@ impl VmRuntimeHandle {
         self.wait_queue.wait_until(condition);
     }
 
+    pub(crate) fn wait_vcpu(&self, vcpu_id: usize) {
+        self.wait_vcpu_until(vcpu_id, || false);
+    }
+
+    pub(crate) fn wait_vcpu_until(&self, vcpu_id: usize, condition: impl Fn() -> bool) {
+        let _ = vcpu_id;
+        self.wait_queue.wait_until(condition);
+    }
+
     #[cfg(any(target_arch = "aarch64", test))]
     pub(crate) fn notification_generation(&self) -> usize {
         self.notification_generation.load(Ordering::Acquire)
@@ -409,6 +418,25 @@ impl VmRuntimeHandle {
         self.wait_queue.notify_one(false);
     }
 
+    pub(crate) fn notify_vcpu(&self, vcpu_id: usize) {
+        self.notification_generation.fetch_add(1, Ordering::Release);
+
+        #[cfg(feature = "rt-shared-wait-baseline")]
+        {
+            let _ = vcpu_id;
+            self.wait_queue.notify_all(false);
+        }
+
+        #[cfg(not(feature = "rt-shared-wait-baseline"))]
+        {
+            let _ = vcpu_id;
+            // A timer or device callback may execute on the target pCPU. In
+            // that case the following host IPI is intentionally elided, so
+            // the shared queue wake must request a local reschedule.
+            self.wait_queue.notify_all(true);
+        }
+    }
+
     pub(crate) fn notify_all(&self) {
         self.notification_generation.fetch_add(1, Ordering::Release);
         self.wait_queue.notify_all(false);
@@ -417,7 +445,7 @@ impl VmRuntimeHandle {
     /// Publishes pending device work before waking the primary vCPU.
     pub(crate) fn notify_device_poll(&self) {
         self.device_poll_requested.store(true, Ordering::Release);
-        self.notify_one();
+        self.notify_vcpu(0);
     }
 
     #[cfg(any(target_arch = "aarch64", test))]
@@ -970,13 +998,11 @@ impl WakeAccessPort for AxVmDeviceAccessPorts {
                 ),
             });
         }
-        vm.with_runtime(|runtime| {
-            runtime.notify_all();
-            Ok(())
-        })
-        .map_err(|error| axdevice::DeviceManagerError::InvalidState {
-            operation: "wake vCPU from device access",
-            detail: format!("{error}"),
+        crate::runtime::vcpus::notify_vcpu(self.vm_id, vcpu_id).map_err(|error| {
+            axdevice::DeviceManagerError::InvalidState {
+                operation: "wake vCPU from device access",
+                detail: format!("{error}"),
+            }
         })
     }
 }

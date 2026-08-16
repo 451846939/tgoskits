@@ -306,7 +306,8 @@ static void legacy_set_status_bit(const struct device *dev, int bit)
 		       legacy_read32(dev, VIRTIO_MMIO_STATUS) | BIT(bit));
 }
 
-static int legacy_virtq_create(struct virtq *vq, void **queue_area, uint16_t size)
+static int legacy_virtq_create(struct virtq *vq, void **queue_area, uint16_t size,
+			       uint16_t usable_descs)
 {
 	const size_t descriptor_size = 16u * size;
 	const size_t available_size = 6u + 2u * size;
@@ -318,7 +319,8 @@ static int legacy_virtq_create(struct virtq *vq, void **queue_area, uint16_t siz
 	uint8_t *shared;
 	int ret;
 
-	if (!is_power_of_two(size) || size == 0u || size > 32768u) {
+	if (!is_power_of_two(size) || size == 0u || size > 32768u ||
+	    usable_descs == 0u || usable_descs > size) {
 		return -EINVAL;
 	}
 
@@ -347,10 +349,17 @@ static int legacy_virtq_create(struct virtq *vq, void **queue_area, uint16_t siz
 	vq->avail = (struct virtq_avail *)(shared + descriptor_size);
 	vq->used = (struct virtq_used *)(shared + used_offset);
 	vq->last_used_idx = 0u;
-	for (uint16_t i = 0; i < size; ++i) {
+	/*
+	 * The ring can be larger than the capacity selected by the function
+	 * driver, but descriptors beyond that capacity must never be offered.
+	 * Zephyr's virtio-net TX path requests one descriptor because every
+	 * packet uses the same backing buffer; exposing more permits an in-flight
+	 * packet to be overwritten and corrupts TCP handshakes.
+	 */
+	for (uint16_t i = 0; i < usable_descs; ++i) {
 		k_stack_push(&vq->free_desc_stack, i);
 	}
-	vq->free_desc_n = size;
+	vq->free_desc_n = usable_descs;
 	*queue_area = shared;
 	return 0;
 }
@@ -425,15 +434,24 @@ static int legacy_init_virtqueues(const struct device *dev, uint16_t queue_count
 		const uint16_t max_size =
 			(uint16_t)legacy_read32(dev, VIRTIO_MMIO_QUEUE_SIZE_MAX);
 		const uint16_t requested_size = enumerate(i, max_size, opaque);
+		if (requested_size == 0u || requested_size > max_size ||
+		    !is_power_of_two(requested_size)) {
+			LOG_ERR("%s queue %u requested invalid size %u (max %u)",
+				dev->name, i, requested_size, max_size);
+			ret = -EINVAL;
+			goto fail;
+		}
 		const uint16_t queue_size =
 			MIN(max_size, MAX(requested_size,
 					  AICP_VIRTIO_LEGACY_MIN_QUEUE_SIZE));
+		const uint16_t usable_descs = requested_size;
 
-		LOG_INF("legacy queue request index=%u requested=%u selected=%u max=%u",
-			i, requested_size, queue_size, max_size);
+		LOG_INF("legacy queue request index=%u requested=%u selected=%u usable=%u max=%u",
+			i, requested_size, queue_size, usable_descs, max_size);
 
 		ret = legacy_virtq_create(&data->virtqueues[i],
-					  &data->queue_areas[i], queue_size);
+					  &data->queue_areas[i], queue_size,
+					  usable_descs);
 		if (ret != 0) {
 			goto fail;
 		}

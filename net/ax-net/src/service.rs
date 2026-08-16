@@ -985,6 +985,16 @@ impl Service {
         self.router.arp_entries(now())
     }
 
+    pub fn set_static_arp_entry(
+        &self,
+        interface_id: InterfaceId,
+        ip: Ipv4Address,
+        hardware: EthernetAddress,
+    ) -> NetResult {
+        self.router
+            .set_static_neighbor(interface_id, IpAddress::Ipv4(ip), hardware)
+    }
+
     pub fn net_dev_stats(&self) -> Vec<NetDevStats> {
         self.router.net_dev_stats()
     }

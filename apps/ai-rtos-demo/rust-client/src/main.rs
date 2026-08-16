@@ -170,7 +170,9 @@ fn apply_guest_defaults(cfg: &mut Config) {
     cfg.mode = "ai".to_string();
     cfg.period_ms = 20;
     cfg.reconnect_ms = 200;
-    cfg.io_timeout_ms = 1000;
+    // QEMU serial multiplexing and a fully loaded two-guest run can stretch
+    // the response tail well beyond the host-only sub-millisecond baseline.
+    cfg.io_timeout_ms = 5000;
     cfg.connect_retries = 120;
     cfg.guest_init = true;
 }
@@ -512,6 +514,7 @@ fn transact_control(
 ) -> io::Result<(StatusPayload, u64)> {
     let payload = control_to_bytes(control);
     let start = Instant::now();
+    let request_seq = *seq;
     let header = AicpHeader::new(
         AICP_MSG_CONTROL_SET,
         AICP_FLAG_ACK_REQUIRED,
@@ -536,7 +539,20 @@ fn transact_control(
             "expected AICP STATUS",
         ));
     }
-    Ok((status_from_bytes(&rx_payload)?, rtt_ns))
+    if rx.seq != request_seq {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "AICP STATUS sequence mismatch",
+        ));
+    }
+    let status = status_from_bytes(&rx_payload)?;
+    if status.applied_seq != request_seq {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "AICP applied sequence mismatch",
+        ));
+    }
+    Ok((status, rtt_ns))
 }
 
 fn clamp(value: f32, low: f32, high: f32) -> f32 {
@@ -768,5 +784,28 @@ fn main() -> io::Result<()> {
         idle_as_init();
     } else {
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guest_timeout_covers_loaded_dual_guest_tail_latency() {
+        let mut config = Config::default();
+        apply_guest_defaults(&mut config);
+
+        assert!(config.io_timeout_ms >= 5000);
+    }
+
+    #[test]
+    fn status_payload_preserves_the_applied_sequence() {
+        let mut payload = [0u8; 24];
+        payload[20..24].copy_from_slice(&42u32.to_le_bytes());
+
+        let status = status_from_bytes(&payload).unwrap();
+
+        assert_eq!(status.applied_seq, 42);
     }
 }

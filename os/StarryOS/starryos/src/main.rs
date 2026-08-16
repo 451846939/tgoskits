@@ -8,6 +8,7 @@ use alloc::{borrow::ToOwned, vec::Vec};
 
 use ax_std as _;
 
+#[cfg(feature = "qemu-aicp-native")]
 mod native_aicp;
 
 #[cfg(feature = "nixos")]
@@ -22,8 +23,10 @@ const ENVIRON: &[&str] = &["container=starryos"];
 #[cfg(not(feature = "nixos"))]
 const ENVIRON: &[&str] = &[];
 
-#[unsafe(no_mangle)]
-extern "C" fn main() {
+#[cfg_attr(target_os = "none", unsafe(no_mangle))]
+fn main() {
+    #[cfg(feature = "qemu-aicp-native")]
+    {
     ax_log::ax_println!(
         "AICP_STARRY_MAIN_ENTER native={} target_os_none={}",
         option_env!("AICP_STARRY_NATIVE").unwrap_or("unset"),
@@ -32,6 +35,7 @@ extern "C" fn main() {
     if native_aicp::maybe_run() {
         ax_log::ax_println!("AICP_STARRY_NATIVE_EXIT");
         ax_std::process::exit(0);
+    }
     }
 
     let args = CMDLINE

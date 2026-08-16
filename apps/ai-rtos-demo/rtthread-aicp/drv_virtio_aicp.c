@@ -320,7 +320,6 @@ static rt_err_t aicp_install_virtio_net_probe(rt_uint32_t irq)
     rt_hw_interrupt_install(irq, aicp_virtio_net_isr, aicp_net_device,
                             "aicp-vnet");
     rt_hw_interrupt_umask(irq);
-
     queue_monitor = rt_thread_create("aicp-vq", aicp_virtio_queue_monitor,
                                      RT_NULL, 4096,
                                      AICP_QUEUE_MONITOR_PRIORITY, 10);
@@ -333,6 +332,15 @@ static rt_err_t aicp_install_virtio_net_probe(rt_uint32_t irq)
     rt_kprintf("AICP_RTTHREAD_IRQ_PROBE irq=%u device=%s\n",
                irq, AICP_VIRTIO_NET_DEVICE);
     return RT_EOK;
+}
+
+rt_err_t aicp_virtio_net_publish_link_up(void)
+{
+    if (aicp_net_device == RT_NULL || aicp_net_device->parent.netif == RT_NULL)
+    {
+        return -RT_EBUSY;
+    }
+    return eth_device_linkchange(&aicp_net_device->parent, RT_TRUE);
 }
 
 void aicp_virtio_net_get_stats(rt_uint32_t *irq_count,

@@ -10,10 +10,8 @@ use ax_memory_addr::PAGE_SIZE_4K;
 use ax_std::os::arceos::{api, modules};
 use axvm_types::{HostPhysAddr, HostVirtAddr};
 
-#[cfg(any(feature = "fs", feature = "host-fs"))]
-use crate::AxVmError;
 use crate::{
-    AxVmResult,
+    AxVmError, AxVmResult,
     arch::{ArchOps, CurrentArch},
     host::{HostCpu, HostMemory, HostPlatform, HostTime},
 };
@@ -396,17 +394,16 @@ impl HostPlatform for ArceOsHost {
                 break;
             }
         }
-        CurrentArch::register_platform_irq_injector();
         let enabled_count = CORES.load(Ordering::Acquire);
         if enabled_count == cpu_count {
             info!("All cores have enabled hardware virtualization support.");
         } else {
-            warn!(
-                "Only {enabled_count}/{cpu_count} cores enabled hardware virtualization before \
-                 timeout; continuing with host CPU mask {:#x}",
-                crate::percpu::enabled_cpu_mask()
-            );
+            return Err(AxVmError::host(
+                "enable virtualization on all CPUs",
+                std::format!("only {enabled_count}/{cpu_count} CPUs completed before the timeout"),
+            ));
         }
+        CurrentArch::register_platform_irq_injector();
         Ok(())
     }
 }

@@ -6,7 +6,8 @@ cd "$workspace"
 
 objcopy="${LLVM_OBJCOPY:-}"
 if [[ -z "$objcopy" ]]; then
-    objcopy="$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/llvm-objcopy"
+    host_triple=$(rustc -vV | sed -n 's/^host: //p')
+    objcopy="$(rustc --print sysroot)/lib/rustlib/${host_triple}/bin/llvm-objcopy"
 fi
 if [[ ! -x "$objcopy" ]]; then
     echo "llvm-objcopy not found: $objcopy (set LLVM_OBJCOPY)" >&2

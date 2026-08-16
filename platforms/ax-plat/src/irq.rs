@@ -43,6 +43,18 @@ pub const LOONGARCH_EIOINTC_DOMAIN: IrqDomainId = IrqDomainId(5);
 /// LoongArch PCH-PIC interrupt domain.
 pub const LOONGARCH_PCH_PIC_DOMAIN: IrqDomainId = IrqDomainId(6);
 
+/// Result of offering an acknowledged physical IRQ to a guest.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum GuestIrqInjection {
+    /// No guest owns or accepted the interrupt.
+    NotHandled,
+    /// The guest received a software representation of the interrupt.
+    Emulated,
+    /// The guest now owns the physical active state until its virtual EOI.
+    HardwareForwarded,
+}
+
 /// Creates a legacy IRQ id without truncating the raw IRQ number.
 pub fn try_legacy_irq(raw: usize) -> Result<IrqId, IrqError> {
     let hwirq = u32::try_from(raw).map_err(|_| IrqError::InvalidIrq)?;

@@ -17,6 +17,7 @@
 #include <net/if_arp.h>
 #include <net/if.h>
 #include <netinet/in.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -113,6 +114,10 @@
 #define AICP_INIT_TCP_TIMEOUT_MS 3000u
 #endif
 
+#ifndef AICP_INIT_LINK_TIMEOUT_MS
+#define AICP_INIT_LINK_TIMEOUT_MS 30000u
+#endif
+
 #ifndef AICP_INIT_TRANSPORT
 #define AICP_INIT_TRANSPORT "tcp"
 #endif
@@ -144,6 +149,78 @@ static uint64_t monotonic_ns(void) {
 static uint64_t client_monotonic_ns(void *context) {
     (void)context;
     return monotonic_ns();
+}
+
+struct bounded_posix_stream {
+    struct aicp_stream stream;
+    int fd;
+    uint64_t io_deadline_ns;
+};
+
+static int bounded_stream_retry(struct bounded_posix_stream *stream) {
+    if (monotonic_ns() >= stream->io_deadline_ns) {
+        return -ETIMEDOUT;
+    }
+    if (sched_yield() != 0) {
+        return -errno;
+    }
+    return 0;
+}
+
+static ptrdiff_t bounded_stream_read(void *context, void *buffer, size_t length) {
+    struct bounded_posix_stream *stream = context;
+    for (;;) {
+        const ssize_t result = recv(stream->fd, buffer, length, MSG_DONTWAIT);
+        if (result >= 0) {
+            return (ptrdiff_t)result;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            return (ptrdiff_t)-errno;
+        }
+        const int retry = bounded_stream_retry(stream);
+        if (retry != 0) {
+            return retry;
+        }
+    }
+}
+
+static ptrdiff_t bounded_stream_write(void *context, const void *buffer, size_t length) {
+    struct bounded_posix_stream *stream = context;
+    for (;;) {
+        const ssize_t result = send(stream->fd, buffer, length, MSG_DONTWAIT | MSG_NOSIGNAL);
+        if (result >= 0) {
+            return (ptrdiff_t)result;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            return (ptrdiff_t)-errno;
+        }
+        const int retry = bounded_stream_retry(stream);
+        if (retry != 0) {
+            return retry;
+        }
+    }
+}
+
+static void bounded_stream_init(
+    struct bounded_posix_stream *stream,
+    int fd,
+    unsigned timeout_ms) {
+    const uint64_t now_ns = monotonic_ns();
+    const uint64_t timeout_ns = (uint64_t)timeout_ms * 1000000ull;
+
+    stream->fd = fd;
+    stream->io_deadline_ns = now_ns > UINT64_MAX - timeout_ns
+                                 ? UINT64_MAX
+                                 : now_ns + timeout_ns;
+    stream->stream.read = bounded_stream_read;
+    stream->stream.write = bounded_stream_write;
+    stream->stream.context = stream;
 }
 
 static void sleep_ms(unsigned ms) {
@@ -287,6 +364,25 @@ static int set_if_up(int ctl, const char *ifname) {
     return 0;
 }
 
+static int wait_if_running(int ctl, const char *ifname, unsigned timeout_ms) {
+    const uint64_t deadline = monotonic_ns() + (uint64_t)timeout_ms * 1000000ull;
+    for (;;) {
+        struct ifreq ifr;
+        memset(&ifr, 0, sizeof(ifr));
+        snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "%s", ifname);
+        if (ioctl(ctl, SIOCGIFFLAGS, &ifr) != 0) {
+            return -errno;
+        }
+        if ((ifr.ifr_flags & IFF_RUNNING) != 0) {
+            return 0;
+        }
+        if (monotonic_ns() >= deadline) {
+            return -ETIMEDOUT;
+        }
+        sleep_ms(10u);
+    }
+}
+
 static int parse_mac(const char *text, unsigned char out[6]) {
     unsigned values[6];
     if (sscanf(text,
@@ -370,6 +466,13 @@ static int configure_iface(void) {
         printf("AICP %s netcfg step=SIOCSIFFLAGS ret=%d\n", AICP_INIT_GUEST_LABEL, ret);
     }
     if (ret == 0) {
+        ret = wait_if_running(ctl, AICP_INIT_IFACE, AICP_INIT_LINK_TIMEOUT_MS);
+        printf("AICP %s netcfg step=WAIT_RUNNING ret=%d timeout_ms=%u\n",
+               AICP_INIT_GUEST_LABEL,
+               ret,
+               AICP_INIT_LINK_TIMEOUT_MS);
+    }
+    if (ret == 0) {
         ret = add_connected_route(ctl);
         printf("AICP %s netcfg step=SIOCADDRT ret=%d\n", AICP_INIT_GUEST_LABEL, ret);
     }
@@ -425,7 +528,7 @@ static void dump_small_file(const char *tag, const char *path) {
     printf("%s tag=%s path=%s data=%s\n", AICP_INIT_FILE_TOKEN, tag, path, buf);
 }
 
-static void dump_irq_affinity(const char *tag) {
+static void dump_irq_diagnostics(const char *tag, int include_affinity) {
     FILE *interrupts = fopen("/proc/interrupts", "re");
     if (interrupts == NULL) {
         printf("%s tag=%s path=/proc/interrupts open_errno=%d\n",
@@ -459,11 +562,13 @@ static void dump_irq_affinity(const char *tag) {
         }
         printf("%s tag=%s irq=%lu line=%s\n", AICP_INIT_NETDIAG_TOKEN, tag, irq, line);
 
-        char path[PATH_MAX];
-        snprintf(path, sizeof(path), "/proc/irq/%lu/smp_affinity_list", irq);
-        dump_small_file(tag, path);
-        snprintf(path, sizeof(path), "/proc/irq/%lu/effective_affinity_list", irq);
-        dump_small_file(tag, path);
+        if (include_affinity) {
+            char path[PATH_MAX];
+            snprintf(path, sizeof(path), "/proc/irq/%lu/smp_affinity_list", irq);
+            dump_small_file(tag, path);
+            snprintf(path, sizeof(path), "/proc/irq/%lu/effective_affinity_list", irq);
+            dump_small_file(tag, path);
+        }
     }
     fclose(interrupts);
 }
@@ -508,7 +613,10 @@ static void dump_iface_diag(const char *tag) {
            read_stat("rx_errors"));
     dump_small_file(tag, "/proc/net/route");
     dump_small_file(tag, "/proc/net/arp");
-    dump_irq_affinity(tag);
+    // Affinity is configured once and already captured before the workload.
+    // Re-reading the per-IRQ procfs files while Linux is still completing SMP
+    // startup can wait on hotplug locks and hide an otherwise successful run.
+    dump_irq_diagnostics(tag, strcmp(tag, "configured") == 0);
 }
 
 static int set_io_timeout(int fd, unsigned timeout_ms, const char **stage) {
@@ -643,9 +751,9 @@ static const struct aicp_client_ops client_ops = {
 
 static int send_hello(int fd, uint32_t *seq) {
     char payload[96];
-    struct aicp_posix_stream stream;
+    struct bounded_posix_stream stream;
 
-    aicp_posix_stream_init(&stream, fd);
+    bounded_stream_init(&stream, fd, AICP_INIT_TCP_TIMEOUT_MS);
     snprintf(payload,
              sizeof(payload),
              "{\"role\":\"%s\",\"cap\":\"ai,control,status\"}",
@@ -664,9 +772,9 @@ static int transact_control(
     const struct aicp_control_payload *control,
     struct aicp_status_payload *status,
     uint64_t *rtt_ns) {
-    struct aicp_posix_stream stream;
+    struct bounded_posix_stream stream;
 
-    aicp_posix_stream_init(&stream, fd);
+    bounded_stream_init(&stream, fd, AICP_INIT_TCP_TIMEOUT_MS);
     return aicp_client_session_transact_control(
         &stream.stream, seq, control, status, rtt_ns, &client_ops);
 }
@@ -1294,7 +1402,6 @@ int main(void) {
                 break;
             }
             printf("AICP %s connected\n", AICP_INIT_GUEST_LABEL);
-            dump_iface_diag("connected");
         }
 
         const struct aicp_control_payload control =
@@ -1328,7 +1435,6 @@ int main(void) {
                status.measured,
                status.error,
                (unsigned long long)rtt_ns);
-        printf("AICP_LINUX_FINALIZE stage=post-transaction iteration=%u\n", i);
         if (udp_mode && AICP_INIT_UDP_REORDER_TEST && i == 0) {
             ret = udp_test_stale_sequence(&udp, seq - 2u, &control);
             if (ret != 0) {
@@ -1339,27 +1445,20 @@ int main(void) {
             }
         }
         if (ok < AICP_INIT_ITERATIONS && failed < AICP_INIT_ITERATIONS) {
-            printf("AICP_LINUX_FINALIZE stage=sleep-begin ms=20\n");
             sleep_ms(20);
-            printf("AICP_LINUX_FINALIZE stage=sleep-end\n");
         }
     }
 
-    printf("AICP_LINUX_FINALIZE stage=socket-close-begin tcp_fd=%d udp_fd=%d\n",
-           fd, udp.fd);
     if (fd >= 0) {
         close(fd);
     }
     if (udp.fd >= 0) {
         close(udp.fd);
     }
-    printf("AICP_LINUX_FINALIZE stage=socket-close-end\n");
 
     uint64_t avg_rtt = ok == 0 ? 0 : total_rtt / ok;
     uint64_t test_duration_ns = monotonic_ns() - test_start_ns;
-    printf("AICP_LINUX_FINALIZE stage=cpu-stat-begin\n");
     read_cpu_stats(cpu_after);
-    printf("AICP_LINUX_FINALIZE stage=cpu-stat-end\n");
     print_cpu_usage(cpu_before, cpu_after);
     printf("AICP_LINUX_RUNTIME duration_ns=%llu iterations=%u stress_procs=%u\n",
            (unsigned long long)test_duration_ns, ok + failed, AICP_INIT_STRESS_PROCS);
@@ -1370,9 +1469,7 @@ int main(void) {
            failed,
            (unsigned long long)avg_rtt,
            (unsigned long long)max_rtt);
-    printf("AICP_LINUX_FINALIZE stage=done-print\n");
     sync();
-    printf("AICP_LINUX_FINALIZE stage=reboot\n");
     reboot(RB_POWER_OFF);
     return failed == 0 && ok > 0 ? 0 : 1;
 }

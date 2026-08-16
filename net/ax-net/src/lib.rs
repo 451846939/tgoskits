@@ -551,6 +551,22 @@ pub fn arp_entries() -> Vec<ArpEntry> {
     get_service().arp_entries()
 }
 
+/// Installs a permanent IPv4-to-Ethernet mapping on a fixed-address interface.
+///
+/// This is intended for isolated links whose topology declares both endpoint
+/// addresses, including peers that do not implement ARP on their demo network path.
+pub fn set_static_arp_entry(
+    interface_id: InterfaceId,
+    ip: Ipv4Addr,
+    hardware: [u8; 6],
+) -> NetResult {
+    get_service().set_static_arp_entry(
+        interface_id,
+        Ipv4Address::from(ip.octets()),
+        EthernetAddress(hardware),
+    )
+}
+
 /// Returns per-interface RX/TX byte and packet counters for `/proc/net/dev`.
 pub fn net_dev_stats() -> Vec<NetDevStats> {
     get_service().net_dev_stats()

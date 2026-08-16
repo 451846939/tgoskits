@@ -1,0 +1,8 @@
+# Optimized CPU-isolated profile: keep each pinned vCPU runnable across guest
+# WFI and poll its architectural timer/device state at VM-exit boundaries.
+# This removes the secondary-pCPU software-timer worker from the worst-case
+# wakeup path while physical timer IRQs still preempt and enter the vCPU loop.
+features = ["rt-poll-idle"]
+log = "Info"
+target = "aarch64-unknown-none-softfloat"
+vm_configs = []

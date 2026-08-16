@@ -3,6 +3,7 @@ use core::{
     ffi::{c_char, c_int, c_void},
     mem::size_of,
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
+    time::Duration,
 };
 
 use ax_io::PollState;
@@ -20,6 +21,22 @@ use crate::{PosixError, PosixResult, ctypes, sync::Mutex, utils::char_ptr_to_str
 pub enum Socket {
     Udp(Mutex<UdpSocket>),
     Tcp(Mutex<TcpSocket>),
+}
+
+#[derive(Clone, Copy)]
+enum SocketTimeoutKind {
+    Send,
+    Receive,
+}
+
+fn socket_timeout_from_timeval(timeout: ctypes::timeval) -> PosixResult<Duration> {
+    if timeout.tv_sec < 0 || timeout.tv_usec < 0 || timeout.tv_usec >= 1_000_000 {
+        return Err(PosixError::EINVAL);
+    }
+    Ok(Duration::new(
+        timeout.tv_sec as u64,
+        timeout.tv_usec as u32 * 1_000,
+    ))
 }
 
 impl Socket {
@@ -162,6 +179,17 @@ impl Socket {
             Socket::Tcp(tcpsocket) => Ok(tcpsocket
                 .lock()
                 .set_option(SetSocketOption::ReuseAddress(&reuse))?),
+        }
+    }
+
+    fn set_timeout(&self, kind: SocketTimeoutKind, timeout: Duration) -> PosixResult {
+        let option = match kind {
+            SocketTimeoutKind::Send => SetSocketOption::SendTimeout(&timeout),
+            SocketTimeoutKind::Receive => SetSocketOption::ReceiveTimeout(&timeout),
+        };
+        match self {
+            Socket::Udp(socket) => Ok(socket.lock().set_option(option)?),
+            Socket::Tcp(socket) => Ok(socket.lock().set_option(option)?),
         }
     }
 }
@@ -657,20 +685,18 @@ pub unsafe fn sys_setsockopt(
                     _socket.set_reuseaddr(flag != 0)?;
                     Ok(0)
                 }
-                // Accept and silently ignore timeouts — ArceOS's smoltcp
-                // stack does not track per-socket read/write timeouts, but
-                // std calls setsockopt for these during
-                // set_read_timeout / set_write_timeout.
                 ctypes::SO_RCVTIMEO | ctypes::SO_SNDTIMEO => {
-                    debug!(
-                        "sys_setsockopt: ignoring SO_{}TIMEO for fd {}",
-                        if optname == ctypes::SO_RCVTIMEO as _ {
-                            "RCV"
-                        } else {
-                            "SND"
-                        },
-                        socket_fd
-                    );
+                    if optlen < size_of::<ctypes::timeval>() as u32 {
+                        return Err(PosixError::EINVAL);
+                    }
+                    let timeout = unsafe { (optval as *const ctypes::timeval).read_unaligned() };
+                    let timeout = socket_timeout_from_timeval(timeout)?;
+                    let kind = if optname == ctypes::SO_RCVTIMEO as _ {
+                        SocketTimeoutKind::Receive
+                    } else {
+                        SocketTimeoutKind::Send
+                    };
+                    _socket.set_timeout(kind, timeout)?;
                     Ok(0)
                 }
                 ctypes::SO_LINGER | ctypes::SO_KEEPALIVE => {
@@ -713,4 +739,44 @@ pub unsafe fn sys_setsockopt(
             Err(PosixError::ENOPROTOOPT)
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn socket_timeout_timeval_converts_to_duration() {
+        let timeout = ctypes::timeval {
+            tv_sec: 3,
+            tv_usec: 250,
+        };
+        assert_eq!(
+            socket_timeout_from_timeval(timeout).unwrap(),
+            Duration::from_micros(3_000_250)
+        );
+    }
+
+    #[test]
+    fn socket_timeout_timeval_rejects_invalid_fields() {
+        for timeout in [
+            ctypes::timeval {
+                tv_sec: -1,
+                tv_usec: 0,
+            },
+            ctypes::timeval {
+                tv_sec: 0,
+                tv_usec: -1,
+            },
+            ctypes::timeval {
+                tv_sec: 0,
+                tv_usec: 1_000_000,
+            },
+        ] {
+            assert!(matches!(
+                socket_timeout_from_timeval(timeout),
+                Err(PosixError::EINVAL)
+            ));
+        }
+    }
 }

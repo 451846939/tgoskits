@@ -29,6 +29,10 @@ use crate::{
     ArmTimerVmConfig, ArmVcpuResult, ArmVcpuTimer, ArmVmExit,
 };
 
+unsafe extern "C" {
+    fn exception_vector_base_vcpu();
+}
+
 /// (v)CPU register state that must be saved or restored when entering/exiting a VM or switching
 /// between VMs.
 #[repr(C)]
@@ -247,13 +251,23 @@ impl<H: ArmHostOps> ArmVcpu<H> {
     /// Requiring the guard keeps architecture-external VGIC load/save hooks in
     /// the same IRQ-atomic transaction as guest execution.
     pub fn run(&mut self, _host_irq_guard: &ArmHostIrqGuard) -> ArmVcpuResult<ArmVmExit> {
+        if !self.timer.is_configured() || self.timer.is_loaded() {
+            return Err(crate::ArmVcpuError::BadState);
+        }
+
+        let host_vbar_el2 = VBAR_EL2.get();
+        VBAR_EL2.set(exception_vector_base_vcpu as *const () as usize as _);
+        // Publish the vCPU vector before guest system registers and the
+        // exception-return state become visible to the processor.
+        unsafe { core::arch::asm!("isb") };
         let exit_reason = unsafe {
-            if !self.timer.is_configured() || self.timer.is_loaded() {
-                return Err(crate::ArmVcpuError::BadState);
-            }
             self.restore_vm_system_regs();
             self.run_guest()
         };
+        VBAR_EL2.set(host_vbar_el2);
+        // Host Rust resumes immediately after the VM exit and must never run
+        // with the guest exception vector installed.
+        unsafe { core::arch::asm!("isb") };
 
         if self.timer.is_loaded() {
             return Err(crate::ArmVcpuError::BadState);
@@ -325,6 +339,7 @@ impl<H: ArmHostOps> ArmVcpu<H> {
         let hcr_el2 = HCR_EL2::VM::Enable
             + HCR_EL2::TSC::EnableTrapEl1SmcToEl2
             + HCR_EL2::TWI::SET
+            + HCR_EL2::TWE::SET
             + HCR_EL2::RW::EL1IsAarch64
             + HCR_EL2::IMO::EnableVirtualIRQ
             + HCR_EL2::FMO::EnableVirtualFIQ;

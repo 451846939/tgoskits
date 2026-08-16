@@ -565,6 +565,10 @@ pub(crate) fn route_acknowledged_host_irq(token: usize) -> Result<(), GicV3Backe
     physical::route_acknowledged_host_irq(token)
 }
 
+pub(crate) fn route_current_el_host_irq(irq: usize) -> Result<bool, GicV3BackendError> {
+    physical::route_current_el_host_irq(irq)
+}
+
 pub(crate) fn enable_maintenance_interrupt() -> axvm_types::VmBackendResult {
     maintenance::enable_current_cpu()
 }

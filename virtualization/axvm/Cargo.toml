@@ -16,6 +16,12 @@ host-test = [
     "ax-std/host-test",
     "axdevice/host-test",
 ]
+# Keep a dedicated vCPU runnable after guest WFI or PSCI standby. The polling
+# path relies on VM-exit timer synchronization instead of scheduling and then
+# immediately cancelling a host timer wait.
+rt-poll-idle = []
+# A/B-only fallback to the VM-wide wait queue and broadcast wake path.
+rt-shared-wait-baseline = []
 sstc = ["riscv_vcpu/sstc"]
 tls = ["ax-std/tls", "cpu-local/tls"]
 
@@ -70,6 +76,7 @@ riscv_vplic = { workspace = true }
 ax-plat = { workspace = true }
 loongarch_vcpu = { workspace = true }
 [target.'cfg(target_arch = "aarch64")'.dependencies]
+ax-plat = { workspace = true }
 aarch64-cpu-ext = "0.1"
 arm_vcpu = { workspace = true }
 arm_vgic = { workspace = true }

@@ -71,6 +71,11 @@ impl PlatOp for Plat {
 
     fn resolve_irq_source(source: IrqSource) -> Result<IrqId, IrqError> {
         match source {
+            IrqSource::ControllerLine { domain, hwirq }
+                if domain == crate::irq::AARCH64_GIC_DOMAIN =>
+            {
+                gic_irq_id_checked(hwirq)
+            }
             IrqSource::ControllerLine { domain, hwirq } if is_gic_domain(domain) => {
                 Ok(IrqId::new(domain, hwirq))
             }

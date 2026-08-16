@@ -31,10 +31,6 @@ pub struct ArmPerCpu {
     timer_frequency_hz: u64,
 }
 
-unsafe extern "C" {
-    fn exception_vector_base_vcpu();
-}
-
 impl ArmPerCpu {
     /// Creates per-CPU virtualization state.
     pub fn new(cpu_id: usize) -> ArmVcpuResult<Self> {
@@ -60,10 +56,6 @@ impl ArmPerCpu {
         // Safety:
         // Todo: take care of `preemption`
         self.original_vbar_el2 = VBAR_EL2.get();
-
-        // Set current `VBAR_EL2` to `exception_vector_base_vcpu`
-        // defined in this crate.
-        VBAR_EL2.set(exception_vector_base_vcpu as *const () as usize as _);
 
         HCR_EL2.modify(
             HCR_EL2::VM::Enable + HCR_EL2::RW::EL1IsAarch64 + HCR_EL2::TSC::EnableTrapEl1SmcToEl2,

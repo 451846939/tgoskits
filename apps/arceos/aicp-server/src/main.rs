@@ -2,6 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#[cfg(feature = "arceos")]
+use std::net::Ipv4Addr;
 use std::{
     io::{self, Read, Write},
     net::{SocketAddr, TcpListener, TcpStream, UdpSocket},
@@ -20,9 +22,15 @@ use aicp_rust_protocol::{
 use ax_std as _;
 
 const CONTROL_PERIOD_NS: u64 = 20_000_000;
+const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(3);
 const PERIODIC_REPORT_SAMPLES: usize = 128;
 const PERIODIC_SAMPLE_LOG_INTERVAL: usize = 32;
-const PERIODIC_OUTLIER_NS: u64 = 5_000_000;
+// Serial output is deliberately excluded from the normal real-time path.  A
+// low threshold creates a feedback loop in emulation: logging an outlier makes
+// the next period late enough to log again.  Fixed-interval samples preserve
+// observability, while this threshold still records genuinely exceptional
+// stalls.
+const PERIODIC_OUTLIER_NS: u64 = 100_000_000;
 
 static PERIODIC_PROBE_ACTIVE: AtomicBool = AtomicBool::new(false);
 
@@ -197,7 +205,6 @@ fn periodic_probe() {
         if samples == 1
             || samples.is_multiple_of(PERIODIC_SAMPLE_LOG_INTERVAL)
             || lateness_ns >= PERIODIC_OUTLIER_NS
-            || missed != 0
         {
             println!(
                 "AICP_RTOS_PERIODIC sample={} wake_lateness_ns={} interval_ns={} \
@@ -406,7 +413,6 @@ fn serve_udp(socket: UdpSocket) -> io::Result<()> {
                 udp_send_status(&socket, peer, &state, hdr.seq)?;
             }
             MSG_CONTROL_SET => {
-                PERIODIC_PROBE_ACTIVE.store(true, Ordering::Release);
                 let start = Instant::now();
                 let Some(control) = control_from_payload(payload) else {
                     udp_send_error(&socket, peer, hdr.seq, ERROR_BAD_PAYLOAD)?;
@@ -425,6 +431,7 @@ fn serve_udp(socket: UdpSocket) -> io::Result<()> {
                     && hdr.seq.is_multiple_of(drop_every)
                     && last_dropped_seq != Some(hdr.seq)
                 {
+                    PERIODIC_PROBE_ACTIVE.store(true, Ordering::Release);
                     last_dropped_seq = Some(hdr.seq);
                     println!(
                         "AICP UDP fault_drop seq={} drop_every={} peer={}",
@@ -433,6 +440,7 @@ fn serve_udp(socket: UdpSocket) -> io::Result<()> {
                     continue;
                 }
                 udp_send_status(&socket, peer, &state, hdr.seq)?;
+                PERIODIC_PROBE_ACTIVE.store(true, Ordering::Release);
             }
             _ => udp_send_error(&socket, peer, hdr.seq, ERROR_BAD_TYPE)?,
         }
@@ -440,6 +448,8 @@ fn serve_udp(socket: UdpSocket) -> io::Result<()> {
 }
 
 fn serve_client(mut stream: TcpStream) -> io::Result<()> {
+    stream.set_read_timeout(Some(CLIENT_IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(CLIENT_IO_TIMEOUT))?;
     let mut state = ControlState::default();
     let mut timing = TimingState::default();
     let mut payload = [0u8; MAX_PAYLOAD];
@@ -454,7 +464,6 @@ fn serve_client(mut stream: TcpStream) -> io::Result<()> {
             MSG_HELLO => println!("AICP HELLO seq={} payload_len={}", hdr.seq, len),
             MSG_HEARTBEAT => send_status(&mut stream, &state, hdr.seq)?,
             MSG_CONTROL_SET => {
-                PERIODIC_PROBE_ACTIVE.store(true, Ordering::Release);
                 let start = Instant::now();
                 let Some(control) = control_from_payload(&payload[..len]) else {
                     send_error(&mut stream, hdr.seq, ERROR_BAD_PAYLOAD)?;
@@ -468,6 +477,7 @@ fn serve_client(mut stream: TcpStream) -> io::Result<()> {
                 );
                 timing.observe(hdr.seq, start, service_ns);
                 send_status(&mut stream, &state, hdr.seq)?;
+                PERIODIC_PROBE_ACTIVE.store(true, Ordering::Release);
             }
             _ => send_error(&mut stream, hdr.seq, ERROR_BAD_TYPE)?,
         }
@@ -475,6 +485,7 @@ fn serve_client(mut stream: TcpStream) -> io::Result<()> {
 }
 
 fn main() -> io::Result<()> {
+    configure_control_interface()?;
     thread::spawn(periodic_probe);
 
     let udp = UdpSocket::bind("0.0.0.0:8800")?;
@@ -494,6 +505,25 @@ fn main() -> io::Result<()> {
             println!("AICP client closed: {err:?}");
         }
     }
+}
+
+#[cfg(feature = "arceos")]
+fn configure_control_interface() -> io::Result<()> {
+    let interface = ax_net::interface_by_name("eth0")
+        .ok_or_else(|| io::Error::other("AICP control interface eth0 was not discovered"))?;
+    let address = Ipv4Addr::new(10, 0, 3, 2);
+    ax_net::set_interface_ipv4(interface.id, address, 24)
+        .map_err(|error| io::Error::other(format!("configure AICP eth0: {error}")))?;
+    println!(
+        "AICP_RTOS_NET_READY iface=eth0 ip={address}/24 mac={:?}",
+        interface.mac
+    );
+    Ok(())
+}
+
+#[cfg(not(feature = "arceos"))]
+fn configure_control_interface() -> io::Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]

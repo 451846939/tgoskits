@@ -31,11 +31,11 @@ const KERNEL_STACK_SIZE: usize = 0x40000; // 256 KiB
 ///
 /// * `vm_id` - The ID of the VM whose VCpu wait queue is used to block the current thread.
 /// * `condition` - A closure that returns a boolean value indicating whether the condition is met.
-fn wait_for<F>(vm_vcpus: &VmRuntimeHandle, condition: F)
+fn wait_for<F>(vm_vcpus: &VmRuntimeHandle, vcpu_id: usize, condition: F)
 where
     F: Fn() -> bool,
 {
-    vm_vcpus.wait_until(condition);
+    vm_vcpus.wait_vcpu_until(vcpu_id, condition);
 }
 
 fn vcpu_start_is_ready(vm_running: bool, task_registered: bool) -> bool {
@@ -55,7 +55,7 @@ pub(crate) fn notify_primary_vcpu(vm_id: usize) {
         return;
     };
     if let Err(err) = vm.with_runtime(|runtime| {
-        runtime.notify_one();
+        runtime.notify_vcpu(0);
         Ok(())
     }) {
         warn!("VM[{vm_id}] vCPU runtime not found: {err:?}");
@@ -97,7 +97,7 @@ pub(crate) fn queue_pending_interrupt(
 
     let cpu_id = vm.with_runtime(|runtime| runtime.queue_pending_interrupt(vcpu_id, interrupt))?;
     vm.with_runtime(|runtime| {
-        runtime.notify_all();
+        runtime.notify_vcpu(vcpu_id);
         Ok(())
     })?;
     crate::host::task::send_ipi(cpu_id);
@@ -118,7 +118,7 @@ pub(crate) fn notify_vcpu(vm_id: usize, vcpu_id: usize) -> AxVmResult {
 
     let runtime = vm.with_runtime(|runtime| Ok(runtime.clone()))?;
     let cpu_id = runtime.vcpu_cpu_id(vcpu_id)?;
-    runtime.notify_all();
+    runtime.notify_vcpu(vcpu_id);
     crate::host::task::send_ipi(cpu_id);
     Ok(())
 }
@@ -439,12 +439,20 @@ fn vcpu_run() {
 
     info!("VM[{}] VCpu[{}] waiting for running", vm.id(), vcpu.id());
     let cpu_on_start_ack = runtime.cpu_on_start_ack(vcpu_id);
-    wait_for(&runtime, || {
+    let start_is_ready = || {
         vcpu_start_is_ready(vm.running(), runtime.has_vcpu_task(vcpu_id))
             || cpu_on_start_ack
                 .as_ref()
                 .is_some_and(|ack| ack.is_cancelled())
-    });
+    };
+    if !start_is_ready() {
+        // CPU_ON registration and acknowledgement are VM lifecycle events.
+        // They use the shared lifecycle queue because the spawning vCPU and
+        // the newly registered target vCPU wait on opposite sides of the same
+        // handshake. Per-vCPU queues remain reserved for guest-idle and IRQ
+        // delivery waits.
+        runtime.wait_until(start_is_ready);
+    }
 
     if let Some(ack) = &cpu_on_start_ack {
         if !ack.begin_startup() {
@@ -531,7 +539,13 @@ fn vcpu_run() {
             Ok(VcpuRunAction {
                 waits_for_event: true,
                 ..
-            }) => CurrentArch::wait_for_vcpu_event(&vm, &vcpu, &runtime),
+            }) => {
+                // This is the final policy boundary: an architecture-specific
+                // exit must not accidentally put a CPU-isolated polling vCPU
+                // back onto the host wait queue.
+                #[cfg(not(feature = "rt-poll-idle"))]
+                CurrentArch::wait_for_vcpu_event(&vm, &vcpu, &runtime);
+            }
             Ok(VcpuRunAction { .. }) => {}
             Err(err) => {
                 error!("VM[{vm_id}] run VCpu[{vcpu_id}] get error {err:?}");
@@ -549,7 +563,7 @@ fn vcpu_run() {
                 "VM[{}] VCpu[{}] is suspended, waiting for resume...",
                 vm_id, vcpu_id
             );
-            wait_for(&runtime, || !vm.suspending());
+            wait_for(&runtime, vcpu_id, || !vm.suspending());
             info!("VM[{}] VCpu[{}] resumed from suspend", vm_id, vcpu_id);
             continue;
         }
@@ -587,10 +601,13 @@ fn vcpu_run() {
             break;
         }
 
-        // AxVM may run on ArceOS's cooperative FIFO scheduler. Yield after
-        // every completed VM exit so host services such as the management
-        // console and virtual serial input can make progress alongside a
-        // continuously runnable guest.
+        // General-purpose profiles yield after every VM exit so host services
+        // can run beside a continuously runnable guest. A CPU-isolated
+        // real-time profile owns its pCPU and must keep the only vCPU task
+        // runnable: yielding the sole FIFO task can strand the pCPU in host
+        // idle with no reliable secondary-CPU wake source. Its primary-vCPU
+        // device polling is performed at the top of this loop.
+        #[cfg(not(feature = "rt-poll-idle"))]
         crate::host::task::yield_now();
     }
 

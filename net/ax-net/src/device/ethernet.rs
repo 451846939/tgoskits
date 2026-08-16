@@ -109,7 +109,7 @@ pub fn set_ethernet_irq_registrar(registrar: &'static dyn EthernetIrqRegistrar) 
 
 struct Neighbor {
     hardware_address: EthernetAddress,
-    expires_at: Instant,
+    expires_at: Option<Instant>,
 }
 
 struct PendingNeighbor {
@@ -497,7 +497,7 @@ impl EthernetDevice {
                 IpAddress::Ipv4(source_protocol_addr),
                 Neighbor {
                     hardware_address: source_hardware_addr,
-                    expires_at: now + Self::NEIGHBOR_TTL,
+                    expires_at: Some(now + Self::NEIGHBOR_TTL),
                 },
             );
 
@@ -549,7 +549,7 @@ impl EthernetDevice {
                     Keep(Vec<u8>),
                 }
                 let action = match self.neighbors.get(&next_hop) {
-                    Some(neighbor) if neighbor.expires_at > now => {
+                    Some(neighbor) if neighbor.expires_at.is_none_or(|expiry| expiry > now) => {
                         Action::Send(neighbor.hardware_address, buf.to_vec())
                     }
                     Some(_) => Action::Refresh(buf.to_vec()),
@@ -675,7 +675,7 @@ impl Device for EthernetDevice {
         }
 
         let need_request = match self.neighbors.get(&next_hop) {
-            Some(neighbor) if neighbor.expires_at > timestamp => {
+            Some(neighbor) if neighbor.expires_at.is_none_or(|expiry| expiry > timestamp) => {
                 let mut inner = self.inner.driver.lock_irqsave();
                 let frame_len = Self::send_to(
                     &mut **inner,
@@ -763,11 +763,26 @@ impl Device for EthernetDevice {
         // Neighbor/pending state above is IP-context specific and is cleared.
     }
 
+    fn set_static_neighbor(&mut self, ip: IpAddress, hardware: EthernetAddress) -> bool {
+        self.pending_neighbors.remove(&ip);
+        self.neighbors.insert(
+            ip,
+            Neighbor {
+                hardware_address: hardware,
+                expires_at: None,
+            },
+        );
+        true
+    }
+
     fn arp_entries(&self, timestamp: Instant) -> Vec<ArpEntry> {
         self.neighbors
             .iter()
             .filter_map(|(ip_addr, neighbor)| {
-                if neighbor.expires_at <= timestamp {
+                if neighbor
+                    .expires_at
+                    .is_some_and(|expiry| expiry <= timestamp)
+                {
                     return None;
                 }
                 let IpAddress::Ipv4(ip_addr) = ip_addr else {
@@ -1035,6 +1050,24 @@ mod ethernet_counter_tests {
 
         let rx_lens = device.drain_deferred_rx();
         assert_eq!(rx_lens, &[frame_len]);
+    }
+
+    #[test]
+    fn static_neighbor_sends_without_arp_resolution() {
+        let mock = MockEthernetDriver::new(DEV_MAC);
+        let mut device = make_test_device(mock);
+        let now = Instant::from_millis(0);
+
+        device.set_static_neighbor(IpAddress::Ipv4(REMOTE_IP), EthernetAddress(REMOTE_MAC));
+
+        assert!(device.send(IpAddress::Ipv4(REMOTE_IP), &[0u8; 64], now) > 0);
+        assert!(device.drain_deferred_tx().is_empty());
+        assert!(
+            device
+                .arp_entries(now)
+                .iter()
+                .any(|entry| entry.ip_addr == REMOTE_IP.octets() && entry.hw_addr == REMOTE_MAC)
+        );
     }
 
     // ── ARP TX: transmitted ARP frames are counted in drain_deferred_tx ──

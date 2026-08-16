@@ -3,7 +3,7 @@ log = "Info"
 features = [
   "qemu",
   "smp",
-  "ax-driver/virtio-blk",
+  "ax-driver/nvme",
   "ax-driver/virtio-net",
 ]
 max_cpu_num = 2

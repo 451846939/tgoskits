@@ -297,6 +297,16 @@ impl ActiveIrq {
         crate::arch::take_plic_claim(&mut self.inner)
             .map(|(context, source)| RiscvPlicClaim { context, source })
     }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn priority(&self) -> Option<u8> {
+        self.inner.priority()
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn forward_to_guest(self) -> bool {
+        self.inner.forward_to_guest()
+    }
 }
 
 /// A detached RISC-V PLIC claim whose completion may run on another CPU.
@@ -646,6 +656,24 @@ mod tests {
             alloc_irq_domain(owner_b, IrqDomainKind::AArch64Gic),
             Err(IrqError::Unsupported)
         );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn public_gic_selector_resolves_to_the_dynamic_domain() {
+        use crate::common::PlatOp;
+
+        let _guard = TEST_LOCK.lock();
+        reset_domains();
+
+        let dynamic = alloc_irq_domain(DeviceId::new(), IrqDomainKind::AArch64Gic).unwrap();
+        let resolved =
+            <crate::arch::Plat as PlatOp>::resolve_irq_source(IrqSource::ControllerLine {
+                domain: AARCH64_GIC_DOMAIN,
+                hwirq: HwIrq(35),
+            });
+
+        assert_eq!(resolved, Ok(IrqId::new(dynamic, HwIrq(35))));
     }
 
     #[test]

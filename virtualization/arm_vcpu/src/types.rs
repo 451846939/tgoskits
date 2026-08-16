@@ -273,8 +273,15 @@ pub enum ArmVmExit {
         /// retain source information until the guest deactivates the interrupt.
         token: Option<usize>,
     },
-    /// A guest WFI or WFE instruction was trapped.
+    /// A guest WFI instruction was trapped.
     WaitForInterrupt,
+    /// A guest WFE instruction was trapped.
+    ///
+    /// WFE is an architectural hint and may complete without observing an
+    /// interrupt. Embedding VMMs must not turn this exit into an unbounded
+    /// interrupt-only sleep because guest SEV events are not represented by
+    /// [`ArmVmExit::ExternalInterrupt`].
+    WaitForEvent,
     /// A guest PSCI CPU_OFF call was trapped.
     CpuDown {
         /// Guest-provided target state.

@@ -112,18 +112,31 @@ pub fn is_support_icc() -> bool {
 pub struct ActiveIrq {
     irq: rdrive::IrqId,
     ack: IntId,
+    priority: u8,
+    deactivate_on_drop: bool,
 }
 
 impl ActiveIrq {
     pub fn id(&self) -> rdrive::IrqId {
         self.irq
     }
+
+    pub fn priority(&self) -> u8 {
+        self.priority
+    }
+
+    /// Completes the host priority drop but leaves physical deactivation to
+    /// the hardware-backed virtual interrupt's guest EOI.
+    pub fn forward_to_guest(mut self) -> bool {
+        self.deactivate_on_drop = false;
+        true
+    }
 }
 
 impl Drop for ActiveIrq {
     fn drop(&mut self) {
         eoi1(self.ack);
-        if eoi_mode() {
+        if eoi_mode() && self.deactivate_on_drop {
             dir(self.ack);
         }
     }
@@ -138,6 +151,8 @@ pub fn begin_irq() -> Option<ActiveIrq> {
     Some(ActiveIrq {
         irq: (ack.to_u32() as usize).into(),
         ack,
+        priority: ICC_RPR_EL1.read(ICC_RPR_EL1::PRIORITY) as u8,
+        deactivate_on_drop: true,
     })
 }
 
@@ -161,7 +176,7 @@ pub fn irq_set_enable(irq: IrqId, enable: bool) -> Result<(), crate::irq::IrqErr
 pub fn irq_set_trigger(irq: IrqId, trigger: Trigger) -> Result<(), crate::irq::IrqError> {
     super::trigger::dispatch_trigger_configuration(
         irq.hwirq.0,
-        Some(super::its::LPI_INTID_BASE as u32),
+        Some(super::its::LPI_INTID_BASE),
         |raw| {
             let intid = checked_private_intid(raw)?;
             current_cpu_interface().set_cfg(intid, trigger);

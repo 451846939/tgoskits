@@ -1,10 +1,9 @@
-use core::time::Duration;
+use core::{hint::spin_loop, time::Duration};
 
 use ax_log::ax_println;
 use ax_std::{
     io::prelude::*,
     net::{SocketAddr, SocketAddrV4, TcpStream, UdpSocket},
-    thread,
     time::Instant,
 };
 
@@ -97,7 +96,10 @@ pub fn maybe_run() -> bool {
 
     let config = NativeConfig {
         iterations: parse_usize(option_env!("AICP_STARRY_ITERATIONS"), DEFAULT_ITERATIONS),
-        retries: parse_usize(option_env!("AICP_STARRY_UDP_RETRIES"), DEFAULT_RETRIES),
+        retries: parse_usize(
+            option_env!("AICP_STARRY_CONNECT_RETRIES"),
+            parse_usize(option_env!("AICP_STARRY_UDP_RETRIES"), DEFAULT_RETRIES),
+        ),
         mode_ai: option_env!("AICP_STARRY_MODE").unwrap_or("ai") != "fixed",
         server: SocketAddr::V4(SocketAddrV4::new(
             parse_ipv4(option_env!("AICP_STARRY_SERVER").unwrap_or("10.0.3.2")),
@@ -131,7 +133,16 @@ fn run_delayed(config: NativeConfig) {
         config.retries
     );
 
-    configure_peer_neighbor();
+    if let Err(err) = configure_control_interface() {
+        ax_println!("AICP_STARRY_NATIVE_ERROR {err}");
+        ax_println!("AICP_STARRY_DONE ok=0 failed=1 avg_rtt_ns=0 max_rtt_ns=0");
+        return;
+    }
+    if let Err(err) = configure_peer_neighbor(config.server) {
+        ax_println!("AICP_STARRY_NATIVE_ERROR {err}");
+        ax_println!("AICP_STARRY_DONE ok=0 failed=1 avg_rtt_ns=0 max_rtt_ns=0");
+        return;
+    }
 
     match run_client(&config) {
         Ok(summary) => ax_println!(
@@ -156,7 +167,9 @@ struct Summary {
 fn wait_for(duration: Duration) {
     let start = Instant::now();
     while Instant::now().duration_since(start) < duration {
-        thread::yield_now();
+        // This client runs before StarryOS enters its normal userspace task loop. A scheduler
+        // yield can therefore park the kernel entry task without a runnable peer to wake it.
+        spin_loop();
     }
 }
 
@@ -169,7 +182,6 @@ fn run_client(config: &NativeConfig) -> Result<Summary, &'static str> {
 
 fn run_udp_client(config: &NativeConfig) -> Result<Summary, &'static str> {
     let socket = UdpSocket::bind("0.0.0.0:0").map_err(|_| "bind")?;
-    socket.set_nonblocking(true).map_err(|_| "nonblocking")?;
     ax_println!("AICP_STARRY_NATIVE_BOUND local={:?}", socket.local_addr());
 
     let hello_payload = b"{\"guest\":\"StarryOS\",\"transport\":\"udp\",\"role\":\"ai-control\"}";
@@ -418,7 +430,6 @@ fn transact(
                     ));
                 }
                 Err(_) => {
-                    let _ = socket.poll_readiness();
                     wait_for(RETRY_DELAY);
                 }
             }
@@ -655,70 +666,60 @@ fn parse_ipv4(value: &str) -> ax_std::net::Ipv4Addr {
     }
 }
 
-fn configure_peer_neighbor() {
-    let iface = option_env!("AICP_STARRY_IFACE").unwrap_or("eth0");
-    let peer_ip = parse_ipv4_octets(option_env!("AICP_STARRY_SERVER").unwrap_or("10.0.3.2"));
-    let peer_mac = parse_mac(option_env!("AICP_STARRY_SERVER_MAC").unwrap_or("52:54:00:aa:03:02"));
-
-    match ax_net::configure_static_arp(iface, peer_ip, peer_mac) {
-        Ok(()) => ax_println!(
-            "AICP_STARRY_STATIC_ARP iface={} ip={}.{}.{}.{} \
-             mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            iface,
-            peer_ip[0],
-            peer_ip[1],
-            peer_ip[2],
-            peer_ip[3],
-            peer_mac[0],
-            peer_mac[1],
-            peer_mac[2],
-            peer_mac[3],
-            peer_mac[4],
-            peer_mac[5]
-        ),
-        Err(err) => ax_println!("AICP_STARRY_STATIC_ARP_ERROR iface={} err={:?}", iface, err),
+fn parse_mac(value: &str) -> Option<[u8; 6]> {
+    let mut hardware = [0u8; 6];
+    let mut parts = value.split(':');
+    for octet in &mut hardware {
+        let part = parts.next()?;
+        if part.len() != 2 {
+            return None;
+        }
+        *octet = u8::from_str_radix(part, 16).ok()?;
     }
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(hardware)
 }
 
-fn parse_ipv4_octets(value: &str) -> [u8; 4] {
-    let ip = parse_ipv4(value).octets();
-    [ip[0], ip[1], ip[2], ip[3]]
+fn configure_peer_neighbor(server: SocketAddr) -> Result<(), &'static str> {
+    let name = option_env!("AICP_STARRY_IFACE").unwrap_or("eth0");
+    let interface = ax_net::interface_by_name(name).ok_or("network-interface-not-found")?;
+    let SocketAddr::V4(server) = server else {
+        return Err("peer-address-family");
+    };
+    let hardware = parse_mac(option_env!("AICP_STARRY_SERVER_MAC").unwrap_or("52:54:00:aa:03:02"))
+        .ok_or("peer-mac")?;
+    ax_net::set_static_arp_entry(interface.id, *server.ip(), hardware)
+        .map_err(|_| "peer-neighbor-config")?;
+    ax_println!(
+        "AICP_STARRY_NEIGHBOR_STATIC iface={} ip={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        name,
+        server.ip(),
+        hardware[0],
+        hardware[1],
+        hardware[2],
+        hardware[3],
+        hardware[4],
+        hardware[5]
+    );
+    Ok(())
 }
 
-fn parse_mac(value: &str) -> [u8; 6] {
-    let mut out = [0u8; 6];
-    let mut part = 0usize;
-    let mut acc = 0u8;
-    let mut digits = 0usize;
+fn configure_control_interface() -> Result<(), &'static str> {
+    let name = option_env!("AICP_STARRY_IFACE").unwrap_or("eth0");
+    let interface = ax_net::interface_by_name(name).ok_or("network-interface-not-found")?;
+    let address = parse_ipv4(option_env!("AX_IP").unwrap_or("10.0.3.3"));
 
-    for byte in value.bytes().chain(core::iter::once(b':')) {
-        if byte == b':' || byte == b'-' {
-            if digits == 0 || part >= 6 {
-                return [0x52, 0x54, 0x00, 0xaa, 0x03, 0x02];
-            }
-            out[part] = acc;
-            part += 1;
-            acc = 0;
-            digits = 0;
-            continue;
-        }
-
-        let nibble = match byte {
-            b'0'..=b'9' => byte - b'0',
-            b'a'..=b'f' => byte - b'a' + 10,
-            b'A'..=b'F' => byte - b'A' + 10,
-            _ => return [0x52, 0x54, 0x00, 0xaa, 0x03, 0x02],
-        };
-        digits += 1;
-        if digits > 2 {
-            return [0x52, 0x54, 0x00, 0xaa, 0x03, 0x02];
-        }
-        acc = (acc << 4) | nibble;
+    if interface.ipv4.is_none() {
+        ax_net::set_interface_ipv4(interface.id, address, 24)
+            .map_err(|_| "network-interface-config")?;
     }
-
-    if part == 6 {
-        out
-    } else {
-        [0x52, 0x54, 0x00, 0xaa, 0x03, 0x02]
-    }
+    ax_println!(
+        "AICP_STARRY_NET_READY iface={} ip={}/24 mac={:?}",
+        name,
+        address,
+        interface.mac
+    );
+    Ok(())
 }

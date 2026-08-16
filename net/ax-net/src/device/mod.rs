@@ -24,7 +24,7 @@ use axpoll::PollSet;
 use smoltcp::{
     storage::PacketBuffer,
     time::Instant,
-    wire::{IpAddress, Ipv4Cidr},
+    wire::{EthernetAddress, IpAddress, Ipv4Cidr},
 };
 
 use crate::config::InterfaceId;
@@ -149,6 +149,13 @@ pub trait Device: Send + Sync {
 
     /// Updates the IPv4 address used by device-local protocol helpers.
     fn set_ipv4_addr(&mut self, _addr: Option<Ipv4Cidr>) {}
+
+    /// Installs a permanent IP-to-Ethernet mapping for an isolated fixed-address link.
+    ///
+    /// Returns `false` when the device has no Ethernet neighbor table.
+    fn set_static_neighbor(&mut self, _ip: IpAddress, _hardware: EthernetAddress) -> bool {
+        false
+    }
 
     /// Returns device-local ARP/neighbor entries for userspace queries.
     fn arp_entries(&self, _timestamp: Instant) -> Vec<ArpEntry> {

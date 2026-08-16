@@ -17,7 +17,13 @@ version = "0.5.28"
 default = []
 nixos = []
 # Runs the AICP client before the Starry user-space init process.
-qemu-aicp-native = ["ax-feat/defplat", "ax-feat/irq", "ax-feat/rtc"]
+qemu-aicp-native = [
+  "dep:ax-log",
+  "dep:ax-net",
+  "ax-std/net",
+  "ax-runtime/irq",
+  "ax-runtime/rtc",
+]
 qemu-aicp-userland = ["qemu"]
 smp-aicp-native = ["ax-runtime/smp", "axplat-dyn/smp", "ax-hal/smp"]
 qemu = [
@@ -62,13 +68,13 @@ ax-std = { workspace = true, default-features = false, features = [
   "fd",
   "ext-ld",
   "fs",
-  "net",
   "multitask",
   "irq",
 ] }
 ax-driver.workspace = true
 ax-hal.workspace = true
-ax-log.workspace = true
+ax-log = { workspace = true, optional = true }
+ax-net = { workspace = true, optional = true }
 ax-runtime = { workspace = true, features = ["ext-ld", "irq"] }
 axplat-dyn.workspace = true
 starry-kernel = { workspace = true, features = ["dev-log", "ext4"] }

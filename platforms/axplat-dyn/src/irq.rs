@@ -1,3 +1,8 @@
+#[cfg(all(target_arch = "aarch64", feature = "hv"))]
+use core::sync::atomic::{AtomicPtr, Ordering};
+
+#[cfg(all(target_arch = "aarch64", feature = "hv"))]
+use ax_plat::irq::GuestIrqInjection;
 use ax_plat::irq::{
     CpuId, IrqAffinity, IrqError, IrqId, IrqIf, IrqSource, IrqTrigger, TrapVector, dispatch_irq_on,
 };
@@ -8,6 +13,14 @@ mod loongarch64_hv;
 mod riscv64_hv;
 #[cfg(any(all(target_arch = "riscv64", feature = "hv"), test))]
 const RISCV_PLIC_SOURCE_COUNT: usize = 1024;
+
+#[cfg(all(target_arch = "aarch64", feature = "hv"))]
+static AARCH64_VIRTUAL_IRQ_INJECTOR: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
+
+#[cfg(all(target_arch = "aarch64", feature = "hv"))]
+pub fn register_aarch64_virtual_irq_injector(injector: fn(usize, u8) -> GuestIrqInjection) {
+    AARCH64_VIRTUAL_IRQ_INJECTOR.store(injector as *mut (), Ordering::Release);
+}
 
 struct IrqIfImpl;
 
@@ -79,6 +92,25 @@ impl IrqIf for IrqIfImpl {
             let cpu = current_irq_cpu();
             let outcome = dispatch_irq_on(irq, cpu);
             if !outcome.handled {
+                #[cfg(all(target_arch = "aarch64", feature = "hv"))]
+                if is_aarch64_guest_forwardable(irq) {
+                    let Some(priority) = active.priority() else {
+                        warn!("AArch64 IRQ {irq:?} has no GICv3 running priority");
+                        return Some(irq);
+                    };
+                    match inject_aarch64_virtual_irq(irq.hwirq.0 as usize, priority) {
+                        GuestIrqInjection::NotHandled => {}
+                        GuestIrqInjection::Emulated => return Some(irq),
+                        GuestIrqInjection::HardwareForwarded => {
+                            if active.forward_to_guest() {
+                                return Some(irq);
+                            }
+                            warn!("AArch64 IRQ {irq:?} cannot defer physical deactivation");
+                            return Some(irq);
+                        }
+                    }
+                }
+
                 #[cfg(all(target_arch = "loongarch64", feature = "hv"))]
                 if is_loongarch_guest_forwardable(irq)
                     && loongarch64_hv::inject_virtual_irq(irq.hwirq.0 as usize)
@@ -140,6 +172,25 @@ impl IrqIf for IrqIfImpl {
 
 fn current_irq_cpu() -> CpuId {
     CpuId(ax_plat::percpu::this_cpu_id())
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "hv"))]
+fn is_aarch64_guest_forwardable(irq: IrqId) -> bool {
+    somehal::irq::domain_is_kind(irq.domain, somehal::irq::IrqDomainKind::AArch64Gic)
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "hv"))]
+fn inject_aarch64_virtual_irq(irq: usize, priority: u8) -> GuestIrqInjection {
+    let injector = AARCH64_VIRTUAL_IRQ_INJECTOR.load(Ordering::Acquire);
+    if injector.is_null() {
+        return GuestIrqInjection::NotHandled;
+    }
+    // SAFETY: registration stores a function pointer with this exact ABI and
+    // signature. It is installed once during AxVM host initialization and is
+    // never removed while platform IRQ dispatch remains active.
+    unsafe {
+        core::mem::transmute::<*mut (), fn(usize, u8) -> GuestIrqInjection>(injector)(irq, priority)
+    }
 }
 
 #[cfg(any(all(target_arch = "riscv64", feature = "hv"), test))]

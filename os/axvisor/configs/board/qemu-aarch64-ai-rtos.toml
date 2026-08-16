@@ -1,0 +1,8 @@
+# Production demo profile. The QEMU topology dedicates one host pCPU to every
+# guest vCPU, so guest WFI uses the CPU-isolated polling policy. Physical timer
+# IRQs still follow the hardware-backed VGIC lifecycle; virtual-device work is
+# polled by the primary vCPU at the VM-exit boundary.
+features = ["rt-poll-idle"]
+log = "Info"
+target = "aarch64-unknown-none-softfloat"
+vm_configs = []

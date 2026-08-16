@@ -183,6 +183,20 @@ impl ActiveIrq {
             Self::V3(active) => active.id(),
         }
     }
+
+    pub fn priority(&self) -> Option<u8> {
+        match self {
+            Self::V2(_) => None,
+            Self::V3(active) => Some(active.priority()),
+        }
+    }
+
+    pub fn forward_to_guest(self) -> bool {
+        match self {
+            Self::V2(_) => false,
+            Self::V3(active) => active.forward_to_guest(),
+        }
+    }
 }
 
 pub fn begin_irq() -> Option<ActiveIrq> {

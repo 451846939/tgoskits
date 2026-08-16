@@ -1,5 +1,7 @@
 const EXCEPTION_ASSEMBLY: &str = include_str!("architecture/exception.S");
+const EXCEPTION: &str = include_str!("architecture/exception.rs");
 const CONTEXT_FRAME: &str = include_str!("architecture/context_frame.rs");
+const PCPU: &str = include_str!("architecture/pcpu.rs");
 const VCPU: &str = include_str!("architecture/vcpu.rs");
 
 fn section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
@@ -20,6 +22,31 @@ fn assert_in_order(source: &str, operations: &[&str]) {
             .unwrap_or_else(|| panic!("missing ordered operation {operation:?}"));
         cursor += offset + operation.len();
     }
+}
+
+#[test]
+fn trapped_wfe_is_not_reported_as_an_interrupt_wait() {
+    let wait_exit = section(
+        EXCEPTION,
+        "Some(ESR_EL2::EC::Value::TrappedWFIorWFE) => {",
+        "Some(ESR_EL2::EC::Value::DataAbortLowerEL) => {",
+    );
+
+    assert!(wait_exit.contains("ESR_EL2.read(ESR_EL2::ISS)"));
+    assert!(wait_exit.contains("ArmVmExit::WaitForEvent"));
+    assert!(wait_exit.contains("ArmVmExit::WaitForInterrupt"));
+}
+
+#[test]
+fn guest_wfi_and_wfe_are_trapped_for_vmm_owned_wait_policy() {
+    let init = section(
+        VCPU,
+        "let hcr_el2 = HCR_EL2::VM::Enable",
+        "self.guest_system_regs.hcr_el2 = hcr_el2.into();",
+    );
+
+    assert!(init.contains("HCR_EL2::TWI::SET"));
+    assert!(init.contains("HCR_EL2::TWE::SET"));
 }
 
 #[test]
@@ -166,4 +193,27 @@ fn tls_switch_occurs_only_inside_the_final_assembly_windows() {
     assert!(!entry.contains("bl      "));
     assert!(VCPU.contains("offset_of!(HostRuntimeContext, tpidr_el0)"));
     assert!(CONTEXT_FRAME.contains("offset_of!(GuestSystemRegisters, tpidr_el0)"));
+}
+
+#[test]
+fn guest_exception_vector_is_scoped_to_the_irq_atomic_run_window() {
+    let hardware_enable = section(
+        PCPU,
+        "    pub fn hardware_enable",
+        "    pub fn hardware_disable",
+    );
+    assert!(!hardware_enable.contains("exception_vector_base_vcpu"));
+
+    let run = section(VCPU, "    pub fn run(&mut self", "    /// Binds this vCPU");
+    assert_in_order(
+        run,
+        &[
+            "let host_vbar_el2 = VBAR_EL2.get();",
+            "VBAR_EL2.set(exception_vector_base_vcpu",
+            "self.restore_vm_system_regs();",
+            "self.run_guest()",
+            "VBAR_EL2.set(host_vbar_el2);",
+            "self.vmexit_handler(trap_kind)",
+        ],
+    );
 }

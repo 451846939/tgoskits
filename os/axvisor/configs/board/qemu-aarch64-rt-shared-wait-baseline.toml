@@ -1,0 +1,6 @@
+# Controlled baseline: preserve latest-dev's non-rescheduling shared-queue
+# broadcast while leaving workload, affinity, devices, and exits unchanged.
+features = ["rt-shared-wait-baseline"]
+log = "Info"
+target = "aarch64-unknown-none-softfloat"
+vm_configs = []

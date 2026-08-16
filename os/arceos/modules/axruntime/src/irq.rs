@@ -44,11 +44,61 @@ fn resolve_binding_irq_source(source: ax_driver::BindingIrqSource) -> Result<Irq
     }
 }
 
-#[cfg(any(
-    target_arch = "aarch64",
-    target_arch = "loongarch64",
-    target_arch = "riscv64"
-))]
+#[cfg(target_arch = "aarch64")]
+fn resolve_fdt_irq_spec(spec: ax_driver::FdtIrqSpec) -> Result<IrqId, IrqError> {
+    if let Ok(intc) = rdrive::get::<rdif_intc::Intc>(spec.controller) {
+        let mut intc = intc.lock().map_err(|_| IrqError::Controller)?;
+        let translation = intc.translate_fdt(&spec.cells)?;
+        intc.configure(&translation)?;
+        return Ok(translation.id);
+    }
+
+    // The AArch64 machine profile owns the guest GIC, so it may initialize the
+    // platform IRQ domain without publishing a duplicate rdrive controller.
+    // PCI INTx bindings still carry the standard three-cell GIC encoding.
+    let (hwirq, trigger) = decode_aarch64_gic_fdt(&spec.cells).inspect_err(|error| {
+        warn!(
+            "failed to decode machine-owned AArch64 GIC FDT binding controller={:?} cells={:?}: \
+             {error:?}",
+            spec.controller, spec.cells
+        );
+    })?;
+    let id = ax_hal::irq::resolve_irq_source(IrqSource::ControllerLine {
+        domain: ax_hal::irq::AARCH64_GIC_DOMAIN,
+        hwirq,
+    })
+    .inspect_err(|error| {
+        warn!("failed to resolve machine-owned AArch64 GIC line {hwirq:?}: {error:?}");
+    })?;
+    ax_hal::irq::set_trigger(id, trigger).inspect_err(|error| {
+        warn!("failed to configure machine-owned AArch64 GIC line {id:?}: {error:?}");
+    })?;
+    Ok(id)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn decode_aarch64_gic_fdt(cells: &[u32]) -> Result<(HwIrq, ax_hal::irq::IrqTrigger), IrqError> {
+    let [irq_type, irq_num, flags] = cells else {
+        return Err(IrqError::InvalidIrq);
+    };
+    let hwirq = match irq_type {
+        0 => irq_num.checked_add(32),
+        1 => irq_num.checked_add(16),
+        2 => irq_num.checked_add(4096),
+        3 => irq_num.checked_add(1056),
+        4 => Some(*irq_num),
+        _ => None,
+    }
+    .ok_or(IrqError::InvalidIrq)?;
+    let trigger = match flags & 0xf {
+        1..=3 => ax_hal::irq::IrqTrigger::Edge,
+        4 | 8 => ax_hal::irq::IrqTrigger::Level,
+        _ => return Err(IrqError::InvalidIrq),
+    };
+    Ok((HwIrq(hwirq), trigger))
+}
+
+#[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
 fn resolve_fdt_irq_spec(spec: ax_driver::FdtIrqSpec) -> Result<IrqId, IrqError> {
     let mut intc = rdrive::get::<rdif_intc::Intc>(spec.controller)
         .map_err(|_| IrqError::Unsupported)?
@@ -66,6 +116,32 @@ fn resolve_fdt_irq_spec(spec: ax_driver::FdtIrqSpec) -> Result<IrqId, IrqError> 
 )))]
 fn resolve_fdt_irq_spec(_spec: ax_driver::FdtIrqSpec) -> Result<IrqId, IrqError> {
     Err(IrqError::Unsupported)
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_gic_spi_and_trigger_from_fdt_cells() {
+        assert_eq!(
+            decode_aarch64_gic_fdt(&[0, 3, 4]),
+            Ok((HwIrq(35), ax_hal::irq::IrqTrigger::Level))
+        );
+        assert_eq!(
+            decode_aarch64_gic_fdt(&[0, 46, 1]),
+            Ok((HwIrq(78), ax_hal::irq::IrqTrigger::Edge))
+        );
+    }
+
+    #[test]
+    fn rejects_non_gic_or_incomplete_fdt_cells() {
+        assert_eq!(decode_aarch64_gic_fdt(&[3, 4]), Err(IrqError::InvalidIrq));
+        assert_eq!(
+            decode_aarch64_gic_fdt(&[7, 0, 4]),
+            Err(IrqError::InvalidIrq)
+        );
+    }
 }
 
 /// Resolves a per-CPU trap IRQ through the platform IRQ domain.

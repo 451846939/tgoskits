@@ -58,13 +58,13 @@ use smoltcp::{
     storage::PacketMetadata,
     time::Instant,
     wire::{
-        IpAddress, IpCidr, IpProtocol, IpVersion, Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Packet,
-        TcpPacket,
+        EthernetAddress, IpAddress, IpCidr, IpProtocol, IpVersion, Ipv4Address, Ipv4Cidr,
+        Ipv4Packet, Ipv6Packet, TcpPacket,
     },
 };
 
 use crate::{
-    LISTEN_TABLE,
+    LISTEN_TABLE, NetError, NetResult,
     config::{DeviceBinding, InterfaceId, RouteInfo},
     consts::{DEVICE_RX_QUEUE_SIZE, DEVICE_TX_QUEUE_SIZE, SOCKET_BUFFER_SIZE, STANDARD_MTU},
     device::{ArpEntry, Device},
@@ -861,6 +861,25 @@ impl Router {
             entries.extend(device.inner.lock().arp_entries(timestamp));
         }
         entries
+    }
+
+    /// Installs a permanent neighbor mapping on one Ethernet interface.
+    pub fn set_static_neighbor(
+        &self,
+        interface_id: InterfaceId,
+        ip: IpAddress,
+        hardware: EthernetAddress,
+    ) -> NetResult {
+        let device = self
+            .devices
+            .iter()
+            .find(|device| device.interface_id == interface_id)
+            .ok_or(NetError::NoSuchDevice)?;
+        if device.inner.lock().set_static_neighbor(ip, hardware) {
+            Ok(())
+        } else {
+            Err(NetError::OperationNotSupported)
+        }
     }
 
     /// Returns a per-interface snapshot of RX/TX byte and packet counters.

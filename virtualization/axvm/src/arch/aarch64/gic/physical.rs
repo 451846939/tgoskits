@@ -114,6 +114,24 @@ enum AssignedSpiDelivery {
 }
 
 impl AssignedSpiBinding {
+    /// Publishes a current-EL acknowledgement and transfers its physical
+    /// active state to a hardware-backed virtual interrupt.
+    fn publish_from_current_el(&self) -> Result<bool, GicV3BackendError> {
+        let mut delivery = self.delivery.lock();
+        if !self.accepting.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        *delivery = AssignedSpiDelivery::Active;
+        if let Err(error) = self.controller.forward_physical_spi(self.irq) {
+            *delivery = AssignedSpiDelivery::Idle;
+            return Err(GicV3BackendError::new(
+                "forward current-EL assigned physical SPI",
+                std::format!("{error}"),
+            ));
+        }
+        Ok(true)
+    }
+
     /// Publishes one acknowledged activation without VM lookup or allocation.
     fn publish_from_irq(&self, token: usize) -> bool {
         let mut delivery = self.delivery.lock();
@@ -270,6 +288,15 @@ pub(super) fn route_acknowledged_host_irq(token: usize) -> Result<(), GicV3Backe
         dispatch_acknowledged_host_irq(token);
     }
     Ok(())
+}
+
+pub(super) fn route_current_el_host_irq(irq: usize) -> Result<bool, GicV3BackendError> {
+    let Some(route) = ASSIGNED_SPI_ROUTES.get(irq) else {
+        return Ok(false);
+    };
+    route
+        .with_binding(AssignedSpiBinding::publish_from_current_el)
+        .unwrap_or(Ok(false))
 }
 
 pub(super) fn complete_assigned_spi(

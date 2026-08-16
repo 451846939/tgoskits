@@ -193,10 +193,15 @@ static void server_task( void * argument )
     configASSERT( listener != FREERTOS_INVALID_SOCKET );
     aicp_uart_printf( "AICP_FREERTOS_READY transport=tcp port=%u ip=10.0.3.2\n",
                       AICP_PORT );
+    uint32_t accept_retry_count = 0U;
     for( ;; ) {
         Socket_t client = FreeRTOS_accept( listener, NULL, NULL );
         if( client == NULL || client == FREERTOS_INVALID_SOCKET ) {
-            aicp_uart_puts( "AICP_FREERTOS_ACCEPT_RETRY\n" );
+            accept_retry_count++;
+            if( accept_retry_count <= 3U ) {
+                aicp_uart_printf( "AICP_FREERTOS_ACCEPT_RETRY count=%u\n",
+                                  accept_retry_count );
+            }
             vTaskDelay( pdMS_TO_TICKS( 100U ) );
             continue;
         }
@@ -303,7 +308,7 @@ static void periodic_task( void * argument )
     for( ;; ) {
         vTaskDelayUntil( &wake, pdMS_TO_TICKS( 100U ) );
         count++;
-        if( count <= 5U || ( count % 10U ) == 0U ) {
+        if( count <= 5U ) {
             aicp_uart_printf( "AICP_FREERTOS_TICK count=%u tick=%u\n",
                               count,
                               ( unsigned int ) xTaskGetTickCount() );
@@ -320,7 +325,7 @@ static void worker_task( void * argument )
     for( ;; ) {
         vTaskDelay( pdMS_TO_TICKS( 250U ) );
         count++;
-        if( count <= 4U || ( count % 20U ) == 0U ) {
+        if( count <= 4U ) {
             aicp_uart_printf( "AICP_FREERTOS_TASK_SWITCH count=%u tick=%u\n",
                               count,
                               ( unsigned int ) xTaskGetTickCount() );

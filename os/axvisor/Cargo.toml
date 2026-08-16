@@ -42,6 +42,8 @@ default = []
 host-xtask = []
 axtest = []
 fs = ["ax-std/ext4fs", "ax-std/fatfs", "axvm/host-fs"]
+rt-poll-idle = ["axvm/rt-poll-idle"]
+rt-shared-wait-baseline = ["axvm/rt-shared-wait-baseline"]
 sstc = ["axvm/sstc"]
 stack-protector = ["ax-std/stack-protector"]
 backtrace = ["ax-std/backtrace", "dep:axbacktrace"]
@@ -50,6 +52,7 @@ test-panic-no-backtrace = ["dep:axbacktrace"]
 
 [dependencies]
 shlex.workspace = true
+ax-crate-interface.workspace = true
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(axtest)', 'cfg(feature, values("ax-std"))'] }
@@ -106,3 +109,6 @@ proc-macro2 = { workspace = true }
 quote = { workspace = true }
 syn = { workspace = true }
 toml = { workspace = true, features = ["std", "serde", "parse", "display"] }
+
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+axplat-dyn = { workspace = true, features = ["hv"] }

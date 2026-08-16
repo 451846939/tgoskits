@@ -23,6 +23,7 @@
 void aicp_virtio_net_get_stats(rt_uint32_t *irq_count,
                                rt_uint32_t *rx_frames,
                                rt_uint32_t *tx_frames);
+rt_err_t aicp_virtio_net_publish_link_up(void);
 
 static rt_uint32_t accepted_clients;
 static rt_uint32_t disconnected_clients;
@@ -143,8 +144,18 @@ static void wait_for_network(void)
                 static_network_configured = RT_FALSE;
             }
         }
+        if (netdev != RT_NULL && !netdev_is_link_up(netdev))
+        {
+            const rt_err_t ret = aicp_virtio_net_publish_link_up();
+
+            if (ret != RT_EOK && ret != -RT_EBUSY)
+            {
+                rt_kprintf("AICP_RTTHREAD_LINK_RETRY ret=%d dev=%s\n",
+                           ret, netdev->name);
+            }
+        }
         if (netdev != RT_NULL && netdev_is_up(netdev) &&
-            !ip_addr_isany(&netdev->ip_addr))
+            netdev_is_link_up(netdev) && !ip_addr_isany(&netdev->ip_addr))
         {
             rt_kprintf("AICP_RTTHREAD_NET_UP dev=%s ip=%s flags=0x%x link=%u\n",
                        netdev->name, inet_ntoa(netdev->ip_addr), netdev->flags,
@@ -265,7 +276,7 @@ int main(void)
     rt_kprintf("AICP_RTTHREAD_READY transport=tcp port=%u\n", AICP_PORT);
     for (;;)
     {
-        struct timeval timeout = { .tv_sec = 2, .tv_usec = 0 };
+        struct timeval timeout = { .tv_sec = 10, .tv_usec = 0 };
         int client_fd = accept(listen_fd, RT_NULL, RT_NULL);
 
         if (client_fd < 0)

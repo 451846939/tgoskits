@@ -108,6 +108,16 @@ fn complete_hypercall_decode_error<V: VmArchVcpuOps>(
     }
 }
 
+/// Selects whether a guest idle request may block its dedicated host vCPU.
+///
+/// The CPU-isolated real-time profile cooperatively polls architectural timer
+/// state at every VM exit. This avoids depending on a secondary host CPU's
+/// idle timer wakeup, while the outer vCPU loop still yields to host tasks.
+#[inline(always)]
+pub(crate) const fn idle_waits_for_event() -> bool {
+    !cfg!(feature = "rt-poll-idle")
+}
+
 pub(crate) fn hvc_outcome_action(
     outcome: crate::runtime::hvc::HyperCallOutcome,
 ) -> HyperCallExitAction {
@@ -119,7 +129,7 @@ pub(crate) fn hvc_outcome_action(
             HyperCallExitAction::CompleteWithReturn {
                 return_value,
                 action: VcpuRunAction {
-                    waits_for_event: true,
+                    waits_for_event: idle_waits_for_event(),
                     stop_reason: None,
                     resets_vm: false,
                     exits_vcpu: false,

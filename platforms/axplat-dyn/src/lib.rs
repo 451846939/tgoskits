@@ -27,6 +27,8 @@ mod power;
 
 pub use boot::{boot_entropy, boot_stack_bounds, bootargs};
 pub use generic_timer::try_init_epoch_offset;
+#[cfg(all(feature = "irq", feature = "hv", target_arch = "aarch64"))]
+pub use irq::register_aarch64_virtual_irq_injector;
 
 #[cfg(feature = "irq")]
 pub fn enable_timer_irq() {

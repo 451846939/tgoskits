@@ -14,7 +14,10 @@ use axvm_types::{VmBackendError as BackendError, VmBackendResult as BackendResul
 use super::*;
 use crate::{
     AxVmResult,
-    architecture::cpu_up::{self, CpuUpExit, CpuUpOps},
+    architecture::{
+        cpu_up::{self, CpuUpExit, CpuUpOps},
+        idle_waits_for_event,
+    },
     ax_err,
 };
 
@@ -45,6 +48,7 @@ pub(crate) struct Aarch64Arch;
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Aarch64DeferredRunWork {
     ExternalInterrupt { token: Option<usize> },
+    CpuUp { exit: CpuUpExit },
 }
 
 impl CpuUpOps for Aarch64Arch {}
@@ -65,6 +69,10 @@ impl ArchOps for Aarch64Arch {
             addr.as_usize(),
             size,
         );
+    }
+
+    fn register_platform_irq_injector() {
+        crate::irq::register_aarch64_virtual_irq_injector(inject_current_el_irq);
     }
 
     fn activate_devices(vm: &crate::AxVM) -> AxVmResult {
@@ -154,9 +162,21 @@ impl ArchOps for Aarch64Arch {
                 Aarch64DeferredRunWork::ExternalInterrupt { token },
             )),
             ArmVmExit::WaitForInterrupt => {
-                vcpu.get_arch_vcpu().arm_timer_wait()?;
+                let waits_for_event = idle_waits_for_event();
                 Ok(BoundVcpuExit::Complete(VcpuRunAction {
-                    waits_for_event: true,
+                    waits_for_event,
+                    stop_reason: None,
+                    resets_vm: false,
+                    exits_vcpu: false,
+                }))
+            }
+            ArmVmExit::WaitForEvent => {
+                // WFE is a hint and may complete spuriously. Guest SEV events
+                // are not virtualized yet, so do not turn WFE into an
+                // interrupt-only sleep. General-purpose profiles perform one
+                // cooperative host yield after this completed VM exit.
+                Ok(BoundVcpuExit::Complete(VcpuRunAction {
+                    waits_for_event: false,
                     stop_reason: None,
                     resets_vm: false,
                     exits_vcpu: false,
@@ -179,15 +199,13 @@ impl ArchOps for Aarch64Arch {
                 target_cpu,
                 entry_point,
                 arg,
-            } => cpu_up::handle::<Self>(
-                vm,
-                vcpu,
-                CpuUpExit {
+            } => Ok(BoundVcpuExit::Defer(Aarch64DeferredRunWork::CpuUp {
+                exit: CpuUpExit {
                     target_cpu,
                     entry_point: arm_guest_phys_addr_to_ax(entry_point),
                     arg,
                 },
-            ),
+            })),
             ArmVmExit::SystemDown => {
                 warn!("VM[{}] run VCpu[{}] SystemDown", vm.id(), vcpu.id());
                 Ok(BoundVcpuExit::Complete(VcpuRunAction {
@@ -216,7 +234,7 @@ impl ArchOps for Aarch64Arch {
     }
 
     fn finish_deferred_run_work(
-        _vm: &crate::AxVMRef,
+        vm: &crate::AxVMRef,
         vcpu: &crate::vm::AxVCpuRef<Self::VCpu>,
         work: Self::DeferredRunWork,
     ) -> AxVmResult<VcpuRunAction> {
@@ -230,6 +248,13 @@ impl ArchOps for Aarch64Arch {
                     }
                 }
                 crate::check_timer_events();
+            }
+            Aarch64DeferredRunWork::CpuUp { exit } => {
+                let BoundVcpuExit::Complete(action) = cpu_up::handle::<Self>(vm, vcpu, exit)?
+                else {
+                    return ax_err!(BadState, "deferred AArch64 CPU_ON did not complete");
+                };
+                return Ok(action);
             }
         }
         Ok(VcpuRunAction {
@@ -264,6 +289,10 @@ impl ArchOps for Aarch64Arch {
                 return;
             }
         }
+        // Own timer registration at the final sleep boundary. Arming while
+        // handling the VM exit and replacing that timer here creates a window
+        // where an expired callback can be invalidated before the vCPU joins
+        // its wait queue.
         if let Err(error) = vcpu.get_arch_vcpu().arm_timer_wait() {
             warn!(
                 "VM[{}] VCpu[{}] cannot rearm architectural timer before WFI wait: {error:?}",
@@ -289,8 +318,19 @@ impl ArchOps for Aarch64Arch {
             runtime,
             &wait_snapshot,
             || vm.running(),
-            |condition| runtime.wait_until(condition),
+            |condition| runtime.wait_vcpu_until(vcpu.id(), condition),
         );
+    }
+}
+
+fn inject_current_el_irq(irq: usize, _priority: u8) -> crate::irq::GuestIrqInjection {
+    match gic::route_current_el_host_irq(irq) {
+        Ok(true) => crate::irq::GuestIrqInjection::HardwareForwarded,
+        Ok(false) => crate::irq::GuestIrqInjection::NotHandled,
+        Err(error) => {
+            warn!("failed to forward current-EL AArch64 IRQ {irq}: {error}");
+            crate::irq::GuestIrqInjection::NotHandled
+        }
     }
 }
 

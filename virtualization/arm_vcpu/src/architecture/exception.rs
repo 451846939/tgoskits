@@ -107,7 +107,15 @@ pub fn handle_exception_sync(ctx: &mut TrapFrame) -> ArmVcpuResult<ArmVmExit> {
         Some(ESR_EL2::EC::Value::TrappedWFIorWFE) => {
             let next_pc = ctx.exception_pc() + exception_next_instruction_step();
             ctx.set_exception_pc(next_pc);
-            Ok(ArmVmExit::WaitForInterrupt)
+            // ESR_EL2.ISS.TI distinguishes WFI (0) from WFE (1). A trapped
+            // WFE must not become an interrupt-only wait: guest SEV events do
+            // not cross the VMM exit boundary, and the architecture permits
+            // WFE to complete without observing an event.
+            if ESR_EL2.read(ESR_EL2::ISS) & 1 == 0 {
+                Ok(ArmVmExit::WaitForInterrupt)
+            } else {
+                Ok(ArmVmExit::WaitForEvent)
+            }
         }
         Some(ESR_EL2::EC::Value::DataAbortLowerEL) => {
             let elr = ctx.exception_pc();
