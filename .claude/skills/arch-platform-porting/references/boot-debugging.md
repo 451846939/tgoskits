@@ -152,6 +152,21 @@ execution and then fail only on traps or vCPU exits, so it is not a valid fallba
   initialization message.
 - Confirm the runtime reports `EL: 2`, inspect the resolved `ax-cpu` feature set for `arm-el2`, and
   verify that a post-`ioremap` MMIO access succeeds before instrumenting the device driver itself.
+- Keep the Axvisor host exception vector installed while ordinary host tasks run. The vCPU vector
+  belongs only to the IRQ-masked world-switch window: save `VBAR_EL2`, install the vCPU vector and
+  execute an ISB immediately before guest restore/entry, then restore the host vector and execute
+  an ISB before returning to host Rust. Installing the vCPU vector permanently from per-CPU
+  virtualization enablement can route an unrelated current-EL host abort through the guest exit
+  decoder. A characteristic symptom is an intermittent `DataAbortCurrentEL` from an idle, GC, or
+  timer task during multi-core VM initialization, before that CPU has entered a guest.
+- Decode trapped `WFI` and `WFE` instructions separately from `ESR_EL2.ISS.TI`. Only `WFI` may
+  enter the interrupt/timer wait path. Until Axvisor models the guest event register and virtual
+  `SEV` delivery, set `HCR_EL2.TWE` and complete trapped WFE as a permitted spurious return. Leaving
+  WFE native can intermittently park early Linux boot on an event that does not cross the VMM/QEMU
+  boundary. Do not yield while the vCPU remains bound inside the architecture run window; return a
+  completed, non-waiting exit and let the common outer vCPU loop perform its single cooperative
+  host yield. Never block WFE on an interrupt notification, because that cannot represent a guest
+  SEV event.
 - Axvisor QEMU and board test cases own their CPU-count contract. Test requests must discard an
   interactive snapshot's `smp` value; otherwise a stale `tmp/axbuild/.axvisor.toml` can silently
   shrink the host. A Phytium guest assigned to logical CPU 2 will then fall back to CPU 0 and may
@@ -187,6 +202,21 @@ Use this order when auditing an early boot port:
     `ALIVE` at the common entry, and then releases exactly that CPU as `SHOULD_ONLINE`. Keep this
     handshake outside immutable trampoline metadata and separate from the later OS scheduler,
     IRQ, and timer online publication. See `book/design/someboot-secondary-cpu-startup.md`.
+
+## AArch64 Axvisor Assigned-SPI Notes
+
+- Do not install a competing host IRQ action for a physical SPI assigned to a guest. Publish a
+  preallocated ownership route before enabling the VM, so an IRQ acknowledged at current EL can
+  be recognized without VM lookup or allocation in the top half.
+- Route current-EL host IRQ entries and lower-EL guest exits through the same canonical VGIC. For
+  current-EL delivery, transfer the acknowledged physical active state into a hardware-backed LR:
+  perform the priority drop, defer physical deactivation, and let Guest EOI retire the source.
+  Replacing this with a software VGIC pulse plus early host DIR loses the level/active lifecycle;
+  a characteristic failure is an unhandled assigned SPI followed by Linux `NETDEV WATCHDOG` TX
+  timeouts.
+- When a selected PCI host has an `interrupt-map`, parse its parent GIC routes before expanding
+  passthrough address ranges. Expansion changes the selected resource names and can otherwise
+  make interrupt discovery incorrectly treat the original PCI node as unselected.
 
 ## RISC-V FDT SMP Notes
 
@@ -351,6 +381,7 @@ Important details:
 - Use short serial markers for phase isolation. Example phases: `E` for UEFI entry, `M` for memory map, `X` before exit boot services, `x` after exit, `P` before paging, `p` after paging, `T` after trap vectors, `S` before secondary release.
 - Remove markers before finalizing unless they become intentional diagnostics.
 - If QEMU is launched by `ostool`, patch the local ostool or xtask wrapper temporarily rather than hand-assembling a different command line. The reproduced command must remain faithful to the failing path.
+- For an AArch64 guest that intermittently stops after WFI, keep architectural-timer registration at the final vCPU sleep boundary. Registering once in VM-exit handling and replacing it immediately before the wait can invalidate an already-expired wake callback before the task joins its wait queue.
 
 ## Symptom Triage
 
