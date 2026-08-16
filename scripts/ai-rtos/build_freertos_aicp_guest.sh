@@ -6,14 +6,45 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "${repo_root}/scripts/ai-rtos/lib/host_tools.sh"
+source "${repo_root}/scripts/ai-rtos/lib/third_party_source_guard.sh"
 source_dir="${repo_root}/apps/ai-rtos-demo/freertos"
 kernel_dir="${FREERTOS_KERNEL_DIR:-${repo_root}/tmp/ai-rtos/FreeRTOS-Kernel}"
 tcp_dir="${FREERTOS_PLUS_TCP_DIR:-${repo_root}/tmp/ai-rtos/FreeRTOS-Plus-TCP}"
+kernel_revision="${FREERTOS_KERNEL_REVISION:-V11.2.0}"
+tcp_revision="${FREERTOS_PLUS_TCP_REVISION:-V4.3.1}"
+kernel_url="${FREERTOS_KERNEL_URL:-https://github.com/FreeRTOS/FreeRTOS-Kernel.git}"
+tcp_url="${FREERTOS_PLUS_TCP_URL:-https://github.com/FreeRTOS/FreeRTOS-Plus-TCP.git}"
 build_dir="${FREERTOS_BUILD_DIR:-${repo_root}/tmp/ai-rtos/build-freertos-aicp}"
 cross_prefix="$(aicp_resolve_or_install_aarch64_none_elf \
   "${repo_root}" "14.3.rel1" CROSS_COMPILE)"
 baseline="${AICP_FREERTOS_BASELINE:-OFF}"
 stress="${AICP_FREERTOS_STRESS:-OFF}"
+
+if [[ ! -d "${kernel_dir}/.git" ]]; then
+  echo "[ai-rtos] Cloning FreeRTOS-Kernel revision=${kernel_revision}"
+  git clone --depth 1 --branch "${kernel_revision}" "${kernel_url}" "${kernel_dir}"
+fi
+if [[ ! -d "${tcp_dir}/.git" ]]; then
+  echo "[ai-rtos] Cloning FreeRTOS-Plus-TCP revision=${tcp_revision}"
+  git clone --depth 1 --branch "${tcp_revision}" "${tcp_url}" "${tcp_dir}"
+fi
+
+verify_freertos_sources() {
+  third_party_assert_git_source "FreeRTOS-Kernel" "${kernel_dir}" "${kernel_revision}"
+  third_party_assert_git_source "FreeRTOS-Plus-TCP" "${tcp_dir}" "${tcp_revision}"
+}
+
+verify_freertos_on_exit() {
+  local status=$?
+  trap - EXIT
+  if ! verify_freertos_sources; then
+    exit 1
+  fi
+  exit "${status}"
+}
+
+verify_freertos_sources
+trap verify_freertos_on_exit EXIT
 
 test -f "${kernel_dir}/tasks.c" || {
   echo "ERROR: 未找到 FreeRTOS-Kernel：${kernel_dir}" >&2
@@ -48,3 +79,5 @@ echo "bin=${build_dir}/aicp-freertos.bin"
 echo "entry=${entry}"
 echo "baseline=${baseline}"
 echo "stress=${stress}"
+trap - EXIT
+verify_freertos_sources

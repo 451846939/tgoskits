@@ -17,7 +17,7 @@ Runs the verified AxVisor dual-guest AICP TCP/IP scenario twice:
 The extractor reports Linux request-response RTT, RTOS-side control service
 time, request-arrival deviation, and independent 20 ms RTOS periodic wakeup
 lateness/jitter from AICP_RTOS_REQUEST_TIMING and AICP_RTOS_PERIODIC_DONE lines.
-By default the scenario uses the guest-to-guest QEMU hub path; set
+By default the scenario uses AxVisor's internal layer-2 switch; set
 AICP_TRANSPORT=usernet for the hostfwd fallback path.
 EOF
 }
@@ -48,7 +48,7 @@ fi
 run_case() {
   local name="$1"
   local load="$2"
-  local before after log console_log combined_log csv summary stamp
+  local before after log combined_log csv summary
   local runner_status=0
   local extraction_status=0
   local failure_reason=""
@@ -100,18 +100,8 @@ run_case() {
     cp "${log}" "${result_dir}/${name}.axvisor.log"
     combined_log="${result_dir}/${name}.log"
     if [[ "${AICP_TRANSPORT:-hub}" == "hub" ]]; then
-      stamp="$(basename "${log}")"
-      stamp="${stamp#${log_prefix}-}"
-      stamp="${stamp%.log}"
-      console_log="${repo_root}/tmp/ai-rtos/logs/${log_prefix}-linux-console-${stamp}.log"
-      if [[ ! -f "${console_log}" ]]; then
-        echo "[ai-rtos] FAIL: cannot locate ${name} Linux console log: ${console_log}" >&2
-        failure_reason="Linux console log not found"
-        extraction_status=1
-      else
-        cp "${console_log}" "${result_dir}/${name}.linux-console.log"
-        cat "${log}" "${console_log}" > "${combined_log}"
-      fi
+      # AxVisor's console mux writes host and both guest consoles into one log.
+      cp "${log}" "${combined_log}"
     else
       cp "${log}" "${combined_log}"
     fi

@@ -49,7 +49,7 @@ result_dir="${out_dir}/results/axvisor-linux-zephyr"
 bundle_dir="${repo_root}/tmp/images/qemu-aarch64"
 zephyr_base="${ZEPHYR_BASE:-${repo_root}/tmp/zephyrproject/zephyr}"
 zephyr_build_dir="${ZEPHYR_BUILD_DIR:-${repo_root}/tmp/zephyrproject/build-aicp-axvisor-v4.4}"
-west_bin="${WEST:-${repo_root}/tmp/zephyr-venv-4.2/bin/west}"
+west_bin="${WEST:-west}"
 cross_compile="$(aicp_resolve_cross_prefix CROSS_COMPILE \
   aarch64-none-elf- \
   aarch64-elf- \
@@ -110,7 +110,7 @@ wait_for_marker() {
       return 0
     fi
     if LC_ALL=C grep -a -Eq \
-      'VM\[[0-9]+\] setup failed|Failed to initialize guest VM|Stopping VM\[[0-9]+\]: Fault|run VCpu\[[0-9]+\] get error|emu_device mmio (read|write) failed|Unhandled synchronous exception from current EL|EL2 sync fault:|ESR_EL2:|current vCPU is not set|AArch64 guest IRQ injection rejected|panic' \
+      'VM\[[0-9]+\] setup failed|Failed to initialize guest VM|Stopping VM\[[0-9]+\]: Fault|run VCpu\[[0-9]+\] get error|emu_device mmio (read|write) failed|Unhandled synchronous exception from current EL|EL2 sync fault:|ESR_EL2:|current vCPU is not set|AArch64 guest IRQ injection rejected|Kernel panic|thread .* panicked at|Panic:' \
       "${log_file}" 2>/dev/null; then
       echo "[ai-rtos] FAIL：检测到 AxVisor Host/vCPU 异常，停止等待：${marker}" >&2
       tail -n 220 "${log_file}" >&2 || true
@@ -159,13 +159,18 @@ build_host_dtb() {
   dtc -@ -I dts -O dtb -o "${host_overlay_dtbo}" "${host_overlay_dts}"
   fdtoverlay -i "${host_base_dtb}" -o "${host_dtb}" "${host_overlay_dtbo}"
 
-  local zephyr_reserved_reg
+  local linux_reserved_reg zephyr_reserved_reg
+  linux_reserved_reg="$(fdtget -tx "${host_dtb}" /reserved-memory/linux@80000000 reg)"
+  if [[ "${linux_reserved_reg}" != "0 80000000 0 20000000" ]]; then
+    echo "ERROR: 宿主 DTB 中 Linux 预留内存校验失败：${linux_reserved_reg}" >&2
+    exit 1
+  fi
   zephyr_reserved_reg="$(fdtget -tx "${host_dtb}" /reserved-memory/zephyr@d0000000 reg)"
   if [[ "${zephyr_reserved_reg}" != "0 d0000000 0 8000000" ]]; then
     echo "ERROR: 宿主 DTB 中 Zephyr 预留内存校验失败：${zephyr_reserved_reg}" >&2
     exit 1
   fi
-  echo "[ai-rtos] 宿主 DTB 已预留 Zephyr DMA 内存：${zephyr_reserved_reg}"
+  echo "[ai-rtos] 宿主 DTB 已预留 Linux/Zephyr DMA 内存：${linux_reserved_reg}; ${zephyr_reserved_reg}"
 }
 
 write_linux_vm_config() {
@@ -173,7 +178,7 @@ write_linux_vm_config() {
 [base]
 id = 1
 name = "linux-ai-zephyr-qemu"
-vm_type = 1
+guest_type = "virtualized"
 cpu_num = 2
 phys_cpu_ids = [${linux_vcpu0_pcpu}, ${linux_vcpu1_pcpu}]
 phys_cpu_sets = [${linux_vcpu0_mask}, ${linux_vcpu1_mask}]
@@ -190,21 +195,14 @@ ramdisk_load_addr = 0x9000_0000
 memory_regions = [
   # Linux 使用 AxVisor 分配的身份映射内存。QEMU 直通 virtio 设备直接使用
   # virtqueue 中的 Guest PA 做 DMA，因此 Guest PA 必须同时是有效 Host PA。
-  [0x8000_0000, 0x2000_0000, 0x7, 1],
+  [0x8000_0000, 0x2000_0000, 0x7, 2],
 ]
 
 [devices]
-interrupt_mode = "passthrough"
-passthrough_devices = [
-  ["/virtio_mmio@a003c00"],
-  ["/pl011@9040000"],
+passthrough = [
+  { path = "/virtio_mmio@a003c00" },
 ]
-passthrough_addresses = []
-excluded_devices = []
-emu_devices = [
-  ["gppt-gicd", 0x0800_0000, 0x1_0000, 0, 0x21, []],
-  ["gppt-gicr", 0x080a_0000, 0x2_0000, 0, 0x20, [2, 0x2_0000, ${linux_vcpu0_pcpu}]],
-]
+disabled = []
 EOF
 }
 
@@ -213,7 +211,7 @@ write_zephyr_vm_config() {
 [base]
 id = 2
 name = "zephyr-aicp-qemu"
-vm_type = 1
+guest_type = "virtualized"
 cpu_num = 1
 phys_cpu_ids = [${rtos_vcpu0_pcpu}]
 phys_cpu_sets = [${rtos_vcpu0_mask}]
@@ -228,20 +226,10 @@ memory_regions = [
 ]
 
 [devices]
-interrupt_mode = "passthrough"
-passthrough_devices = [
-  ["/virtio_mmio@a003a00"],
+passthrough = [
+  { path = "/virtio_mmio@a003a00" },
 ]
-# Zephyr 串口只用于轮询日志，不声明 SPI 所有权。Linux 使用第二路
-# PL011，从配置层消除两个 Guest 竞争同一物理中断的可能性。
-passthrough_addresses = [
-  [0x0900_0000, 0x1000],
-]
-excluded_devices = []
-emu_devices = [
-  ["gppt-gicd", 0x0800_0000, 0x1_0000, 0, 0x21, []],
-  ["gppt-gicr", 0x080a_0000, 0x2_0000, 0, 0x20, [1, 0x2_0000, ${rtos_vcpu0_pcpu}]],
-]
+disabled = []
 EOF
 }
 
@@ -293,15 +281,14 @@ remove_dts_nodes "${linux_dts}.devices" "${linux_dts}.pruned1" "gpio-keys|pl061@
 remove_dts_nodes "${linux_dts}.pruned1" "${linux_dts}.pruned2" "fw-cfg@|pl031@|flash@"
 remove_dts_nodes "${linux_dts}.pruned2" "${linux_dts}" "platform-bus@|pmu|its@"
 rm -f "${linux_dts}.devices" "${linux_dts}.pruned1" "${linux_dts}.pruned2"
-patch_linux_guest_console "${linux_dts}"
-patch_bootargs "${linux_dts}" "console=ttyAMA0 earlycon=pl011,0x9040000 rdinit=/init panic=-1 loglevel=7"
+patch_bootargs "${linux_dts}" "console=ttyAMA0 earlycon=pl011,0x9000000 rdinit=/init panic=-1 loglevel=7"
 dtc -I dts -O dtb -o "${linux_dtb}" "${linux_dts}"
 build_host_dtb
 write_linux_vm_config
 write_zephyr_vm_config
 
-if ! grep -Fq '[0x8000_0000, 0x2000_0000, 0x7, 1]' "${linux_vm}"; then
-  echo "ERROR: Linux Guest RAM 必须使用 MapIdentical，避免 QEMU virtio DMA 访问固定预留区" >&2
+if ! grep -Fq '[0x8000_0000, 0x2000_0000, 0x7, 2]' "${linux_vm}"; then
+  echo "ERROR: Linux Guest RAM 必须使用宿主 FDT 预留内存，避免 QEMU virtio DMA 访问未保留区域" >&2
   exit 1
 fi
 if ! grep -Fq '[0xD000_0000, 0x0800_0000, 0x7, 2]' "${zephyr_vm}"; then
@@ -350,7 +337,7 @@ echo "[ai-rtos] 启动 AxVisor Linux + Zephyr 双 Guest；日志：${log_file}"
 (
   cd "${repo_root}"
   aicp_exec_new_session cargo xtask axvisor qemu \
-    --config os/axvisor/configs/board/qemu-aarch64.toml \
+    --config os/axvisor/configs/board/qemu-aarch64-ai-rtos.toml \
     --qemu-config "${qemu_config}" \
     --vmconfigs "${zephyr_vm}" \
     --vmconfigs "${linux_vm}"

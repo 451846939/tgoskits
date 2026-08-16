@@ -165,8 +165,8 @@ iterations boot_timeout_seconds stress_procs rounds
 
 | 变体 | AxVisor board config | 含义 |
 | --- | --- | --- |
-| `baseline` | `os/axvisor/configs/board/qemu-aarch64-rt-shared-wait-baseline.toml` | 恢复共享 vCPU 等待队列和广播唤醒关键路径 |
-| `optimized` | `os/axvisor/configs/board/qemu-aarch64-rt.toml` | 每 vCPU 等待队列、定向唤醒、IRQ 路由和亲和性优化路径 |
+| `baseline` | `os/axvisor/configs/board/qemu-aarch64-rt-shared-wait-baseline.toml` | 精确恢复最新 `dev` 的共享等待队列；启动超时也作为稳定性结果保留 |
+| `optimized` | `os/axvisor/configs/board/qemu-aarch64-rt.toml` | 独占 pCPU 上保持 vCPU 可运行；IRQ 采用 pending 队列、定向目标和目标 pCPU IPI，设备 poll 请求不发送冗余 IPI |
 
 覆盖默认配置：
 
@@ -176,7 +176,7 @@ AICP_OPTIMIZED_BOARD_CONFIG=path/to/optimized.toml \
 scripts/ai-rtos/run_axvisor_rt_before_after.sh 300 360 2 3
 ```
 
-这里的基线是在同一代码树、同一镜像、同一负载下恢复未优化关键路径的受控配置，不需要切换历史 commit。多轮运行会交替 baseline/optimized 顺序，降低先后顺序对 QEMU 调度的影响。
+这里的基线是在同一代码树、同一镜像、同一负载下恢复未优化关键路径的受控配置，不需要切换历史 commit。旧路径在长样本中可能无法完成启动；脚本会保留失败日志并返回非零，而不会用不完整样本计算改善率。多轮运行会交替 baseline/optimized 顺序，降低先后顺序对 QEMU 调度的影响。
 
 ### 3.7 原生 RTOS 周期基线
 
@@ -596,10 +596,14 @@ tmp/ai-rtos/results/rt-before-after-<timestamp>/
 
 ```text
 log=<qemu-log-path>
-linux_console_log=<linux-console-log-path>
+linux_console_log=<optional-separate-linux-console-log-path>
 summary=<summary-path>
 result_dir=<result-directory>
 ```
+
+最新 AxVisor 内部二层交换机路径通过 console mux 将 Host、Linux 和 RTOS
+输出写入 `log`，因此不会额外输出 `linux_console_log`；usernet 等旧路径仍可返回
+独立的 Linux console 日志。
 
 ## 11. 成功判定
 

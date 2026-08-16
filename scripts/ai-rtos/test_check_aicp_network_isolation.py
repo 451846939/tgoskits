@@ -37,6 +37,26 @@ class ForbiddenQemuNetworkTest(unittest.TestCase):
         self.assertEqual(MODULE.find_forbidden_qemu_net(values), values)
 
 
+class InternalAxvisorNetworkTest(unittest.TestCase):
+    def test_guest_mac_array_is_normalized(self):
+        config = """
+[[devices.virtual]]
+id = "virtnet0"
+model = "virtio-net"
+guest_mac = [0x52, 0x54, 0x00, 0xaa, 0x03, 0x02]
+"""
+
+        self.assertEqual(
+            MODULE.extract_internal_virtio_net_macs(config),
+            ["52:54:00:aa:03:02"],
+        )
+
+    def test_invalid_guest_mac_is_ignored(self):
+        config = 'guest_mac = [0x52, 0x54, 0x00, 0xaa, 0x03, 0x100]'
+
+        self.assertEqual(MODULE.extract_internal_virtio_net_macs(config), [])
+
+
 class RuntimeMatrixTest(unittest.TestCase):
     def test_common_aicp_stream_is_platform_neutral(self):
         stream_header = Path("apps/ai-rtos-demo/aicp/aicp_stream.h")

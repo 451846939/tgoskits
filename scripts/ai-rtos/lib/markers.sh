@@ -52,6 +52,12 @@ aicp_logs_have_terminal_failure() {
     "$@"
 }
 
+aicp_logs_have_fatal_host_irq() {
+  aicp_logs_match_regex \
+    'private IRQ arrived outside a vCPU task|Unhandled (acknowledged host IRQ (26|27|30)|IRQ .*hwirq: HwIrq\((26|27|30)\))' \
+    "$@"
+}
+
 aicp_protocol_event_regex() {
   case "$1" in
     hello)

@@ -15,9 +15,9 @@ Runs the QEMU/AxVisor dual-guest AICP closed loop twice:
   ai     - neural-network adaptive parameters
 
 The script stores raw QEMU logs, extracted CSV files, latency summaries, and a
-fixed-vs-AI comparison under tmp/ai-rtos/results. By default it uses the
-guest-to-guest QEMU hub path; set AICP_TRANSPORT=usernet for the hostfwd
-fallback path.
+fixed-vs-AI comparison under tmp/ai-rtos/results. By default it uses AxVisor's
+internal layer-2 switch; set AICP_TRANSPORT=usernet for the hostfwd fallback
+path.
 EOF
 }
 
@@ -36,7 +36,7 @@ mkdir -p "${result_dir}"
 
 run_mode() {
   local mode="$1"
-  local before after log console_log combined_log csv summary stamp
+  local before after log combined_log csv summary
   local client_impl="${AICP_CLIENT_IMPL:-c}"
   local log_prefix="axvisor-dual-guest-aicp-${client_impl}"
   local log_glob="${log_prefix}-[0-9]*.log"
@@ -72,16 +72,8 @@ run_mode() {
   cp "${log}" "${result_dir}/${mode}.axvisor.log"
   combined_log="${result_dir}/${mode}.log"
   if [[ "${AICP_TRANSPORT:-hub}" == "hub" ]]; then
-    stamp="$(basename "${log}")"
-    stamp="${stamp#${log_prefix}-}"
-    stamp="${stamp%.log}"
-    console_log="${repo_root}/tmp/ai-rtos/logs/${log_prefix}-linux-console-${stamp}.log"
-    if [[ ! -f "${console_log}" ]]; then
-      echo "[ai-rtos] FAIL: cannot locate ${mode} Linux console log: ${console_log}" >&2
-      exit 1
-    fi
-    cp "${console_log}" "${result_dir}/${mode}.linux-console.log"
-    cat "${log}" "${console_log}" > "${combined_log}"
+    # AxVisor's console mux writes host and both guest consoles into one log.
+    cp "${log}" "${combined_log}"
   else
     cp "${log}" "${combined_log}"
   fi

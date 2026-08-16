@@ -32,6 +32,7 @@ connect_retries="${AICP_STARRY_CONNECT_RETRIES:-120}"
 qemu_net_backend="${AICP_QEMU_NET_BACKEND:-hub}"
 starry_native="${AICP_STARRY_NATIVE:-0}"
 starry_transport="${AICP_STARRY_TRANSPORT:-udp}"
+qemu_trace="${AICP_STARRY_QEMU_TRACE:-0}"
 starry_transport_label="UDP"
 rtos_guest="${AICP_RTOS_GUEST:-arceos}"
 if [[ "${mode}" != "ai" && "${mode}" != "fixed" ]]; then
@@ -93,18 +94,20 @@ starry_build_config="${out_dir}/starry-aicp-build-aarch64.generated.toml"
 rtos_build_config="${out_dir}/arceos-aicp-build-aarch64.generated.toml"
 rootfs_img="${out_dir}/rootfs-aarch64-aicp-starry.img"
 overlay_dir="${out_dir}/starry-aicp-overlay"
-starry_elf="${repo_root}/target/aarch64-unknown-linux-musl/release/starryos"
+starry_elf="${repo_root}/target/aarch64-unknown-none-softfloat/release/starryos"
 starry_bin="${starry_elf}.bin"
 arceos_bin="${repo_root}/target/aarch64-unknown-linux-musl/release/arceos-aicp-server.bin"
-axvisor_board_config="${AICP_AXVISOR_BOARD_CONFIG:-os/axvisor/configs/board/qemu-aarch64.toml}"
+axvisor_board_config="${AICP_AXVISOR_BOARD_CONFIG:-os/axvisor/configs/board/qemu-aarch64-ai-rtos.toml}"
 freertos_build_dir="${FREERTOS_BUILD_DIR:-${out_dir}/build-freertos-aicp}"
 rtthread_build_dir="${RTTHREAD_BUILD_DIR:-${repo_root}/tmp/rtthread-aicp-axvisor-build}"
 zephyr_base="${ZEPHYR_BASE:-${repo_root}/tmp/zephyrproject/zephyr}"
 zephyr_build_dir="${ZEPHYR_BUILD_DIR:-${repo_root}/tmp/zephyrproject/build-aicp-axvisor-v4.4}"
-west_bin="${WEST:-${repo_root}/tmp/zephyr-venv-4.2/bin/west}"
+west_bin="${WEST:-west}"
 cross_compile=""
 rtthread_dts="${out_dir}/rtthread-starry-aicp.dts"
 rtthread_dtb="${out_dir}/rtthread-starry-aicp.dtb"
+host_raw_dtb="${out_dir}/qemu-aarch64-starry-${rtos_guest}-host-raw.dtb"
+host_base_dts="${out_dir}/qemu-aarch64-starry-${rtos_guest}-host-base.dts"
 host_base_dtb="${out_dir}/qemu-aarch64-starry-${rtos_guest}-host-base.dtb"
 host_overlay_dtbo="${out_dir}/qemu-aarch64-starry-${rtos_guest}-reserved-memory.dtbo"
 host_dtb="${out_dir}/qemu-aarch64-starry-${rtos_guest}-host.dtb"
@@ -138,6 +141,12 @@ EOF
 fi
 export DEBUGFS="${debugfs_bin}"
 
+# The lwprintf-rs build script compiles an ELF object with the musl cross
+# compiler.  On macOS, cc-rs otherwise finds the host ar/ranlib pair, which
+# replaces that ELF member with an empty Mach-O symbol table archive.
+starry_target_ar="$(aicp_resolve_tool AICP_STARRY_TARGET_AR aarch64-linux-musl-ar)"
+export AR_aarch64_unknown_none_softfloat="${starry_target_ar}"
+
 wait_for_any_marker() {
   local description="$1"
   shift
@@ -165,26 +174,96 @@ prune_aicp_guest_dts() {
     "${path}.pruned2"
 }
 
+normalize_qemu_pci_intx_map() {
+  local path="$1"
+  python3 - "${path}" <<'PYDTS'
+import re
+import sys
+
+path = sys.argv[1]
+lines = open(path).read().splitlines(keepends=True)
+out = []
+in_gic = False
+gic_depth = 0
+normalized_map = False
+normalized_gic = False
+for line in lines:
+    if re.match(r"\s*intc@8000000\s*\{", line):
+        in_gic = True
+        gic_depth = 0
+    if in_gic and "#address-cells" in line:
+        line = re.sub(r"<0x[0-9a-fA-F]+>", "<0x00>", line, count=1)
+        normalized_gic = True
+    if "msi-map =" in line:
+        continue
+    if "interrupt-map =" in line:
+        prefix, encoded = line.split("<", 1)
+        cells_text, suffix = encoded.split(">", 1)
+        cells = [int(value, 0) for value in cells_text.split()]
+        if len(cells) % 10 != 0:
+            raise SystemExit(f"unexpected QEMU PCI interrupt-map cell count: {len(cells)}")
+        normalized = []
+        for offset in range(0, len(cells), 10):
+            entry = cells[offset : offset + 10]
+            normalized.extend(entry[:5])
+            normalized.extend(entry[7:])
+        rendered = " ".join(f"0x{value:x}" for value in normalized)
+        line = prefix + "<" + rendered + ">" + suffix
+        normalized_map = True
+    out.append(line)
+    if in_gic:
+        gic_depth += line.count("{") - line.count("}")
+        if gic_depth == 0:
+            in_gic = False
+if not normalized_map or not normalized_gic:
+    raise SystemExit("failed to normalize QEMU PCI INTx/GIC cells")
+open(path, "w").write("".join(out))
+PYDTS
+}
+
+enable_starry_pcie_intx() {
+  local path="$1"
+  python3 - "${path}" <<'PYDTS'
+import sys
+
+path = sys.argv[1]
+lines = open(path).read().splitlines(keepends=True)
+out = []
+in_pcie = False
+found = False
+for line in lines:
+    if line.startswith("\t// pcie@10000000 {"):
+        in_pcie = True
+        found = True
+    if in_pcie:
+        line = line.replace("\t// ", "\t", 1)
+        # AxVisor forwards the PCI INTx SPIs through the software VGIC.  Do not
+        # expose the physical ITS to the guest; this also makes ax-driver fall
+        # back from MSI-X to the PCI interrupt-map route.
+        if "msi-map =" in line:
+            continue
+        if line.startswith("\t};"):
+            in_pcie = False
+    out.append(line)
+if not found or in_pcie:
+    raise SystemExit("failed to enable the QEMU PCI host node for StarryOS")
+open(path, "w").write("".join(out))
+PYDTS
+  normalize_qemu_pci_intx_map "${path}"
+}
+
 write_starry_vm_config() {
-  local starry_passthrough_devices
-  if [[ "${starry_native}" == "1" ]]; then
-    starry_passthrough_devices='[
-  ["/virtio_mmio@a003c00"],
-  ["/pl011@9000000"],
+  local starry_passthrough
+  starry_passthrough='[
+  { path = "/pcie@10000000" },
+  { path = "/virtio_mmio@a003c00" },
 ]'
-  else
-    starry_passthrough_devices='[
-  ["/virtio_mmio@a003c00"],
-  ["/virtio_mmio@a003e00"],
-  ["/pl011@9000000"],
-]'
-  fi
 
   cat > "${starry_vm}" <<EOF
 [base]
 id = 1
 name = "starry-ai-dual-qemu"
-vm_type = 1
+guest_type = "virtualized"
 cpu_num = 2
 phys_cpu_ids = [${linux_vcpu0_pcpu}, ${linux_vcpu1_pcpu}]
 phys_cpu_sets = [${linux_vcpu0_mask}, ${linux_vcpu1_mask}]
@@ -201,14 +280,8 @@ memory_regions = [
 ]
 
 [devices]
-interrupt_mode = "passthrough"
-passthrough_devices = ${starry_passthrough_devices}
-passthrough_addresses = []
-excluded_devices = []
-emu_devices = [
-  ["gppt-gicd", 0x0800_0000, 0x1_0000, 0, 0x21, []],
-  ["gppt-gicr", 0x080a_0000, 0x2_0000, 0, 0x20, [2, 0x2_0000, ${linux_vcpu0_pcpu}]],
-]
+passthrough = ${starry_passthrough}
+disabled = []
 EOF
 }
 
@@ -228,7 +301,7 @@ write_rtos_vm_config() {
 [base]
 id = 2
 name = "${name}"
-vm_type = 1
+guest_type = "virtualized"
 cpu_num = 1
 phys_cpu_ids = [${rtos_vcpu0_pcpu}]
 phys_cpu_sets = [${rtos_vcpu0_mask}]
@@ -243,18 +316,10 @@ memory_regions = [
 ]
 
 [devices]
-interrupt_mode = "passthrough"
-passthrough_devices = [
-  ["/virtio_mmio@a003a00"],
+passthrough = [
+  { path = "/virtio_mmio@a003a00" },
 ]
-passthrough_addresses = [
-  [0x0900_0000, 0x1000],
-]
-excluded_devices = []
-emu_devices = [
-  ["gppt-gicd", 0x0800_0000, 0x1_0000, 0, 0x21, []],
-  ["gppt-gicr", 0x080a_0000, 0x2_0000, 0, 0x20, [1, 0x2_0000, ${rtos_vcpu0_pcpu}]],
-]
+disabled = []
 EOF
     return
   fi
@@ -264,16 +329,16 @@ EOF
 [base]
 id = 2
 name = "rtthread-aicp-starry-qemu"
-vm_type = 1
+guest_type = "virtualized"
 cpu_num = 1
 phys_cpu_ids = [${rtos_vcpu0_pcpu}]
 phys_cpu_sets = [${rtos_vcpu0_mask}]
 
 [kernel]
-entry_point = 0xC008_0000
+entry_point = 0xC000_0000
 image_location = "memory"
 kernel_path = "${rtthread_build_dir}/rtthread.bin"
-kernel_load_addr = 0xC008_0000
+kernel_load_addr = 0xC000_0000
 dtb_path = "${rtthread_dtb}"
 dtb_load_addr = 0xCFE0_0000
 memory_regions = [
@@ -281,18 +346,10 @@ memory_regions = [
 ]
 
 [devices]
-interrupt_mode = "passthrough"
-passthrough_devices = [
-  ["/virtio_mmio@a003a00"],
+passthrough = [
+  { path = "/virtio_mmio@a003a00" },
 ]
-passthrough_addresses = [
-  [0x0900_0000, 0x1000],
-]
-excluded_devices = []
-emu_devices = [
-  ["gppt-gicd", 0x0800_0000, 0x1_0000, 0, 0x21, []],
-  ["gppt-gicr", 0x080a_0000, 0x2_0000, 0, 0x20, [1, 0x2_0000, ${rtos_vcpu0_pcpu}]],
-]
+disabled = []
 EOF
     return
   fi
@@ -301,7 +358,7 @@ EOF
 [base]
 id = 2
 name = "arceos-aicp-starry-dual-qemu"
-vm_type = 1
+guest_type = "virtualized"
 cpu_num = 1
 phys_cpu_ids = [${rtos_vcpu0_pcpu}]
 phys_cpu_sets = [${rtos_vcpu0_mask}]
@@ -318,26 +375,19 @@ memory_regions = [
 ]
 
 [devices]
-interrupt_mode = "passthrough"
-passthrough_devices = [
-  ["/virtio_mmio@a002a00"],
+passthrough = [
+  { path = "/virtio_mmio@a002a00" },
 ]
-passthrough_addresses = [
-  [0x0900_0000, 0x1000],
-]
-excluded_devices = []
-emu_devices = [
-  ["gppt-gicd", 0x0800_0000, 0x1_0000, 0, 0x21, []],
-  ["gppt-gicr", 0x080a_0000, 0x2_0000, 0, 0x20, [1, 0x2_0000, ${rtos_vcpu0_pcpu}]],
-]
+disabled = []
 EOF
 }
 
 build_host_dtb() {
-  [[ "${rtos_guest}" == "arceos" ]] && return
-
   local overlay reserved_path expected_reg actual_reg
   case "${rtos_guest}" in
+    arceos)
+      overlay=""
+      ;;
     freertos)
       overlay="${repo_root}/configs/ai-rtos/qemu-aarch64-freertos-reserved-memory-overlay.dts"
       reserved_path="/reserved-memory/freertos@d0000000"
@@ -369,15 +419,24 @@ build_host_dtb() {
     -monitor none \
     -serial null \
     -cpu cortex-a72 \
-    -machine "virt,virtualization=on,gic-version=3,dumpdtb=${host_base_dtb}" \
+    -machine "virt,virtualization=on,gic-version=3,its=off,dumpdtb=${host_raw_dtb}" \
     -smp "${host_cpus}" \
     -m 8g \
-    -device virtio-blk-device,drive=disk0 \
+    -device nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65 \
     -drive "id=disk0,if=none,format=raw,file=${host_dtb_dummy_disk}" \
+    -device virtio-serial-device,max_ports=1 \
     -netdev hubport,id=linuxnet,hubid=3 \
     -device virtio-net-device,netdev=linuxnet,mac=52:54:00:aa:03:03 \
     -netdev hubport,id=rtosnet,hubid=3 \
     -device virtio-net-device,netdev=rtosnet,mac=52:54:00:aa:03:02
+  dtc -I dtb -O dts -o "${host_base_dts}" "${host_raw_dtb}"
+  normalize_qemu_pci_intx_map "${host_base_dts}"
+  dtc -@ -I dts -O dtb -o "${host_base_dtb}" "${host_base_dts}"
+  if [[ -z "${overlay}" ]]; then
+    cp "${host_base_dtb}" "${host_dtb}"
+    echo "[ai-rtos] Host PCI INTx map normalized for assigned NVMe"
+    return
+  fi
   dtc -@ -I dts -O dtb -o "${host_overlay_dtbo}" "${overlay}"
   fdtoverlay -i "${host_base_dtb}" -o "${host_dtb}" "${host_overlay_dtbo}"
   actual_reg="$(fdtget -tx "${host_dtb}" "${reserved_path}" reg)"
@@ -394,13 +453,14 @@ write_guest_build_configs() {
     starry_features='[
   "qemu-aicp-native",
   "smp-aicp-native",
+  "ax-driver/nvme",
   "ax-driver/virtio-net",
 ]'
   else
     starry_features='[
   "qemu-aicp-userland",
   "smp",
-  "ax-driver/virtio-blk",
+  "ax-driver/nvme",
   "ax-driver/virtio-net",
 ]'
   fi
@@ -408,7 +468,7 @@ write_guest_build_configs() {
   cat > "${starry_build_config}" <<EOF
 target = "aarch64-unknown-none-softfloat"
 log = "Info"
-env = { AX_IP = "${starry_ip}", AX_GW = "0.0.0.0", AX_PREFIX_LEN = "24", AX_NET_MAC = "52:54:00:aa:03:03", AX_IFACE_NAME = "aicp0", AICP_STARRY_NATIVE = "${starry_native}", AICP_STARRY_ITERATIONS = "${iterations}", AICP_STARRY_MODE = "${mode}", AICP_STARRY_SERVER = "${rtos_ip}", AICP_STARRY_SERVER_PORT = "8800", AICP_STARRY_SERVER_MAC = "52:54:00:aa:03:02", AICP_STARRY_IFACE = "aicp0", AICP_STARRY_TRANSPORT = "${starry_transport}", AICP_STARRY_UDP_RETRIES = "${AICP_STARRY_UDP_RETRIES:-8}", AX_NET_STRICT_CONFIG = "1", AX_NET_DRIVER_MAC_FILTER = "1" }
+env = { AX_IP = "${starry_ip}", AX_GW = "0.0.0.0", AX_PREFIX_LEN = "24", AX_NET_MAC = "52:54:00:aa:03:03", AX_IFACE_NAME = "eth0", AICP_STARRY_NATIVE = "${starry_native}", AICP_STARRY_ITERATIONS = "${iterations}", AICP_STARRY_MODE = "${mode}", AICP_STARRY_SERVER = "${rtos_ip}", AICP_STARRY_SERVER_PORT = "8800", AICP_STARRY_SERVER_MAC = "52:54:00:aa:03:02", AICP_STARRY_IFACE = "eth0", AICP_STARRY_TRANSPORT = "${starry_transport}", AICP_STARRY_UDP_RETRIES = "${AICP_STARRY_UDP_RETRIES:-8}", AICP_STARRY_CONNECT_RETRIES = "${connect_retries}", AX_NET_STRICT_CONFIG = "1", AX_NET_DRIVER_MAC_FILTER = "1" }
 features = ${starry_features}
 max_cpu_num = 2
 EOF
@@ -460,7 +520,7 @@ else
   AICP_STARRY_NET_PREFIX="10.0.3.0" \
   AICP_STARRY_STATIC_ARP="1" \
   AICP_STARRY_SERVER_MAC="52:54:00:aa:03:02" \
-  AICP_STARRY_IFACE="aicp0" \
+  AICP_STARRY_IFACE="eth0" \
   AICP_STARRY_TRANSPORT="${starry_transport}" \
   AICP_STARRY_UDP_RETRIES="${AICP_STARRY_UDP_RETRIES:-8}" \
   AICP_STARRY_CONNECT_RETRIES="${connect_retries}" \
@@ -479,22 +539,41 @@ python3 - \
   "${rootfs_img}" \
   "${qemu_net_backend}" \
   "${rtos_guest}" \
-  "${host_dtb}" <<'PYQ'
+  "${host_dtb}" \
+  "${qemu_trace}" \
+  "${log_dir}/axvisor-starry-${rtos_guest}-qemu-${stamp}.trace" <<'PYQ'
 import sys
-src, dst, rootfs, net_backend, rtos_guest, host_dtb = sys.argv[1:]
+src, dst, rootfs, net_backend, rtos_guest, host_dtb, qemu_trace, trace_file = sys.argv[1:]
 text = open(src).read()
 text = text.replace('file=${workspace}/tmp/axbuild/rootfs/rootfs-aarch64-alpine.img', 'file=' + rootfs)
+text = text.replace(
+    '"virtio-blk-device,drive=disk0",',
+    '"nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65",',
+    1,
+)
+text = text.replace(
+    "virt,virtualization=on,gic-version=3",
+    "virt,virtualization=on,gic-version=3,its=off",
+    1,
+)
 lines = text.splitlines(keepends=True)
 out = []
-inserted_padding = False
+reserved_disk_slot = False
+inserted_arceos_padding = False
 for line in lines:
+    if not reserved_disk_slot and '"-netdev"' in line:
+        out.append('  "-device",\n')
+        out.append('  "virtio-serial-device,max_ports=1",\n')
+        reserved_disk_slot = True
     out.append(line)
-    if rtos_guest == "arceos" and not inserted_padding and '"virtio-net-device,netdev=linuxnet' in line:
+    if rtos_guest == "arceos" and not inserted_arceos_padding and '"virtio-net-device,netdev=linuxnet' in line:
         for _ in range(8):
             out.append('  "-device",\n')
             out.append('  "virtio-serial-device,max_ports=1",\n')
-        inserted_padding = True
-if rtos_guest == "arceos" and not inserted_padding:
+        inserted_arceos_padding = True
+if not reserved_disk_slot:
+    raise SystemExit("failed to reserve the former root-disk virtio-mmio slot")
+if rtos_guest == "arceos" and not inserted_arceos_padding:
     raise SystemExit("failed to insert AICP virtio-mmio padding after linuxnet")
 text = ''.join(out)
 if rtos_guest == "freertos":
@@ -502,13 +581,30 @@ if rtos_guest == "freertos":
         "netdev=rtosnet,mac=52:54:00:aa:03:02,csum=off,guest_csum=off,guest_tso4=off,guest_tso6=off,guest_ecn=off,guest_ufo=off,host_tso4=off,host_tso6=off,host_ecn=off,host_ufo=off,mrg_rxbuf=on",
         "netdev=rtosnet,mac=52:54:00:aa:03:02,csum=off,guest_csum=off,guest_tso4=off,guest_tso6=off,guest_ecn=off,guest_ufo=off,host_tso4=off,host_tso6=off,host_ecn=off,host_ufo=off,mrg_rxbuf=off",
     )
-if rtos_guest != "arceos":
-    append = '  "-append",\n'
-    if append not in text:
-        raise SystemExit("failed to locate QEMU -append insertion point")
+append = '  "-append",\n'
+if append not in text:
+    raise SystemExit("failed to locate QEMU -append insertion point")
+text = text.replace(
+    append,
+    '  "-dtb",\n  "' + host_dtb + '",\n' + append,
+    1,
+)
+if qemu_trace == "1":
+    trace_events = [
+        "pci_nvme_irq_pin",
+        "pci_nvme_irq_masked",
+        "pci_nvme_mmio_intm_set",
+        "pci_nvme_mmio_intm_clr",
+        "pci_route_irq",
+        "gic_enable_irq",
+        "gic_disable_irq",
+        "gicv3_dist_set_irq",
+    ]
+    trace_events_file = trace_file + ".events"
+    open(trace_events_file, "w").write("\n".join(trace_events) + "\n")
     text = text.replace(
         append,
-        '  "-dtb",\n  "' + host_dtb + '",\n' + append,
+        '  "-trace",\n  "events=' + trace_events_file + ',file=' + trace_file + '",\n' + append,
         1,
     )
 if net_backend == "mcast":
@@ -569,6 +665,7 @@ case "${rtos_guest}" in
     echo "[ai-rtos] Building RT-Thread overlay guest without modifying upstream sources..."
     RTTHREAD_GIC_VERSION=3 \
     RTTHREAD_RAM_BASE=0xC0000000 \
+    RTTHREAD_TEXT_OFFSET=0x0 \
     RTTHREAD_VIRTIO_MMIO_BASE=0x0a003a00 \
     RTTHREAD_VIRTIO_MAX_NR=1 \
     RTTHREAD_VIRTIO_IRQ_BASE=77 \
@@ -599,11 +696,8 @@ case "${rtos_guest}" in
     ;;
 esac
 
-if [[ "${starry_native}" == "1" ]]; then
-  crop_virtio_nodes "${linux_src_dts}" "${starry_dts}" "virtio_mmio@a003c00"
-else
-  crop_virtio_nodes "${linux_src_dts}" "${starry_dts}" "virtio_mmio@a003[ce]00"
-fi
+crop_virtio_nodes "${linux_src_dts}" "${starry_dts}" "virtio_mmio@a003c00"
+enable_starry_pcie_intx "${starry_dts}"
 prune_aicp_guest_dts "${starry_dts}"
 if [[ "${AICP_STARRY_NET_POLL_ONLY:-0}" == "1" ]]; then
 python3 - "${starry_dts}" <<'PYDTS'
@@ -627,6 +721,10 @@ text = re.sub(
 open(path, 'w').write(text)
 PYDTS
 fi
+if [[ "${starry_native}" != "1" ]]; then
+  patch_bootargs "${starry_dts}" \
+    "root=/dev/vda rw init=/usr/bin/aicp_starry_init fsck.repair=yes"
+fi
 if [[ "${rtos_guest}" == "arceos" ]]; then
   crop_virtio_nodes "${linux_src_dts}" "${rtos_dts}" "virtio_mmio@a002a00"
   prune_aicp_guest_dts "${rtos_dts}"
@@ -645,7 +743,7 @@ write_rtos_vm_config
 echo "[ai-rtos] Booting AxVisor StarryOS+RTOS AICP hub; log: ${log_file}"
 (
   cd "${repo_root}"
-  cargo xtask axvisor qemu \
+  aicp_exec_new_session cargo xtask axvisor qemu \
     --config "${axvisor_board_config}" \
     --rootfs "${rootfs_img}" \
     --qemu-config "${qemu_config}" \
@@ -729,6 +827,13 @@ if ! LC_ALL=C grep -a -q "${rtos_control_marker}" "${log_file}"; then
   tail -n 180 "${log_file}" >&2 || true
   exit 1
 fi
+
+# The marker-driven success path can finish before `cargo xtask` has reaped
+# QEMU. Tear down the entire launch session and verify that the writable root
+# image is unlocked before another matrix stage reuses it.
+aicp_cleanup_process_tree "${qemu_pid}"
+qemu_pid=""
+aicp_wait_for_qemu_image_release "${rootfs_img}" 20
 
 LC_ALL=C grep -a "AICP_STARRY_DONE" "${log_file}" | tail -n 1
 echo "[ai-rtos] PASS: AxVisor StarryOS+RTOS AICP ${starry_transport_label}/IP closed loop complete"

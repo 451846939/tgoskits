@@ -90,6 +90,23 @@ if aicp_logs_have_terminal_failure "${terminal_failure_log}"; then
   exit 1
 fi
 
+host_irq_failure_log="${test_dir}/host-irq-failure.log"
+printf '%s\n' \
+  'Unhandled IRQ IrqId { domain: IrqDomainId(7), hwirq: HwIrq(26) } on CPU 1' \
+  > "${host_irq_failure_log}"
+if ! aicp_logs_have_fatal_host_irq "${host_irq_failure_log}"; then
+  echo "FAIL: 宿主 EL2 物理定时器 PPI 26 未处理事件未被识别" >&2
+  exit 1
+fi
+
+printf '%s\n' \
+  'AICP_FREERTOS_NET_IRQ_ENABLED intid=77 priority=240' \
+  'AICP_LINUX_DONE ok=1 failed=0' > "${host_irq_failure_log}"
+if aicp_logs_have_fatal_host_irq "${host_irq_failure_log}"; then
+  echo "FAIL: 正常的 Guest SPI 与成功汇总被误判为宿主 IRQ 故障" >&2
+  exit 1
+fi
+
 image_lock_bin="${test_dir}/image-lock-bin"
 mkdir -p "${image_lock_bin}"
 cat > "${image_lock_bin}/lsof" <<'EOF'

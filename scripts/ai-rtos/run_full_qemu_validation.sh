@@ -26,6 +26,7 @@ usage() {
   AICP_FULL_STRESS_PROCS=N              Linux 压力进程数，默认 2
   AICP_FULL_INCLUDE_LONG_STABILITY=0|1  增加 1000/10000 次长稳
   AICP_FULL_DRY_RUN=0|1                 只打印阶段计划，不执行
+  PYTHON=/path/to/python3               指定 Python 解释器
 
 结果目录：
   tmp/ai-rtos/results/full-validation-<timestamp>/summary.txt
@@ -53,6 +54,8 @@ esac
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "${repo_root}/scripts/ai-rtos/lib/host_tools.sh"
+python_bin="$(aicp_resolve_tool PYTHON python3)"
+export PYTHONPYCACHEPREFIX="${PYTHONPYCACHEPREFIX:-${repo_root}/tmp/ai-rtos/python-cache}"
 stamp="$(date +%Y%m%d-%H%M%S)"
 result_dir="${repo_root}/tmp/ai-rtos/results/full-validation-${stamp}"
 stage_log_dir="${result_dir}/logs"
@@ -188,18 +191,26 @@ check_runtime_isolation() {
     --log "${primary_log}"
     --summary "${result_dir}/isolation-${name}.txt"
   )
+  if [[ "${network_profile}" == "arceos-tcp" && "${ai_guest}" == "linux" ]]; then
+    arguments+=(
+      --vm-config "${repo_root}/tmp/ai-rtos/axvisor-dual-guest-aicp-c-linux.generated.toml"
+      --vm-config "${repo_root}/tmp/ai-rtos/axvisor-dual-guest-aicp-c-arceos.generated.toml"
+    )
+  fi
   if [[ -n "${secondary_pattern}" ]]; then
     secondary_log="$(latest_file "${secondary_pattern}")"
     arguments+=(--log "${secondary_log}")
   fi
-  python3 "${arguments[@]}"
+  "${python_bin}" "${arguments[@]}"
 }
 
 check_commands() {
   local command_name
   local missing=0
-  local required=(cargo make python3 qemu-system-aarch64 dtc fdtoverlay mkfs.ext4 timeout cpio gzip perl lsof)
+  local required=(cargo make qemu-system-aarch64 dtc fdtoverlay mkfs.ext4 timeout cpio gzip perl lsof)
   local yolo_install_dir="${repo_root}/apps/ai-rtos-demo/yolov8-rust-onnx/install/aarch64"
+
+  echo "command=python path=${python_bin}"
 
   if [[ "${profile}" == "full" ]] &&
      { [[ "${AICP_YOLO_RUST_REBUILD:-0}" == "1" ]] ||
@@ -233,8 +244,8 @@ run_stage preflight check_commands
 run_stage shell_syntax scripts/ai-rtos/check_shell_syntax.sh
 run_stage host_tools_unit scripts/ai-rtos/test_host_tools.sh
 run_stage run_artifacts_unit scripts/ai-rtos/test_run_artifacts.sh
-run_stage python_syntax python3 -m py_compile scripts/ai-rtos/*.py
-run_stage isolation_unit python3 -m unittest scripts/ai-rtos/test_check_aicp_network_isolation.py
+run_stage python_syntax "${python_bin}" -m py_compile scripts/ai-rtos/*.py
+run_stage isolation_unit "${python_bin}" -m unittest scripts/ai-rtos/test_check_aicp_network_isolation.py
 run_stage architecture scripts/ai-rtos/check_demo_architecture.sh
 run_stage third_party_clean scripts/ai-rtos/check_third_party_sources_clean.sh
 run_stage host_build make -C apps/ai-rtos-demo all
@@ -250,8 +261,7 @@ run_stage linux_arceos scripts/ai-rtos/run_axvisor_dual_guest_aicp.sh "${iterati
 run_stage isolation_linux_arceos check_runtime_isolation \
   linux-arceos linux arceos-tcp \
   "${repo_root}/tmp/ai-rtos/axvisor-dual-guest-aicp-c-qemu.generated.toml" \
-  'axvisor-dual-guest-aicp-c-[0-9]*.log' \
-  'axvisor-dual-guest-aicp-c-linux-console-*.log'
+  'axvisor-dual-guest-aicp-c-[0-9]*.log'
 
 run_stage linux_rtthread scripts/ai-rtos/run_axvisor_linux_rtthread_aicp.sh "${iterations}" ai "${boot_timeout_s}"
 run_stage isolation_linux_rtthread check_runtime_isolation \

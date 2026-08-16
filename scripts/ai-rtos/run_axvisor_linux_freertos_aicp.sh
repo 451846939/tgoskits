@@ -16,6 +16,9 @@ usage() {
 
 两个 virtio-net 设备接入同一个隔离 QEMU 二层 hub。主数据通道是
 TCP/IP，不使用 vsock、共享内存、HyperCall、hostfwd 或 NAT。
+
+环境变量 AICP_TCP_TIMEOUT_MS 设置 Linux 客户端的连接和收包超时；
+FreeRTOS+TCP 在 QEMU TCG 压力下调度较慢，默认 10000 ms。
 EOF
 }
 
@@ -40,6 +43,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "${repo_root}/scripts/ai-rtos/lib/cpu_topology.sh"
 source "${repo_root}/scripts/ai-rtos/lib/dtb.sh"
 source "${repo_root}/scripts/ai-rtos/lib/host_tools.sh"
+source "${repo_root}/scripts/ai-rtos/lib/markers.sh"
 source "${repo_root}/scripts/ai-rtos/lib/process.sh"
 demo_dir="${repo_root}/apps/ai-rtos-demo"
 out_dir="${repo_root}/tmp/ai-rtos"
@@ -49,6 +53,7 @@ bundle_dir="${repo_root}/tmp/images/qemu-aarch64"
 stress_procs="${AICP_STRESS_PROCS:-0}"
 skip_freertos_build="${AICP_SKIP_FREERTOS_BUILD:-0}"
 qemu_trace="${AICP_QEMU_TRACE:-0}"
+tcp_timeout_ms="${AICP_TCP_TIMEOUT_MS:-10000}"
 mkdir -p "${out_dir}" "${log_dir}" "${result_dir}" "${demo_dir}/build/aarch64"
 aicp_configure_dual_guest_cpu_topology
 
@@ -62,6 +67,11 @@ if [[ "${skip_freertos_build}" != "0" && "${skip_freertos_build}" != "1" ]]; the
 fi
 if [[ "${qemu_trace}" != "0" && "${qemu_trace}" != "1" ]]; then
   echo "ERROR: AICP_QEMU_TRACE 必须为 0 或 1，实际为 '${qemu_trace}'" >&2
+  exit 2
+fi
+if ! [[ "${tcp_timeout_ms}" =~ ^[0-9]+$ ]] ||
+   (( tcp_timeout_ms < 1 || tcp_timeout_ms > 60000)); then
+  echo "ERROR: AICP_TCP_TIMEOUT_MS 必须在 [1, 60000]，实际为 '${tcp_timeout_ms}'" >&2
   exit 2
 fi
 
@@ -110,6 +120,12 @@ wait_for_marker() {
       tail -n 120 "${linux_console_log}" >&2 || true
       return 1
     fi
+    if aicp_logs_have_fatal_host_irq "${log_file}"; then
+      echo "[ai-rtos] FAIL：检测到未处理的 Host/Guest 私有定时器 IRQ，停止等待：${marker}" >&2
+      tail -n 220 "${log_file}" >&2 || true
+      tail -n 120 "${linux_console_log}" >&2 || true
+      return 1
+    fi
     if ! kill -0 "${qemu_pid}" 2>/dev/null; then
       echo "[ai-rtos] AxVisor 在出现标记前退出：${marker}" >&2
       tail -n 220 "${log_file}" >&2 || true
@@ -153,13 +169,18 @@ build_host_dtb() {
   dtc -@ -I dts -O dtb -o "${host_overlay_dtbo}" "${host_overlay_dts}"
   fdtoverlay -i "${host_base_dtb}" -o "${host_dtb}" "${host_overlay_dtbo}"
 
-  local freertos_reserved_reg
+  local linux_reserved_reg freertos_reserved_reg
+  linux_reserved_reg="$(fdtget -tx "${host_dtb}" /reserved-memory/linux@80000000 reg)"
+  if [[ "${linux_reserved_reg}" != "0 80000000 0 20000000" ]]; then
+    echo "ERROR: 宿主 DTB 中 Linux 预留内存校验失败：${linux_reserved_reg}" >&2
+    exit 1
+  fi
   freertos_reserved_reg="$(fdtget -tx "${host_dtb}" /reserved-memory/freertos@d0000000 reg)"
   if [[ "${freertos_reserved_reg}" != "0 d0000000 0 8000000" ]]; then
     echo "ERROR: 宿主 DTB 中 FreeRTOS 预留内存校验失败：${freertos_reserved_reg}" >&2
     exit 1
   fi
-  echo "[ai-rtos] 宿主 DTB 已预留 FreeRTOS DMA 内存：${freertos_reserved_reg}"
+  echo "[ai-rtos] 宿主 DTB 已预留 Linux/FreeRTOS DMA 内存：${linux_reserved_reg}; ${freertos_reserved_reg}"
 }
 
 write_linux_vm_config() {
@@ -167,7 +188,7 @@ write_linux_vm_config() {
 [base]
 id = 1
 name = "linux-ai-freertos-qemu"
-vm_type = 1
+guest_type = "virtualized"
 cpu_num = 2
 phys_cpu_ids = [${linux_vcpu0_pcpu}, ${linux_vcpu1_pcpu}]
 phys_cpu_sets = [${linux_vcpu0_mask}, ${linux_vcpu1_mask}]
@@ -184,21 +205,14 @@ ramdisk_load_addr = 0x9000_0000
 memory_regions = [
   # Linux 使用 AxVisor 分配的身份映射内存。QEMU 直通 virtio 设备直接使用
   # virtqueue 中的 Guest PA 做 DMA，因此 Guest PA 必须同时是有效 Host PA。
-  [0x8000_0000, 0x2000_0000, 0x7, 1],
+  [0x8000_0000, 0x2000_0000, 0x7, 2],
 ]
 
 [devices]
-interrupt_mode = "passthrough"
-passthrough_devices = [
-  ["/virtio_mmio@a003c00"],
-  ["/pl011@9040000"],
+passthrough = [
+  { path = "/virtio_mmio@a003c00" },
 ]
-passthrough_addresses = []
-excluded_devices = []
-emu_devices = [
-  ["gppt-gicd", 0x0800_0000, 0x1_0000, 0, 0x21, []],
-  ["gppt-gicr", 0x080a_0000, 0x2_0000, 0, 0x20, [2, 0x2_0000, ${linux_vcpu0_pcpu}]],
-]
+disabled = []
 EOF
 }
 
@@ -207,7 +221,7 @@ write_freertos_vm_config() {
 [base]
 id = 2
 name = "freertos-aicp-qemu"
-vm_type = 1
+guest_type = "virtualized"
 cpu_num = 1
 phys_cpu_ids = [${rtos_vcpu0_pcpu}]
 phys_cpu_sets = [${rtos_vcpu0_mask}]
@@ -222,20 +236,10 @@ memory_regions = [
 ]
 
 [devices]
-interrupt_mode = "passthrough"
-passthrough_devices = [
-  ["/virtio_mmio@a003a00"],
+passthrough = [
+  { path = "/virtio_mmio@a003a00" },
 ]
-# UART 仅用于轮询日志输出，不声明其中断所有权。宿主保留第一个 PL011
-# 的 SPI，Linux Guest 使用独立的第二个 PL011，避免中断所有权冲突。
-passthrough_addresses = [
-  [0x0900_0000, 0x1000],
-]
-excluded_devices = []
-emu_devices = [
-  ["gppt-gicd", 0x0800_0000, 0x1_0000, 0, 0x21, []],
-  ["gppt-gicr", 0x080a_0000, 0x2_0000, 0, 0x20, [1, 0x2_0000, ${rtos_vcpu0_pcpu}]],
-]
+disabled = []
 EOF
 }
 
@@ -270,7 +274,7 @@ mkdir -p "${initramfs_dir}"
 echo "[ai-rtos] 构建 Linux Guest 静态 AICP 客户端"
 rm -f "${demo_dir}/build/aarch64/aicp_init"
 make -C "${demo_dir}" linux-init-aarch64 \
-  CFLAGS="-O2 -g -Wall -Wextra -Werror -std=c11 -DAICP_INIT_ITERATIONS=${iterations}u -DAICP_INIT_MODE=\\\"${mode}\\\" -DAICP_INIT_SERVER=\\\"10.0.3.2\\\" -DAICP_INIT_SERVER_PORT=8800u -DAICP_INIT_CLIENT=\\\"10.0.3.3\\\" -DAICP_INIT_NET_PREFIX=\\\"10.0.3.0\\\" -DAICP_INIT_NETMASK=\\\"255.255.255.0\\\" -DAICP_INIT_SERVER_MAC=\\\"52:54:00:aa:03:02\\\" -DAICP_INIT_STATIC_ARP=1 -DAICP_INIT_STRESS_PROCS=${stress_procs}u"
+  CFLAGS="-O2 -g -Wall -Wextra -Werror -std=c11 -DAICP_INIT_ITERATIONS=${iterations}u -DAICP_INIT_MODE=\\\"${mode}\\\" -DAICP_INIT_SERVER=\\\"10.0.3.2\\\" -DAICP_INIT_SERVER_PORT=8800u -DAICP_INIT_CLIENT=\\\"10.0.3.3\\\" -DAICP_INIT_NET_PREFIX=\\\"10.0.3.0\\\" -DAICP_INIT_NETMASK=\\\"255.255.255.0\\\" -DAICP_INIT_SERVER_MAC=\\\"52:54:00:aa:03:02\\\" -DAICP_INIT_STATIC_ARP=1 -DAICP_INIT_STRESS_PROCS=${stress_procs}u -DAICP_INIT_TCP_TIMEOUT_MS=${tcp_timeout_ms}u"
 cp "${demo_dir}/build/aarch64/aicp_init" "${initramfs_dir}/init"
 chmod +x "${initramfs_dir}/init"
 (
@@ -287,15 +291,14 @@ remove_dts_nodes "${linux_dts}.pruned1" "${linux_dts}.pruned2" "fw-cfg@|pl031@|f
 # 此场景不向 Guest 暴露 PMU、MSI/LPI 或 QEMU platform bus。
 remove_dts_nodes "${linux_dts}.pruned2" "${linux_dts}" "platform-bus@|pmu|its@"
 rm -f "${linux_dts}.devices" "${linux_dts}.pruned1" "${linux_dts}.pruned2"
-patch_linux_guest_console "${linux_dts}"
-patch_bootargs "${linux_dts}" "console=ttyAMA0 earlycon=pl011,0x9040000 rdinit=/init panic=-1 loglevel=7"
+patch_bootargs "${linux_dts}" "console=ttyAMA0 earlycon=pl011,0x9000000 rdinit=/init panic=-1 loglevel=7"
 dtc -I dts -O dtb -o "${linux_dtb}" "${linux_dts}"
 build_host_dtb
 write_linux_vm_config
 write_freertos_vm_config
 
-if ! grep -Fq '[0x8000_0000, 0x2000_0000, 0x7, 1]' "${linux_vm}"; then
-  echo "ERROR: Linux Guest RAM 必须使用 MapIdentical，避免 QEMU virtio DMA 访问固定预留区" >&2
+if ! grep -Fq '[0x8000_0000, 0x2000_0000, 0x7, 2]' "${linux_vm}"; then
+  echo "ERROR: Linux Guest RAM 必须使用宿主 FDT 预留内存，避免 QEMU virtio DMA 访问未保留区域" >&2
   exit 1
 fi
 if ! grep -Fq '[0xD000_0000, 0x0800_0000, 0x7, 2]' "${freertos_vm}"; then
@@ -345,7 +348,7 @@ echo "[ai-rtos] 启动 AxVisor Linux + FreeRTOS 双 Guest；日志：${log_file}
 (
   cd "${repo_root}"
   aicp_exec_new_session cargo xtask axvisor qemu \
-    --config os/axvisor/configs/board/qemu-aarch64.toml \
+    --config os/axvisor/configs/board/qemu-aarch64-ai-rtos.toml \
     --qemu-config "${qemu_config}" \
     --vmconfigs "${freertos_vm}" \
     --vmconfigs "${linux_vm}"
@@ -354,10 +357,10 @@ qemu_pid=$!
 global_deadline=$((SECONDS + boot_timeout_s))
 
 wait_for_marker "smp: Brought up 1 node, 2 CPUs"
-wait_for_marker "AICP_FREERTOS_NET_IRQ_ENABLED"
 # Host and guest diagnostics share the AxVisor console and may split a UART line.
-# A complete HELLO observed below proves that the listener accepted an IP/TCP
-# connection, so readiness is gated by protocol progress instead of one log line.
+# `AICP_FREERTOS_NET_IRQ_ENABLED` remains useful when intact, but a complete
+# HELLO observed below proves that the listener accepted an IP/TCP connection.
+# Gate readiness on protocol progress instead of one interleavable log line.
 wait_for_marker "AICP Linux guest client starting"
 wait_for_marker "AICP_LINUX_TX_FRAME type=HELLO"
 wait_for_marker "AICP_FREERTOS_HELLO"
@@ -368,10 +371,8 @@ wait_for_marker "AICP_LINUX_DONE ok="
 # Give the shutting-down Linux vCPU time to leave its task context, then verify
 # that guest-private architectural timer sources did not leak into Host tasks.
 sleep 1
-if LC_ALL=C grep -a -Eq \
-  'private IRQ arrived outside a vCPU task|Unhandled IRQ .*hwirq: HwIrq\((27|30)\)' \
-  "${log_file}"; then
-  echo "[ai-rtos] FAIL：Guest 架构定时器在 vCPU 退出后仍向 Host 注入私有 IRQ" >&2
+if aicp_logs_have_fatal_host_irq "${log_file}"; then
+  echo "[ai-rtos] FAIL：检测到未处理的 Host/Guest 私有定时器 IRQ" >&2
   tail -n 220 "${log_file}" >&2 || true
   exit 1
 fi
@@ -399,8 +400,8 @@ fi
 
 {
   echo "AxVisor Linux + FreeRTOS AICP/TCP 双 Guest 实测摘要"
-  echo "Linux: 2 vCPU -> pCPU1,pCPU2, IP 10.0.3.3, RAM 0x80000000/512MiB, NIC a003c00"
-  echo "FreeRTOS: 1 vCPU -> pCPU0, IP 10.0.3.2, RAM 0xD0000000/128MiB, NIC a003a00 IRQ77"
+  echo "Linux: 2 vCPU -> pCPU${linux_vcpu0_pcpu},pCPU${linux_vcpu1_pcpu}, IP 10.0.3.3, RAM 0x80000000/512MiB, NIC a003c00"
+  echo "FreeRTOS: 1 vCPU -> pCPU${rtos_vcpu0_pcpu}, IP 10.0.3.2, RAM 0xD0000000/128MiB, NIC a003a00 IRQ77"
   LC_ALL=C grep -a "AICP_FREERTOS_NET_IRQ_ENABLED" "${log_file}" | tail -n 1 || true
   LC_ALL=C grep -a "AICP_FREERTOS_NETWORK_EVENT state=up" "${log_file}" | tail -n 1 || true
   echo "FreeRTOS TCP 服务就绪证据："

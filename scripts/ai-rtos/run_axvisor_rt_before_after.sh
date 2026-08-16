@@ -14,8 +14,13 @@ Runs the same dual-guest AICP workload with two AxVisor variants:
   optimized - board config selected by AICP_OPTIMIZED_BOARD_CONFIG
   baseline  - board config selected by AICP_BASELINE_BOARD_CONFIG
 
-The default baseline falls back to the old shared vCPU wait queue and broadcast
-wake path. Either config can be overridden for a single-variable experiment.
+The default baseline preserves latest-dev's shared VM wait queue and deferred
+broadcast wake path. The optimized variant keeps each CPU-isolated vCPU task
+runnable across guest WFI with rt-poll-idle. Targeted interrupt delivery still
+uses pending state plus a target-pCPU IPI; device polling notifications publish
+an atomic request without adding a redundant IPI in the polling profile. A
+baseline timeout is retained as a stability result
+instead of being converted into fabricated latency samples.
 With multiple rounds, execution order alternates to reduce order bias. Every
 round keeps raw artifacts and the final report summarizes medians, ranges, and
 worst values.
@@ -24,7 +29,8 @@ Optional environment variables:
   AICP_OPTIMIZED_BOARD_CONFIG - optimized board config override
   AICP_BASELINE_BOARD_CONFIG  - baseline board config override
 
-The optimized default intentionally does not enable rt-preempt. The optional
+The optimized default intentionally enables rt-poll-idle and does not enable
+rt-preempt. The optional
 qemu-aarch64-rt-preempt.toml config is retained for shared-pCPU experiments,
 but adds unnecessary scheduler IPIs in the default one-vCPU-per-pCPU layout.
 EOF

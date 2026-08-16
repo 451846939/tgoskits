@@ -59,6 +59,17 @@ aicp_cross_prefix_available() {
   aicp_resolve_cross_candidate "$1" >/dev/null
 }
 
+# Return success only when a cross compiler provides the hosted C headers
+# required by third-party RTOS components such as FreeRTOS+TCP. A compiler-only
+# Homebrew aarch64-elf installation is insufficient even though <prefix>gcc
+# exists, because its sysroot does not contain newlib headers.
+aicp_cross_prefix_has_c_library_headers() {
+  local prefix="$1"
+  local compiler="${prefix}gcc"
+
+  printf '#include <string.h>\n' | "${compiler}" -E -x c - >/dev/null 2>&1
+}
+
 # Resolve a compiler prefix. The environment override is checked first, then
 # each supplied prefix is tested by locating <prefix>gcc.
 aicp_resolve_cross_prefix() {
@@ -138,22 +149,30 @@ aicp_resolve_or_install_aarch64_none_elf() {
   local cached_compiler
 
   if [[ -n "${configured}" ]]; then
-    aicp_resolve_cross_prefix "${env_name}" "${configured}"
-    return
+    prefix="$(aicp_resolve_cross_prefix "${env_name}" "${configured}")" || return 1
+    if ! aicp_cross_prefix_has_c_library_headers "${prefix}"; then
+      echo "ERROR: ${env_name} 对应的工具链缺少 string.h 等 C 运行库头文件：${prefix}" >&2
+      return 1
+    fi
+    printf '%s\n' "${prefix}"
+    return 0
   fi
 
   for cached_compiler in \
     "${repo_root}"/tmp/arm-gnu-toolchain-"${version}"-*-aarch64-none-elf/bin/aarch64-none-elf-gcc; do
-    if [[ -x "${cached_compiler}" ]]; then
-      printf '%s\n' "${cached_compiler%gcc}"
+    prefix="${cached_compiler%gcc}"
+    if [[ -x "${cached_compiler}" ]] && aicp_cross_prefix_has_c_library_headers "${prefix}"; then
+      printf '%s\n' "${prefix}"
       return 0
     fi
   done
 
-  for prefix in aarch64-none-elf- aarch64-elf-; do
+  for prefix in aarch64-none-elf-; do
     if prefix="$(aicp_resolve_cross_candidate "${prefix}")"; then
-      printf '%s\n' "${prefix}"
-      return 0
+      if aicp_cross_prefix_has_c_library_headers "${prefix}"; then
+        printf '%s\n' "${prefix}"
+        return 0
+      fi
     fi
   done
 
@@ -179,5 +198,11 @@ aicp_resolve_or_install_aarch64_none_elf() {
     "${tar_bin}" -xJf "${archive}" -C "${repo_root}/tmp"
   fi
 
-  printf '%s\n' "${toolchain_dir}/bin/aarch64-none-elf-"
+  prefix="${toolchain_dir}/bin/aarch64-none-elf-"
+  if ! aicp_cross_prefix_has_c_library_headers "${prefix}"; then
+    echo "ERROR: 下载的 Arm GNU Toolchain 缺少 C 运行库头文件：${prefix}" >&2
+    return 1
+  fi
+
+  printf '%s\n' "${prefix}"
 }

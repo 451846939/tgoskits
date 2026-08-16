@@ -38,11 +38,22 @@ cmp -s "${linux_log}" "${result_dir}/linux-console.log"
 grep -q '^rt-trace:' "${result_dir}/run.log"
 grep -q '^AICP_LINUX_DONE ok=1 failed=0$' "${result_dir}/run.log"
 
-invalid_output="${test_dir}/invalid-runner-output.log"
-printf 'log=%s\n' "${qemu_log}" > "${invalid_output}"
-if aicp_archive_dual_guest_logs "${invalid_output}" "${test_dir}/invalid-result" 2>/dev/null; then
-  echo "FAIL: 缺少 Linux 串口路径时归档仍然成功" >&2
+combined_result="${test_dir}/combined-result"
+combined_output="${test_dir}/combined-runner-output.log"
+printf 'log=%s\n' "${qemu_log}" > "${combined_output}"
+aicp_archive_dual_guest_logs "${combined_output}" "${combined_result}"
+cmp -s "${qemu_log}" "${combined_result}/qemu.log"
+cmp -s "${qemu_log}" "${combined_result}/run.log"
+if [[ -e "${combined_result}/linux-console.log" ]]; then
+  echo "FAIL: 合并日志不应生成独立 Linux console 归档" >&2
   exit 1
 fi
 
-echo "PASS: dual-guest run artifacts are archived from explicit runner paths"
+invalid_output="${test_dir}/invalid-runner-output.log"
+printf 'summary=%s\n' "${test_dir}/summary.txt" > "${invalid_output}"
+if aicp_archive_dual_guest_logs "${invalid_output}" "${test_dir}/invalid-result" 2>/dev/null; then
+  echo "FAIL: 缺少主日志路径时归档仍然成功" >&2
+  exit 1
+fi
+
+echo "PASS: split and multiplexed dual-guest logs are archived from explicit runner paths"

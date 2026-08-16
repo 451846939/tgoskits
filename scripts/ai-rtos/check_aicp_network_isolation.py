@@ -146,6 +146,19 @@ def load_qemu_args(path):
     return re.findall(r'"([^"]*)"', match.group("body"))
 
 
+def extract_internal_virtio_net_macs(text):
+    macs = []
+    for body in re.findall(r"guest_mac\s*=\s*\[(.*?)\]", text, re.S):
+        octets = re.findall(r"0x[0-9a-fA-F]+|[0-9]+", body)
+        if len(octets) != 6:
+            continue
+        values = [int(octet, 0) for octet in octets]
+        if any(value > 0xFF for value in values):
+            continue
+        macs.append(":".join(f"{value:02x}" for value in values))
+    return macs
+
+
 def contains_any(values, needles):
     hits = []
     for value in values:
@@ -219,6 +232,11 @@ def main() -> int:
         action="append",
         help="Runtime log. Repeat for separate AxVisor and Linux console logs.",
     )
+    parser.add_argument(
+        "--vm-config",
+        action="append",
+        help="AxVisor VM config. Repeat for both endpoints of an internal L2 link.",
+    )
     parser.add_argument("--summary", required=True)
     args = parser.parse_args()
 
@@ -226,6 +244,8 @@ def main() -> int:
     header = Path(args.protocol_header)
     qemu_args = load_qemu_args(qemu_config)
     joined = "\n".join(qemu_args)
+    vm_configs = [Path(path) for path in args.vm_config or []]
+    vm_config_texts = [path.read_text(errors="replace") for path in vm_configs]
     profile = NETWORK_PROFILES[args.profile]
     report = []
     failures = []
@@ -233,10 +253,26 @@ def main() -> int:
     hubports = [arg for arg in qemu_args if arg.startswith("hubport,")]
     hubids = [match.group(1) for arg in hubports if (match := re.search(r"(?:^|,)hubid=([^,]+)", arg))]
     macs = re.findall(r"mac=([0-9a-fA-F:]{17})", joined)
+    internal_nics = sum(text.count('model = "virtio-net"') for text in vm_config_texts)
+    internal_macs = [
+        mac
+        for text in vm_config_texts
+        for mac in extract_internal_virtio_net_macs(text)
+    ]
     linux_net = next((arg for arg in qemu_args if "netdev=linuxnet" in arg), "")
     rtos_net = next((arg for arg in qemu_args if "netdev=rtosnet" in arg), "")
     forbidden_net = find_forbidden_qemu_net(qemu_args)
-    forbidden_side = contains_any(qemu_args, FORBIDDEN_SIDE_CHANNEL)
+    forbidden_side = contains_any(qemu_args + vm_config_texts, FORBIDDEN_SIDE_CHANNEL)
+
+    if hubports:
+        topology = "qemu-hub"
+        topology_macs = macs
+    elif internal_nics:
+        topology = "axvisor-internal-l2"
+        topology_macs = internal_macs
+    else:
+        topology = "unknown"
+        topology_macs = []
 
     report.append(f"qemu_config={qemu_config}")
     report.append(f"profile={args.profile}")
@@ -244,27 +280,44 @@ def main() -> int:
     report.append(f"rtos_guest={profile['rtos']}")
     report.append(f"netdev_hubports={len(hubports)}")
     report.append(f"hubids={','.join(hubids)}")
-    report.append(f"macs={','.join(macs)}")
-    report.append(
-        f"topology=isolated QEMU hubport hubid={hubids[0] if hubids else 'unknown'}; "
-        "no host NIC, NAT or bridge"
-    )
+    report.append(f"internal_virtio_nics={internal_nics}")
+    report.append(f"macs={','.join(topology_macs)}")
+    for vm_config in vm_configs:
+        report.append(f"vm_config={vm_config}")
+    if topology == "qemu-hub":
+        report.append(
+            f"topology=isolated QEMU hubport hubid={hubids[0]}; "
+            "no host NIC, NAT or bridge"
+        )
+    elif topology == "axvisor-internal-l2":
+        report.append("topology=isolated AxVisor internal L2 switch; no host NIC, NAT or bridge")
+    else:
+        report.append("topology=unknown")
     report.append(f"linux_or_starry_ip={profile['guest_ip']}")
     report.append(f"rtos_ip={profile['rtos_ip']}")
     report.append(f"aicp_port=8800/{profile['transport']}")
 
-    if len(hubports) != 2:
-        failures.append(f"expected 2 hubport netdevs, found {len(hubports)}")
-    if len(hubids) != 2 or len(set(hubids)) != 1:
-        failures.append(f"expected two endpoints on the same hub, found hubids={hubids}")
+    if topology == "qemu-hub":
+        if len(hubports) != 2:
+            failures.append(f"expected 2 hubport netdevs, found {len(hubports)}")
+        if len(hubids) != 2 or len(set(hubids)) != 1:
+            failures.append(f"expected two endpoints on the same hub, found hubids={hubids}")
+    elif topology == "axvisor-internal-l2":
+        if len(vm_configs) != 2 or internal_nics != 2:
+            failures.append(
+                "expected two VM configs with one AxVisor virtio-net endpoint each, "
+                f"found configs={len(vm_configs)} nics={internal_nics}"
+            )
+    else:
+        failures.append("no isolated two-endpoint network topology was found")
     for mac in ("52:54:00:aa:03:03", "52:54:00:aa:03:02"):
-        if mac not in macs:
+        if mac not in topology_macs:
             failures.append(f"missing expected MAC {mac}")
     if forbidden_net:
         failures.append(f"forbidden host/external network options present: {forbidden_net}")
     if forbidden_side:
         failures.append(f"forbidden side-channel options present: {forbidden_side}")
-    if profile["rtos"] in ("rtthread", "zephyr"):
+    if topology == "qemu-hub" and profile["rtos"] in ("rtthread", "zephyr"):
         report.append(f"linux_mrg_rxbuf_off={'mrg_rxbuf=off' in linux_net}")
         report.append(f"rtos_mrg_rxbuf_on={'mrg_rxbuf=on' in rtos_net}")
         if "mrg_rxbuf=off" not in linux_net:

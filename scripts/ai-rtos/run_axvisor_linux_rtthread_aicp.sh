@@ -19,7 +19,8 @@ RT-Thread 的 10.0.2.15:8800。
 主数据通道是 TCP/IP，不使用 vsock、共享内存或 HyperCall。
 
 环境变量 AICP_AXVISOR_BOARD_CONFIG 可指定 AxVisor 构建配置，默认使用
-os/axvisor/configs/board/qemu-aarch64.toml。
+os/axvisor/configs/board/qemu-aarch64-ai-rtos.toml。该配置不在 AxVisor
+Host 挂载交给 Guest 的磁盘。
 
 环境变量 AICP_RTTHREAD_CLIENT_PROFILE 可选：
   control       静态 C 客户端，默认值
@@ -58,8 +59,9 @@ stress_procs="${AICP_STRESS_PROCS:-0}"
 reliability_test="${AICP_RTTHREAD_RELIABILITY:-0}"
 client_profile="${AICP_RTTHREAD_CLIENT_PROFILE:-control}"
 qemu_trace="${AICP_QEMU_TRACE:-0}"
+qemu_gdb_port="${AICP_QEMU_GDB_PORT:-}"
 tcp_timeout_ms="${AICP_TCP_TIMEOUT_MS:-3000}"
-axvisor_board_config="${AICP_AXVISOR_BOARD_CONFIG:-os/axvisor/configs/board/qemu-aarch64.toml}"
+axvisor_board_config="${AICP_AXVISOR_BOARD_CONFIG:-os/axvisor/configs/board/qemu-aarch64-ai-rtos.toml}"
 mkdir -p "${out_dir}" "${log_dir}" "${result_dir}" "${demo_dir}/build/aarch64"
 aicp_configure_dual_guest_cpu_topology
 
@@ -83,6 +85,12 @@ if [[ "${client_profile}" != "control" && "${client_profile}" != "yolov8-rust" ]
 fi
 if [[ "${qemu_trace}" != "0" && "${qemu_trace}" != "1" ]]; then
   echo "ERROR: AICP_QEMU_TRACE must be 0 or 1, got '${qemu_trace}'" >&2
+  exit 2
+fi
+if [[ -n "${qemu_gdb_port}" ]] &&
+   { ! [[ "${qemu_gdb_port}" =~ ^[0-9]+$ ]] ||
+     (( qemu_gdb_port < 1024 || qemu_gdb_port > 65535 )); }; then
+  echo "ERROR: AICP_QEMU_GDB_PORT must be an integer in [1024, 65535]" >&2
   exit 2
 fi
 if ! [[ "${tcp_timeout_ms}" =~ ^[0-9]+$ ]] ||
@@ -144,7 +152,7 @@ wait_for_marker() {
       return 1
     fi
     if grep -a -Eq \
-      'VM\[[0-9]+\] setup failed|Failed to initialize guest VM|Stopping VM\[[0-9]+\]: Fault|run VCpu\[[0-9]+\] get error|emu_device mmio (read|write) failed|panic' \
+      'VM\[[0-9]+\] setup failed|Failed to initialize guest VM|Stopping VM\[[0-9]+\]: Fault|run VCpu\[[0-9]+\] get error|emu_device mmio (read|write) failed|Kernel panic|thread .* panicked at|Panic:' \
       "${log_file}" 2>/dev/null; then
       echo "[ai-rtos] FAIL：检测到 AxVisor Host/vCPU 异常，停止等待：${marker}" >&2
       tail -n 220 "${log_file}" >&2 || true
@@ -193,13 +201,18 @@ build_host_dtb() {
   dtc -@ -I dts -O dtb -o "${host_overlay_dtbo}" "${host_overlay_dts}"
   fdtoverlay -i "${host_base_dtb}" -o "${host_dtb}" "${host_overlay_dtbo}"
 
-  local reserved_reg
+  local linux_reserved_reg reserved_reg
+  linux_reserved_reg="$(fdtget -tx "${host_dtb}" /reserved-memory/linux@80000000 reg)"
+  if [[ "${linux_reserved_reg}" != "0 80000000 0 20000000" ]]; then
+    echo "ERROR: 宿主 DTB 中 Linux 预留内存校验失败：${linux_reserved_reg}" >&2
+    exit 1
+  fi
   reserved_reg="$(fdtget -tx "${host_dtb}" /reserved-memory/rtthread@c0000000 reg)"
   if [[ "${reserved_reg}" != "0 c0000000 0 10000000" ]]; then
     echo "ERROR: 宿主 DTB 中 RT-Thread 预留内存校验失败：${reserved_reg}" >&2
     exit 1
   fi
-  echo "[ai-rtos] 宿主 DTB 已预留 RT-Thread DMA 内存：${reserved_reg}"
+  echo "[ai-rtos] 宿主 DTB 已预留 Linux/RT-Thread DMA 内存：${linux_reserved_reg}; ${reserved_reg}"
 }
 
 write_linux_vm_config() {
@@ -207,7 +220,7 @@ write_linux_vm_config() {
 [base]
 id = 1
 name = "linux-ai-rtthread-qemu"
-vm_type = 1
+guest_type = "virtualized"
 cpu_num = 2
 phys_cpu_ids = [${linux_vcpu0_pcpu}, ${linux_vcpu1_pcpu}]
 phys_cpu_sets = [${linux_vcpu0_mask}, ${linux_vcpu1_mask}]
@@ -222,21 +235,14 @@ dtb_load_addr = 0x8000_0000
 ramdisk_path = "${initramfs}"
 ramdisk_load_addr = 0x9000_0000
 memory_regions = [
-  [0x8000_0000, 0x2000_0000, 0x7, 1],
+  [0x8000_0000, 0x2000_0000, 0x7, 2],
 ]
 
 [devices]
-interrupt_mode = "passthrough"
-passthrough_devices = [
-  ["/virtio_mmio@a003c00"],
-  ["/pl011@9040000"],
+passthrough = [
+  { path = "/virtio_mmio@a003c00" },
 ]
-passthrough_addresses = []
-excluded_devices = []
-emu_devices = [
-  ["gppt-gicd", 0x0800_0000, 0x1_0000, 0, 0x21, []],
-  ["gppt-gicr", 0x080a_0000, 0x2_0000, 0, 0x20, [2, 0x2_0000, ${linux_vcpu0_pcpu}]],
-]
+disabled = []
 EOF
 }
 
@@ -245,16 +251,16 @@ write_rtthread_vm_config() {
 [base]
 id = 2
 name = "rtthread-aicp-qemu"
-vm_type = 1
+guest_type = "virtualized"
 cpu_num = 1
 phys_cpu_ids = [${rtos_vcpu0_pcpu}]
 phys_cpu_sets = [${rtos_vcpu0_mask}]
 
 [kernel]
-entry_point = 0xC008_0000
+entry_point = 0xC000_0000
 image_location = "memory"
 kernel_path = "${rtthread_bin}"
-kernel_load_addr = 0xC008_0000
+kernel_load_addr = 0xC000_0000
 dtb_path = "${rtthread_dtb}"
 dtb_load_addr = 0xCFE0_0000
 memory_regions = [
@@ -264,20 +270,10 @@ memory_regions = [
 ]
 
 [devices]
-interrupt_mode = "passthrough"
-passthrough_devices = [
-  ["/virtio_mmio@a003a00"],
+passthrough = [
+  { path = "/virtio_mmio@a003a00" },
 ]
-# UART 只用于轮询日志，不声明其中断所有权。Linux 使用第二路 PL011，
-# 避免两个 Guest 竞争宿主第一路 PL011 的 SPI。
-passthrough_addresses = [
-  [0x0900_0000, 0x1000],
-]
-excluded_devices = []
-emu_devices = [
-  ["gppt-gicd", 0x0800_0000, 0x1_0000, 0, 0x21, []],
-  ["gppt-gicr", 0x080a_0000, 0x2_0000, 0, 0x20, [1, 0x2_0000, ${rtos_vcpu0_pcpu}]],
-]
+disabled = []
 EOF
 }
 
@@ -290,6 +286,7 @@ fi
 echo "[ai-rtos] 构建 AxVisor 专用 RT-Thread：GICv3、RAM 0xC0000000、专属 virtio 槽位"
 RTTHREAD_GIC_VERSION=3 \
 RTTHREAD_RAM_BASE=0xC0000000 \
+RTTHREAD_TEXT_OFFSET=0x0 \
 RTTHREAD_VIRTIO_MMIO_BASE=0x0a003a00 \
 RTTHREAD_VIRTIO_MAX_NR=1 \
 RTTHREAD_VIRTIO_IRQ_BASE=77 \
@@ -342,8 +339,7 @@ remove_dts_nodes "${linux_dts}.devices" "${linux_dts}.pruned1" "gpio-keys|pl061@
 remove_dts_nodes "${linux_dts}.pruned1" "${linux_dts}.pruned2" "fw-cfg@|pl031@|flash@"
 remove_dts_nodes "${linux_dts}.pruned2" "${linux_dts}" "platform-bus@|pmu|its@"
 rm -f "${linux_dts}.devices" "${linux_dts}.pruned1" "${linux_dts}.pruned2"
-patch_linux_guest_console "${linux_dts}"
-patch_bootargs "${linux_dts}" "console=ttyAMA0 earlycon=pl011,0x9040000 rdinit=/init panic=-1 loglevel=7"
+patch_bootargs "${linux_dts}" "console=ttyAMA0 earlycon=pl011,0x9000000 rdinit=/init panic=-1 loglevel=7"
 crop_virtio_nodes "${linux_src_dts}" "${rtthread_dts}" "virtio_mmio@a003a00"
 perl -0pi -e \
   's/memory\@80000000/memory\@c0000000/; s/<0x00 0x80000000 0x00 0x40000000>/<0x00 0xc0000000 0x00 0x10000000>/' \
@@ -360,6 +356,12 @@ if [[ "$(grep -Fc 'hubport,id=' "${qemu_config}")" -ne 2 ]] || \
    [[ "$(grep -Fc 'hubid=3' "${qemu_config}")" -ne 2 ]]; then
   echo "ERROR: Linux 与 RT-Thread virtio-net 必须连接同一个 QEMU 二层 hub" >&2
   exit 1
+fi
+if [[ -n "${qemu_gdb_port}" ]]; then
+  QEMU_GDB_PORT="${qemu_gdb_port}" perl -0pi -e \
+    's#  "-cpu",#  "-gdb",\n  "tcp::$ENV{QEMU_GDB_PORT}",\n  "-cpu",#' \
+    "${qemu_config}"
+  echo "[ai-rtos] QEMU GDB stub: tcp::${qemu_gdb_port}"
 fi
 rm -f "${linux_console_log}"
 LINUX_CONSOLE_LOG="${linux_console_log}" perl -0pi -e \
