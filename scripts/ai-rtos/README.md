@@ -165,7 +165,7 @@ iterations boot_timeout_seconds stress_procs rounds
 
 | 变体 | AxVisor board config | 含义 |
 | --- | --- | --- |
-| `baseline` | `os/axvisor/configs/board/qemu-aarch64-rt-shared-wait-baseline.toml` | 精确恢复最新 `dev` 的共享等待队列；启动超时也作为稳定性结果保留 |
+| `baseline` | `os/axvisor/configs/board/qemu-aarch64-rt-shared-wait-baseline.toml` | 本分支新增的验证专用配置，用于重建最新 `dev` 原有共享等待语义；不作为正式运行配置，启动超时按失败证据保留 |
 | `optimized` | `os/axvisor/configs/board/qemu-aarch64-rt.toml` | 独占 pCPU 上保持 vCPU 可运行；IRQ 采用 pending 队列、定向目标和目标 pCPU IPI，设备 poll 请求不发送冗余 IPI |
 
 覆盖默认配置：
