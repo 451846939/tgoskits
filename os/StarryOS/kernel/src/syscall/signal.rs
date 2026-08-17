@@ -268,10 +268,13 @@ pub fn sys_tkill(tid: i32, signo: u32) -> StarryResult<isize> {
     Ok(0)
 }
 
-pub fn sys_tgkill(tgid: u32, tid: u32, signo: u32) -> StarryResult<isize> {
-    let process = current_pid_view().resolve_process(TgidNumber::try_from(tgid)?)?;
+pub fn sys_tgkill(tgid: i32, tid: i32, signo: u32) -> StarryResult<isize> {
+    if tgid <= 0 || tid <= 0 {
+        return Err(StarryError::InvalidInput);
+    }
+    let process = current_pid_view().resolve_process(TgidNumber::try_from(tgid as u32)?)?;
     check_kill_permission_identity(&process)?;
-    let task = get_user_task_by_number(TidNumber::try_from(tid)?)?;
+    let task = get_user_task_by_number(TidNumber::try_from(tid as u32)?)?;
     let sig = make_siginfo(signo, SI_TKILL)?;
     send_signal_to_task(&task, Some(process), sig)?;
     Ok(0)
