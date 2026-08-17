@@ -3,6 +3,18 @@ phase = "test"
 group = "AxVisor"
 
 [[check]]
+id = "test-ai-rtos-host-protocol"
+name = "Host · AICP protocol and service"
+runs_on = ["self-hosted", "linux", "qcs"]
+environment = "base"
+self_hosted_owner = "rcore-os"
+fallback_environment = "base"
+timeout_minutes = 10
+command = '''
+make -C apps/ai-rtos-demo test
+'''
+
+[[check]]
 id = "test-axvisor-aarch64-qemu-smoke-axtest-timer-stress"
 name = "aarch64 QEMU · Smoke + virtio-blk guest + axtest + timer stress"
 runs_on = ["self-hosted", "linux", "qcs"]
