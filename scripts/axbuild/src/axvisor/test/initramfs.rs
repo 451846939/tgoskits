@@ -75,6 +75,7 @@ case "$cmdline" in
     exec /bin/busybox sh -i
     ;;
   *axvisor.timer_case=gicv3-its*) success_marker=AXVISOR_GICV3_ITS_TIMER_STRESS_PASSED; require_its=1 ;;
+  *axvisor.timer_case=rt-poll-idle-gicv2*) success_marker=AXVISOR_RT_POLL_IDLE_TIMER_WAKE_PASSED; require_its=0 ;;
   *axvisor.timer_case=gicv2*) success_marker=AXVISOR_GICV2_TIMER_STRESS_PASSED; require_its=0 ;;
   *axvisor.timer_case=gicv3*) success_marker=AXVISOR_GICV3_TIMER_STRESS_PASSED; require_its=0 ;;
   *) echo AXVISOR_GUEST_ASSERTION_CASE_UNKNOWN; exec /bin/busybox sh -i ;;
@@ -386,6 +387,10 @@ mod tests {
         assert!(
             init.windows(b"AXVISOR_GICV3_ITS_TIMER_STRESS_PASSED".len())
                 .any(|window| window == b"AXVISOR_GICV3_ITS_TIMER_STRESS_PASSED")
+        );
+        assert!(
+            init.windows(b"AXVISOR_RT_POLL_IDLE_TIMER_WAKE_PASSED".len())
+                .any(|window| window == b"AXVISOR_RT_POLL_IDLE_TIMER_WAKE_PASSED")
         );
         assert!(
             init.windows(b"AXVISOR_X86_DIRECT_ACPI_PASSED".len())

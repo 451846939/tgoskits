@@ -23,6 +23,8 @@ echo "==> axvisor aarch64 gicv2 timer stress"
 cargo xtask axvisor test qemu --arch aarch64 --test-case gicv2-timer-stress
 echo "==> axvisor aarch64 gicv3 timer stress"
 cargo xtask axvisor test qemu --arch aarch64 --test-case gicv3-timer-stress
+echo "==> axvisor aarch64 rt-poll-idle timer wake"
+cargo xtask axvisor test qemu --arch aarch64 --test-case rt-poll-idle-timer-wake
 '''
 
 [[check]]

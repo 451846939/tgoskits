@@ -538,7 +538,7 @@ impl VmRuntimeHandle {
     }
 }
 
-#[cfg(any(target_arch = "aarch64", test))]
+#[cfg(all(any(target_arch = "aarch64", test), not(feature = "rt-poll-idle")))]
 impl VcpuEventWaitSnapshot {
     pub(crate) fn has_pending_event(&self, runtime: &VmRuntimeHandle) -> bool {
         runtime.device_poll_requested()
