@@ -384,10 +384,6 @@ impl VmRuntimeHandle {
             .unwrap_or_default()
     }
 
-    pub(crate) fn wait(&self) {
-        self.wait_queue.wait();
-    }
-
     pub(crate) fn wait_until(&self, condition: impl Fn() -> bool) {
         self.wait_queue.wait_until(condition);
     }
@@ -411,11 +407,6 @@ impl VmRuntimeHandle {
         VcpuEventWaitSnapshot {
             notification_generation: self.notification_generation(),
         }
-    }
-
-    pub(crate) fn notify_one(&self) {
-        self.notification_generation.fetch_add(1, Ordering::Release);
-        self.wait_queue.notify_one(false);
     }
 
     pub(crate) fn notify_vcpu(&self, vcpu_id: usize) {
@@ -2224,7 +2215,7 @@ mod tests {
         let runtime = VmRuntimeHandle::new();
         let observed = runtime.notification_generation();
 
-        runtime.notify_one();
+        runtime.notify_vcpu(0);
 
         assert_ne!(runtime.notification_generation(), observed);
     }
