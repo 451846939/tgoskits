@@ -58,7 +58,7 @@ fi
 export DEBUGFS="${debugfs_bin}"
 
 echo "[ai-rtos] Building host AICP reference server..."
-make -C "${demo_dir}" "${demo_dir}/build/aicp_server"
+make -C "${demo_dir}" build/aicp_server
 
 echo "[ai-rtos] Starting host RTOS reference server on 0.0.0.0:${port}; log: ${server_log}"
 "${demo_dir}/build/aicp_server" "${port}" >"${server_log}" 2>&1 &
