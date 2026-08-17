@@ -828,8 +828,8 @@ mod tests {
     use fdt_raw::RegInfo;
 
     use super::{
-        align_reserved_region_4k, parse_passthrough_devices_address, parse_vm_interrupt,
-        reserve_excluded_device_ranges, resolve_phys_cpu_sets,
+        align_reserved_region_4k, node_interrupt_specifiers, parse_passthrough_devices_address,
+        parse_vm_interrupt, reserve_excluded_device_ranges, resolve_phys_cpu_sets,
     };
     use crate::config::{AxVMConfig, AxVMConfigParams, PhysCpuList};
 
@@ -1404,28 +1404,18 @@ mod tests {
     }
 
     #[test]
-    fn inherited_gic_interrupt_cells_are_kept_as_one_specifier() {
+    fn inherited_interrupt_parent_groups_gic_cells_into_one_specifier() {
         let dtb = fdt_with_inherited_gic_interrupt();
-        let mut vm_cfg = AxVMConfig::new(AxVMConfigParams {
-            id: 1,
-            name: "test".to_string(),
-            phys_cpu_ls: PhysCpuList::new(1, None, None),
-            pass_through_devices: vec![HostDeviceAssignment {
-                name: "/virtio_mmio@a003c00".to_string(),
-                ..Default::default()
-            }],
-            ..Default::default()
-        });
-
-        parse_vm_interrupt(&mut vm_cfg, &GuestConfig::default(), &dtb).unwrap();
+        let fdt = Fdt::from_bytes(&dtb).unwrap();
+        let device_path = "/virtio_mmio@a003c00";
+        let device_id = fdt
+            .iter_node_ids()
+            .find(|&node_id| fdt.path_of(node_id) == device_path)
+            .unwrap();
 
         assert_eq!(
-            vm_cfg
-                .pass_through_irqs()
-                .iter()
-                .map(|interrupt| interrupt.source)
-                .collect::<Vec<_>>(),
-            [46]
+            node_interrupt_specifiers(&fdt, device_id, device_path),
+            [vec![0, 46, 1]]
         );
     }
 
