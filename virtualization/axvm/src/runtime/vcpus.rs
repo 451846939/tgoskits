@@ -35,7 +35,16 @@ fn wait_for<F>(vm_vcpus: &VmRuntimeHandle, vcpu_id: usize, condition: F)
 where
     F: Fn() -> bool,
 {
+    #[cfg(not(feature = "rt-poll-idle"))]
     vm_vcpus.wait_vcpu_until(vcpu_id, condition);
+
+    #[cfg(feature = "rt-poll-idle")]
+    {
+        // This synchronizes vCPU startup rather than guest WFI. Polling idle
+        // bypasses guest-idle waits but still waits for CPU_ON task setup.
+        let _ = vcpu_id;
+        vm_vcpus.wait_until(condition);
+    }
 }
 
 fn vcpu_start_is_ready(vm_running: bool, task_registered: bool) -> bool {

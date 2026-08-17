@@ -165,6 +165,7 @@ fn runtime_waits_and_wakes_the_target_vcpu() {
 fn polling_idle_profile_excludes_blocking_vcpu_wait_helpers() {
     let vm = read_source("src/vm/mod.rs");
     let aarch64 = read_source("src/arch/aarch64/mod.rs");
+    let runtime = read_source("src/runtime/vcpus.rs");
 
     assert!(vm.contains("#[cfg(not(feature = \"rt-poll-idle\"))]\n    pub(crate) fn wait_vcpu"));
     assert!(
@@ -173,6 +174,7 @@ fn polling_idle_profile_excludes_blocking_vcpu_wait_helpers() {
     assert!(
         aarch64.contains("#[cfg(not(feature = \"rt-poll-idle\"))]\n    fn wait_for_vcpu_event")
     );
+    assert!(runtime.contains("vm_vcpus.wait_until(condition);"));
 }
 
 #[test]
