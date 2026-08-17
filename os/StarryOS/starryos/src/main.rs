@@ -23,8 +23,8 @@ const ENVIRON: &[&str] = &["container=starryos"];
 #[cfg(not(feature = "nixos"))]
 const ENVIRON: &[&str] = &[];
 
-#[cfg_attr(target_os = "none", unsafe(no_mangle))]
-fn main() {
+#[unsafe(no_mangle)]
+extern "C" fn main() {
     #[cfg(feature = "qemu-aicp-native")]
     {
         ax_log::ax_println!(
