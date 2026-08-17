@@ -265,6 +265,7 @@ impl ArchOps for Aarch64Arch {
         })
     }
 
+    #[cfg(not(feature = "rt-poll-idle"))]
     fn wait_for_vcpu_event(
         vm: &crate::AxVMRef,
         vcpu: &crate::vm::AxVCpuRef<Self::VCpu>,

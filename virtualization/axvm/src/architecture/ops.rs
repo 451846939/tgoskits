@@ -60,7 +60,11 @@ pub(crate) trait ArchOps {
         _vcpu: &crate::vm::AxVCpuRef<Self::VCpu>,
         runtime: &crate::vm::VmRuntimeHandle,
     ) {
+        #[cfg(not(feature = "rt-poll-idle"))]
         runtime.wait_vcpu(_vcpu.id());
+
+        #[cfg(feature = "rt-poll-idle")]
+        let _ = runtime;
     }
 
     fn inject_pending_interrupt(

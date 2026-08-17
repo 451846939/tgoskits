@@ -162,6 +162,20 @@ fn runtime_waits_and_wakes_the_target_vcpu() {
 }
 
 #[test]
+fn polling_idle_profile_excludes_blocking_vcpu_wait_helpers() {
+    let vm = read_source("src/vm/mod.rs");
+    let aarch64 = read_source("src/arch/aarch64/mod.rs");
+
+    assert!(vm.contains("#[cfg(not(feature = \"rt-poll-idle\"))]\n    pub(crate) fn wait_vcpu"));
+    assert!(
+        vm.contains("#[cfg(not(feature = \"rt-poll-idle\"))]\n    pub(crate) fn wait_vcpu_until")
+    );
+    assert!(
+        aarch64.contains("#[cfg(not(feature = \"rt-poll-idle\"))]\n    fn wait_for_vcpu_event")
+    );
+}
+
+#[test]
 fn target_vcpu_wake_requests_reschedule_when_the_notifier_runs_locally() {
     let vm = read_source("src/vm/mod.rs");
     let targeted_wake = section(

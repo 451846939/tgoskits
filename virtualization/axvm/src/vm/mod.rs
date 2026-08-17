@@ -191,12 +191,12 @@ pub(crate) struct VmRuntimeHandle {
     deferred_reset_requested: AtomicBool,
 }
 
-#[cfg(any(target_arch = "aarch64", test))]
+#[cfg(all(any(target_arch = "aarch64", test), not(feature = "rt-poll-idle")))]
 pub(crate) struct VcpuEventWaitSnapshot {
     notification_generation: usize,
 }
 
-#[cfg(any(target_arch = "aarch64", test))]
+#[cfg(all(any(target_arch = "aarch64", test), not(feature = "rt-poll-idle")))]
 pub(crate) fn wait_for_vcpu_event_if_idle(
     runtime: &VmRuntimeHandle,
     wait_snapshot: &VcpuEventWaitSnapshot,
@@ -388,21 +388,23 @@ impl VmRuntimeHandle {
         self.wait_queue.wait_until(condition);
     }
 
+    #[cfg(not(feature = "rt-poll-idle"))]
     pub(crate) fn wait_vcpu(&self, vcpu_id: usize) {
         self.wait_vcpu_until(vcpu_id, || false);
     }
 
+    #[cfg(not(feature = "rt-poll-idle"))]
     pub(crate) fn wait_vcpu_until(&self, vcpu_id: usize, condition: impl Fn() -> bool) {
         let _ = vcpu_id;
         self.wait_queue.wait_until(condition);
     }
 
-    #[cfg(any(target_arch = "aarch64", test))]
+    #[cfg(all(any(target_arch = "aarch64", test), not(feature = "rt-poll-idle")))]
     pub(crate) fn notification_generation(&self) -> usize {
         self.notification_generation.load(Ordering::Acquire)
     }
 
-    #[cfg(any(target_arch = "aarch64", test))]
+    #[cfg(all(any(target_arch = "aarch64", test), not(feature = "rt-poll-idle")))]
     pub(crate) fn vcpu_event_wait_snapshot(&self) -> VcpuEventWaitSnapshot {
         VcpuEventWaitSnapshot {
             notification_generation: self.notification_generation(),

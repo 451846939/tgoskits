@@ -145,7 +145,19 @@ if [[ ! -s "${child_pid_file}" ]]; then
 fi
 process_child_pid="$(cat "${child_pid_file}")"
 aicp_cleanup_process_tree "${process_root_pid}"
-if kill -0 "${process_root_pid}" 2>/dev/null || kill -0 "${process_child_pid}" 2>/dev/null; then
+
+# kill -0 reports success for a zombie until its parent reaps it. The cleanup
+# contract is that no process remains executable, so treat a zombie as exited.
+aicp_process_is_live() {
+  local pid="$1"
+  local state
+
+  kill -0 "${pid}" 2>/dev/null || return 1
+  state="$(ps -p "${pid}" -o stat= 2>/dev/null || true)"
+  [[ -n "${state}" && "${state}" != Z* ]]
+}
+
+if aicp_process_is_live "${process_root_pid}" || aicp_process_is_live "${process_child_pid}"; then
   echo "FAIL: 进程树清理后仍有测试进程存活" >&2
   exit 1
 fi
