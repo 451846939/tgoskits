@@ -17,13 +17,7 @@ version = "0.5.28"
 default = []
 nixos = []
 # Runs the AICP client before the Starry user-space init process.
-qemu-aicp-native = [
-  "dep:ax-log",
-  "dep:ax-net",
-  "ax-std/net",
-  "ax-runtime/irq",
-  "ax-runtime/rtc",
-]
+qemu-aicp-native = ["dep:ax-log", "dep:ax-net", "ax-std/net", "ax-runtime/irq", "ax-runtime/rtc"]
 qemu-aicp-userland = ["qemu"]
 smp-aicp-native = ["ax-runtime/smp", "axplat-dyn/smp", "ax-hal/smp"]
 qemu = [
