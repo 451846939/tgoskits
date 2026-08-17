@@ -27,15 +27,15 @@ const ENVIRON: &[&str] = &[];
 fn main() {
     #[cfg(feature = "qemu-aicp-native")]
     {
-    ax_log::ax_println!(
-        "AICP_STARRY_MAIN_ENTER native={} target_os_none={}",
-        option_env!("AICP_STARRY_NATIVE").unwrap_or("unset"),
-        cfg!(target_os = "none")
-    );
-    if native_aicp::maybe_run() {
-        ax_log::ax_println!("AICP_STARRY_NATIVE_EXIT");
-        ax_std::process::exit(0);
-    }
+        ax_log::ax_println!(
+            "AICP_STARRY_MAIN_ENTER native={} target_os_none={}",
+            option_env!("AICP_STARRY_NATIVE").unwrap_or("unset"),
+            cfg!(target_os = "none")
+        );
+        if native_aicp::maybe_run() {
+            ax_log::ax_println!("AICP_STARRY_NATIVE_EXIT");
+            ax_std::process::exit(0);
+        }
     }
 
     let args = CMDLINE
