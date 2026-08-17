@@ -512,8 +512,10 @@ fn configure_control_interface() -> io::Result<()> {
     let interface = ax_net::interface_by_name("eth0")
         .ok_or_else(|| io::Error::other("AICP control interface eth0 was not discovered"))?;
     let address = Ipv4Addr::new(10, 0, 3, 2);
-    ax_net::set_interface_ipv4(interface.id, address, 24)
-        .map_err(|error| io::Error::other(format!("configure AICP eth0: {error}")))?;
+    if ax_net::ipv4_config("eth0").is_none() {
+        ax_net::set_interface_ipv4(interface.id, address, 24)
+            .map_err(|error| io::Error::other(format!("configure AICP eth0: {error}")))?;
+    }
     println!(
         "AICP_RTOS_NET_READY iface=eth0 ip={address}/24 mac={:?}",
         interface.mac

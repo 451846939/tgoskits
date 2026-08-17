@@ -118,7 +118,36 @@ fn register_unix_namespace() {
 
 #[cfg(feature = "net")]
 fn parse_network_config() -> ax_net::NetworkConfig {
-    ax_net::NetworkConfig::default()
+    let Some(ip) = option_env!("AX_IP") else {
+        return ax_net::NetworkConfig::default();
+    };
+    let ip = ip
+        .parse()
+        .unwrap_or_else(|_| panic!("AX_IP must be a valid IPv4 address: {ip}"));
+    let gateway = option_env!("AX_GW")
+        .unwrap_or("0.0.0.0")
+        .parse()
+        .unwrap_or_else(|_| panic!("AX_GW must be a valid IPv4 address"));
+    let prefix_len = option_env!("AX_PREFIX_LEN")
+        .unwrap_or("24")
+        .parse()
+        .unwrap_or_else(|_| panic!("AX_PREFIX_LEN must be an integer in [0, 32]"));
+
+    ax_net::NetworkConfig {
+        interfaces: alloc::vec![ax_net::InterfaceConfig {
+            name: alloc::string::String::from("eth0"),
+            match_by: ax_net::InterfaceMatcher::ByOrder(0),
+            static_ip: Some(ax_net::StaticIpConfig {
+                ip,
+                prefix_len,
+                gateway,
+            }),
+            dhcp: false,
+            metric: 100,
+            dns_servers: alloc::vec![],
+        }],
+        default_dns_servers: alloc::vec![],
+    }
 }
 
 /// A wireless device that registers *after* `init_network`: its already-wrapped
