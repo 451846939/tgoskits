@@ -1034,6 +1034,20 @@ fn nvme_smoke_keeps_storage_in_host_and_verifies_file_io() {
             qemu.success_regex, expected_success_regex,
             "{qemu_path} should require all architecture-specific shell markers"
         );
+        assert_eq!(
+            qemu.fail_regex,
+            vec![
+                r"(?i)\bpanic(?:ked)?\b",
+                r"(?i)kernel panic",
+                r"(?i)login incorrect",
+                r"(?i)permission denied",
+                r"(?m)^echo: (?:no file specified|\S+:)",
+                r"(?m)^cat: (?:no file specified|\S+:)",
+                r"(?m)^rm: (?:missing operand|cannot remove )",
+            ],
+            "{qemu_path} should only match concrete shell command errors, not serial output that \
+             happens to begin with a command name"
+        );
     }
 }
 

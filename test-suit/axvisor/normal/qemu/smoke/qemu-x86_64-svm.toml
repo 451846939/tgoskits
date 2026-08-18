@@ -31,7 +31,9 @@ fail_regex = [
   "(?i)kernel panic",
   "(?i)login incorrect",
   "(?i)permission denied",
-  "(?m)^(?:echo|cat|rm):",
+  "(?m)^echo: (?:no file specified|\\S+:)",
+  "(?m)^cat: (?:no file specified|\\S+:)",
+  "(?m)^rm: (?:missing operand|cannot remove )",
 ]
 success_regex = [
   "(?m)^AXVISOR_NVME_RW_PAYLOAD\\s*$",
