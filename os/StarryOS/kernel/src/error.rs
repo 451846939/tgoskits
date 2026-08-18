@@ -6,7 +6,7 @@ use ax_io::IoError;
 use ax_memory_set::MappingError;
 use ax_mm::MmError;
 use ax_net::NetError;
-use ax_runtime::RuntimeError;
+use ax_runtime::{RuntimeError, serial::ConfigError};
 use ax_task::future::{Elapsed, Interrupted, PollIoError, TaskError};
 use axfs_ng_vfs::VfsError;
 use dma_api::DmaError;
@@ -355,6 +355,14 @@ fn vfs_error_from_errno(errno: Errno) -> VfsError {
 
 fn runtime_errno(error: &RuntimeError) -> Errno {
     match error {
+        RuntimeError::SerialConfig(error) => match error {
+            ConfigError::InvalidBaudrate
+            | ConfigError::UnsupportedDataBits
+            | ConfigError::UnsupportedStopBits
+            | ConfigError::UnsupportedParity => Errno::EINVAL,
+            ConfigError::Timeout => Errno::ETIMEDOUT,
+            ConfigError::RegisterError => Errno::EIO,
+        },
         RuntimeError::SerialNotStarted => Errno::EFAULT,
         RuntimeError::SerialControlBusy => Errno::EBUSY,
         RuntimeError::WouldBlock => Errno::EAGAIN,
@@ -734,6 +742,30 @@ fn leaf_errno_mappings_hold() -> bool {
         (
             StarryError::Runtime(RuntimeError::SerialControlBusy),
             Errno::EBUSY,
+        ),
+        (
+            StarryError::Runtime(RuntimeError::SerialConfig(ConfigError::InvalidBaudrate)),
+            Errno::EINVAL,
+        ),
+        (
+            StarryError::Runtime(RuntimeError::SerialConfig(ConfigError::UnsupportedDataBits)),
+            Errno::EINVAL,
+        ),
+        (
+            StarryError::Runtime(RuntimeError::SerialConfig(ConfigError::UnsupportedStopBits)),
+            Errno::EINVAL,
+        ),
+        (
+            StarryError::Runtime(RuntimeError::SerialConfig(ConfigError::UnsupportedParity)),
+            Errno::EINVAL,
+        ),
+        (
+            StarryError::Runtime(RuntimeError::SerialConfig(ConfigError::Timeout)),
+            Errno::ETIMEDOUT,
+        ),
+        (
+            StarryError::Runtime(RuntimeError::SerialConfig(ConfigError::RegisterError)),
+            Errno::EIO,
         ),
         (
             StarryError::Runtime(RuntimeError::WouldBlock),
