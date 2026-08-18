@@ -828,8 +828,9 @@ mod tests {
     use fdt_raw::RegInfo;
 
     use super::{
-        align_reserved_region_4k, node_interrupt_specifiers, parse_passthrough_devices_address,
-        parse_vm_interrupt, reserve_excluded_device_ranges, resolve_phys_cpu_sets,
+        align_reserved_region_4k, node_interrupt_specifiers, node_pci_interrupt_specifiers,
+        parse_passthrough_devices_address, parse_vm_interrupt, reserve_excluded_device_ranges,
+        resolve_phys_cpu_sets,
     };
     use crate::config::{AxVMConfig, AxVMConfigParams, PhysCpuList};
 
@@ -952,6 +953,9 @@ mod tests {
             .set_property(prop_u32("phandle", 1));
 
         let pcie = fdt.add_node(root, Node::new("pcie@10000000"));
+        fdt.node_mut(pcie)
+            .unwrap()
+            .set_property(super::super::tree::prop_string("device_type", "pci"));
         fdt.node_mut(pcie)
             .unwrap()
             .set_property(super::super::tree::prop_string(
@@ -1420,28 +1424,17 @@ mod tests {
     }
 
     #[test]
-    fn selected_pci_host_forwards_interrupt_map_parent_routes() {
+    fn pci_interrupt_map_returns_full_gic_parent_specifier() {
         let dtb = fdt_with_pci_interrupt_map();
-        let mut vm_cfg = AxVMConfig::new(AxVMConfigParams {
-            id: 1,
-            name: "test".to_string(),
-            phys_cpu_ls: PhysCpuList::new(1, None, None),
-            pass_through_devices: vec![HostDeviceAssignment {
-                name: "/pcie@10000000".to_string(),
-                ..Default::default()
-            }],
-            ..Default::default()
-        });
-
-        parse_vm_interrupt(&mut vm_cfg, &GuestConfig::default(), &dtb).unwrap();
+        let fdt = Fdt::from_bytes(&dtb).unwrap();
+        let pcie_id = fdt
+            .iter_node_ids()
+            .find(|&node_id| fdt.path_of(node_id) == "/pcie@10000000")
+            .unwrap();
 
         assert_eq!(
-            vm_cfg
-                .pass_through_irqs()
-                .iter()
-                .map(|interrupt| interrupt.source)
-                .collect::<Vec<_>>(),
-            [3]
+            node_pci_interrupt_specifiers(&fdt, pcie_id),
+            [vec![0, 3, 4]]
         );
     }
 
