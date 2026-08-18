@@ -149,7 +149,6 @@ dependencies = [
 name = "ahci-driver"
 version = "0.1.2"
 dependencies = [
- "axtest",
  "dma-api",
  "log",
  "mmio-api",
@@ -348,15 +347,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "arceos-axtest-suit"
-version = "0.1.0"
-dependencies = [
- "ax-hal",
- "ax-std",
- "axtest",
-]
-
-[[package]]
 name = "arceos-helloworld"
 version = "0.1.0"
 dependencies = [
@@ -419,6 +409,10 @@ version = "0.3.1"
 dependencies = [
  "ax-std",
 ]
+
+[[package]]
+name = "arceos-test-smoke"
+version = "0.1.0"
 
 [[package]]
 name = "arceos-test-suit"
@@ -792,7 +786,6 @@ dependencies = [
 name = "ax-cpumask"
 version = "0.3.7"
 dependencies = [
- "axtest",
  "bitmaps",
 ]
 
@@ -845,7 +838,6 @@ dependencies = [
  "ax-crate-interface",
  "ax-sync",
  "axklib",
- "axtest",
  "crab-usb",
  "cv181x-sdhci",
  "dma-api",
@@ -913,10 +905,13 @@ dependencies = [
 name = "ax-fs-ng"
 version = "0.8.7"
 dependencies = [
+ "ax-hal",
  "ax-io",
  "ax-lazyinit",
+ "ax-std",
  "ax-sync",
  "axfs-ng-vfs",
+ "axtest",
  "bitflags 2.13.1",
  "cfg-if",
  "chrono",
@@ -939,10 +934,12 @@ version = "0.5.31"
 dependencies = [
  "ax-alloc",
  "ax-cpu",
+ "ax-hal",
  "ax-lazyinit",
  "ax-memory-addr",
  "ax-percpu",
  "ax-plat",
+ "ax-std",
  "ax-sync",
  "axplat-dyn",
  "axtest",
@@ -973,7 +970,6 @@ dependencies = [
 name = "ax-io"
 version = "0.6.4"
 dependencies = [
- "axtest",
  "heapless",
  "memchr",
  "thiserror 2.0.20",
@@ -993,9 +989,6 @@ dependencies = [
 [[package]]
 name = "ax-lazyinit"
 version = "0.4.10"
-dependencies = [
- "axtest",
-]
 
 [[package]]
 name = "ax-libc"
@@ -1028,16 +1021,12 @@ dependencies = [
 [[package]]
 name = "ax-memory-addr"
 version = "0.6.11"
-dependencies = [
- "axtest",
-]
 
 [[package]]
 name = "ax-memory-set"
 version = "0.6.14"
 dependencies = [
  "ax-memory-addr",
- "axtest",
  "thiserror 2.0.20",
 ]
 
@@ -1068,7 +1057,6 @@ dependencies = [
  "ax-sync",
  "ax-task",
  "axpoll",
- "axtest",
  "bitflags 2.13.1",
  "cfg-if",
  "enum_dispatch",
@@ -1234,7 +1222,6 @@ name = "ax-sync"
 version = "0.5.31"
 dependencies = [
  "ax-crate-interface",
- "axtest",
  "lock_api",
 ]
 
@@ -1252,6 +1239,7 @@ dependencies = [
  "ax-mm",
  "ax-percpu",
  "ax-sched",
+ "ax-std",
  "ax-timer-list",
  "axpanic",
  "axpoll",
@@ -1290,7 +1278,9 @@ name = "axbacktrace"
 version = "0.4.8"
 dependencies = [
  "addr2line 0.26.1",
+ "ax-hal",
  "ax-lazyinit",
+ "ax-std",
  "axpanic",
  "axtest",
  "cfg-if",
@@ -1386,7 +1376,6 @@ name = "axfs-ng-vfs"
 version = "0.5.8"
 dependencies = [
  "ax-sync",
- "axtest",
  "bitflags 2.13.1",
  "cfg-if",
  "hashbrown 0.16.1",
@@ -1463,7 +1452,6 @@ version = "0.5.4"
 dependencies = [
  "ax-lazyinit",
  "ax-sync",
- "axtest",
  "bitflags 2.13.1",
  "futures",
  "linux-raw-sys 0.12.1",
@@ -1586,7 +1574,6 @@ dependencies = [
  "ax-driver",
  "ax-hal",
  "ax-std",
- "ax-task",
  "axbacktrace",
  "axbuild",
  "axdevice",
@@ -1926,7 +1913,6 @@ name = "buddy-slab-allocator"
 version = "0.4.8"
 dependencies = [
  "ax-sync",
- "axtest",
  "divan",
  "log",
  "rand 0.10.2",
@@ -3008,7 +2994,6 @@ version = "0.9.5"
 dependencies = [
  "aarch64-cpu-ext",
  "ax-sync",
- "axtest",
  "cfg-if",
  "derive_more",
  "log",
@@ -4365,7 +4350,6 @@ checksum = "6a756c3fac73139e83f14c2d742155dd2b78d3ee56597b419a0579b7bdd6dd78"
 name = "irq-framework"
 version = "0.3.2"
 dependencies = [
- "axtest",
  "thiserror 2.0.20",
 ]
 
@@ -4649,7 +4633,6 @@ dependencies = [
 name = "kernutil"
 version = "0.2.4"
 dependencies = [
- "axtest",
  "heapless",
  "num-align",
  "ranges-ext",
@@ -5177,7 +5160,6 @@ dependencies = [
 name = "mmio-api"
 version = "0.2.4"
 dependencies = [
- "axtest",
  "derive_more",
  "thiserror 2.0.20",
 ]
@@ -5701,7 +5683,6 @@ dependencies = [
 name = "pcie"
 version = "0.6.9"
 dependencies = [
- "axtest",
  "bit_field",
  "bitflags 2.13.1",
  "fdt-edit",
@@ -6461,7 +6442,6 @@ version = "0.8.5"
 dependencies = [
  "as-any",
  "async-trait",
- "axtest",
  "paste",
  "rdif-def",
  "thiserror 2.0.20",
@@ -6472,7 +6452,6 @@ dependencies = [
 name = "rdif-block"
 version = "0.11.4"
 dependencies = [
- "axtest",
  "dma-api",
  "rdif-base",
  "thiserror 2.0.20",
@@ -6489,7 +6468,6 @@ dependencies = [
 name = "rdif-def"
 version = "0.3.2"
 dependencies = [
- "axtest",
  "thiserror 2.0.20",
 ]
 
@@ -6497,7 +6475,6 @@ dependencies = [
 name = "rdif-display"
 version = "0.2.2"
 dependencies = [
- "axtest",
  "rdif-base",
  "thiserror 2.0.20",
 ]
@@ -6506,7 +6483,6 @@ dependencies = [
 name = "rdif-eth"
 version = "0.3.10"
 dependencies = [
- "axtest",
  "dma-api",
  "rdif-base",
  "thiserror 2.0.20",
@@ -6516,7 +6492,6 @@ dependencies = [
 name = "rdif-input"
 version = "0.2.2"
 dependencies = [
- "axtest",
  "rdif-base",
  "thiserror 2.0.20",
 ]
@@ -6525,7 +6500,6 @@ dependencies = [
 name = "rdif-intc"
 version = "0.15.2"
 dependencies = [
- "axtest",
  "cfg-if",
  "irq-framework",
  "rdif-base",
@@ -6535,7 +6509,6 @@ dependencies = [
 name = "rdif-msi"
 version = "0.2.2"
 dependencies = [
- "axtest",
  "irq-framework",
  "rdif-base",
 ]
@@ -6544,7 +6517,6 @@ dependencies = [
 name = "rdif-pcie"
 version = "0.2.7"
 dependencies = [
- "axtest",
  "pci_types",
  "rdif-base",
  "serde",
@@ -6555,7 +6527,6 @@ dependencies = [
 name = "rdif-pinctrl"
 version = "0.1.4"
 dependencies = [
- "axtest",
  "fdt-edit",
  "rdif-base",
  "thiserror 2.0.20",
@@ -6565,7 +6536,6 @@ dependencies = [
 name = "rdif-power"
 version = "0.8.2"
 dependencies = [
- "axtest",
  "rdif-base",
  "thiserror 2.0.20",
 ]
@@ -6582,7 +6552,6 @@ dependencies = [
 name = "rdif-reset"
 version = "0.1.2"
 dependencies = [
- "axtest",
  "rdif-base",
  "thiserror 2.0.20",
 ]
@@ -6591,7 +6560,6 @@ dependencies = [
 name = "rdif-serial"
 version = "0.9.3"
 dependencies = [
- "axtest",
  "bitflags 2.13.1",
  "thiserror 2.0.20",
 ]
@@ -6614,7 +6582,6 @@ dependencies = [
 name = "rdif-vsock"
 version = "0.1.4"
 dependencies = [
- "axtest",
  "rdif-base",
  "thiserror 2.0.20",
 ]
@@ -6626,7 +6593,6 @@ dependencies = [
  "acpi",
  "ax-lazyinit",
  "ax-sync",
- "axtest",
  "fdt-edit",
  "fdt-raw",
  "log",
@@ -7012,7 +6978,6 @@ name = "rsext4"
 version = "0.7.8"
 dependencies = [
  "ax-sync",
- "axtest",
  "bitflags 2.13.1",
  "log",
 ]
@@ -7288,7 +7253,6 @@ dependencies = [
  "ax-lazyinit",
  "ax-percpu",
  "ax-sync",
- "axtest",
  "cpu-local",
  "ctor",
 ]
@@ -7889,7 +7853,6 @@ dependencies = [
  "ax-alloc",
  "ax-cgroup",
  "ax-cpu",
- "ax-cpumask",
  "ax-crate-interface",
  "ax-display",
  "ax-driver",
@@ -7916,7 +7879,6 @@ dependencies = [
  "axtest",
  "bitflags 2.13.1",
  "bitmaps",
- "buddy-slab-allocator",
  "bytemuck",
  "cfg-if",
  "chrono",
@@ -7932,11 +7894,9 @@ dependencies = [
  "hashbrown 0.16.1",
  "indoc",
  "inherit-methods-macro",
- "irq-framework",
  "k230-kpu",
  "kbpf-basic",
  "kernel-elf-parser",
- "kernutil",
  "kmod-loader",
  "kmod-tools",
  "kprobe",
@@ -7945,33 +7905,17 @@ dependencies = [
  "linux-raw-sys 0.12.1",
  "lock_api",
  "lwprintf-rs",
- "mmio-api",
  "num_enum",
  "ouroboros",
- "page-table-generic",
  "rand 0.10.2",
- "ranges-ext",
  "rbpf",
- "rdif-base",
  "rdif-block",
- "rdif-def",
- "rdif-display",
- "rdif-eth",
- "rdif-input",
- "rdif-intc",
- "rdif-msi",
- "rdif-pcie",
  "rdif-pinctrl",
- "rdif-power",
  "rdif-pwm",
- "rdif-reset",
- "rdif-serial",
- "rdif-vsock",
  "rdrive",
  "ringbuf",
  "riscv",
  "rockchip-rga",
- "rsext4",
  "scope-local",
  "sg2002-tpu",
  "sg200x-bsp",
