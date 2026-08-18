@@ -36,3 +36,12 @@ pub use switch::{PreparedContextSwitch, PreviousContextBinding, prepare_context_
 #[doc(hidden)]
 pub use symbol::{cpu_area_template_base, cpu_area_template_size};
 pub use thread::*;
+
+/// Host-only observations of the modeled architecture-register boundary.
+#[cfg(feature = "host-test")]
+#[doc(hidden)]
+pub mod host_test {
+    pub use crate::register::host_test::{
+        RegisterReadCounts, register_read_counts, reset_register_read_counts,
+    };
+}
