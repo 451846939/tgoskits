@@ -28,7 +28,7 @@ class CiPlanTests(unittest.TestCase):
         plan = ci_plan.build_main_plan(self.upstream)
 
         self.assertEqual(len(plan["static_matrix"]["include"]), 3)
-        self.assertEqual(len(plan["test_matrix"]["include"]), 33)
+        self.assertEqual(len(plan["test_matrix"]["include"]), 34)
         self.assertTrue(
             all(" / " in row["name"] for row in plan["test_matrix"]["include"])
         )
@@ -109,7 +109,7 @@ class CiPlanTests(unittest.TestCase):
 
         self.assertIn('--since "$SINCE_REF"', incremental_rows["test-with-std"]["command"])
         self.assertNotIn("--since", full_rows["test-with-std"]["command"])
-        self.assertEqual(len(full_rows), 32)
+        self.assertEqual(len(full_rows), 34)
 
     def test_app_only_impact_does_not_select_runtime_checks(self) -> None:
         context = ci_plan.PlanContext(
@@ -156,7 +156,7 @@ class CiPlanTests(unittest.TestCase):
                 )
 
                 self.assertEqual(with_impact, baseline)
-                self.assertEqual(len(with_impact["test_matrix"]["include"]), 32)
+                self.assertEqual(len(with_impact["test_matrix"]["include"]), 34)
 
     def test_display_names_expose_target_and_purpose(self) -> None:
         plan = ci_plan.build_main_plan(self.upstream)
@@ -223,7 +223,7 @@ class CiPlanTests(unittest.TestCase):
         static_rows = {row["id"]: row for row in plan["static_matrix"]["include"]}
         test_rows = {row["id"]: row for row in plan["test_matrix"]["include"]}
 
-        self.assertEqual(len(test_rows), 17)
+        self.assertEqual(len(test_rows), 18)
         self.assertFalse(any("board" in row["id"] for row in test_rows.values()))
         self.assertEqual(static_rows["check-formatting"]["runs_on"], ["ubuntu-latest"])
         self.assertEqual(

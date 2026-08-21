@@ -4,6 +4,7 @@ group = "AxVisor"
 
 [[check]]
 id = "test-ai-rtos-host-protocol"
+impact_targets = ["axvisor:aarch64", "starry:aarch64"]
 name = "Host · AICP protocol and service"
 runs_on = ["self-hosted", "linux", "qcs"]
 environment = "base"
@@ -12,6 +13,20 @@ fallback_environment = "base"
 timeout_minutes = 10
 command = '''
 make -C apps/ai-rtos-demo test
+'''
+
+[[check]]
+id = "test-ai-rtos-linux-rtthread-control-loop"
+impact_targets = ["axvisor:aarch64", "starry:aarch64"]
+name = "aarch64 QEMU · AICP IP AI-to-RT-Thread control loop"
+runs_on = ["self-hosted", "linux", "qcs"]
+environment = "host"
+self_hosted_owner = "rcore-os"
+fallback_environment = "base"
+timeout_minutes = 20
+command = '''
+cargo xtask image pull qemu-aarch64 --extract-dir tmp/images
+scripts/ai-rtos/aicp.sh run linux rtthread 1 ai 300
 '''
 
 [[check]]

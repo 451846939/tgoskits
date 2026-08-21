@@ -14,7 +14,7 @@ Prepares the QEMU AArch64 image bundle entries and generated AxVisor VM
 configs that can be consumed directly from the TGOSKits image archive.
 For Zephyr the script uses the current TGOSKits image command:
 
-  cargo xtask image pull qemu-aarch64 -o tmp/images
+  cargo xtask image pull qemu-aarch64 --extract-dir tmp/images
 
 The AICP FreeRTOS guest is built from the repository-owned application and
 requires a dedicated reserved-memory host DTB. Use:
@@ -52,7 +52,7 @@ if [[ "${guest}" == "zephyr" || "${guest}" == "all" ]]; then
   echo "[ai-rtos] Preparing qemu-aarch64 guest image bundle..."
   (
     cd "${repo_root}"
-    cargo xtask image pull qemu-aarch64 -o tmp/images
+    cargo xtask image pull qemu-aarch64 --extract-dir tmp/images
   )
 fi
 

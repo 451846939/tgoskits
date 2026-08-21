@@ -162,7 +162,7 @@ EOF
 
 if [[ ! -f "${linux_kernel}" ]]; then
   echo "ERROR: Linux kernel not found at ${linux_kernel}" >&2
-  echo "Run: cargo xtask image pull qemu-aarch64 -o tmp/images" >&2
+  echo "Run: cargo xtask image pull qemu-aarch64 --extract-dir tmp/images" >&2
   exit 1
 fi
 

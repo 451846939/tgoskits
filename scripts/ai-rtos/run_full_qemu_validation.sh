@@ -248,7 +248,7 @@ run_stage python_syntax "${python_bin}" -m py_compile scripts/ai-rtos/*.py
 run_stage isolation_unit "${python_bin}" -m unittest scripts/ai-rtos/test_check_aicp_network_isolation.py
 run_stage architecture scripts/ai-rtos/check_demo_architecture.sh
 run_stage third_party_clean scripts/ai-rtos/check_third_party_sources_clean.sh
-run_stage host_build make -C apps/ai-rtos-demo all
+run_stage host_build make -C apps/ai-rtos-demo clean all
 run_stage protocol_unit make -C apps/ai-rtos-demo test
 
 if [[ "${prepare_images}" == "1" ]]; then
