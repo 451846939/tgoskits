@@ -28,7 +28,7 @@ connect_retries="${AICP_STARRY_CONNECT_RETRIES:-80}"
 transport="${AICP_STARRY_TRANSPORT:-udp}"
 udp_retries="${AICP_STARRY_UDP_RETRIES:-8}"
 udp_reorder_test="${AICP_STARRY_UDP_REORDER_TEST:-0}"
-iface="${AICP_STARRY_IFACE:-aicp0}"
+iface="${AICP_STARRY_IFACE:-eth0}"
 
 starry_defs="-DAICP_INIT_GUEST_LABEL=\\\"StarryOS_guest\\\""
 starry_defs+=" -DAICP_INIT_ROLE=\\\"starryos-guest-init\\\""

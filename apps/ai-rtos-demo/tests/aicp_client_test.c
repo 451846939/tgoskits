@@ -14,6 +14,7 @@
 struct server_case {
     int socket;
     int corrupt_response_seq;
+    int corrupt_response_version;
     int result;
 };
 
@@ -45,6 +46,24 @@ static void record_event(
         trace->rx_complete++;
         break;
     }
+}
+
+static int send_response(
+    struct aicp_stream *stream,
+    struct aicp_header response,
+    const struct aicp_status_payload *status) {
+    uint8_t wire[AICP_HEADER_LEN];
+
+    response.magic = AICP_MAGIC;
+    response.header_len = AICP_HEADER_LEN;
+    response.crc16 = aicp_frame_crc(response, status);
+    aicp_header_encode(&response, wire);
+
+    int result = aicp_stream_write_full(stream, wire, sizeof(wire));
+    if (result != 0) {
+        return result;
+    }
+    return aicp_stream_write_full(stream, status, sizeof(*status));
 }
 
 static void *serve_client(void *argument) {
@@ -80,18 +99,21 @@ static void *serve_client(void *argument) {
     };
     const uint32_t response_seq =
         test->corrupt_response_seq ? request.seq + 1u : request.seq;
-    const struct aicp_header response = aicp_make_header(
+    struct aicp_header response = aicp_make_header(
         AICP_MSG_STATUS,
         0,
         sizeof(status),
         response_seq,
         1234,
         AICP_OK);
-    test->result = aicp_stream_send_frame(&stream.stream, response, &status);
+    if (test->corrupt_response_version) {
+        response.version = AICP_VERSION + 1;
+    }
+    test->result = send_response(&stream.stream, response, &status);
     return NULL;
 }
 
-static int run_case(int corrupt_response_seq) {
+static int run_case(int corrupt_response_seq, int corrupt_response_version) {
     int sockets[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) {
         return -1;
@@ -100,6 +122,7 @@ static int run_case(int corrupt_response_seq) {
     struct server_case server = {
         .socket = sockets[1],
         .corrupt_response_seq = corrupt_response_seq,
+        .corrupt_response_version = corrupt_response_version,
         .result = 0,
     };
     pthread_t thread;
@@ -130,7 +153,15 @@ static int run_case(int corrupt_response_seq) {
         .feed_forward = 0.2f,
         .mode = 1,
     };
-    struct aicp_status_payload status;
+    struct aicp_status_payload status = {
+        .setpoint = -1.0f,
+        .measured = -2.0f,
+        .control_output = -3.0f,
+        .error = -4.0f,
+        .mode = UINT32_MAX,
+        .applied_seq = UINT32_MAX,
+    };
+    const struct aicp_status_payload original_status = status;
     uint64_t rtt_ns = 0;
     if (result == 0) {
         result = aicp_client_session_transact_control(
@@ -141,14 +172,19 @@ static int run_case(int corrupt_response_seq) {
     pthread_join(thread, NULL);
     close(sockets[1]);
 
-    const int expected = corrupt_response_seq ? -EPROTO : 0;
+    const int expect_protocol_error =
+        corrupt_response_seq || corrupt_response_version;
+    const int expected = expect_protocol_error ? -EPROTO : 0;
     if (result != expected || server.result != 0 || seq != 3 ||
         trace.tx_begin != 2 || trace.tx_complete != 2 ||
         trace.rx_complete != 1) {
         return -1;
     }
-    if (!corrupt_response_seq &&
-        (status.applied_seq != 2 || rtt_ns != 1000)) {
+    if (expect_protocol_error &&
+        memcmp(&status, &original_status, sizeof(status)) != 0) {
+        return -1;
+    }
+    if (!expect_protocol_error && (status.applied_seq != 2 || rtt_ns != 1000)) {
         return -1;
     }
     return 0;
@@ -158,12 +194,17 @@ int main(void) {
     unsigned passed = 0;
     unsigned failed = 0;
 
-    if (run_case(0) == 0) {
+    if (run_case(0, 0) == 0) {
         passed++;
     } else {
         failed++;
     }
-    if (run_case(1) == 0) {
+    if (run_case(1, 0) == 0) {
+        passed++;
+    } else {
+        failed++;
+    }
+    if (run_case(0, 1) == 0) {
         passed++;
     } else {
         failed++;

@@ -103,6 +103,9 @@ int aicp_client_session_transact_control(
     if (rtt_ns != NULL) {
         *rtt_ns = monotonic_ns(ops) - start;
     }
+    if (response.version != AICP_VERSION) {
+        return -EPROTO;
+    }
     if (response.msg_type == AICP_MSG_ERROR) {
         return -EPROTO;
     }
