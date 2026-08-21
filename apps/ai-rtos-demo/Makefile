@@ -29,6 +29,11 @@ AARCH64_INIT := $(AARCH64_BIN_DIR)/aicp_init
 AARCH64_STARRY_INIT := $(AARCH64_BIN_DIR)/aicp_starry_init
 AARCH64_YOLO_INIT := $(AARCH64_BIN_DIR)/aicp_yolov8_init
 AARCH64_MODEL_RUNNER := $(AARCH64_BIN_DIR)/aicp_model_runner
+AICP_PORT ?= 18800
+AICP_ITERATIONS ?= 50
+AICP_MODE ?= ai
+AICP_CSV ?= $(BIN_DIR)/aicp_latency.csv
+AICP_SUMMARY ?= $(BIN_DIR)/aicp_summary.txt
 
 .PHONY: all clean smoke protocol-test service-test client-test test model-runner model-compare rust-client rust-client-aarch64 model-runner-aarch64 cross-aarch64 linux-init-aarch64 starry-init-aarch64 yolov8-init-aarch64
 
@@ -116,7 +121,12 @@ model-runner-aarch64: $(AARCH64_MODEL_RUNNER)
 cross-aarch64: $(AARCH64_CLIENT) $(AARCH64_SERVER) $(AARCH64_INIT) $(AARCH64_STARRY_INIT) $(AARCH64_YOLO_INIT) $(AARCH64_MODEL_RUNNER)
 
 smoke: all
-	../../scripts/ai-rtos/aicp.sh smoke
+	@set -eu; \
+	  $(SERVER) $(AICP_PORT) >$(BIN_DIR)/aicp_server.log 2>&1 & server_pid=$$!; \
+	  trap 'kill $$server_pid 2>/dev/null || true; wait $$server_pid 2>/dev/null || true' EXIT INT TERM; \
+	  sleep 0.2; \
+	  $(CLIENT) 127.0.0.1 $(AICP_PORT) $(AICP_ITERATIONS) $(AICP_CSV) $(AICP_MODE); \
+	  ../../scripts/ai-rtos/summarize_latency.py $(AICP_CSV) $(AICP_ITERATIONS) | tee $(AICP_SUMMARY)
 
 clean:
 	rm -rf $(BIN_DIR)
