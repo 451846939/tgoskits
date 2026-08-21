@@ -167,6 +167,69 @@ def find_forbidden_qemu_net(values):
     return hits
 
 
+def virtual_net_macs(vm_text):
+    blocks = re.findall(
+        r"\[\[devices\.virtual\]\](.*?)(?=\[\[devices\.|\Z)", vm_text, re.S
+    )
+    macs = []
+    for block in blocks:
+        if not re.search(r'^model\s*=\s*"virtio-net"\s*$', block, re.M):
+            continue
+        match = re.search(r"guest_mac\s*=\s*\[([^]]+)\]", block)
+        if not match:
+            continue
+        try:
+            macs.append(":".join(f"{int(value.strip(), 0):02x}" for value in match.group(1).split(",")))
+        except ValueError:
+            continue
+    return macs
+
+
+def evaluate_axvisor_virtual_switch_topology(qemu_args, vm_texts):
+    """Validate that AICP guests use AxVisor virtual NICs, not QEMU networking."""
+    expected_guest_macs = {"52:54:00:aa:03:03", "52:54:00:aa:03:02"}
+    expected_probe_mac = "52:54:00:aa:03:01"
+    failures = []
+    report = ["topology=axvisor virtual switch; guest NICs are not QEMU netdevs"]
+    guest_macs = []
+
+    for index, vm_text in enumerate(vm_texts, start=1):
+        macs = virtual_net_macs(vm_text)
+        report.append(f"vm{index}_virtual_net_macs={','.join(macs)}")
+        if len(macs) != 1:
+            failures.append(f"VM {index} must define exactly one virtio-net virtual device, found {len(macs)}")
+        guest_macs.extend(macs)
+
+    if set(guest_macs) != expected_guest_macs:
+        failures.append(
+            "virtual guest MACs must be 52:54:00:aa:03:03 and 52:54:00:aa:03:02, "
+            f"found {guest_macs}"
+        )
+
+    forbidden_net = [
+        value
+        for value in find_forbidden_qemu_net(qemu_args)
+        if value != "user,id=hostnet"
+    ]
+    if forbidden_net:
+        failures.append(f"forbidden guest/external QEMU network options present: {forbidden_net}")
+    if "user,id=hostnet" not in qemu_args:
+        failures.append("missing documented host-only QEMU virtio-net probe backend")
+
+    host_probe_devices = [
+        value for value in qemu_args if "netdev=hostnet" in value and "virtio-net-device" in value
+    ]
+    if len(host_probe_devices) != 1 or expected_probe_mac not in host_probe_devices[0].lower():
+        failures.append(
+            "host-only QEMU virtio-net probe must use MAC "
+            f"{expected_probe_mac}, found {host_probe_devices}"
+        )
+    if any(mac in "\n".join(host_probe_devices).lower() for mac in expected_guest_macs):
+        failures.append("a guest AICP MAC is attached to the QEMU host network backend")
+
+    return failures, report
+
+
 def find_marker(text, alternatives):
     return next((marker for marker in alternatives if marker in text), "")
 
@@ -219,6 +282,11 @@ def main() -> int:
         action="append",
         help="Runtime log. Repeat for separate AxVisor and Linux console logs.",
     )
+    parser.add_argument(
+        "--vm-config",
+        action="append",
+        help="Generated AxVM guest configuration. Repeat once per AICP guest to validate the virtual switch topology.",
+    )
     parser.add_argument("--summary", required=True)
     args = parser.parse_args()
 
@@ -245,23 +313,32 @@ def main() -> int:
     report.append(f"netdev_hubports={len(hubports)}")
     report.append(f"hubids={','.join(hubids)}")
     report.append(f"macs={','.join(macs)}")
-    report.append(
-        f"topology=isolated QEMU hubport hubid={hubids[0] if hubids else 'unknown'}; "
-        "no host NIC, NAT or bridge"
-    )
+    if args.vm_config:
+        report.append("topology=AxVisor virtual switch; QEMU NIC is host-only")
+    else:
+        report.append(
+            f"topology=isolated QEMU hubport hubid={hubids[0] if hubids else 'unknown'}; "
+            "no host NIC, NAT or bridge"
+        )
     report.append(f"linux_or_starry_ip={profile['guest_ip']}")
     report.append(f"rtos_ip={profile['rtos_ip']}")
     report.append(f"aicp_port=8800/{profile['transport']}")
 
-    if len(hubports) != 2:
-        failures.append(f"expected 2 hubport netdevs, found {len(hubports)}")
-    if len(hubids) != 2 or len(set(hubids)) != 1:
-        failures.append(f"expected two endpoints on the same hub, found hubids={hubids}")
-    for mac in ("52:54:00:aa:03:03", "52:54:00:aa:03:02"):
-        if mac not in macs:
-            failures.append(f"missing expected MAC {mac}")
-    if forbidden_net:
-        failures.append(f"forbidden host/external network options present: {forbidden_net}")
+    if args.vm_config:
+        vm_texts = [Path(path).read_text(errors="replace") for path in args.vm_config]
+        virtual_failures, virtual_report = evaluate_axvisor_virtual_switch_topology(qemu_args, vm_texts)
+        failures.extend(virtual_failures)
+        report.extend(virtual_report)
+    else:
+        if len(hubports) != 2:
+            failures.append(f"expected 2 hubport netdevs, found {len(hubports)}")
+        if len(hubids) != 2 or len(set(hubids)) != 1:
+            failures.append(f"expected two endpoints on the same hub, found hubids={hubids}")
+        for mac in ("52:54:00:aa:03:03", "52:54:00:aa:03:02"):
+            if mac not in macs:
+                failures.append(f"missing expected MAC {mac}")
+        if forbidden_net:
+            failures.append(f"forbidden host/external network options present: {forbidden_net}")
     if forbidden_side:
         failures.append(f"forbidden side-channel options present: {forbidden_side}")
     if profile["rtos"] in ("rtthread", "zephyr"):

@@ -188,6 +188,12 @@ check_runtime_isolation() {
     --log "${primary_log}"
     --summary "${result_dir}/isolation-${name}.txt"
   )
+  if [[ "${network_profile}" == "arceos-tcp" ]]; then
+    arguments+=(
+      --vm-config "${repo_root}/tmp/ai-rtos/axvisor-dual-guest-aicp-c-linux.generated.toml"
+      --vm-config "${repo_root}/tmp/ai-rtos/axvisor-dual-guest-aicp-c-arceos.generated.toml"
+    )
+  fi
   if [[ -n "${secondary_pattern}" ]]; then
     secondary_log="$(latest_file "${secondary_pattern}")"
     arguments+=(--log "${secondary_log}")

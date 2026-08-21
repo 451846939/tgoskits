@@ -37,6 +37,60 @@ class ForbiddenQemuNetworkTest(unittest.TestCase):
         self.assertEqual(MODULE.find_forbidden_qemu_net(values), values)
 
 
+class AxVisorVirtualSwitchTopologyTest(unittest.TestCase):
+    def test_virtual_guest_network_accepts_only_the_documented_host_probe(self):
+        qemu_args = [
+            "user,id=hostnet",
+            "virtio-net-device,netdev=hostnet,mac=52:54:00:aa:03:01",
+        ]
+        vm_texts = [
+            """
+[[devices.virtual]]
+id = "aicp-net"
+model = "virtio-net"
+guest_mac = [0x52, 0x54, 0x00, 0xaa, 0x03, 0x03]
+""",
+            """
+[[devices.virtual]]
+id = "aicp-net"
+model = "virtio-net"
+guest_mac = [0x52, 0x54, 0x00, 0xaa, 0x03, 0x02]
+""",
+        ]
+
+        failures, report = MODULE.evaluate_axvisor_virtual_switch_topology(qemu_args, vm_texts)
+
+        self.assertEqual(failures, [])
+        self.assertTrue(
+            any(item.startswith("topology=axvisor virtual switch") for item in report)
+        )
+
+    def test_virtual_guest_network_rejects_a_guest_bypass_or_missing_mac(self):
+        qemu_args = [
+            "user,id=hostnet,hostfwd=tcp::8800-:8800",
+            "virtio-net-device,netdev=hostnet,mac=52:54:00:aa:03:03",
+        ]
+        vm_texts = [
+            """
+[[devices.virtual]]
+id = "aicp-net"
+model = "virtio-net"
+guest_mac = [0x52, 0x54, 0x00, 0xaa, 0x03, 0x03]
+""",
+            """
+[[devices.virtual]]
+id = "aicp-net"
+model = "virtio-blk"
+""",
+        ]
+
+        failures, _ = MODULE.evaluate_axvisor_virtual_switch_topology(qemu_args, vm_texts)
+
+        self.assertTrue(any("hostfwd" in failure for failure in failures))
+        self.assertTrue(any("virtio-net" in failure for failure in failures))
+        self.assertTrue(any("52:54:00:aa:03:02" in failure for failure in failures))
+
+
 class RuntimeMatrixTest(unittest.TestCase):
     def test_common_aicp_stream_is_platform_neutral(self):
         stream_header = Path("apps/ai-rtos-demo/aicp/aicp_stream.h")
