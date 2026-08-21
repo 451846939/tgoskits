@@ -8,7 +8,7 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  scripts/ai-rtos/run_zephyr_periodic_baseline.sh
+  scripts/ai-rtos/runners/run_zephyr_periodic_baseline.sh
 
 Builds and runs the native Zephyr 20 ms periodic-task baseline in idle and
 CPU-stress modes. Results are saved under:
@@ -35,7 +35,7 @@ if [[ $# -ne 0 ]]; then
   exit 2
 fi
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 source "${repo_root}/scripts/ai-rtos/lib/host_tools.sh"
 revision="${ZEPHYR_REVISION:-v4.2.0}"
 cross_compile="$(aicp_resolve_cross_prefix ZEPHYR_CROSS_COMPILE aarch64-linux-musl-)"

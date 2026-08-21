@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 demo_root="${repo_root}/apps/ai-rtos-demo"
 failed=0
 checked=0
@@ -110,7 +110,7 @@ require_repo_contains net/ax-net/src/device/driver.rs \
 require_repo_absent os/axvisor/src/manager.rs \
   'set_aarch64_passthrough_irq_routes_enabled\(vm_id, true\)' \
   "VM startup must not unmask passthrough IRQs before the guest driver enables them"
-require_repo_contains scripts/ai-rtos/run_zephyr_periodic_baseline.sh \
+require_repo_contains scripts/ai-rtos/runners/run_zephyr_periodic_baseline.sh \
   'ZEPHYR_BASELINE_TIMEOUT_SECONDS' \
   "Zephyr periodic baseline timeout must be configurable for loaded validation hosts"
 

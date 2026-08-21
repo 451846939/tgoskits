@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
+repo_root="$(cd "$(dirname "$0")/../../.." && pwd)"
 demo_dir="${repo_root}/apps/ai-rtos-demo"
 port="${AICP_DELAYED_SERVER_PORT:-18809}"
 iterations="${AICP_DELAYED_SERVER_ITERATIONS:-5}"

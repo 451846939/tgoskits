@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 
 find "${repo_root}/scripts/ai-rtos" -type f -name '*.sh' -print0 \
   | xargs -0 -n 1 bash -n

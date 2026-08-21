@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 source "${repo_root}/scripts/ai-rtos/lib/run_artifacts.sh"
 
 test_dir="$(mktemp -d "${TMPDIR:-/tmp}/aicp-run-artifacts.XXXXXX")"

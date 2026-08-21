@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 source "${repo_root}/scripts/ai-rtos/lib/host_tools.sh"
 source "${repo_root}/scripts/ai-rtos/lib/markers.sh"
 source "${repo_root}/scripts/ai-rtos/lib/process.sh"

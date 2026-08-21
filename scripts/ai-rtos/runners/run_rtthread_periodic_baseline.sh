@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 revision="${RTTHREAD_REVISION:-v5.2.1}"
 source_dir="${RTTHREAD_SOURCE_DIR:-${repo_root}/tmp/rt-thread-${revision}}"
 bsp_dir="${source_dir}/bsp/qemu-virt64-aarch64"

@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 source "${repo_root}/scripts/ai-rtos/lib/host_tools.sh"
 source_dir="${repo_root}/apps/ai-rtos-demo/freertos"
 kernel_dir="${FREERTOS_KERNEL_DIR:-${repo_root}/tmp/ai-rtos/FreeRTOS-Kernel}"

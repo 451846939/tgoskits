@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
+repo_root="$(cd "$(dirname "$0")/../../.." && pwd)"
 demo_dir="$repo_root/apps/ai-rtos-demo"
 port="${AICP_PORT:-18801}"
 iterations="${AICP_ITERATIONS:-100}"
@@ -22,4 +22,4 @@ trap 'kill "$server_pid" 2>/dev/null || true' EXIT
 sleep 0.2
 "$demo_dir/build/aicp_client" 127.0.0.1 "$port" "$iterations" "$fixed_csv" fixed
 "$demo_dir/build/aicp_client" 127.0.0.1 "$port" "$iterations" "$ai_csv" ai
-"$repo_root/scripts/ai-rtos/compare_control.py" "$fixed_csv" "$ai_csv" "$iterations" | tee "$summary"
+"$repo_root/scripts/ai-rtos/analysis/compare_control.py" "$fixed_csv" "$ai_csv" "$iterations" | tee "$summary"

@@ -11,7 +11,7 @@ runner = "qcs"
 timeout_minutes = 10
 command = '''
 make -C apps/ai-rtos-demo test
-scripts/ai-rtos/run_aicp_protocol_reliability.sh 20
+scripts/ai-rtos/runners/run_aicp_protocol_reliability.sh 20
 '''
 
 [[check]]

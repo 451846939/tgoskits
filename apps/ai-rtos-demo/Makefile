@@ -126,7 +126,7 @@ smoke: all
 	  trap 'kill $$server_pid 2>/dev/null || true; wait $$server_pid 2>/dev/null || true' EXIT INT TERM; \
 	  sleep 0.2; \
 	  $(CLIENT) 127.0.0.1 $(AICP_PORT) $(AICP_ITERATIONS) $(AICP_CSV) $(AICP_MODE); \
-	  ../../scripts/ai-rtos/summarize_latency.py $(AICP_CSV) $(AICP_ITERATIONS) | tee $(AICP_SUMMARY)
+	  ../../scripts/ai-rtos/analysis/summarize_latency.py $(AICP_CSV) $(AICP_ITERATIONS) | tee $(AICP_SUMMARY)
 
 clean:
 	rm -rf $(BIN_DIR)

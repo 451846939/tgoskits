@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 stamp="$(date +%Y%m%d-%H%M%S)"
 result_dir="${repo_root}/tmp/ai-rtos/results/freertos-periodic-${stamp}"
 mkdir -p "${result_dir}"
@@ -29,7 +29,7 @@ run_mode() {
   AICP_FREERTOS_BASELINE=ON \
     AICP_FREERTOS_STRESS="${stress}" \
     FREERTOS_BUILD_DIR="${build_dir}" \
-    "${repo_root}/scripts/ai-rtos/build_freertos_aicp_guest.sh"
+    "${repo_root}/scripts/ai-rtos/build/build_freertos_aicp_guest.sh"
 
   echo "[ai-rtos] 直接启动 QEMU FreeRTOS 周期基线 mode=${mode}"
   set +e

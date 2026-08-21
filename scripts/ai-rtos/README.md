@@ -6,6 +6,9 @@
 两个 Guest 使用 AxVisor 的 `virtio-net` 虚拟设备和虚拟交换机；主数据通道
 不使用 vsock、共享内存或 HyperCall。
 
+顶层只有 `aicp.sh` 这一公开命令入口。`runners/`、`build/`、`checks/`、
+`analysis/` 和 `lib/` 是由该入口编排的内部实现，不构成稳定的用户接口。
+
 ## 最短复现
 
 ```sh

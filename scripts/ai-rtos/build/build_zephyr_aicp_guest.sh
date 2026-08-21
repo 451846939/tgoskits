@@ -36,7 +36,7 @@ if [[ $# -gt 1 || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
 fi
 
 board="${1:-qemu_cortex_a53}"
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 app_dir="${repo_root}/apps/ai-rtos-demo/zephyr"
 build_dir="${ZEPHYR_BUILD_DIR:-${app_dir}/build}"
 required_ref="${ZEPHYR_REQUIRED_REF:-v4.4.0}"

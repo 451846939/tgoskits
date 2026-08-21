@@ -8,7 +8,7 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  scripts/ai-rtos/run_axvisor_dual_guest_aicp.sh [iterations] [ai|fixed] [boot_timeout_seconds]
+  scripts/ai-rtos/runners/run_axvisor_dual_guest_aicp.sh [iterations] [ai|fixed] [boot_timeout_seconds]
 
 Boots two AxVisor guests in one QEMU AArch64 run:
   Linux AI guest    10.0.3.3/24, 2 vCPUs pinned to pCPU2,pCPU3
@@ -42,7 +42,7 @@ if [[ "${client_impl}" != "c" && "${client_impl}" != "rust" ]]; then
   exit 2
 fi
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 source "${repo_root}/scripts/ai-rtos/lib/cpu_topology.sh"
 source "${repo_root}/scripts/ai-rtos/lib/markers.sh"
 source "${repo_root}/scripts/ai-rtos/lib/process.sh"

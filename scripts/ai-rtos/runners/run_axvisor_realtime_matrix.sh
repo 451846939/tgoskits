@@ -8,7 +8,7 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  scripts/ai-rtos/run_axvisor_realtime_matrix.sh [iterations] [boot_timeout_seconds] [stress_procs]
+  scripts/ai-rtos/runners/run_axvisor_realtime_matrix.sh [iterations] [boot_timeout_seconds] [stress_procs]
 
 Runs the verified AxVisor dual-guest AICP TCP/IP scenario twice:
   idle   - no synthetic Linux guest background load
@@ -29,7 +29,7 @@ fi
 iterations="${1:-200}"
 boot_timeout_s="${2:-240}"
 stress_procs="${3:-2}"
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 source "${repo_root}/scripts/ai-rtos/lib/process.sh"
 result_dir="${repo_root}/tmp/ai-rtos/results/realtime-$(date +%Y%m%d-%H%M%S)"
 rootfs_image="${repo_root}/tmp/axbuild/rootfs/rootfs-aarch64-alpine.img/rootfs-aarch64-alpine.img"
@@ -54,7 +54,7 @@ run_case() {
   local client_impl="${AICP_CLIENT_IMPL:-c}"
   local log_prefix="axvisor-dual-guest-aicp-${client_impl}"
   local log_glob="${log_prefix}-[0-9]*.log"
-  local runner="${repo_root}/scripts/ai-rtos/run_axvisor_dual_guest_aicp.sh"
+  local runner="${repo_root}/scripts/ai-rtos/runners/run_axvisor_dual_guest_aicp.sh"
 
   if [[ "${AICP_TRANSPORT:-hub}" != "hub" ]]; then
     echo "ERROR: AICP_TRANSPORT must be hub" >&2
@@ -103,7 +103,7 @@ run_case() {
   if [[ -n "${combined_log:-}" && -f "${combined_log}" ]]; then
     csv="${result_dir}/${name}.csv"
     summary="${result_dir}/${name}.summary.txt"
-    if "${repo_root}/scripts/ai-rtos/extract_aicp_log.py" \
+    if "${repo_root}/scripts/ai-rtos/analysis/extract_aicp_log.py" \
       "${combined_log}" --csv "${csv}" --summary "${summary}" --expected "${iterations}"; then
       :
     else

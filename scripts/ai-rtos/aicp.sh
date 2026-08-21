@@ -116,7 +116,7 @@ run_pair() {
 
   case "${ai_guest}:${rtos_guest}" in
     linux:arceos)
-      exec "${script_dir}/run_axvisor_dual_guest_aicp.sh" "$@"
+      exec "${script_dir}/runners/run_axvisor_dual_guest_aicp.sh" "$@"
       ;;
     *)
       echo "ERROR：当前最新 dev 已验证的虚拟网卡闭环仅支持 linux + arceos；请求的是 ${ai_guest} + ${rtos_guest}" >&2
@@ -132,17 +132,17 @@ list_scripts() {
   aicp.sh                         环境检查、准备、矩阵、单组合和专项测试入口
 
 内部编排器：
-  run_full_qemu_validation.sh     smoke/full 全矩阵编排和阶段日志汇总
+  runners/run_full_qemu_validation.sh  smoke/full 全矩阵编排和阶段日志汇总
 双 Guest 主线：
-  run_axvisor_dual_guest_aicp.sh          Linux + ArceOS
+  runners/run_axvisor_dual_guest_aicp.sh  Linux + ArceOS
 
 专项验证：
-  run_axvisor_rt_before_after.sh             AxVisor 实时优化 A/B
-  run_*_periodic_baseline.sh                 三种原生 RTOS 周期基线
-  run_*_long_stability.sh                    长时间稳定性
+  runners/run_axvisor_rt_before_after.sh     AxVisor 实时优化 A/B
+  runners/run_*_periodic_baseline.sh          三种原生 RTOS 周期基线
+  runners/run_*_long_stability.sh             长时间稳定性
 
 辅助检查与数据处理：
-  check_*.sh、extract_*.py、summarize_*.py、compare_control.py
+  checks/、analysis/、lib/
   由上层脚本调用，普通复现通常不需要直接执行。
 
 完整命令由本入口的 `--help` 和 `list` 提供；脚本内部实现不构成稳定的用户接口。
@@ -165,7 +165,7 @@ case "${command_name}" in
     ;;
   smoke|full)
     require_arg_count 1 1 "$#"
-    exec "${script_dir}/run_full_qemu_validation.sh" "${command_name}"
+    exec "${script_dir}/runners/run_full_qemu_validation.sh" "${command_name}"
     ;;
   run)
     require_arg_count 3 6 "$#"
@@ -173,24 +173,24 @@ case "${command_name}" in
     ;;
   realtime)
     require_arg_count 1 4 "$#"
-    exec "${script_dir}/run_axvisor_rt_before_after.sh" "${@:2}"
+    exec "${script_dir}/runners/run_axvisor_rt_before_after.sh" "${@:2}"
     ;;
   baseline)
     require_arg_count 2 2 "$#"
     case "$2" in
       rtthread)
-        exec "${script_dir}/run_rtthread_periodic_baseline.sh"
+        exec "${script_dir}/runners/run_rtthread_periodic_baseline.sh"
         ;;
       zephyr)
-        exec "${script_dir}/run_zephyr_periodic_baseline.sh"
+        exec "${script_dir}/runners/run_zephyr_periodic_baseline.sh"
         ;;
       freertos)
-        exec "${script_dir}/run_freertos_periodic_baseline.sh"
+        exec "${script_dir}/runners/run_freertos_periodic_baseline.sh"
         ;;
       all)
-        "${script_dir}/run_rtthread_periodic_baseline.sh"
-        "${script_dir}/run_zephyr_periodic_baseline.sh"
-        "${script_dir}/run_freertos_periodic_baseline.sh"
+        "${script_dir}/runners/run_rtthread_periodic_baseline.sh"
+        "${script_dir}/runners/run_zephyr_periodic_baseline.sh"
+        "${script_dir}/runners/run_freertos_periodic_baseline.sh"
         ;;
       *)
         usage >&2
@@ -200,7 +200,7 @@ case "${command_name}" in
     ;;
   reliability)
     require_arg_count 1 3 "$#"
-    exec "${script_dir}/run_aicp_protocol_reliability.sh" "${2:-20}"
+    exec "${script_dir}/runners/run_aicp_protocol_reliability.sh" "${2:-20}"
     ;;
   list)
     require_arg_count 1 1 "$#"

@@ -4,11 +4,11 @@
 # Run host-side AICP protocol reliability checks and collect reproducible logs.
 #
 # Usage:
-#   scripts/ai-rtos/run_aicp_protocol_reliability.sh [smoke_iterations]
+#   scripts/ai-rtos/runners/run_aicp_protocol_reliability.sh [smoke_iterations]
 
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
+repo_root="$(cd "$(dirname "$0")/../../.." && pwd)"
 iterations="${1:-50}"
 stamp="$(date +%Y%m%d-%H%M%S)"
 result_dir="${repo_root}/tmp/ai-rtos/results/protocol-${stamp}"
@@ -30,7 +30,7 @@ AICP_ITERATIONS="${iterations}" make -C "${demo_dir}" smoke 2>&1 | tee "${smoke_
 
 echo "[ai-rtos] running delayed-server reconnect regression"
 AICP_DELAYED_SERVER_RESULT_DIR="${result_dir}/delayed-server" \
-  "${repo_root}/scripts/ai-rtos/test_aicp_delayed_server_reconnect.sh" 2>&1 | tee "${delayed_server_log}"
+  "${repo_root}/scripts/ai-rtos/checks/test_aicp_delayed_server_reconnect.sh" 2>&1 | tee "${delayed_server_log}"
 
 passed="$(awk -F'[ =]' '/AICP_PROTOCOL_SUMMARY/ {for (i=1;i<=NF;i++) if ($i=="passed") print $(i+1)}' "${protocol_log}" | tail -n 1)"
 failed="$(awk -F'[ =]' '/AICP_PROTOCOL_SUMMARY/ {for (i=1;i<=NF;i++) if ($i=="failed") print $(i+1)}' "${protocol_log}" | tail -n 1)"

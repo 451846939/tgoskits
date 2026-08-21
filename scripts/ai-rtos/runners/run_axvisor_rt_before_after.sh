@@ -8,7 +8,7 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  scripts/ai-rtos/run_axvisor_rt_before_after.sh [iterations] [boot_timeout_seconds] [stress_procs] [rounds]
+  scripts/ai-rtos/runners/run_axvisor_rt_before_after.sh [iterations] [boot_timeout_seconds] [stress_procs] [rounds]
 
 Runs the same dual-guest AICP workload with two AxVisor variants:
   optimized - board config selected by AICP_OPTIMIZED_BOARD_CONFIG
@@ -46,7 +46,7 @@ if ! [[ "${rounds}" =~ ^[0-9]+$ ]] || (( rounds == 0 )); then
   exit 2
 fi
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 result_dir="${repo_root}/tmp/ai-rtos/results/rt-before-after-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "${result_dir}"
 
@@ -62,7 +62,7 @@ run_variant() {
 
   echo "[ai-rtos] Running ${variant} realtime matrix"
   if AICP_AXVISOR_BOARD_CONFIG="${board_config}" \
-    "${repo_root}/scripts/ai-rtos/run_axvisor_realtime_matrix.sh" \
+    "${repo_root}/scripts/ai-rtos/runners/run_axvisor_realtime_matrix.sh" \
       "${iterations}" "${boot_timeout_s}" "${stress_procs}"; then
     :
   else
@@ -130,7 +130,7 @@ for ((round = 1; round <= rounds; round++)); do
     fi
   done
 
-  python3 "${repo_root}/scripts/ai-rtos/summarize_rt_before_after.py" \
+  python3 "${repo_root}/scripts/ai-rtos/analysis/summarize_rt_before_after.py" \
     "${round_dir}/baseline" \
     "${round_dir}/optimized" \
     --summary "${round_dir}/before_after.summary.txt"
@@ -138,7 +138,7 @@ for ((round = 1; round <= rounds; round++)); do
 done
 
 if (( rounds > 1 )); then
-  python3 "${repo_root}/scripts/ai-rtos/summarize_rt_multirun.py" \
+  python3 "${repo_root}/scripts/ai-rtos/analysis/summarize_rt_multirun.py" \
     "${round_dirs[@]}" \
     --summary "${result_dir}/multirun.summary.txt"
   cat "${result_dir}/multirun.summary.txt"

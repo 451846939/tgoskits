@@ -8,7 +8,7 @@ set -euo pipefail
 iterations="${1:-10000}"
 boot_timeout_s="${2:-4200}"
 stress_procs="${3:-2}"
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 result_dir="${repo_root}/tmp/ai-rtos/results/long-stability-$(date +%Y%m%d-%H%M%S)"
 runner_output="${result_dir}/runner-output.log"
 source "${repo_root}/scripts/ai-rtos/lib/run_artifacts.sh"
@@ -26,12 +26,12 @@ mkdir -p "${result_dir}"
 
 start_epoch="$(date +%s)"
 AICP_STRESS_PROCS="${stress_procs}" \
-  "${repo_root}/scripts/ai-rtos/run_axvisor_dual_guest_aicp.sh" \
+  "${repo_root}/scripts/ai-rtos/runners/run_axvisor_dual_guest_aicp.sh" \
   "${iterations}" ai "${boot_timeout_s}" | tee "${runner_output}"
 end_epoch="$(date +%s)"
 
 aicp_archive_dual_guest_logs "${runner_output}" "${result_dir}"
-python3 "${repo_root}/scripts/ai-rtos/extract_aicp_log.py" \
+python3 "${repo_root}/scripts/ai-rtos/analysis/extract_aicp_log.py" \
   "${result_dir}/run.log" \
   --csv "${result_dir}/samples.csv" \
   --summary "${result_dir}/summary.txt" \

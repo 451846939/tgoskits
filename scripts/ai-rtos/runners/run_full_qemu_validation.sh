@@ -8,8 +8,8 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 用法：
-  scripts/ai-rtos/run_full_qemu_validation.sh smoke
-  scripts/ai-rtos/run_full_qemu_validation.sh full
+  scripts/ai-rtos/runners/run_full_qemu_validation.sh smoke
+  scripts/ai-rtos/runners/run_full_qemu_validation.sh full
 
 验证档位：
   smoke  准备镜像并执行协议检查，以最小有效次数验证 Linux 2-vCPU
@@ -50,7 +50,7 @@ case "${profile}" in
     ;;
 esac
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 source "${repo_root}/scripts/ai-rtos/lib/host_tools.sh"
 stamp="$(date +%Y%m%d-%H%M%S)"
 result_dir="${repo_root}/tmp/ai-rtos/results/full-validation-${stamp}"
@@ -181,7 +181,7 @@ check_runtime_isolation() {
 
   primary_log="$(latest_file "${primary_pattern}")"
   arguments=(
-    "${repo_root}/scripts/ai-rtos/check_aicp_network_isolation.py"
+    "${repo_root}/scripts/ai-rtos/checks/check_aicp_network_isolation.py"
     --qemu-config "${qemu_config}"
     --profile "${network_profile}"
     --ai-guest "${ai_guest}"
@@ -236,14 +236,14 @@ check_commands() {
 cd "${repo_root}"
 
 run_stage preflight check_commands
-run_stage shell_syntax scripts/ai-rtos/check_shell_syntax.sh
-run_stage host_tools_unit scripts/ai-rtos/test_host_tools.sh
-run_stage run_artifacts_unit scripts/ai-rtos/test_run_artifacts.sh
+run_stage shell_syntax scripts/ai-rtos/checks/check_shell_syntax.sh
+run_stage host_tools_unit scripts/ai-rtos/checks/test_host_tools.sh
+run_stage run_artifacts_unit scripts/ai-rtos/checks/test_run_artifacts.sh
 run_stage python_syntax env PYTHONPYCACHEPREFIX="${repo_root}/tmp/ai-rtos/pycache" \
-  python3 -m py_compile scripts/ai-rtos/*.py
-run_stage isolation_unit python3 -m unittest scripts/ai-rtos/test_check_aicp_network_isolation.py
-run_stage architecture scripts/ai-rtos/check_demo_architecture.sh
-run_stage third_party_clean scripts/ai-rtos/check_third_party_sources_clean.sh
+  python3 -m py_compile scripts/ai-rtos/checks/*.py scripts/ai-rtos/analysis/*.py
+run_stage isolation_unit python3 -m unittest scripts/ai-rtos/checks/test_check_aicp_network_isolation.py
+run_stage architecture scripts/ai-rtos/checks/check_demo_architecture.sh
+run_stage third_party_clean scripts/ai-rtos/checks/check_third_party_sources_clean.sh
 run_stage host_build make -C apps/ai-rtos-demo clean all
 run_stage protocol_unit make -C apps/ai-rtos-demo test
 
@@ -251,9 +251,9 @@ if [[ "${prepare_images}" == "1" ]]; then
   run_stage prepare_images cargo xtask image pull qemu-aarch64 --extract-dir tmp/images
 fi
 
-run_stage protocol_reliability scripts/ai-rtos/run_aicp_protocol_reliability.sh "${protocol_iterations}"
+run_stage protocol_reliability scripts/ai-rtos/runners/run_aicp_protocol_reliability.sh "${protocol_iterations}"
 
-run_stage linux_arceos scripts/ai-rtos/run_axvisor_dual_guest_aicp.sh "${iterations}" ai "${boot_timeout_s}"
+run_stage linux_arceos scripts/ai-rtos/runners/run_axvisor_dual_guest_aicp.sh "${iterations}" ai "${boot_timeout_s}"
 run_stage isolation_linux_arceos check_runtime_isolation \
   linux-arceos linux arceos-tcp \
   "${repo_root}/tmp/ai-rtos/axvisor-dual-guest-aicp-c-qemu.generated.toml" \
@@ -261,14 +261,14 @@ run_stage isolation_linux_arceos check_runtime_isolation \
   'axvisor-dual-guest-aicp-c-linux-console-*.log'
 
 if [[ "${profile}" == "full" ]]; then
-  run_stage control_compare env AICP_ITERATIONS=100 scripts/ai-rtos/run_aicp_control_compare.sh
-  run_stage realtime_before_after scripts/ai-rtos/run_axvisor_rt_before_after.sh 300 "${boot_timeout_s}" "${stress_procs}"
-  run_stage baseline_zephyr scripts/ai-rtos/run_zephyr_periodic_baseline.sh
-  run_stage baseline_rtthread scripts/ai-rtos/run_rtthread_periodic_baseline.sh
-  run_stage baseline_freertos scripts/ai-rtos/run_freertos_periodic_baseline.sh
+  run_stage control_compare env AICP_ITERATIONS=100 scripts/ai-rtos/runners/run_aicp_control_compare.sh
+  run_stage realtime_before_after scripts/ai-rtos/runners/run_axvisor_rt_before_after.sh 300 "${boot_timeout_s}" "${stress_procs}"
+  run_stage baseline_zephyr scripts/ai-rtos/runners/run_zephyr_periodic_baseline.sh
+  run_stage baseline_rtthread scripts/ai-rtos/runners/run_rtthread_periodic_baseline.sh
+  run_stage baseline_freertos scripts/ai-rtos/runners/run_freertos_periodic_baseline.sh
 
   if [[ "${include_long_stability}" == "1" ]]; then
-    run_stage long_arceos scripts/ai-rtos/run_axvisor_long_stability.sh 10000 4200 "${stress_procs}"
+    run_stage long_arceos scripts/ai-rtos/runners/run_axvisor_long_stability.sh 10000 4200 "${stress_procs}"
   fi
 fi
 
