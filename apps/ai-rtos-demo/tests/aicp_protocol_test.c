@@ -275,7 +275,7 @@ static int test_bad_payload_error_reply(void) {
     }
 
     uint8_t decoded_payload[AICP_MAX_PAYLOAD];
-    struct aicp_header decoded;
+    struct aicp_header decoded = {0};
     int ret = aicp_posix_recv_frame(
         fds[1], &decoded, decoded_payload, sizeof(decoded_payload));
     if (ret != 0 || decoded.payload_len == sizeof(struct aicp_control_payload)) {
