@@ -35,6 +35,12 @@ impl UdpSocket {
         Ok(api::ax_udp_peer_addr(&self.0)?)
     }
 
+    /// Moves this socket into or out of nonblocking mode.
+    pub fn set_nonblocking(&self, nonblocking: bool) -> StdResult {
+        api::ax_udp_set_nonblocking(&self.0, nonblocking)?;
+        Ok(())
+    }
+
     /// Receives a single datagram message on the socket. On success, returns
     /// the number of bytes read and the origin.
     pub fn recv_from(&self, buf: &mut [u8]) -> StdResult<(usize, SocketAddr)> {

@@ -19,7 +19,7 @@ the topology with AICP_HOST_CPUS, AICP_LINUX_VCPU0_PCPU,
 AICP_LINUX_VCPU1_PCPU, and AICP_RTOS_VCPU0_PCPU.
 
 Set AICP_CLIENT_IMPL=c or AICP_CLIENT_IMPL=rust to select the Linux client.
-Both guests communicate through an isolated QEMU layer-2 hub.
+Both guests communicate through AxVisor's isolated virtual switch.
 EOF
 }
 
@@ -73,6 +73,7 @@ initramfs_dir="${out_dir}/${run_name}-initramfs"
 initramfs="${out_dir}/${run_name}-initramfs.cpio.gz"
 linux_kernel="${bundle_dir}/linux/linux-qemu"
 arceos_bin="${repo_root}/target/aarch64-unknown-linux-musl/release/arceos-aicp-server.bin"
+arceos_build_config="apps/arceos/aicp-server/build-aarch64-unknown-none-softfloat.toml"
 
 cleanup() {
   aicp_cleanup_process_tree "${qemu_pid:-}"
@@ -97,6 +98,34 @@ require_tool() {
     echo "ERROR: missing required tool: $1" >&2
     exit 1
   fi
+}
+
+prepare_arceos_raw_image() {
+  local arceos_elf="${repo_root}/target/aarch64-unknown-linux-musl/release/arceos-aicp-server"
+  local objcopy=""
+  local candidate
+
+  if [[ ! -s "${arceos_elf}" ]]; then
+    echo "ERROR: ArceOS AICP ELF is missing or empty: ${arceos_elf}" >&2
+    exit 1
+  fi
+  for candidate in aarch64-linux-musl-objcopy aarch64-linux-gnu-objcopy rust-objcopy llvm-objcopy objcopy; do
+    if command -v "${candidate}" >/dev/null 2>&1; then
+      objcopy="${candidate}"
+      break
+    fi
+  done
+  if [[ -z "${objcopy}" ]]; then
+    echo "ERROR: no AArch64 ELF-to-binary objcopy tool is available" >&2
+    exit 1
+  fi
+
+  "${objcopy}" -O binary "${arceos_elf}" "${arceos_bin}"
+  if [[ ! -s "${arceos_bin}" ]]; then
+    echo "ERROR: ArceOS AICP raw image is missing or empty after objcopy: ${arceos_bin}" >&2
+    exit 1
+  fi
+  echo "[ai-rtos] Prepared ArceOS raw image with ${objcopy}: ${arceos_bin}"
 }
 
 build_linux_initramfs() {
@@ -207,16 +236,12 @@ build_linux_initramfs
 echo "[ai-rtos] Building ArceOS RTOS guest"
 (
   cd "${repo_root}"
-  AX_IP=10.0.3.2 AX_GW=0.0.0.0 AX_PREFIX_LEN=24 \
-    cargo xtask arceos build \
-      -p arceos-aicp-server \
-      --arch aarch64 \
-      --config apps/arceos/build-aarch64-unknown-none-softfloat.toml
+  cargo xtask arceos build \
+    -p arceos-aicp-server \
+    --arch aarch64 \
+    --config "${arceos_build_config}"
 )
-if [[ ! -s "${arceos_bin}" ]]; then
-  echo "ERROR: ArceOS AICP image is missing or empty: ${arceos_bin}" >&2
-  exit 1
-fi
+prepare_arceos_raw_image
 
 echo "[ai-rtos] Generating AxVM virtual-device guest configurations"
 write_linux_vm_config

@@ -1,0 +1,7 @@
+# The AICP server assigns eth0's static address at runtime through ax-net's
+# public control API, after AxRuntime has registered the virtio NIC.
+features = []
+log = "Info"
+max_cpu_num = 1
+target = "aarch64-unknown-none-softfloat"
+to_bin = true

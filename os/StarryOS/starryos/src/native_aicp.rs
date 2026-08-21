@@ -131,7 +131,7 @@ fn run_delayed(config: NativeConfig) {
         config.retries
     );
 
-    configure_peer_neighbor();
+    log_peer_neighbor_discovery();
 
     match run_client(&config) {
         Ok(summary) => ax_println!(
@@ -417,10 +417,7 @@ fn transact(
                         Instant::now().duration_since(start).as_nanos(),
                     ));
                 }
-                Err(_) => {
-                    let _ = socket.poll_readiness();
-                    wait_for(RETRY_DELAY);
-                }
+                Err(_) => wait_for(RETRY_DELAY),
             }
         }
         ax_println!(
@@ -655,29 +652,26 @@ fn parse_ipv4(value: &str) -> ax_std::net::Ipv4Addr {
     }
 }
 
-fn configure_peer_neighbor() {
+fn log_peer_neighbor_discovery() {
     let iface = option_env!("AICP_STARRY_IFACE").unwrap_or("eth0");
     let peer_ip = parse_ipv4_octets(option_env!("AICP_STARRY_SERVER").unwrap_or("10.0.3.2"));
     let peer_mac = parse_mac(option_env!("AICP_STARRY_SERVER_MAC").unwrap_or("52:54:00:aa:03:02"));
 
-    match ax_net::configure_static_arp(iface, peer_ip, peer_mac) {
-        Ok(()) => ax_println!(
-            "AICP_STARRY_STATIC_ARP iface={} ip={}.{}.{}.{} \
-             mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            iface,
-            peer_ip[0],
-            peer_ip[1],
-            peer_ip[2],
-            peer_ip[3],
-            peer_mac[0],
-            peer_mac[1],
-            peer_mac[2],
-            peer_mac[3],
-            peer_mac[4],
-            peer_mac[5]
-        ),
-        Err(err) => ax_println!("AICP_STARRY_STATIC_ARP_ERROR iface={} err={:?}", iface, err),
-    }
+    ax_println!(
+        "AICP_STARRY_NEIGHBOR_DISCOVERY iface={} peer_ip={}.{}.{}.{} \
+         peer_mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        iface,
+        peer_ip[0],
+        peer_ip[1],
+        peer_ip[2],
+        peer_ip[3],
+        peer_mac[0],
+        peer_mac[1],
+        peer_mac[2],
+        peer_mac[3],
+        peer_mac[4],
+        peer_mac[5]
+    );
 }
 
 fn parse_ipv4_octets(value: &str) -> [u8; 4] {

@@ -7975,7 +7975,6 @@ dependencies = [
  "ax-driver",
  "ax-hal",
  "ax-log",
- "ax-net",
  "ax-runtime",
  "ax-std",
  "axbuild",

@@ -26,6 +26,24 @@ const PERIODIC_OUTLIER_NS: u64 = 5_000_000;
 
 static PERIODIC_PROBE_ACTIVE: AtomicBool = AtomicBool::new(false);
 
+#[cfg(feature = "arceos")]
+fn configure_aicp_network() -> io::Result<()> {
+    let interface = ax_net::interfaces()
+        .into_iter()
+        .find(|interface| interface.name == "eth0")
+        .ok_or_else(|| io::Error::other("AICP network interface eth0 is unavailable"))?;
+
+    ax_net::set_interface_ipv4(interface.id, std::net::Ipv4Addr::new(10, 0, 3, 2), 24)
+        .map_err(|err| io::Error::other(format!("configure AICP static IPv4: {err:?}")))?;
+    println!("AICP_RTOS_NET_READY iface=eth0 ip=10.0.3.2/24");
+    Ok(())
+}
+
+#[cfg(not(feature = "arceos"))]
+fn configure_aicp_network() -> io::Result<()> {
+    Ok(())
+}
+
 fn udp_drop_every() -> u32 {
     option_env!("AICP_UDP_DROP_EVERY")
         .and_then(|value| value.parse().ok())
@@ -475,6 +493,7 @@ fn serve_client(mut stream: TcpStream) -> io::Result<()> {
 }
 
 fn main() -> io::Result<()> {
+    configure_aicp_network()?;
     thread::spawn(periodic_probe);
 
     let udp = UdpSocket::bind("0.0.0.0:8800")?;
