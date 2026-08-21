@@ -4,11 +4,9 @@
 
 普通复现从 [`aicp.sh`](aicp.sh) 进入即可。目录中的 `run_*.sh`、`build_*.sh`、`check_*.sh` 和数据处理脚本用于专项验证、失败重跑或底层调试，不需要按文件名逐个执行。
 
-完整架构、代码修改、协议设计、实测数据和评分项对应关系见：
-
-- [完整全流程实现与复现手册](../../docs/ai-rtos/完整全流程实现与复现手册.md)
-- [开发记录与问题排查](../../docs/ai-rtos/开发记录与问题排查.md)
-- [演示应用源码说明](../../apps/ai-rtos-demo/README.md)
+协议字段、状态机和演示应用的源码说明见
+[演示应用源码说明](../../apps/ai-rtos-demo/README.md)。设计报告、运行数据和
+开发排查记录是参赛材料，不属于仓库通用架构文档，因此不随源码提交。
 
 ## 1. 支持范围
 
@@ -373,7 +371,6 @@ scripts/ai-rtos/build_freertos_aicp_guest.sh
 | `aicp.sh` | 统一中文命令入口 | 是 |
 | `run_full_qemu_validation.sh` | 编排 smoke/full 全流程并保存阶段日志 | 需要细调环境变量时 |
 | `setup_qemu_rtos.sh` | 拉取镜像并生成 Zephyr/ArceOS 基础配置 | 通常由 `prepare` 调用 |
-| `run_axvisor_all_guest_modes.sh` | Linux/StarryOS 与 ArceOS 的 fixed/ai 四种模式对照 | 专项对照时 |
 
 ### 8.2 Guest 构建
 
@@ -388,14 +385,12 @@ scripts/ai-rtos/build_freertos_aicp_guest.sh
 | 脚本 | 默认参数 | 作用 |
 | --- | --- | --- |
 | `run_axvisor_dual_guest_aicp.sh` | `40 ai 180` | Linux + ArceOS，C/Rust 客户端可选 |
-| `run_axvisor_dual_guest_aicp_rust.sh` | 透传参数 | Linux + ArceOS，强制 Rust AICP 客户端 |
 | `run_axvisor_dual_guest_aicp_usernet.sh` | `40 ai 150` | QEMU user-net/hostfwd 回退拓扑，不是默认主线 |
 | `run_axvisor_linux_rtthread_aicp.sh` | `40 ai 180` | Linux + RT-Thread TCP 闭环 |
 | `run_axvisor_linux_zephyr_aicp.sh` | `20 ai 240` | Linux + Zephyr TCP 闭环 |
 | `run_axvisor_linux_freertos_aicp.sh` | `20 ai 240` | Linux + FreeRTOS TCP 闭环 |
 | `run_axvisor_starry_rtos_aicp.sh` | `40 ai 180` | StarryOS + 可选控制 Guest；原生 RTOS 使用 TCP |
 | `run_axvisor_starry_udp_faults.sh` | `20` | StarryOS + ArceOS UDP 故障注入 |
-| `run_axvisor_dual_guest_compare.sh` | `30 180` | Linux + ArceOS fixed/ai 控制效果和延迟对比 |
 
 直接调用 StarryOS 通用脚本时需设置控制 Guest：
 
@@ -412,10 +407,8 @@ scripts/ai-rtos/run_axvisor_starry_rtos_aicp.sh 20 ai 300
 | 脚本 | 作用 |
 | --- | --- |
 | `run_axvisor_rtthread_yolov8_rust_aicp.sh` | 统一入口使用的 Rust YOLOv8n CPU + RT-Thread 闭环包装器 |
-| `run_axvisor_yolov8_rust_aicp.sh` | Rust YOLOv8n CPU + ArceOS 闭环 |
-| `run_axvisor_yolov8_cpu_aicp.sh` | C++ ONNX Runtime YOLOv8 CPU + ArceOS 闭环 |
 
-`AICP_YOLO_RUST_SKIP_BUILD=1` 和 `AICP_YOLO_CPU_SKIP_BUILD=1` 用于复用已经生成的 AArch64 运行包。只有确认模型、运行库和可执行文件完整时才应跳过构建。
+`AICP_YOLO_RUST_SKIP_BUILD=1` 用于复用已经生成的 AArch64 运行包。只有确认模型、运行库和可执行文件完整时才应跳过构建。
 
 ### 8.5 实时性与稳定性
 
@@ -428,7 +421,6 @@ scripts/ai-rtos/run_axvisor_starry_rtos_aicp.sh 20 ai 300
 | `run_rtthread_periodic_baseline.sh` | 无 | RT-Thread 原生 20 ms idle/stress 基线 |
 | `run_zephyr_periodic_baseline.sh` | 无 | Zephyr 原生 20 ms idle/stress 基线 |
 | `run_freertos_periodic_baseline.sh` | 无 | FreeRTOS 原生 20 ms idle/stress 基线 |
-| `run_freertos_baseline.sh` | `60` | 旧 FreeRTOS AxVisor benchmark 表格提取，区别于周期基线 |
 
 实时报告中的主要字段：
 
@@ -460,14 +452,9 @@ QEMU 结果用于验证改造方向、回归和可复现对比。开发板最终
 
 | 脚本 | 作用 |
 | --- | --- |
-| `run_arceos_aicp_qemu_smoke.sh` | ArceOS AICP 服务端直接 QEMU 启动 |
-| `run_rtthread_aicp_smoke.sh` | RT-Thread AICP 服务端直接 QEMU + 主机客户端 |
-| `run_zephyr_aicp_smoke.sh` | Zephyr AICP 服务端直接 QEMU + hostfwd 客户端 |
 | `run_freertos_aicp_guest_smoke.sh` | AxVisor 下 FreeRTOS 启动、定时器、网络和 AICP 服务检查 |
 | `run_starry_aicp_smoke.sh` | StarryOS 单 Guest + 宿主参考服务端 |
 | `run_rtos_boot_smoke.sh` | `freertos|zephyr|arceos-aicp` 通用启动标记检查 |
-| `run_axvisor_aicp_e2e.sh` | AxVisor ArceOS Guest + 宿主 C 客户端 hostfwd 测试 |
-| `run_axvisor_aicp_e2e_rust.sh` | AxVisor ArceOS Guest + 宿主 Rust 客户端 hostfwd 测试 |
 
 ### 8.8 工程检查与自测
 
@@ -634,13 +621,13 @@ export DEBUGFS="$(command -v debugfs)"
 
 ### 12.2 等待 `RTOS AICP server ready` 超时
 
-先单独验证控制 Guest，再运行双 Guest：
+先通过统一入口缩小到单个双 Guest 组合：
 
 ```sh
-scripts/ai-rtos/run_arceos_aicp_qemu_smoke.sh
-scripts/ai-rtos/run_rtthread_aicp_smoke.sh 8 ai
-scripts/ai-rtos/run_zephyr_aicp_smoke.sh 8 60
-scripts/ai-rtos/run_freertos_aicp_guest_smoke.sh 60
+scripts/ai-rtos/aicp.sh run linux arceos 1 ai 180
+scripts/ai-rtos/aicp.sh run linux rtthread 1 ai 300
+scripts/ai-rtos/aicp.sh run linux zephyr 1 ai 300
+scripts/ai-rtos/aicp.sh run linux freertos 1 ai 300
 ```
 
 随后检查最新 QEMU 日志中的以下层次：

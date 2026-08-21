@@ -176,8 +176,7 @@ Guest 构建：
   check_*.sh、extract_*.py、summarize_*.py、compare_control.py
   由上层脚本调用，普通复现通常不需要直接执行。
 
-完整命令、环境变量、脚本字典和失败重跑方法见：
-  docs/ai-rtos/完整全流程实现与复现手册.md
+完整命令由本入口的 `--help` 和 `list` 提供；脚本内部实现不构成稳定的用户接口。
 EOF
 }
 

@@ -247,7 +247,7 @@ EOF
 
 if [[ ! -f "${linux_kernel}" ]]; then
   echo "ERROR: 缺少 Linux kernel：${linux_kernel}" >&2
-  echo "请先执行：cargo xtask image pull qemu-aarch64 -o tmp/images" >&2
+  echo "请先执行：cargo xtask image pull qemu-aarch64 --extract-dir tmp/images" >&2
   exit 1
 fi
 
