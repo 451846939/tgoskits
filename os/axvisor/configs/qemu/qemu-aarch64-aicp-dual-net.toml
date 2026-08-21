@@ -20,7 +20,10 @@ args = [
   "-append",
   "root=/dev/nvme0n1 rw init=/bin/sh",
   "-m",
-  "8g",
+  # Linux reserves 512 MiB and the ArceOS guest reserves 256 MiB. Keep enough
+  # headroom for AxVisor while avoiding an unnecessary 8 GiB host allocation
+  # on shared CI runners.
+  "4g",
 ]
 fail_regex = []
 success_regex = []
