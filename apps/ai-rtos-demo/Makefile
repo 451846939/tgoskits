@@ -116,7 +116,7 @@ model-runner-aarch64: $(AARCH64_MODEL_RUNNER)
 cross-aarch64: $(AARCH64_CLIENT) $(AARCH64_SERVER) $(AARCH64_INIT) $(AARCH64_STARRY_INIT) $(AARCH64_YOLO_INIT) $(AARCH64_MODEL_RUNNER)
 
 smoke: all
-	../../scripts/ai-rtos/run_aicp_smoke.sh
+	../../scripts/ai-rtos/aicp.sh smoke
 
 clean:
 	rm -rf $(BIN_DIR)

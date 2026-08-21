@@ -17,9 +17,11 @@ Standalone smoke mode uses QEMU user networking and connects to the host at
 StarryOS guest uses `10.0.3.3/24` and connects to the RTOS guest at
 `10.0.3.2:8800` over the isolated virtio-mmio hub.
 
-Useful commands:
+The standalone smoke runner is an implementation-level diagnostic, rather than
+the supported multi-guest reproduction entry point. The current latest-dev
+validated AICP closed loop is Linux + ArceOS; use the single public entry point:
 
 ```sh
-scripts/ai-rtos/run_starry_aicp_smoke.sh 20 ai
-scripts/ai-rtos/run_axvisor_starry_rtos_aicp.sh 40 ai 180
+scripts/ai-rtos/aicp.sh doctor
+scripts/ai-rtos/aicp.sh smoke
 ```

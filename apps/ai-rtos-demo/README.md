@@ -30,9 +30,8 @@ Rust 公共协议 crate 位于 `components/aicp-protocol/`；ArceOS 服务端位
 主机协议与服务状态机：
 
 ```sh
-scripts/ai-rtos/check_demo_architecture.sh
 make -C apps/ai-rtos-demo clean all test
-scripts/ai-rtos/run_aicp_smoke.sh
+scripts/ai-rtos/aicp.sh reliability
 ```
 
 结构检查会验证公共层不存在 OS 特判、三种原生 RTOS glue 均接入同一服务状态机、Linux/StarryOS 与 C++ YOLOv8 共用客户端事务核心、旧重复入口已经移除，并阻止第三方 RTOS 源码进入演示目录。
@@ -40,13 +39,13 @@ scripts/ai-rtos/run_aicp_smoke.sh
 当前 QEMU 双 Guest最小闭环：
 
 ```sh
-scripts/ai-rtos/run_full_qemu_validation.sh smoke
+scripts/ai-rtos/aicp.sh smoke
 ```
 
 包含闭环、实时 A/B、三种原生 RTOS 周期基线、可靠性和控制效果的完整验证：
 
 ```sh
-scripts/ai-rtos/run_full_qemu_validation.sh full
+scripts/ai-rtos/aicp.sh full
 ```
 
 已验证的统一入口：
