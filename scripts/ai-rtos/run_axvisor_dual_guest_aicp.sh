@@ -172,7 +172,7 @@ write_linux_vm_config() {
 [base]
 id = 1
 name = "linux-ai-dual-qemu"
-vm_type = 1
+guest_type = "virtualized"
 cpu_num = 2
 phys_cpu_ids = [${linux_vcpu0_pcpu}, ${linux_vcpu1_pcpu}]
 phys_cpu_sets = [${linux_vcpu0_mask}, ${linux_vcpu1_mask}]
@@ -182,26 +182,22 @@ entry_point = 0x8020_0000
 image_location = "memory"
 kernel_path = "${linux_kernel}"
 kernel_load_addr = 0x8020_0000
-dtb_path = "${linux_dtb}"
 dtb_load_addr = 0x8000_0000
 ramdisk_path = "${initramfs}"
 ramdisk_load_addr = 0x9000_0000
+cmdline = "console=ttyAMA0 earlycon rdinit=/init panic=-1 loglevel=7 aicp.iterations=${iterations} aicp.mode=${mode} aicp.connect_retries=120"
 memory_regions = [
-  [0x8000_0000, 0x2000_0000, 0x7, 1],
+  [0x8000_0000, 0x2000_0000, 0x7, 0],
 ]
 
 [devices]
-interrupt_mode = "passthrough"
-passthrough_devices = [
-  ["/virtio_mmio@a003c00"],
-  ["/pl011@9040000"],
-]
-passthrough_addresses = []
-excluded_devices = []
-emu_devices = [
-  ["gppt-gicd", 0x0800_0000, 0x1_0000, 0, 0x21, []],
-  ["gppt-gicr", 0x080a_0000, 0x2_0000, 0, 0x20, [2, 0x2_0000, ${linux_vcpu0_pcpu}]],
-]
+passthrough = []
+disabled = []
+
+[[devices.virtual]]
+id = "aicp-net"
+model = "virtio-net"
+guest_mac = [0x52, 0x54, 0x00, 0xaa, 0x03, 0x03]
 EOF
 }
 
@@ -210,7 +206,7 @@ write_rtos_vm_config() {
 [base]
 id = 2
 name = "arceos-aicp-dual-qemu"
-vm_type = 1
+guest_type = "virtualized"
 cpu_num = 1
 phys_cpu_ids = [${rtos_vcpu0_pcpu}]
 phys_cpu_sets = [${rtos_vcpu0_mask}]
@@ -220,27 +216,19 @@ entry_point = 0xC020_0000
 image_location = "memory"
 kernel_path = "${arceos_bin}"
 kernel_load_addr = 0xC020_0000
-dtb_path = "${rtos_dtb}"
 dtb_load_addr = 0xC000_0000
 memory_regions = [
-  # QEMU passthrough VirtIO DMA uses guest physical addresses directly, so the
-  # RTOS RAM is an identity-mapped host reserved-memory region.
-  [0xC000_0000, 0x1000_0000, 0x7, 2],
+  [0xC000_0000, 0x1000_0000, 0x7, 0],
 ]
 
 [devices]
-interrupt_mode = "passthrough"
-passthrough_devices = [
-  ["/virtio_mmio@a003a00"],
-]
-passthrough_addresses = [
-  [0x0900_0000, 0x1000],
-]
-excluded_devices = []
-emu_devices = [
-  ["gppt-gicd", 0x0800_0000, 0x1_0000, 0, 0x21, []],
-  ["gppt-gicr", 0x080a_0000, 0x2_0000, 0, 0x20, [1, 0x2_0000, ${rtos_vcpu0_pcpu}]],
-]
+passthrough = []
+disabled = []
+
+[[devices.virtual]]
+id = "aicp-net"
+model = "virtio-net"
+guest_mac = [0x52, 0x54, 0x00, 0xaa, 0x03, 0x02]
 EOF
 }
 
@@ -270,38 +258,14 @@ if [[ ! -s "${arceos_bin}" ]]; then
   exit 1
 fi
 
-echo "[ai-rtos] Generating isolated Linux and ArceOS DTBs"
-crop_virtio_nodes "${linux_src_dts}" "${linux_dts}.devices" "virtio_mmio@a003c00"
-remove_dts_nodes "${linux_dts}.devices" "${linux_dts}.pruned1" "gpio-keys|pl061@"
-remove_dts_nodes "${linux_dts}.pruned1" "${linux_dts}.pruned2" "fw-cfg@|pl031@|flash@"
-remove_dts_nodes "${linux_dts}.pruned2" "${linux_dts}" "platform-bus@|pmu|its@"
-rm -f "${linux_dts}.devices" "${linux_dts}.pruned1" "${linux_dts}.pruned2"
-patch_linux_guest_console "${linux_dts}"
-patch_bootargs "${linux_dts}" "console=ttyAMA0 earlycon=pl011,0x9040000 rdinit=/init panic=-1 loglevel=7 aicp.iterations=${iterations} aicp.mode=${mode} aicp.connect_retries=120"
-
-crop_virtio_nodes "${linux_src_dts}" "${rtos_dts}.devices" "virtio_mmio@a003a00"
-remove_dts_nodes "${rtos_dts}.devices" "${rtos_dts}.pruned1" "gpio-keys|pl061@"
-remove_dts_nodes "${rtos_dts}.pruned1" "${rtos_dts}.pruned2" "fw-cfg@|pl031@|flash@"
-remove_dts_nodes "${rtos_dts}.pruned2" "${rtos_dts}" "platform-bus@|pmu|its@"
-rm -f "${rtos_dts}.devices" "${rtos_dts}.pruned1" "${rtos_dts}.pruned2"
-perl -0pi -e \
-  's/memory\@80000000/memory\@c0000000/; s/<0x00 0x80000000 0x00 0x40000000>/<0x00 0xc0000000 0x00 0x10000000>/' \
-  "${rtos_dts}"
-patch_bootargs "${rtos_dts}" ""
-
-dtc -I dts -O dtb -o "${linux_dtb}" "${linux_dts}"
-dtc -I dts -O dtb -o "${rtos_dtb}" "${rtos_dts}"
-build_host_dtb
+echo "[ai-rtos] Generating AxVM virtual-device guest configurations"
 write_linux_vm_config
 write_rtos_vm_config
 
 cp "${qemu_template}" "${qemu_config}"
 rm -f "${linux_console_log}"
-LINUX_CONSOLE_LOG="${linux_console_log}" perl -0pi -e \
-  's#  "-nographic",#  "-display",\n  "none",\n  "-monitor",\n  "none",\n  "-serial",\n  "stdio",\n  "-serial",\n  "file:$ENV{LINUX_CONSOLE_LOG}",#' \
-  "${qemu_config}"
-HOST_DTB="${host_dtb}" perl -0pi -e \
-  's#  "-append",#  "-dtb",\n  "$ENV{HOST_DTB}",\n  "-append",#' \
+AXVISOR_CONSOLE_LOG="${log_file}" LINUX_CONSOLE_LOG="${linux_console_log}" perl -0pi -e \
+  's#  "-nographic",#  "-display",\n  "none",\n  "-monitor",\n  "none",\n  "-serial",\n  "file:$ENV{AXVISOR_CONSOLE_LOG}",\n  "-serial",\n  "file:$ENV{LINUX_CONSOLE_LOG}",#' \
   "${qemu_config}"
 
 echo "[ai-rtos] Booting AxVisor Linux + ArceOS dual guest; log: ${log_file}"

@@ -7,12 +7,21 @@ license.workspace = true
 publish = false
 
 [features]
-default = []
-arceos = ["dep:ax-std", "ax-std/net", "ax-std/multitask"]
+default = ["arceos"]
+arceos = [
+    "dep:ax-net",
+    "dep:ax-std",
+    "ax-std/arceos",
+    "ax-std/net",
+    "ax-std/virtio-net",
+    "ax-std/multitask",
+    "ax-std/tls",
+]
 
 [dependencies]
 aicp-rust-protocol = { workspace = true }
+ax-net = { workspace = true, optional = true }
 ax-std = { workspace = true, optional = true }
 
 [package.metadata.axstd]
-features = ["log-level-info", "net", "multitask"]
+features = ["log-level-info", "net", "virtio-net", "multitask", "tls"]

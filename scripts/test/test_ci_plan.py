@@ -182,10 +182,6 @@ class CiPlanTests(unittest.TestCase):
             '--since "$SINCE_REF"', incremental_rows["test-with-std"]["command"]
         )
         self.assertNotIn("--since", full_rows["test-with-std"]["command"])
-<<<<<<< HEAD
-=======
-        self.assertEqual(len(full_rows), 34)
->>>>>>> 83cd06418 (fix(ai-rtos): make smoke and control loop reproducible)
 
     def test_app_only_impact_does_not_select_runtime_checks(self) -> None:
         context = ci_plan.PlanContext(
@@ -237,11 +233,7 @@ class CiPlanTests(unittest.TestCase):
                 )
 
                 self.assertEqual(with_impact, baseline)
-<<<<<<< HEAD
                 self.assert_unique_ids(main_test_rows(with_impact))
-=======
-                self.assertEqual(len(with_impact["test_matrix"]["include"]), 34)
->>>>>>> 83cd06418 (fix(ai-rtos): make smoke and control loop reproducible)
 
     def test_pure_test_suite_change_runs_only_the_exact_registered_case(self) -> None:
         context = ci_plan.PlanContext(
@@ -539,7 +531,6 @@ command = "true"
         static_rows = self.assert_unique_ids(plan["static_matrix"]["include"])
         test_rows = self.assert_unique_ids(main_test_rows(plan))
 
-<<<<<<< HEAD
         self.assertTrue(
             {
                 "run-clippy",
@@ -549,9 +540,6 @@ command = "true"
                 "test-starry-aarch64-qemu",
             }.issubset(test_rows)
         )
-=======
-        self.assertEqual(len(test_rows), 18)
->>>>>>> 83cd06418 (fix(ai-rtos): make smoke and control loop reproducible)
         self.assertFalse(any("board" in row["id"] for row in test_rows.values()))
         self.assertTrue(
             all(

@@ -315,6 +315,7 @@ name = "arceos-aicp-server"
 version = "0.1.0"
 dependencies = [
  "aicp-rust-protocol",
+ "ax-net",
  "ax-std",
 ]
 
@@ -7973,6 +7974,8 @@ dependencies = [
  "anyhow",
  "ax-driver",
  "ax-hal",
+ "ax-log",
+ "ax-net",
  "ax-runtime",
  "ax-std",
  "axbuild",
