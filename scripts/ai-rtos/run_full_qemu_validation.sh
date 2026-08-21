@@ -12,10 +12,9 @@ usage() {
   scripts/ai-rtos/run_full_qemu_validation.sh full
 
 验证档位：
-  smoke  准备镜像并执行协议检查，以最小有效次数验证 Linux/StarryOS
-         与 ArceOS/RT-Thread/Zephyr/FreeRTOS 组成的八组双 Guest 闭环。
-  full   在八组闭环基础上增加控制效果对比、RT-Thread 可靠性、
-         StarryOS UDP 故障恢复、Rust YOLOv8n、AxVisor 实时 A/B
+  smoke  准备镜像并执行协议检查，以最小有效次数验证 Linux 2-vCPU
+         与 ArceOS 控制 Guest 的 AICP/TCP/IP 闭环。
+  full   在该闭环基础上增加控制效果对比、协议可靠性、AxVisor 实时 A/B
          和三种原生 RTOS 周期基线。
 
 可选环境变量：
@@ -134,9 +133,10 @@ run_stage() {
 
   started="$(date +%s)"
   set +e
-  "$@" 2>&1 | tee "${log_file}"
-  status="${PIPESTATUS[0]}"
+  "$@" > "${log_file}" 2>&1
+  status=$?
   set -e
+  cat "${log_file}"
   ended="$(date +%s)"
   duration=$((ended - started))
 
@@ -233,7 +233,8 @@ run_stage preflight check_commands
 run_stage shell_syntax scripts/ai-rtos/check_shell_syntax.sh
 run_stage host_tools_unit scripts/ai-rtos/test_host_tools.sh
 run_stage run_artifacts_unit scripts/ai-rtos/test_run_artifacts.sh
-run_stage python_syntax python3 -m py_compile scripts/ai-rtos/*.py
+run_stage python_syntax env PYTHONPYCACHEPREFIX="${repo_root}/tmp/ai-rtos/pycache" \
+  python3 -m py_compile scripts/ai-rtos/*.py
 run_stage isolation_unit python3 -m unittest scripts/ai-rtos/test_check_aicp_network_isolation.py
 run_stage architecture scripts/ai-rtos/check_demo_architecture.sh
 run_stage third_party_clean scripts/ai-rtos/check_third_party_sources_clean.sh
@@ -241,7 +242,7 @@ run_stage host_build make -C apps/ai-rtos-demo clean all
 run_stage protocol_unit make -C apps/ai-rtos-demo test
 
 if [[ "${prepare_images}" == "1" ]]; then
-  run_stage prepare_images scripts/ai-rtos/setup_qemu_rtos.sh all
+  run_stage prepare_images cargo xtask image pull qemu-aarch64 --extract-dir tmp/images
 fi
 
 run_stage protocol_reliability scripts/ai-rtos/run_aicp_protocol_reliability.sh "${protocol_iterations}"
@@ -253,49 +254,14 @@ run_stage isolation_linux_arceos check_runtime_isolation \
   'axvisor-dual-guest-aicp-c-[0-9]*.log' \
   'axvisor-dual-guest-aicp-c-linux-console-*.log'
 
-run_stage linux_rtthread scripts/ai-rtos/run_axvisor_linux_rtthread_aicp.sh "${iterations}" ai "${boot_timeout_s}"
-run_stage isolation_linux_rtthread check_runtime_isolation \
-  linux-rtthread linux rtthread-tcp \
-  "${repo_root}/tmp/ai-rtos/qemu-aarch64-linux-rtthread.toml" \
-  'axvisor-linux-rtthread-control-aicp-*.log' 'linux-rtthread-console-*.log'
-
-run_stage linux_zephyr scripts/ai-rtos/run_axvisor_linux_zephyr_aicp.sh "${iterations}" ai "${boot_timeout_s}"
-run_stage isolation_linux_zephyr check_runtime_isolation \
-  linux-zephyr linux zephyr-tcp \
-  "${repo_root}/tmp/ai-rtos/qemu-aarch64-linux-zephyr.toml" \
-  'axvisor-linux-zephyr-aicp-*.log' 'linux-zephyr-console-*.log'
-
-run_stage linux_freertos scripts/ai-rtos/run_axvisor_linux_freertos_aicp.sh "${iterations}" ai "${boot_timeout_s}"
-run_stage isolation_linux_freertos check_runtime_isolation \
-  linux-freertos linux freertos-tcp \
-  "${repo_root}/tmp/ai-rtos/qemu-aarch64-linux-freertos.toml" \
-  'axvisor-linux-freertos-aicp-*.log' 'linux-freertos-console-*.log'
-
-for rtos_guest in arceos rtthread zephyr freertos; do
-  run_stage "starry_${rtos_guest}" env \
-    AICP_STARRY_NATIVE=1 \
-    AICP_QEMU_NET_BACKEND=hub \
-    AICP_STARRY_TRANSPORT=tcp \
-    AICP_RTOS_GUEST="${rtos_guest}" \
-    scripts/ai-rtos/run_axvisor_starry_rtos_aicp.sh "${iterations}" ai "${boot_timeout_s}"
-  run_stage "isolation_starry_${rtos_guest}" check_runtime_isolation \
-    "starry-${rtos_guest}" starry "${rtos_guest}-tcp" \
-    "${repo_root}/tmp/ai-rtos/qemu-aarch64-aicp-starry-dual.generated.toml" \
-    "axvisor-starry-${rtos_guest}-aicp-*.log"
-done
-
 if [[ "${profile}" == "full" ]]; then
   run_stage control_compare env AICP_ITERATIONS=100 scripts/ai-rtos/run_aicp_control_compare.sh
-  run_stage rtthread_reliability scripts/ai-rtos/run_axvisor_rtthread_reliability.sh 20 "${boot_timeout_s}"
-  run_stage starry_udp_faults scripts/ai-rtos/run_axvisor_starry_udp_faults.sh 20
-  run_stage rust_yolov8_rtthread scripts/ai-rtos/run_axvisor_rtthread_yolov8_rust_aicp.sh "${boot_timeout_s}"
   run_stage realtime_before_after scripts/ai-rtos/run_axvisor_rt_before_after.sh 300 "${boot_timeout_s}" "${stress_procs}"
   run_stage baseline_zephyr scripts/ai-rtos/run_zephyr_periodic_baseline.sh
   run_stage baseline_rtthread scripts/ai-rtos/run_rtthread_periodic_baseline.sh
   run_stage baseline_freertos scripts/ai-rtos/run_freertos_periodic_baseline.sh
 
   if [[ "${include_long_stability}" == "1" ]]; then
-    run_stage long_rtthread scripts/ai-rtos/run_axvisor_rtthread_long_stability.sh 1000 900 "${stress_procs}"
     run_stage long_arceos scripts/ai-rtos/run_axvisor_long_stability.sh 10000 4200 "${stress_procs}"
   fi
 fi

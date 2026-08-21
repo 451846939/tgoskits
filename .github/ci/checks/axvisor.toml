@@ -14,14 +14,14 @@ make -C apps/ai-rtos-demo test
 '''
 
 [[check]]
-id = "test-ai-rtos-linux-rtthread-control-loop"
+id = "test-ai-rtos-linux-arceos-control-loop"
 impact_targets = ["axvisor:aarch64", "starry:aarch64"]
-name = "aarch64 QEMU · AICP IP AI-to-RT-Thread control loop"
+name = "aarch64 QEMU · AICP IP AI-to-ArceOS control loop"
 runner = "qcs"
 timeout_minutes = 20
 command = '''
 cargo xtask image pull qemu-aarch64 --extract-dir tmp/images
-scripts/ai-rtos/aicp.sh run linux rtthread 1 ai 300
+scripts/ai-rtos/aicp.sh run linux arceos 1 ai 300
 '''
 
 [[check]]

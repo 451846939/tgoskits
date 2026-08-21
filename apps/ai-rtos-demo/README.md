@@ -1,6 +1,6 @@
 # AI/RTOS 多客户机控制演示
 
-该目录保存 AICP 应用层协议、Linux/StarryOS 智能计算程序、RTOS 控制服务、YOLOv8 推理程序、原生 RTOS 基线和主机测试工具。Linux 与 StarryOS 两条智能计算路径同时保留，控制 Guest 支持 ArceOS、RT-Thread、Zephyr 和 FreeRTOS。
+该目录保存 AICP 应用层协议、Linux 智能计算程序、ArceOS 控制服务、YOLOv8 推理程序、原生 RTOS 基线和主机测试工具。当前最新 `dev` 已实际验证的虚拟化闭环是 Linux 与 ArceOS；其他 RTOS 目录只保留平台适配或原生基线，不作为可复现的 AxVisor 网络闭环声明。
 
 ## 工程分层
 
@@ -37,24 +37,23 @@ scripts/ai-rtos/run_aicp_smoke.sh
 
 结构检查会验证公共层不存在 OS 特判、三种原生 RTOS glue 均接入同一服务状态机、Linux/StarryOS 与 C++ YOLOv8 共用客户端事务核心、旧重复入口已经移除，并阻止第三方 RTOS 源码进入演示目录。
 
-八组 QEMU 双 Guest 最小闭环：
+当前 QEMU 双 Guest最小闭环：
 
 ```sh
 scripts/ai-rtos/run_full_qemu_validation.sh smoke
 ```
 
-包含八组闭环、实时 A/B、三种原生 RTOS 周期基线、可靠性、控制效果和 Rust YOLOv8n 的完整验证：
+包含闭环、实时 A/B、三种原生 RTOS 周期基线、可靠性和控制效果的完整验证：
 
 ```sh
 scripts/ai-rtos/run_full_qemu_validation.sh full
 ```
 
-统一入口支持以下矩阵：
+已验证的统一入口：
 
-| 智能计算 Guest | ArceOS | RT-Thread | Zephyr | FreeRTOS |
-| --- | --- | --- | --- | --- |
-| Linux | TCP/IP | TCP/IP | TCP/IP | TCP/IP |
-| StarryOS | TCP/IP；另有 UDP 故障注入 | TCP/IP | TCP/IP | TCP/IP |
+| 智能计算 Guest | 控制 Guest | 主数据通道 |
+| --- | --- | --- |
+| Linux（2 vCPU） | ArceOS（1 vCPU） | AICP v1 over TCP/IP |
 
 ## 文档
 

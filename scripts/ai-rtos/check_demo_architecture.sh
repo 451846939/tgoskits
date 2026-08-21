@@ -101,18 +101,15 @@ require_contains zephyr/src/main.c '#include "aicp_service.h"' \
   "Zephyr glue must use the shared RTOS service state machine"
 require_contains freertos/main.c '#include "aicp_service.h"' \
   "FreeRTOS glue must use the shared RTOS service state machine"
-require_repo_contains net/ax-net/src/device/ethernet.rs \
-  'pub fn new_polling' \
-  "poll-only networking must expose a dedicated device mode"
 require_repo_contains net/ax-net/src/lib.rs \
-  'EthernetDevice::new_polling' \
-  "poll-only networking must retain a device IRQ acknowledgement path"
+  'dedicated_poll: bool' \
+  "poll-only networking must expose a dedicated device mode"
+require_repo_contains net/ax-net/src/device/driver.rs \
+  'fn handle_irq\(&mut self\) -> NetIrqEvents' \
+  "network drivers must retain an IRQ acknowledgement and readiness path"
 require_repo_absent os/axvisor/src/manager.rs \
   'set_aarch64_passthrough_irq_routes_enabled\(vm_id, true\)' \
   "VM startup must not unmask passthrough IRQs before the guest driver enables them"
-require_repo_absent scripts/ai-rtos/run_axvisor_starry_rtos_aicp.sh \
-  '^  \["/"\],$' \
-  "dual-guest configs must assign explicit devices instead of claiming the host device tree root"
 require_repo_contains scripts/ai-rtos/run_zephyr_periodic_baseline.sh \
   'ZEPHYR_BASELINE_TIMEOUT_SECONDS' \
   "Zephyr periodic baseline timeout must be configurable for loaded validation hosts"

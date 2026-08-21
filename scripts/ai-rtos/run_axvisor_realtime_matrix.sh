@@ -17,8 +17,7 @@ Runs the verified AxVisor dual-guest AICP TCP/IP scenario twice:
 The extractor reports Linux request-response RTT, RTOS-side control service
 time, request-arrival deviation, and independent 20 ms RTOS periodic wakeup
 lateness/jitter from AICP_RTOS_REQUEST_TIMING and AICP_RTOS_PERIODIC_DONE lines.
-By default the scenario uses the guest-to-guest QEMU hub path; set
-AICP_TRANSPORT=usernet for the hostfwd fallback path.
+The scenario uses the guest-to-guest AxVisor virtual-switch path.
 EOF
 }
 
@@ -57,11 +56,8 @@ run_case() {
   local log_glob="${log_prefix}-[0-9]*.log"
   local runner="${repo_root}/scripts/ai-rtos/run_axvisor_dual_guest_aicp.sh"
 
-  if [[ "${AICP_TRANSPORT:-hub}" == "usernet" ]]; then
-    log_glob='axvisor-dual-guest-aicp-usernet-*.log'
-    runner="${repo_root}/scripts/ai-rtos/run_axvisor_dual_guest_aicp_usernet.sh"
-  elif [[ "${AICP_TRANSPORT:-hub}" != "hub" ]]; then
-    echo "ERROR: AICP_TRANSPORT must be hub or usernet" >&2
+  if [[ "${AICP_TRANSPORT:-hub}" != "hub" ]]; then
+    echo "ERROR: AICP_TRANSPORT must be hub" >&2
     exit 2
   fi
 
@@ -70,19 +66,10 @@ run_case() {
   find "${repo_root}/tmp/ai-rtos/logs" -maxdepth 1 -type f -name "${log_glob}" -print 2>/dev/null | sort > "${before}" || true
 
   echo "[ai-rtos] Running realtime case=${name} iterations=${iterations} stress_procs=${load}"
-  if [[ "${AICP_TRANSPORT:-hub}" == "usernet" ]]; then
-    if AICP_HOST_PORT="${AICP_HOST_PORT:-18800}" AICP_STRESS_PROCS="${load}" \
-      "${runner}" "${iterations}" ai "${boot_timeout_s}"; then
-      :
-    else
-      runner_status=$?
-    fi
+  if AICP_STRESS_PROCS="${load}" "${runner}" "${iterations}" ai "${boot_timeout_s}"; then
+    :
   else
-    if AICP_STRESS_PROCS="${load}" "${runner}" "${iterations}" ai "${boot_timeout_s}"; then
-      :
-    else
-      runner_status=$?
-    fi
+    runner_status=$?
   fi
   if ! aicp_wait_for_qemu_image_release "${rootfs_image}" 20; then
     runner_status=1
@@ -99,21 +86,17 @@ run_case() {
   else
     cp "${log}" "${result_dir}/${name}.axvisor.log"
     combined_log="${result_dir}/${name}.log"
-    if [[ "${AICP_TRANSPORT:-hub}" == "hub" ]]; then
-      stamp="$(basename "${log}")"
-      stamp="${stamp#${log_prefix}-}"
-      stamp="${stamp%.log}"
-      console_log="${repo_root}/tmp/ai-rtos/logs/${log_prefix}-linux-console-${stamp}.log"
-      if [[ ! -f "${console_log}" ]]; then
-        echo "[ai-rtos] FAIL: cannot locate ${name} Linux console log: ${console_log}" >&2
-        failure_reason="Linux console log not found"
-        extraction_status=1
-      else
-        cp "${console_log}" "${result_dir}/${name}.linux-console.log"
-        cat "${log}" "${console_log}" > "${combined_log}"
-      fi
+    stamp="$(basename "${log}")"
+    stamp="${stamp#${log_prefix}-}"
+    stamp="${stamp%.log}"
+    console_log="${repo_root}/tmp/ai-rtos/logs/${log_prefix}-linux-console-${stamp}.log"
+    if [[ ! -f "${console_log}" ]]; then
+      echo "[ai-rtos] FAIL: cannot locate ${name} Linux console log: ${console_log}" >&2
+      failure_reason="Linux console log not found"
+      extraction_status=1
     else
-      cp "${log}" "${combined_log}"
+      cp "${console_log}" "${result_dir}/${name}.linux-console.log"
+      cat "${log}" "${console_log}" > "${combined_log}"
     fi
   fi
 

@@ -15,8 +15,7 @@ usage() {
   scripts/ai-rtos/aicp.sh prepare
   scripts/ai-rtos/aicp.sh smoke
   scripts/ai-rtos/aicp.sh full
-  scripts/ai-rtos/aicp.sh run <linux|starry> <arceos|rtthread|zephyr|freertos> [次数] [ai|fixed] [超时秒数]
-  scripts/ai-rtos/aicp.sh yolov8 [超时秒数]
+  scripts/ai-rtos/aicp.sh run linux arceos [次数] [ai|fixed] [超时秒数]
   scripts/ai-rtos/aicp.sh realtime [次数] [超时秒数] [Linux 压力进程数]
   scripts/ai-rtos/aicp.sh baseline <rtthread|zephyr|freertos|all>
   scripts/ai-rtos/aicp.sh reliability [次数] [超时秒数]
@@ -25,13 +24,12 @@ usage() {
 常用命令：
   doctor      只检查宿主工具和环境，不下载、不构建
   prepare     拉取 QEMU 镜像并生成基础 Guest 配置
-  smoke       最小次数验证八组 Linux/StarryOS + 控制 Guest 闭环
-  full        执行完整闭环、可靠性、YOLOv8、实时 A/B 和 RTOS 基线
+  smoke       最小次数验证 Linux 2-vCPU 与 ArceOS 控制 Guest 的 TCP/IP 闭环
+  full        执行闭环、控制效果对比、实时 A/B 和原生 RTOS 基线
   run         单独运行一组双 Guest，便于演示和排障
-  yolov8      运行 Linux Rust YOLOv8n CPU + RT-Thread 控制闭环
   realtime    执行 AxVisor 实时优化前后 A/B 对比
   baseline    执行原生 RTOS 20 ms 周期任务空载/压力基线
-  reliability 执行 RT-Thread 协议可靠性与异常恢复测试
+  reliability 执行主机侧协议可靠性与异常恢复测试
   list        显示入口和底层脚本的职责分类
 
 工具路径：
@@ -120,24 +118,8 @@ run_pair() {
     linux:arceos)
       exec "${script_dir}/run_axvisor_dual_guest_aicp.sh" "$@"
       ;;
-    linux:rtthread)
-      exec "${script_dir}/run_axvisor_linux_rtthread_aicp.sh" "$@"
-      ;;
-    linux:zephyr)
-      exec "${script_dir}/run_axvisor_linux_zephyr_aicp.sh" "$@"
-      ;;
-    linux:freertos)
-      exec "${script_dir}/run_axvisor_linux_freertos_aicp.sh" "$@"
-      ;;
-    starry:arceos|starry:rtthread|starry:zephyr|starry:freertos)
-      AICP_STARRY_NATIVE=1 \
-        AICP_QEMU_NET_BACKEND=hub \
-        AICP_STARRY_TRANSPORT=tcp \
-        AICP_RTOS_GUEST="${rtos_guest}" \
-        exec "${script_dir}/run_axvisor_starry_rtos_aicp.sh" "$@"
-      ;;
     *)
-      echo "ERROR：不支持的 Guest 组合：${ai_guest} + ${rtos_guest}" >&2
+      echo "ERROR：当前最新 dev 已验证的虚拟网卡闭环仅支持 linux + arceos；请求的是 ${ai_guest} + ${rtos_guest}" >&2
       usage >&2
       exit 2
       ;;
@@ -151,24 +133,11 @@ list_scripts() {
 
 内部编排器：
   run_full_qemu_validation.sh     smoke/full 全矩阵编排和阶段日志汇总
-  setup_qemu_rtos.sh              基础镜像拉取与 ArceOS/Zephyr 配置生成
-
-Guest 构建：
-  build_rtthread_aicp_guest.sh    构建 RT-Thread AICP Guest
-  build_zephyr_aicp_guest.sh      构建 Zephyr AICP Guest
-  build_freertos_aicp_guest.sh    构建 FreeRTOS AICP Guest
-
 双 Guest 主线：
   run_axvisor_dual_guest_aicp.sh          Linux + ArceOS
-  run_axvisor_linux_rtthread_aicp.sh      Linux + RT-Thread
-  run_axvisor_linux_zephyr_aicp.sh        Linux + Zephyr
-  run_axvisor_linux_freertos_aicp.sh      Linux + FreeRTOS
-  run_axvisor_starry_rtos_aicp.sh         StarryOS + 四种控制 Guest
 
 专项验证：
-  run_axvisor_rtthread_yolov8_rust_aicp.sh  Rust YOLOv8n CPU 控制闭环
   run_axvisor_rt_before_after.sh             AxVisor 实时优化 A/B
-  run_axvisor_rtthread_reliability.sh        RT-Thread 可靠性与恢复
   run_*_periodic_baseline.sh                 三种原生 RTOS 周期基线
   run_*_long_stability.sh                    长时间稳定性
 
@@ -191,7 +160,8 @@ case "${command_name}" in
     ;;
   prepare)
     require_arg_count 1 1 "$#"
-    exec "${script_dir}/setup_qemu_rtos.sh" all
+    cd "${repo_root}"
+    exec cargo xtask image pull qemu-aarch64 --extract-dir tmp/images
     ;;
   smoke|full)
     require_arg_count 1 1 "$#"
@@ -200,10 +170,6 @@ case "${command_name}" in
   run)
     require_arg_count 3 6 "$#"
     run_pair "$2" "$3" "${@:4}"
-    ;;
-  yolov8)
-    require_arg_count 1 2 "$#"
-    exec "${script_dir}/run_axvisor_rtthread_yolov8_rust_aicp.sh" "${2:-420}"
     ;;
   realtime)
     require_arg_count 1 4 "$#"
@@ -234,7 +200,7 @@ case "${command_name}" in
     ;;
   reliability)
     require_arg_count 1 3 "$#"
-    exec "${script_dir}/run_axvisor_rtthread_reliability.sh" "${@:2}"
+    exec "${script_dir}/run_aicp_protocol_reliability.sh" "${2:-20}"
     ;;
   list)
     require_arg_count 1 1 "$#"

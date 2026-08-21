@@ -44,7 +44,6 @@ fi
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "${repo_root}/scripts/ai-rtos/lib/cpu_topology.sh"
-source "${repo_root}/scripts/ai-rtos/lib/dtb.sh"
 source "${repo_root}/scripts/ai-rtos/lib/markers.sh"
 source "${repo_root}/scripts/ai-rtos/lib/process.sh"
 
@@ -66,20 +65,10 @@ stamp="$(date +%Y%m%d-%H%M%S)"
 run_name="axvisor-dual-guest-aicp-${client_impl}"
 log_file="${log_dir}/${run_name}-${stamp}.log"
 linux_console_log="${log_dir}/${run_name}-linux-console-${stamp}.log"
-linux_src_dts="${repo_root}/os/axvisor/configs/vms/qemu/aarch64/linux-smp1.dts"
-linux_dts="${out_dir}/${run_name}-linux.dts"
-linux_dtb="${out_dir}/${run_name}-linux.dtb"
-rtos_dts="${out_dir}/${run_name}-arceos.dts"
-rtos_dtb="${out_dir}/${run_name}-arceos.dtb"
 linux_vm="${out_dir}/${run_name}-linux.generated.toml"
 rtos_vm="${out_dir}/${run_name}-arceos.generated.toml"
 qemu_config="${out_dir}/${run_name}-qemu.generated.toml"
 qemu_template="${repo_root}/os/axvisor/configs/qemu/qemu-aarch64-aicp-dual-net.toml"
-host_base_dtb="${out_dir}/${run_name}-host-base.dtb"
-host_overlay_dts="${repo_root}/configs/ai-rtos/qemu-aarch64-arceos-reserved-memory-overlay.dts"
-host_overlay_dtbo="${out_dir}/${run_name}-host-overlay.dtbo"
-host_dtb="${out_dir}/${run_name}-host.dtb"
-host_dtb_dummy_disk="${out_dir}/${run_name}-dummy-disk.img"
 initramfs_dir="${out_dir}/${run_name}-initramfs"
 initramfs="${out_dir}/${run_name}-initramfs.cpio.gz"
 linux_kernel="${bundle_dir}/linux/linux-qemu"
@@ -136,35 +125,6 @@ build_linux_initramfs() {
     cd "${initramfs_dir}"
     find . -print | cpio -o -H newc | gzip -9 > "${initramfs}"
   )
-}
-
-build_host_dtb() {
-  : > "${host_dtb_dummy_disk}"
-  qemu-system-aarch64 \
-    -display none \
-    -monitor none \
-    -serial null \
-    -serial "file:${linux_console_log}" \
-    -cpu cortex-a72 \
-    -machine "virt,virtualization=on,gic-version=3,dumpdtb=${host_base_dtb}" \
-    -smp "${host_cpus}" \
-    -m 8g \
-    -device virtio-blk-device,drive=disk0 \
-    -drive "id=disk0,if=none,format=raw,file=${host_dtb_dummy_disk}" \
-    -netdev hubport,id=linuxnet,hubid=3 \
-    -device virtio-net-device,netdev=linuxnet,mac=52:54:00:aa:03:03 \
-    -netdev hubport,id=rtosnet,hubid=3 \
-    -device virtio-net-device,netdev=rtosnet,mac=52:54:00:aa:03:02
-
-  dtc -@ -I dts -O dtb -o "${host_overlay_dtbo}" "${host_overlay_dts}"
-  fdtoverlay -i "${host_base_dtb}" -o "${host_dtb}" "${host_overlay_dtbo}"
-
-  local reserved_reg
-  reserved_reg="$(fdtget -tx "${host_dtb}" /reserved-memory/arceos@c0000000 reg)"
-  if [[ "${reserved_reg}" != "0 c0000000 0 10000000" ]]; then
-    echo "ERROR: invalid ArceOS reserved-memory region: ${reserved_reg}" >&2
-    exit 1
-  fi
 }
 
 write_linux_vm_config() {
@@ -232,7 +192,7 @@ guest_mac = [0x52, 0x54, 0x00, 0xaa, 0x03, 0x02]
 EOF
 }
 
-for tool in qemu-system-aarch64 dtc fdtoverlay fdtget cpio gzip; do
+for tool in cpio gzip; do
   require_tool "${tool}"
 done
 if [[ ! -f "${linux_kernel}" ]]; then
