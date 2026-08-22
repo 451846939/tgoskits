@@ -385,6 +385,38 @@ static int test_datagram_round_trip(void) {
     return 0;
 }
 
+static int test_datagram_rejects_unsupported_version(void) {
+    const uint8_t payload[] = {0x11, 0x22, 0x33, 0x44};
+    uint8_t packet[AICP_HEADER_LEN + sizeof(payload)];
+    struct aicp_header header = aicp_make_header(
+        AICP_MSG_STATUS,
+        0,
+        sizeof(payload),
+        72,
+        1234,
+        AICP_OK);
+    header.version = AICP_VERSION + 1;
+    header.crc16 = aicp_frame_crc(header, payload);
+    aicp_header_encode(&header, packet);
+    memcpy(packet + AICP_HEADER_LEN, payload, sizeof(payload));
+
+    uint8_t decoded_payload[sizeof(payload)] = {0xaa, 0xbb, 0xcc, 0xdd};
+    const uint8_t original_payload[sizeof(decoded_payload)] = {0xaa, 0xbb, 0xcc, 0xdd};
+    struct aicp_header decoded = {0};
+    int ret = aicp_datagram_decode(
+        packet,
+        sizeof(packet),
+        &decoded,
+        decoded_payload,
+        sizeof(decoded_payload));
+    if (ret != -EPROTO ||
+        memcmp(decoded_payload, original_payload, sizeof(decoded_payload)) != 0) {
+        fprintf(stderr, "datagram version: expected -EPROTO without payload write, got %d\n", ret);
+        return 1;
+    }
+    return 0;
+}
+
 static int test_datagram_rejects_trailing_bytes(void) {
     uint8_t packet[AICP_HEADER_LEN + 2];
     size_t packet_len = 0;
@@ -460,6 +492,7 @@ int main(void) {
         {"timeout_is_reported", test_timeout_is_reported},
         {"reconnect_after_peer_close", test_reconnect_after_peer_close},
         {"datagram_round_trip", test_datagram_round_trip},
+        {"datagram_rejects_unsupported_version", test_datagram_rejects_unsupported_version},
         {"datagram_rejects_trailing_bytes", test_datagram_rejects_trailing_bytes},
         {"datagram_crc_detects_corruption", test_datagram_crc_detects_corruption},
     };

@@ -63,7 +63,8 @@ static inline int aicp_datagram_decode(
 
     const uint8_t *wire = (const uint8_t *)packet;
     aicp_header_decode(wire, header);
-    if (header->magic != AICP_MAGIC || header->header_len != AICP_HEADER_LEN) {
+    if (header->magic != AICP_MAGIC || header->version != AICP_VERSION ||
+        header->header_len != AICP_HEADER_LEN) {
         return -EPROTO;
     }
     if (header->payload_len > AICP_MAX_PAYLOAD ||
