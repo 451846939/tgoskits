@@ -6,19 +6,12 @@ args = [
   "virt,virtualization=on,gic-version=3",
   "-smp",
   "4",
-  "-device",
-  "nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65",
-  "-drive",
-  "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-aarch64-alpine.img",
-  # The current QEMU board build probes one host-side virtio-net device during
-  # AxVisor startup. It is not assigned to either guest: guest-to-guest AICP
+  # This host-only NIC is not assigned to either guest. Guest-to-guest AICP
   # traffic uses the configured AxVisor virtual switch instead.
   "-netdev",
   "user,id=hostnet",
   "-device",
   "virtio-net-device,netdev=hostnet,mac=52:54:00:aa:03:01",
-  "-append",
-  "root=/dev/nvme0n1 rw init=/bin/sh",
   "-m",
   # Linux reserves 512 MiB and the ArceOS guest reserves 256 MiB. Keep enough
   # headroom for AxVisor while avoiding an unnecessary 8 GiB host allocation

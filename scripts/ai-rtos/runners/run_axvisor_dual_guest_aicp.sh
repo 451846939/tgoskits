@@ -54,7 +54,7 @@ bundle_dir="${repo_root}/tmp/images/qemu-aarch64"
 mkdir -p "${out_dir}" "${log_dir}" "${demo_dir}/build/aarch64"
 
 stress_procs="${AICP_STRESS_PROCS:-0}"
-axvisor_board_config="${AICP_AXVISOR_BOARD_CONFIG:-os/axvisor/configs/board/qemu-aarch64.toml}"
+axvisor_board_config="${AICP_AXVISOR_BOARD_CONFIG:-os/axvisor/configs/board/qemu-aarch64-aicp-dual.toml}"
 if ! [[ "${stress_procs}" =~ ^[0-9]+$ ]] || (( stress_procs > 16 )); then
   echo "ERROR: AICP_STRESS_PROCS must be an integer in [0, 16], got '${stress_procs}'" >&2
   exit 2

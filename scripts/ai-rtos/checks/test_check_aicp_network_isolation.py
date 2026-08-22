@@ -38,6 +38,16 @@ class ForbiddenQemuNetworkTest(unittest.TestCase):
 
 
 class AxVisorVirtualSwitchTopologyTest(unittest.TestCase):
+    def test_aicp_qemu_profile_avoids_an_unused_host_root_disk(self):
+        qemu_profile = Path("os/axvisor/configs/qemu/qemu-aarch64-aicp-dual-net.toml")
+        board_profile = Path("os/axvisor/configs/board/qemu-aarch64-aicp-dual.toml")
+        runner = Path("scripts/ai-rtos/runners/run_axvisor_dual_guest_aicp.sh")
+
+        self.assertNotIn("nvme,drive=disk0", qemu_profile.read_text())
+        self.assertNotIn("root=/dev/nvme0n1", qemu_profile.read_text())
+        self.assertIn("features = []", board_profile.read_text())
+        self.assertIn(str(board_profile), runner.read_text())
+
     def test_virtual_guest_network_accepts_only_the_documented_host_probe(self):
         qemu_args = [
             "user,id=hostnet",
