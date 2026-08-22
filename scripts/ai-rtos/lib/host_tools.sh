@@ -127,7 +127,7 @@ aicp_arm_gnu_host_tag() {
 }
 
 # Resolve a pinned Arm GNU AArch64 bare-metal toolchain. Existing explicit,
-# repository-cached and PATH toolchains are reused before downloading.
+# host-matching repository-cached and PATH toolchains are reused before downloading.
 aicp_resolve_or_install_aarch64_none_elf() {
   local repo_root="$1"
   local version="$2"
@@ -142,8 +142,13 @@ aicp_resolve_or_install_aarch64_none_elf() {
     return
   fi
 
+  host_tag="$(aicp_arm_gnu_host_tag)" || {
+    echo "请设置 ${env_name}=/path/to/aarch64-none-elf-" >&2
+    return 1
+  }
+
   for cached_compiler in \
-    "${repo_root}"/tmp/arm-gnu-toolchain-"${version}"-*-aarch64-none-elf/bin/aarch64-none-elf-gcc; do
+    "${repo_root}/tmp/arm-gnu-toolchain-${version}-${host_tag}-aarch64-none-elf/bin/aarch64-none-elf-gcc"; do
     if [[ -x "${cached_compiler}" ]]; then
       printf '%s\n' "${cached_compiler%gcc}"
       return 0
@@ -157,10 +162,6 @@ aicp_resolve_or_install_aarch64_none_elf() {
     fi
   done
 
-  host_tag="$(aicp_arm_gnu_host_tag)" || {
-    echo "请设置 ${env_name}=/path/to/aarch64-none-elf-" >&2
-    return 1
-  }
   toolchain_name="arm-gnu-toolchain-${version}-${host_tag}-aarch64-none-elf"
   toolchain_dir="${repo_root}/tmp/${toolchain_name}"
   archive="${repo_root}/tmp/${toolchain_name}.tar.xz"

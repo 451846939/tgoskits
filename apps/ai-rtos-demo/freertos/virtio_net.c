@@ -86,6 +86,7 @@ static bool device_ready;
 static uint32_t irq_count;
 static uint32_t rx_count;
 static uint32_t tx_count;
+static bool tx_in_flight;
 
 static inline uint32_t mmio_read32( uint32_t offset )
 {
@@ -152,6 +153,28 @@ static void rx_publish_descriptor( uint16_t descriptor )
     *rx_queue.avail_idx = ( uint16_t )( avail + 1U );
 }
 
+static bool tx_reap_completion( void )
+{
+    observe();
+    if( !tx_in_flight ) {
+        return true;
+    }
+    if( tx_queue.last_used == *tx_queue.used_idx ) {
+        return false;
+    }
+
+    const struct virtq_used_elem used =
+        tx_queue.used_ring[tx_queue.last_used % VIRTIO_QUEUE_SIZE];
+    tx_queue.last_used++;
+    tx_in_flight = false;
+    if( used.id != 0U ) {
+        aicp_uart_printf( "AICP_FREERTOS_VIRTIO_TX_BAD id=%u len=%u\n", used.id, used.len );
+        device_ready = false;
+        return false;
+    }
+    return true;
+}
+
 bool aicp_virtio_net_init( void )
 {
     if( device_ready ) {
@@ -187,6 +210,7 @@ bool aicp_virtio_net_init( void )
     mmio_write32( VIRTIO_MMIO_GUEST_PAGE_SIZE, VIRTIO_PAGE_SIZE );
     queue_layout( &rx_queue, rx_ring_area );
     queue_layout( &tx_queue, tx_ring_area );
+    tx_in_flight = false;
     if( !queue_activate( VIRTIO_RX_QUEUE, &rx_queue ) ||
         !queue_activate( VIRTIO_TX_QUEUE, &tx_queue ) ) {
         return false;
@@ -279,6 +303,12 @@ bool aicp_virtio_net_send( const uint8_t * frame, size_t length )
     if( !device_ready || length > VIRTIO_MAX_FRAME_SIZE ) {
         return false;
     }
+    if( !tx_reap_completion() ) {
+        aicp_uart_printf( "AICP_FREERTOS_VIRTIO_TX_BUSY avail=%u used=%u\n",
+                          *tx_queue.avail_idx,
+                          *tx_queue.used_idx );
+        return false;
+    }
     memset( tx_buffer, 0, VIRTIO_NET_HEADER_SIZE );
     memcpy( tx_buffer + VIRTIO_NET_HEADER_SIZE, frame, length );
     tx_queue.desc[0].addr = ( uintptr_t ) tx_buffer;
@@ -291,10 +321,10 @@ bool aicp_virtio_net_send( const uint8_t * frame, size_t length )
     *tx_queue.avail_idx = ( uint16_t )( avail + 1U );
     publish();
     mmio_write32( VIRTIO_MMIO_QUEUE_NOTIFY, VIRTIO_TX_QUEUE );
+    tx_in_flight = true;
 
     const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS( 100U );
-    while( tx_queue.last_used == *tx_queue.used_idx ) {
-        observe();
+    while( !tx_reap_completion() ) {
         if( xTaskGetTickCount() >= deadline ) {
             aicp_uart_printf( "AICP_FREERTOS_VIRTIO_TX_TIMEOUT avail=%u used=%u\n",
                               *tx_queue.avail_idx,
@@ -303,7 +333,6 @@ bool aicp_virtio_net_send( const uint8_t * frame, size_t length )
         }
         taskYIELD();
     }
-    tx_queue.last_used++;
     tx_count++;
     if( tx_count <= VIRTIO_TRACE_LIMIT ) {
         aicp_uart_printf( "AICP_FREERTOS_VIRTIO_TX count=%u len=%u\n",

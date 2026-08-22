@@ -188,10 +188,55 @@ fn percentile(values: &[u64], percentile: usize) -> u64 {
     sorted[(sorted.len() - 1) * percentile / 100]
 }
 
+struct PeriodicSamples {
+    wake_lateness: Vec<u64>,
+    interval_abs_jitter: Vec<u64>,
+}
+
+impl PeriodicSamples {
+    fn new() -> Self {
+        Self {
+            wake_lateness: Vec::with_capacity(PERIODIC_REPORT_SAMPLES),
+            interval_abs_jitter: Vec::with_capacity(PERIODIC_REPORT_SAMPLES),
+        }
+    }
+
+    fn push(&mut self, lateness_ns: u64, interval_jitter_ns: u64) {
+        debug_assert!(self.wake_lateness.len() < PERIODIC_REPORT_SAMPLES);
+        debug_assert!(self.interval_abs_jitter.len() < PERIODIC_REPORT_SAMPLES);
+        self.wake_lateness.push(lateness_ns);
+        self.interval_abs_jitter.push(interval_jitter_ns);
+    }
+
+    fn len(&self) -> usize {
+        self.wake_lateness.len()
+    }
+
+    fn report_and_reset(&mut self, missed_deadlines: u64) {
+        let samples = self.len();
+        debug_assert_eq!(samples, self.interval_abs_jitter.len());
+        println!(
+            "AICP_RTOS_PERIODIC_DONE samples={} period_ns={} wake_lateness_avg_ns={} \
+             wake_lateness_p99_ns={} wake_lateness_max_ns={} interval_abs_jitter_avg_ns={} \
+             interval_abs_jitter_p99_ns={} interval_abs_jitter_max_ns={} missed_deadlines={}",
+            samples,
+            CONTROL_PERIOD_NS,
+            self.wake_lateness.iter().sum::<u64>() / samples as u64,
+            percentile(&self.wake_lateness, 99),
+            self.wake_lateness.iter().copied().max().unwrap_or(0),
+            self.interval_abs_jitter.iter().sum::<u64>() / samples as u64,
+            percentile(&self.interval_abs_jitter, 99),
+            self.interval_abs_jitter.iter().copied().max().unwrap_or(0),
+            missed_deadlines,
+        );
+        self.wake_lateness.clear();
+        self.interval_abs_jitter.clear();
+    }
+}
+
 fn periodic_probe() {
     let period = Duration::from_nanos(CONTROL_PERIOD_NS);
-    let mut wake_lateness = Vec::new();
-    let mut interval_abs_jitter = Vec::new();
+    let mut samples = PeriodicSamples::new();
     let mut missed_deadlines = 0u64;
 
     while !PERIODIC_PROBE_ACTIVE.load(Ordering::Acquire) {
@@ -217,36 +262,22 @@ fn periodic_probe() {
         let interval_jitter_ns = interval_ns.abs_diff(CONTROL_PERIOD_NS);
         let missed = lateness_ns / CONTROL_PERIOD_NS;
         missed_deadlines = missed_deadlines.saturating_add(missed);
-        wake_lateness.push(lateness_ns);
-        interval_abs_jitter.push(interval_jitter_ns);
+        samples.push(lateness_ns, interval_jitter_ns);
 
-        let samples = wake_lateness.len();
-        if samples == 1
-            || samples.is_multiple_of(PERIODIC_SAMPLE_LOG_INTERVAL)
+        let sample_count = samples.len();
+        if sample_count == 1
+            || sample_count.is_multiple_of(PERIODIC_SAMPLE_LOG_INTERVAL)
             || lateness_ns >= PERIODIC_OUTLIER_NS
             || missed != 0
         {
             println!(
                 "AICP_RTOS_PERIODIC sample={} wake_lateness_ns={} interval_ns={} \
                  interval_abs_jitter_ns={} missed_deadlines={}",
-                samples, lateness_ns, interval_ns, interval_jitter_ns, missed_deadlines
+                sample_count, lateness_ns, interval_ns, interval_jitter_ns, missed_deadlines
             );
         }
-        if samples.is_multiple_of(PERIODIC_REPORT_SAMPLES) {
-            println!(
-                "AICP_RTOS_PERIODIC_DONE samples={} period_ns={} wake_lateness_avg_ns={} \
-                 wake_lateness_p99_ns={} wake_lateness_max_ns={} interval_abs_jitter_avg_ns={} \
-                 interval_abs_jitter_p99_ns={} interval_abs_jitter_max_ns={} missed_deadlines={}",
-                samples,
-                CONTROL_PERIOD_NS,
-                wake_lateness.iter().sum::<u64>() / samples as u64,
-                percentile(&wake_lateness, 99),
-                wake_lateness.iter().copied().max().unwrap_or(0),
-                interval_abs_jitter.iter().sum::<u64>() / samples as u64,
-                percentile(&interval_abs_jitter, 99),
-                interval_abs_jitter.iter().copied().max().unwrap_or(0),
-                missed_deadlines,
-            );
+        if sample_count == PERIODIC_REPORT_SAMPLES {
+            samples.report_and_reset(missed_deadlines);
         }
 
         previous_wake = wake;
@@ -316,15 +347,6 @@ fn status_to_payload(status: StatusPayload) -> [u8; 24] {
     out[16..20].copy_from_slice(&status.mode.to_ne_bytes());
     out[20..24].copy_from_slice(&status.applied_seq.to_ne_bytes());
     out
-}
-
-fn send_status(stream: &mut TcpStream, state: &ControlState, seq: u32) -> io::Result<()> {
-    let payload = status_to_payload(state.status());
-    send_frame(
-        stream,
-        make_header(MSG_STATUS, payload.len(), seq, ERROR_OK),
-        &payload,
-    )
 }
 
 fn send_error(stream: &mut TcpStream, seq: u32, code: u16) -> io::Result<()> {
@@ -466,9 +488,61 @@ fn serve_udp(socket: UdpSocket) -> io::Result<()> {
     }
 }
 
-fn serve_client(mut stream: TcpStream) -> io::Result<()> {
-    let mut state = ControlState::default();
-    let mut timing = TimingState::default();
+#[derive(Clone, Copy)]
+enum TcpReply {
+    Status(StatusPayload),
+    Error(u16),
+}
+
+#[derive(Default)]
+struct TcpControlService {
+    state: ControlState,
+    timing: TimingState,
+    last_seq: Option<u32>,
+    last_reply: Option<TcpReply>,
+}
+
+impl TcpControlService {
+    fn replay_last_reply(&self, stream: &mut TcpStream) -> io::Result<()> {
+        let Some(seq) = self.last_seq else {
+            return Ok(());
+        };
+        match self.last_reply {
+            Some(TcpReply::Status(status)) => {
+                let payload = status_to_payload(status);
+                send_frame(
+                    stream,
+                    make_header(MSG_STATUS, payload.len(), seq, ERROR_OK),
+                    &payload,
+                )
+            }
+            Some(TcpReply::Error(code)) => send_error(stream, seq, code),
+            None => Ok(()),
+        }
+    }
+
+    fn send_status(&mut self, stream: &mut TcpStream, seq: u32) -> io::Result<()> {
+        let status = self.state.status();
+        let payload = status_to_payload(status);
+        send_frame(
+            stream,
+            make_header(MSG_STATUS, payload.len(), seq, ERROR_OK),
+            &payload,
+        )?;
+        self.last_seq = Some(seq);
+        self.last_reply = Some(TcpReply::Status(status));
+        Ok(())
+    }
+
+    fn send_error(&mut self, stream: &mut TcpStream, seq: u32, code: u16) -> io::Result<()> {
+        send_error(stream, seq, code)?;
+        self.last_seq = Some(seq);
+        self.last_reply = Some(TcpReply::Error(code));
+        Ok(())
+    }
+}
+
+fn serve_client(service: &mut TcpControlService, mut stream: TcpStream) -> io::Result<()> {
     let mut payload = [0u8; MAX_PAYLOAD];
 
     loop {
@@ -477,26 +551,36 @@ fn serve_client(mut stream: TcpStream) -> io::Result<()> {
             send_error(&mut stream, hdr.seq, ERROR_VERSION)?;
             continue;
         }
+        if service.last_seq == Some(hdr.seq) {
+            service.replay_last_reply(&mut stream)?;
+            continue;
+        }
+        if let Some(previous) = service.last_seq
+            && !seq_is_newer(hdr.seq, previous)
+        {
+            send_error(&mut stream, hdr.seq, ERROR_SEQUENCE)?;
+            continue;
+        }
         match hdr.msg_type {
             MSG_HELLO => println!("AICP HELLO seq={} payload_len={}", hdr.seq, len),
-            MSG_HEARTBEAT => send_status(&mut stream, &state, hdr.seq)?,
+            MSG_HEARTBEAT => service.send_status(&mut stream, hdr.seq)?,
             MSG_CONTROL_SET => {
                 PERIODIC_PROBE_ACTIVE.store(true, Ordering::Release);
                 let start = Instant::now();
                 let Some(control) = control_from_payload(&payload[..len]) else {
-                    send_error(&mut stream, hdr.seq, ERROR_BAD_PAYLOAD)?;
+                    service.send_error(&mut stream, hdr.seq, ERROR_BAD_PAYLOAD)?;
                     continue;
                 };
-                let status = state.step(control, hdr.seq);
+                let status = service.state.step(control, hdr.seq);
                 let service_ns = duration_ns(start.elapsed());
                 println!(
                     "CONTROL seq={} target={:.3} measured={:.3} output={:.3}",
                     hdr.seq, status.setpoint, status.measured, status.control_output
                 );
-                timing.observe(hdr.seq, start, service_ns);
-                send_status(&mut stream, &state, hdr.seq)?;
+                service.timing.observe(hdr.seq, start, service_ns);
+                service.send_status(&mut stream, hdr.seq)?;
             }
-            _ => send_error(&mut stream, hdr.seq, ERROR_BAD_TYPE)?,
+            _ => service.send_error(&mut stream, hdr.seq, ERROR_BAD_TYPE)?,
         }
     }
 }
@@ -515,10 +599,11 @@ fn main() -> io::Result<()> {
     let listener = TcpListener::bind("0.0.0.0:8800")?;
     println!("AICP ArceOS RTOS TCP server listening on 0.0.0.0:8800");
     println!("AICP_RTOS_READY");
+    let mut service = TcpControlService::default();
     loop {
         let (stream, addr) = listener.accept()?;
         println!("AICP client connected: {addr}");
-        if let Err(err) = serve_client(stream) {
+        if let Err(err) = serve_client(&mut service, stream) {
             println!("AICP client closed: {err:?}");
         }
     }
@@ -528,6 +613,13 @@ fn main() -> io::Result<()> {
 mod tests {
     use super::*;
 
+    fn write_frame(stream: &mut TcpStream, mut header: Header, payload: &[u8]) {
+        header.payload_len = payload.len() as u32;
+        header.crc16 = frame_crc(header, payload);
+        stream.write_all(&encode_header(header)).unwrap();
+        stream.write_all(payload).unwrap();
+    }
+
     fn write_frame_with_version(
         stream: &mut TcpStream,
         mut header: Header,
@@ -535,10 +627,7 @@ mod tests {
         version: u8,
     ) {
         header.version = version;
-        header.payload_len = payload.len() as u32;
-        header.crc16 = frame_crc(header, payload);
-        stream.write_all(&encode_header(header)).unwrap();
-        stream.write_all(payload).unwrap();
+        write_frame(stream, header, payload);
     }
 
     #[test]
@@ -576,12 +665,29 @@ mod tests {
     }
 
     #[test]
+    fn periodic_samples_are_bounded_by_the_reporting_window() {
+        let mut samples = PeriodicSamples::new();
+        let wake_capacity = samples.wake_lateness.capacity();
+        let jitter_capacity = samples.interval_abs_jitter.capacity();
+        for index in 0..PERIODIC_REPORT_SAMPLES * 3 {
+            samples.push(index as u64, index as u64 + 1);
+            if samples.len() == PERIODIC_REPORT_SAMPLES {
+                samples.report_and_reset(0);
+            }
+            assert!(samples.len() < PERIODIC_REPORT_SAMPLES);
+            assert_eq!(samples.wake_lateness.capacity(), wake_capacity);
+            assert_eq!(samples.interval_abs_jitter.capacity(), jitter_capacity);
+        }
+    }
+
+    #[test]
     fn tcp_server_returns_version_error_for_valid_unknown_version_frame() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            serve_client(stream)
+            let mut service = TcpControlService::default();
+            serve_client(&mut service, stream)
         });
         let mut client = TcpStream::connect(address).unwrap();
 
@@ -604,5 +710,87 @@ mod tests {
 
         drop(client);
         assert!(server.join().unwrap().is_err());
+    }
+
+    #[test]
+    fn tcp_duplicate_control_replays_cached_status_without_another_step() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut service = TcpControlService::default();
+            let result = serve_client(&mut service, stream);
+            (result, service.state)
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        let control = ControlPayload {
+            target: 0.8,
+            kp: 0.72,
+            ki: 0.08,
+            kd: 0.02,
+            feed_forward: 0.03,
+            mode: 1,
+        };
+        let mut payload = [0u8; 24];
+        payload[0..4].copy_from_slice(&control.target.to_ne_bytes());
+        payload[4..8].copy_from_slice(&control.kp.to_ne_bytes());
+        payload[8..12].copy_from_slice(&control.ki.to_ne_bytes());
+        payload[12..16].copy_from_slice(&control.kd.to_ne_bytes());
+        payload[16..20].copy_from_slice(&control.feed_forward.to_ne_bytes());
+        payload[20..24].copy_from_slice(&control.mode.to_ne_bytes());
+
+        let request = make_header(MSG_CONTROL_SET, payload.len(), 42, ERROR_OK);
+        write_frame(&mut client, request, &payload);
+        let mut response_payload = [0u8; MAX_PAYLOAD];
+        let (first, first_len) = recv_frame(&mut client, &mut response_payload).unwrap();
+        let first_status = response_payload[..first_len].to_vec();
+        write_frame(&mut client, request, &payload);
+        let (second, second_len) = recv_frame(&mut client, &mut response_payload).unwrap();
+
+        assert_eq!(first.msg_type, MSG_STATUS);
+        assert_eq!(second.msg_type, MSG_STATUS);
+        assert_eq!(first.seq, 42);
+        assert_eq!(second.seq, 42);
+        assert_eq!(&response_payload[..second_len], first_status);
+        drop(client);
+        let (result, state) = server.join().unwrap();
+        assert!(result.is_err());
+        assert_eq!(state.applied_seq, 42);
+        assert_eq!(state.status().measured.to_ne_bytes(), first_status[4..8]);
+    }
+
+    #[test]
+    fn tcp_stale_control_returns_sequence_error_without_changing_state() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut service = TcpControlService::default();
+            let result = serve_client(&mut service, stream);
+            (result, service.state)
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        let payload = [0u8; 24];
+        write_frame(
+            &mut client,
+            make_header(MSG_CONTROL_SET, payload.len(), 2, ERROR_OK),
+            &payload,
+        );
+        let mut response_payload = [0u8; MAX_PAYLOAD];
+        let _ = recv_frame(&mut client, &mut response_payload).unwrap();
+        write_frame(
+            &mut client,
+            make_header(MSG_CONTROL_SET, payload.len(), 1, ERROR_OK),
+            &payload,
+        );
+        let (response, _) = recv_frame(&mut client, &mut response_payload).unwrap();
+
+        assert_eq!(response.msg_type, MSG_ERROR);
+        assert_eq!(response.error_code, ERROR_SEQUENCE);
+        assert_eq!(response.seq, 1);
+        drop(client);
+        let (result, state) = server.join().unwrap();
+        assert!(result.is_err());
+        assert_eq!(state.applied_seq, 2);
     }
 }

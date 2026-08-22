@@ -16,8 +16,30 @@ fake_bin="${test_dir}/toolchain/bin"
 mkdir -p "${fake_bin}"
 printf '#!/usr/bin/env bash\nexit 0\n' > "${fake_bin}/aarch64-elf-gcc"
 chmod +x "${fake_bin}/aarch64-elf-gcc"
+cat > "${fake_bin}/uname" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+  -s) printf '%s\n' "${AICP_TEST_UNAME_OS}" ;;
+  -m) printf '%s\n' "${AICP_TEST_UNAME_ARCH}" ;;
+esac
+EOF
+chmod +x "${fake_bin}/uname"
 
 expected_prefix="${fake_bin}/aarch64-elf-"
+
+linux_host_tag="$(AICP_TEST_UNAME_OS=Linux AICP_TEST_UNAME_ARCH=x86_64 \
+  PATH="${fake_bin}:${PATH}" aicp_arm_gnu_host_tag)"
+if [[ "${linux_host_tag}" != "x86_64" ]]; then
+  echo "FAIL: Linux 主机工具链标签错误：${linux_host_tag}" >&2
+  exit 1
+fi
+
+darwin_host_tag="$(AICP_TEST_UNAME_OS=Darwin AICP_TEST_UNAME_ARCH=arm64 \
+  PATH="${fake_bin}:${PATH}" aicp_arm_gnu_host_tag)"
+if [[ "${darwin_host_tag}" != "darwin-arm64" ]]; then
+  echo "FAIL: Darwin 主机工具链标签错误：${darwin_host_tag}" >&2
+  exit 1
+fi
 
 revision_key="$(aicp_revision_key 'refs/tags/v4.2.0')"
 if [[ "${revision_key}" != "refs-tags-v4.2.0" ]]; then
