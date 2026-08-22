@@ -498,11 +498,15 @@ enum TcpReply {
 struct TcpControlService {
     state: ControlState,
     timing: TimingState,
+}
+
+#[derive(Default)]
+struct TcpConnectionSession {
     last_seq: Option<u32>,
     last_reply: Option<TcpReply>,
 }
 
-impl TcpControlService {
+impl TcpConnectionSession {
     fn replay_last_reply(&self, stream: &mut TcpStream) -> io::Result<()> {
         let Some(seq) = self.last_seq else {
             return Ok(());
@@ -521,8 +525,12 @@ impl TcpControlService {
         }
     }
 
-    fn send_status(&mut self, stream: &mut TcpStream, seq: u32) -> io::Result<()> {
-        let status = self.state.status();
+    fn send_status(
+        &mut self,
+        stream: &mut TcpStream,
+        status: StatusPayload,
+        seq: u32,
+    ) -> io::Result<()> {
         let payload = status_to_payload(status);
         send_frame(
             stream,
@@ -544,6 +552,7 @@ impl TcpControlService {
 
 fn serve_client(service: &mut TcpControlService, mut stream: TcpStream) -> io::Result<()> {
     let mut payload = [0u8; MAX_PAYLOAD];
+    let mut session = TcpConnectionSession::default();
 
     loop {
         let (hdr, len) = recv_frame(&mut stream, &mut payload)?;
@@ -551,11 +560,11 @@ fn serve_client(service: &mut TcpControlService, mut stream: TcpStream) -> io::R
             send_error(&mut stream, hdr.seq, ERROR_VERSION)?;
             continue;
         }
-        if service.last_seq == Some(hdr.seq) {
-            service.replay_last_reply(&mut stream)?;
+        if session.last_seq == Some(hdr.seq) {
+            session.replay_last_reply(&mut stream)?;
             continue;
         }
-        if let Some(previous) = service.last_seq
+        if let Some(previous) = session.last_seq
             && !seq_is_newer(hdr.seq, previous)
         {
             send_error(&mut stream, hdr.seq, ERROR_SEQUENCE)?;
@@ -563,12 +572,12 @@ fn serve_client(service: &mut TcpControlService, mut stream: TcpStream) -> io::R
         }
         match hdr.msg_type {
             MSG_HELLO => println!("AICP HELLO seq={} payload_len={}", hdr.seq, len),
-            MSG_HEARTBEAT => service.send_status(&mut stream, hdr.seq)?,
+            MSG_HEARTBEAT => session.send_status(&mut stream, service.state.status(), hdr.seq)?,
             MSG_CONTROL_SET => {
                 PERIODIC_PROBE_ACTIVE.store(true, Ordering::Release);
                 let start = Instant::now();
                 let Some(control) = control_from_payload(&payload[..len]) else {
-                    service.send_error(&mut stream, hdr.seq, ERROR_BAD_PAYLOAD)?;
+                    session.send_error(&mut stream, hdr.seq, ERROR_BAD_PAYLOAD)?;
                     continue;
                 };
                 let status = service.state.step(control, hdr.seq);
@@ -578,9 +587,9 @@ fn serve_client(service: &mut TcpControlService, mut stream: TcpStream) -> io::R
                     hdr.seq, status.setpoint, status.measured, status.control_output
                 );
                 service.timing.observe(hdr.seq, start, service_ns);
-                service.send_status(&mut stream, hdr.seq)?;
+                session.send_status(&mut stream, status, hdr.seq)?;
             }
-            _ => service.send_error(&mut stream, hdr.seq, ERROR_BAD_TYPE)?,
+            _ => session.send_error(&mut stream, hdr.seq, ERROR_BAD_TYPE)?,
         }
     }
 }
@@ -757,6 +766,53 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(state.applied_seq, 42);
         assert_eq!(state.status().measured.to_ne_bytes(), first_status[4..8]);
+    }
+
+    #[test]
+    fn tcp_reconnect_accepts_a_fresh_sequence_after_hello() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut service = TcpControlService::default();
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().unwrap();
+                assert!(serve_client(&mut service, stream).is_err());
+            }
+            service.state
+        });
+        let first_control = [0u8; 24];
+        let mut first_client = TcpStream::connect(address).unwrap();
+        write_frame(
+            &mut first_client,
+            make_header(MSG_CONTROL_SET, first_control.len(), 10, ERROR_OK),
+            &first_control,
+        );
+        let mut response_payload = [0u8; MAX_PAYLOAD];
+        let (first_response, _) = recv_frame(&mut first_client, &mut response_payload).unwrap();
+        assert_eq!(first_response.msg_type, MSG_STATUS);
+        drop(first_client);
+
+        let second_control = [1u8; 24];
+        let mut second_client = TcpStream::connect(address).unwrap();
+        write_frame(
+            &mut second_client,
+            make_header(MSG_HELLO, 0, 1, ERROR_OK),
+            b"",
+        );
+        write_frame(
+            &mut second_client,
+            make_header(MSG_CONTROL_SET, second_control.len(), 1, ERROR_OK),
+            &second_control,
+        );
+        let (response, response_len) =
+            recv_frame(&mut second_client, &mut response_payload).unwrap();
+
+        assert_eq!(response.msg_type, MSG_STATUS);
+        assert_eq!(response.seq, 1);
+        assert_eq!(response.error_code, ERROR_OK);
+        assert_eq!(response_payload[..response_len][20..24], 1u32.to_ne_bytes());
+        drop(second_client);
+        assert_eq!(server.join().unwrap().applied_seq, 1);
     }
 
     #[test]
