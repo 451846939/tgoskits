@@ -126,13 +126,20 @@ pub fn decode_header(input: &[u8; HEADER_LEN]) -> Header {
     }
 }
 
-pub fn validate_header(header: Header) -> Result<(), ProtocolError> {
+fn validate_magic(header: Header) -> Result<(), ProtocolError> {
     if header.magic != MAGIC {
         return Err(ProtocolError::BadMagic);
     }
-    if header.version != VERSION {
-        return Err(ProtocolError::UnsupportedVersion);
-    }
+    Ok(())
+}
+
+/// Validates the header fields required to safely receive an AICP frame.
+///
+/// This intentionally leaves version selection to the caller. A server uses
+/// it to read and CRC-check a complete unknown-version frame before replying
+/// with `ERROR_VERSION`; a client should use [`validate_header`] instead.
+pub fn validate_header_shape(header: Header) -> Result<(), ProtocolError> {
+    validate_magic(header)?;
     if header.header_len as usize != HEADER_LEN {
         return Err(ProtocolError::BadHeaderLength);
     }
@@ -140,6 +147,14 @@ pub fn validate_header(header: Header) -> Result<(), ProtocolError> {
         return Err(ProtocolError::PayloadTooLarge);
     }
     Ok(())
+}
+
+pub fn validate_header(header: Header) -> Result<(), ProtocolError> {
+    validate_magic(header)?;
+    if header.version != VERSION {
+        return Err(ProtocolError::UnsupportedVersion);
+    }
+    validate_header_shape(header)
 }
 
 pub fn crc16_update(mut crc: u16, data: &[u8]) -> u16 {
@@ -297,6 +312,13 @@ mod tests {
             validate_header(header),
             Err(ProtocolError::UnsupportedVersion)
         );
+    }
+
+    #[test]
+    fn frame_shape_accepts_unknown_version_for_server_error_response() {
+        let mut header = test_header(0);
+        header.version = VERSION + 1;
+        assert_eq!(validate_header_shape(header), Ok(()));
     }
 
     #[test]

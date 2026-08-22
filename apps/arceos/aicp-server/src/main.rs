@@ -14,7 +14,7 @@ use aicp_rust_protocol::{
     ERROR_BAD_PAYLOAD, ERROR_BAD_TYPE, ERROR_CRC, ERROR_OK, ERROR_SEQUENCE, ERROR_VERSION,
     HEADER_LEN, Header, MAX_PAYLOAD, MSG_CONTROL_SET, MSG_ERROR, MSG_HEARTBEAT, MSG_HELLO,
     MSG_STATUS, ProtocolError, VERSION, decode_frame, decode_header, encode_frame, encode_header,
-    frame_crc, validate_header,
+    frame_crc, validate_header_shape,
 };
 #[cfg(feature = "arceos")]
 use ax_std as _;
@@ -271,7 +271,7 @@ fn recv_frame(
     let mut wire = [0u8; HEADER_LEN];
     stream.read_exact(&mut wire)?;
     let hdr = decode_header(&wire);
-    validate_header(hdr).map_err(protocol_io_error)?;
+    validate_header_shape(hdr).map_err(protocol_io_error)?;
     let len = hdr.payload_len as usize;
     stream.read_exact(&mut payload[..len])?;
     if hdr.crc16 != frame_crc(hdr, &payload[..len]) {
@@ -519,6 +519,19 @@ fn main() -> io::Result<()> {
 mod tests {
     use super::*;
 
+    fn write_frame_with_version(
+        stream: &mut TcpStream,
+        mut header: Header,
+        payload: &[u8],
+        version: u8,
+    ) {
+        header.version = version;
+        header.payload_len = payload.len() as u32;
+        header.crc16 = frame_crc(header, payload);
+        stream.write_all(&encode_header(header)).unwrap();
+        stream.write_all(payload).unwrap();
+    }
+
     #[test]
     fn crc_changes_when_payload_changes() {
         let hdr = make_header(MSG_HELLO, 3, 7, ERROR_OK);
@@ -551,5 +564,36 @@ mod tests {
         assert!(!seq_is_newer(10, 10));
         assert!(!seq_is_newer(9, 10));
         assert!(seq_is_newer(0, u32::MAX));
+    }
+
+    #[test]
+    fn tcp_server_returns_version_error_for_valid_unknown_version_frame() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            serve_client(stream)
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+
+        write_frame_with_version(
+            &mut client,
+            make_header(MSG_HELLO, 0, 41, ERROR_OK),
+            b"",
+            VERSION + 1,
+        );
+
+        let mut payload = [0u8; MAX_PAYLOAD];
+        let (response, response_len) = recv_frame(&mut client, &mut payload).unwrap();
+        assert_eq!(response.msg_type, MSG_ERROR);
+        assert_eq!(response.error_code, ERROR_VERSION);
+        assert_eq!(response.seq, 41);
+        assert_eq!(
+            &payload[..response_len],
+            b"{\"error\":\"invalid AICP frame\"}"
+        );
+
+        drop(client);
+        assert!(server.join().unwrap().is_err());
     }
 }
