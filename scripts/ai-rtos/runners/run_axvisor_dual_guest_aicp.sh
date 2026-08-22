@@ -267,6 +267,7 @@ qemu_pid=$!
 aicp_wait_for_arceos_ready_in_logs \
   "$((SECONDS + boot_timeout_s))" "${qemu_pid}" 180 \
   2 "${log_file}" "${linux_console_log}"
+wait_for_marker "AICP_RTOS_NET_READY iface=eth0 ip=10.0.3.2/24"
 if [[ "${client_impl}" == "rust" ]]; then
   wait_for_marker "AICP_RUST_GUEST_INIT begin=1"
   wait_for_marker "AICP_RUST_GUEST_NETCFG step=SIOCSIFFLAGS ret=0"

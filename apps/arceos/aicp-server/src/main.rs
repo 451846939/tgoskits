@@ -33,9 +33,18 @@ fn configure_aicp_network() -> io::Result<()> {
         .find(|interface| interface.name == "eth0")
         .ok_or_else(|| io::Error::other("AICP network interface eth0 is unavailable"))?;
 
-    ax_net::set_interface_ipv4(interface.id, std::net::Ipv4Addr::new(10, 0, 3, 2), 24)
+    let ip = std::net::Ipv4Addr::new(10, 0, 3, 2);
+    if let Some(ipv4) = interface.ipv4 {
+        ax_net::remove_interface_ipv4(
+            interface.id,
+            std::net::Ipv4Addr::from(ipv4.address.address().octets()),
+            ipv4.address.prefix_len(),
+        )
+        .map_err(|err| io::Error::other(format!("clear inherited IPv4: {err:?}")))?;
+    }
+    ax_net::set_interface_ipv4(interface.id, ip, 24)
         .map_err(|err| io::Error::other(format!("configure AICP static IPv4: {err:?}")))?;
-    println!("AICP_RTOS_NET_READY iface=eth0 ip=10.0.3.2/24");
+    println!("AICP_RTOS_NET_READY iface=eth0 ip={ip}/24");
     Ok(())
 }
 

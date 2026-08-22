@@ -12,6 +12,6 @@ args = [
 ]
 uefi = false
 to_bin = true
-success_regex = ["AICP ArceOS RTOS server listening on 0.0.0.0:8800"]
+success_regex = ["AICP_RTOS_READY"]
 fail_regex = ["(?i)\\bpanic(?:ked)?\\b"]
 timeout = 60
