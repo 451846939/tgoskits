@@ -16,6 +16,10 @@ host-test = [
     "ax-std/host-test",
     "axdevice/host-test",
 ]
+# Keep CPU-isolated vCPUs runnable across guest WFI/standby exits. The vCPU
+# loop continues to poll architectural timer and virtual-device state instead
+# of entering the shared host wait queue.
+rt-poll-idle = []
 sstc = ["riscv_vcpu/sstc"]
 tls = ["ax-std/tls", "cpu-local/tls"]
 

@@ -12,9 +12,9 @@ Usage:
 
 Runs the same dual-guest AICP workload with two AxVisor variants:
   optimized - board config selected by AICP_OPTIMIZED_BOARD_CONFIG
-  baseline  - board config selected by AICP_BASELINE_BOARD_CONFIG
+  control   - board config selected by AICP_CONTROL_BOARD_CONFIG
 
-The default baseline falls back to the old shared vCPU wait queue and broadcast
+The default control profile retains the old shared vCPU wait queue and broadcast
 wake path. Either config can be overridden for a single-variable experiment.
 With multiple rounds, execution order alternates to reduce order bias. Every
 round keeps raw artifacts and the final report summarizes medians, ranges, and
@@ -22,7 +22,7 @@ worst values.
 
 Optional environment variables:
   AICP_OPTIMIZED_BOARD_CONFIG - optimized board config override
-  AICP_BASELINE_BOARD_CONFIG  - baseline board config override
+  AICP_CONTROL_BOARD_CONFIG   - control board config override
 
 The optimized default intentionally does not enable rt-preempt. The optional
 qemu-aarch64-rt-preempt.toml config is retained for shared-pCPU experiments,
@@ -40,7 +40,7 @@ boot_timeout_s="${2:-360}"
 stress_procs="${3:-2}"
 rounds="${4:-1}"
 optimized_board_config="${AICP_OPTIMIZED_BOARD_CONFIG:-os/axvisor/configs/board/qemu-aarch64-rt.toml}"
-baseline_board_config="${AICP_BASELINE_BOARD_CONFIG:-os/axvisor/configs/board/qemu-aarch64-rt-shared-wait-baseline.toml}"
+control_board_config="${AICP_CONTROL_BOARD_CONFIG:-os/axvisor/configs/board/qemu-aarch64-rt-shared-wait-control.toml}"
 if ! [[ "${rounds}" =~ ^[0-9]+$ ]] || (( rounds == 0 )); then
   echo "ERROR: rounds must be a positive integer" >&2
   exit 2
@@ -115,13 +115,13 @@ for ((round = 1; round <= rounds; round++)); do
   round_dirs+=("${round_dir}")
 
   if (( round % 2 == 1 )); then
-    variants=(baseline optimized)
+    variants=(control optimized)
   else
-    variants=(optimized baseline)
+    variants=(optimized control)
   fi
   for variant in "${variants[@]}"; do
-    if [[ "${variant}" == "baseline" ]]; then
-      board_config="${baseline_board_config}"
+    if [[ "${variant}" == "control" ]]; then
+      board_config="${control_board_config}"
     else
       board_config="${optimized_board_config}"
     fi
@@ -131,7 +131,7 @@ for ((round = 1; round <= rounds; round++)); do
   done
 
   python3 "${repo_root}/scripts/ai-rtos/analysis/summarize_rt_before_after.py" \
-    "${round_dir}/baseline" \
+    "${round_dir}/control" \
     "${round_dir}/optimized" \
     --summary "${round_dir}/before_after.summary.txt"
   cat "${round_dir}/before_after.summary.txt"

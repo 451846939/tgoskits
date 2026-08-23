@@ -65,29 +65,29 @@ def load_variant_status(root: Path) -> str:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Summarize AxVisor RT before/after matrix output.")
-    parser.add_argument("before_dir", type=Path)
-    parser.add_argument("after_dir", type=Path)
+    parser = argparse.ArgumentParser(description="Summarize AxVisor RT control/optimized matrix output.")
+    parser.add_argument("control_dir", type=Path)
+    parser.add_argument("optimized_dir", type=Path)
     parser.add_argument("--summary", type=Path, required=True)
     args = parser.parse_args()
 
     lines = [
-        f"before_dir={args.before_dir}",
-        f"after_dir={args.after_dir}",
-        f"before_status={load_variant_status(args.before_dir)}",
-        f"after_status={load_variant_status(args.after_dir)}",
+        f"control_dir={args.control_dir}",
+        f"optimized_dir={args.optimized_dir}",
+        f"control_status={load_variant_status(args.control_dir)}",
+        f"optimized_status={load_variant_status(args.optimized_dir)}",
     ]
     for case in ("idle", "stress"):
-        before = load_summary(args.before_dir / f"{case}.summary.txt")
-        after = load_summary(args.after_dir / f"{case}.summary.txt")
+        control = load_summary(args.control_dir / f"{case}.summary.txt")
+        optimized = load_summary(args.optimized_dir / f"{case}.summary.txt")
         lines.append("")
         lines.append(f"[{case}]")
         for key in KEYS:
-            before_value = before.get(key)
-            after_value = after.get(key)
+            control_value = control.get(key)
+            optimized_value = optimized.get(key)
             lines.append(
-                f"{key}: before={fmt(before_value)} after={fmt(after_value)} "
-                f"improvement={improvement(before_value, after_value)}"
+                f"{key}: control={fmt(control_value)} optimized={fmt(optimized_value)} "
+                f"improvement={improvement(control_value, optimized_value)}"
             )
 
     args.summary.write_text("\n".join(lines) + "\n")

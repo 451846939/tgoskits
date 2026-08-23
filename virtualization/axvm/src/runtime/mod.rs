@@ -115,13 +115,18 @@ pub fn start_vm(vm_id: usize) -> AxVmResult {
 /// per-vCPU wait queue that can target vCPU0.
 pub fn notify_vm(vm_id: usize) -> AxVmResult {
     let vm = vm_by_id(vm_id)?;
+    #[cfg(not(feature = "rt-poll-idle"))]
     let vcpu_num = vm.vcpu_num();
     vm.with_runtime(|runtime| {
+        #[cfg(feature = "rt-poll-idle")]
+        runtime.notify_device_poll();
+        #[cfg(not(feature = "rt-poll-idle"))]
         notify_runtime_for_device_poll(runtime, vcpu_num);
         Ok(())
     })
 }
 
+#[cfg(any(not(feature = "rt-poll-idle"), test))]
 fn notify_runtime_for_device_poll(runtime: &crate::vm::VmRuntimeHandle, vcpu_num: usize) {
     if vcpu_num == 1 {
         runtime.notify_device_poll();
