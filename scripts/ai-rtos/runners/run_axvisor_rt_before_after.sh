@@ -24,9 +24,6 @@ Optional environment variables:
   AICP_OPTIMIZED_BOARD_CONFIG - optimized board config override
   AICP_CONTROL_BOARD_CONFIG   - control board config override
 
-The optimized default intentionally does not enable rt-preempt. The optional
-qemu-aarch64-rt-preempt.toml config is retained for shared-pCPU experiments,
-but adds unnecessary scheduler IPIs in the default one-vCPU-per-pCPU layout.
 EOF
 }
 
