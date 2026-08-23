@@ -235,6 +235,7 @@ pub(crate) struct VmRuntimeHandle {
     vcpu_wake_count: Arc<AtomicU64>,
 }
 
+#[cfg(any(not(feature = "rt-poll-idle"), test))]
 pub(crate) struct VcpuEventWaitSnapshot {
     notification_generation: usize,
 }
@@ -257,6 +258,7 @@ impl VcpuTimerWakeHandle {
     }
 }
 
+#[cfg(any(not(feature = "rt-poll-idle"), test))]
 pub(crate) fn wait_for_vcpu_event_if_idle(
     runtime: &VmRuntimeHandle,
     wait_snapshot: &VcpuEventWaitSnapshot,
@@ -558,10 +560,12 @@ impl VmRuntimeHandle {
         }
     }
 
+    #[cfg(any(not(feature = "rt-poll-idle"), test))]
     pub(crate) fn notification_generation(&self) -> usize {
         self.notification_generation.load(Ordering::Acquire)
     }
 
+    #[cfg(any(not(feature = "rt-poll-idle"), test))]
     pub(crate) fn vcpu_event_wait_snapshot(&self) -> VcpuEventWaitSnapshot {
         VcpuEventWaitSnapshot {
             notification_generation: self.notification_generation(),
@@ -576,6 +580,19 @@ impl VmRuntimeHandle {
         if let Some(wait_queue) = self.vcpu_timer_wait_queues.lock().get(&0) {
             wait_queue.notify_one(false);
         }
+    }
+
+    /// Wakes vCPUs after an interrupt or device event has been published.
+    ///
+    /// The control profile deliberately preserves the old broadcast wake
+    /// behavior. The polling profile does not block on guest-idle exits, but
+    /// still uses this notification for startup and lifecycle transitions.
+    pub(crate) fn notify_vcpu(&self, _vcpu_id: usize) {
+        self.notification_generation.fetch_add(1, Ordering::Release);
+        #[cfg(feature = "rt-poll-idle")]
+        self.wait_queue.notify_all(true);
+        #[cfg(not(feature = "rt-poll-idle"))]
+        self.wait_queue.notify_all(false);
     }
 
     pub(crate) fn notify_all(&self) {
@@ -594,6 +611,7 @@ impl VmRuntimeHandle {
         self.notify_one();
     }
 
+    #[cfg(any(not(feature = "rt-poll-idle"), test))]
     pub(crate) fn device_poll_requested(&self) -> bool {
         self.device_poll_requested.load(Ordering::Acquire)
     }
@@ -699,6 +717,7 @@ impl VmRuntimeHandle {
     }
 }
 
+#[cfg(any(not(feature = "rt-poll-idle"), test))]
 impl VcpuEventWaitSnapshot {
     pub(crate) fn has_pending_event(&self, runtime: &VmRuntimeHandle) -> bool {
         runtime.device_poll_requested()

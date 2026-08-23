@@ -32,10 +32,12 @@ const KERNEL_STACK_SIZE: usize = 0x40000; // 256 KiB
 ///
 /// * `vm_id` - The ID of the VM whose VCpu wait queue is used to block the current thread.
 /// * `condition` - A closure that returns a boolean value indicating whether the condition is met.
-fn wait_for<F>(vm_vcpus: &VmRuntimeHandle, condition: F)
+fn wait_for<F>(vm_vcpus: &VmRuntimeHandle, _vcpu_id: usize, condition: F)
 where
     F: Fn() -> bool,
 {
+    // Polling applies only after guest WFI/standby. Lifecycle transitions
+    // still use the shared condition wait so CPU_ON and suspend remain safe.
     vm_vcpus.wait_until(condition);
 }
 
@@ -56,7 +58,7 @@ pub(crate) fn notify_primary_vcpu(vm_id: usize) {
         return;
     };
     match vm.runtime_handle() {
-        Ok(runtime) => runtime.notify_one(),
+        Ok(runtime) => runtime.notify_vcpu(0),
         Err(err) => warn!("VM[{vm_id}] vCPU runtime not found: {err:?}"),
     }
 }
@@ -95,7 +97,7 @@ pub(crate) fn queue_pending_interrupt(
 
     let runtime = vm.runtime_handle()?;
     let cpu_id = runtime.queue_pending_interrupt(vcpu_id, interrupt)?;
-    runtime.notify_all();
+    runtime.notify_vcpu(vcpu_id);
     crate::host::task::send_ipi(cpu_id);
     Ok(())
 }
@@ -114,7 +116,7 @@ pub(crate) fn notify_vcpu(vm_id: usize, vcpu_id: usize) -> AxVmResult {
 
     let runtime = vm.runtime_handle()?;
     let cpu_id = runtime.vcpu_cpu_id(vcpu_id)?;
-    runtime.notify_all();
+    runtime.notify_vcpu(vcpu_id);
     crate::host::task::send_ipi(cpu_id);
     Ok(())
 }
@@ -434,7 +436,7 @@ fn vcpu_run() {
 
     info!("VM[{}] VCpu[{}] waiting for running", vm.id(), vcpu.id());
     let cpu_on_start_ack = runtime.cpu_on_start_ack(vcpu_id);
-    wait_for(&runtime, || {
+    wait_for(&runtime, vcpu_id, || {
         vcpu_start_is_ready(vm.running(), runtime.has_vcpu_task(vcpu_id))
             || cpu_on_start_ack
                 .as_ref()
@@ -563,7 +565,13 @@ fn vcpu_run() {
                 VcpuRunAction {
                     waits_for_event: true,
                     ..
-                } => CurrentArch::wait_for_vcpu_event(&vm, &vcpu, &runtime),
+                } => {
+                    // A CPU-isolated polling vCPU keeps executing after WFI so
+                    // timer and virtual-device state are observed at VM-exit
+                    // boundaries instead of sleeping on the shared host queue.
+                    #[cfg(not(feature = "rt-poll-idle"))]
+                    CurrentArch::wait_for_vcpu_event(&vm, &vcpu, &runtime);
+                }
                 VcpuRunAction { .. } => {}
             }
         }
@@ -585,7 +593,7 @@ fn vcpu_run() {
             // `guest_park_count`, correctly reporting that the pause did not
             // genuinely complete instead of passing on a fake.
             let parked = Cell::new(false);
-            wait_for(&runtime, || {
+            wait_for(&runtime, vcpu_id, || {
                 if !vm.suspending() {
                     return true;
                 }
@@ -632,10 +640,16 @@ fn vcpu_run() {
             break;
         }
 
-        // AxVM may run on ArceOS's cooperative FIFO scheduler. Yield after
-        // every completed VM exit so host services such as the management
-        // console and virtual serial input can make progress alongside a
-        // continuously runnable guest.
+        // A polling vCPU cannot rely on the shared wait queue to re-enter its
+        // owner CPU's timer worker. Poll that CPU's timer wheel before the
+        // next guest entry so a guest WFI is released once its virtual timer
+        // deadline becomes due.
+        #[cfg(feature = "rt-poll-idle")]
+        crate::check_timer_events();
+
+        // AxVM may run on ArceOS's cooperative FIFO scheduler. Polling does
+        // not enter the shared wait queue, but it still gives local host
+        // services a scheduling point after checking the timer wheel.
         crate::host::task::yield_now();
     }
 

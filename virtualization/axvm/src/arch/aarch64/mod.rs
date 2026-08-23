@@ -220,6 +220,7 @@ impl ArchOps for Aarch64Arch {
         })
     }
 
+    #[cfg(not(feature = "rt-poll-idle"))]
     fn wait_for_vcpu_event(
         vm: &crate::AxVMRef,
         vcpu: &crate::vm::AxVCpuRef<Self::VCpu>,
@@ -457,6 +458,7 @@ impl AxvmArmVcpu {
             .is_some_and(|binding| binding.accept_host_irq(token))
     }
 
+    #[cfg(not(feature = "rt-poll-idle"))]
     fn has_pending_interrupt(&self) -> AxVmResult<bool> {
         self.binding()?
             .has_pending_interrupt()

@@ -115,6 +115,7 @@ pub fn start_vm(vm_id: usize) -> AxVmResult {
 /// per-vCPU wait queue that can target vCPU0.
 pub fn notify_vm(vm_id: usize) -> AxVmResult {
     let vm = vm_by_id(vm_id)?;
+    #[cfg(not(feature = "rt-poll-idle"))]
     let vcpu_num = vm.vcpu_num();
     // `WaitQueue::wait_until` evaluates the vCPU wake predicate while it
     // holds both the wait-queue and run-queue locks. That predicate may read
@@ -122,10 +123,14 @@ pub fn notify_vm(vm_id: usize) -> AxVmResult {
     // `vm.machine` while notifying the same wait queue, or the notifier and a
     // vCPU entering WFI can deadlock in opposite lock order.
     let runtime = vm.runtime_handle()?;
+    #[cfg(feature = "rt-poll-idle")]
+    runtime.notify_device_poll();
+    #[cfg(not(feature = "rt-poll-idle"))]
     notify_runtime_for_device_poll(&runtime, vcpu_num);
     Ok(())
 }
 
+#[cfg(any(not(feature = "rt-poll-idle"), test))]
 fn notify_runtime_for_device_poll(runtime: &crate::vm::VmRuntimeHandle, vcpu_num: usize) {
     if vcpu_num == 1 {
         runtime.notify_device_poll();
