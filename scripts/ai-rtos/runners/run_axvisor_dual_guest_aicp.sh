@@ -18,7 +18,9 @@ The default four-core layout reserves pCPU0 for AxVisor housekeeping. Override
 the topology with AICP_HOST_CPUS, AICP_LINUX_VCPU0_PCPU,
 AICP_LINUX_VCPU1_PCPU, and AICP_RTOS_VCPU0_PCPU.
 
-Set AICP_CLIENT_IMPL=c or AICP_CLIENT_IMPL=rust to select the Linux client.
+Set AICP_CLIENT_IMPL=c, rust, or yolo-rust to select the Linux client. The
+yolo-rust profile injects the ONNX Runtime, YOLOv8n model, and validation image
+into the Linux initramfs, then sends the inference-derived control output.
 Set AICP_RTOS_GUEST=arceos, freertos, rtthread, or zephyr to select the control guest.
 ArceOS and FreeRTOS use AxVisor's isolated virtual switch. Zephyr uses the
 QEMU hub-backed direct VirtIO-MMIO compatibility path, as does RT-Thread.
@@ -40,8 +42,9 @@ if [[ "${mode}" != "ai" && "${mode}" != "fixed" ]]; then
   usage >&2
   exit 2
 fi
-if [[ "${client_impl}" != "c" && "${client_impl}" != "rust" ]]; then
-  echo "ERROR: AICP_CLIENT_IMPL must be c or rust, got '${client_impl}'" >&2
+if [[ "${client_impl}" != "c" && "${client_impl}" != "rust" && \
+      "${client_impl}" != "yolo-rust" ]]; then
+  echo "ERROR: AICP_CLIENT_IMPL must be c, rust, or yolo-rust, got '${client_impl}'" >&2
   exit 2
 fi
 if [[ "${rtos_guest}" != "arceos" && "${rtos_guest}" != "freertos" && \
@@ -52,6 +55,7 @@ fi
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 source "${repo_root}/scripts/ai-rtos/lib/cpu_topology.sh"
+source "${repo_root}/scripts/ai-rtos/lib/host_tools.sh"
 source "${repo_root}/scripts/ai-rtos/lib/markers.sh"
 source "${repo_root}/scripts/ai-rtos/lib/process.sh"
 
@@ -91,6 +95,7 @@ rtthread_build_dir="${AICP_RTTHREAD_BUILD_DIR:-${out_dir}/build-rtthread-aicp-di
 rtthread_bin="${AICP_RTTHREAD_BIN:-${rtthread_build_dir}/rtthread.bin}"
 zephyr_build_dir="${AICP_ZEPHYR_BUILD_DIR:-${out_dir}/build-zephyr-aicp-direct}"
 zephyr_bin="${AICP_ZEPHYR_BIN:-${zephyr_build_dir}/zephyr/zephyr.bin}"
+yolo_install_dir="${AICP_YOLO_RUST_INSTALL_DIR:-${demo_dir}/yolov8-rust-onnx/install/aarch64}"
 
 cleanup() {
   aicp_cleanup_process_tree "${qemu_pid:-}"
@@ -204,6 +209,27 @@ build_linux_initramfs() {
       exit 1
     fi
     cp "${rust_init}" "${initramfs_dir}/init"
+  elif [[ "${client_impl}" == "yolo-rust" ]]; then
+    if ! aicp_yolo_rust_bundle_ready "${yolo_install_dir}"; then
+      if [[ "${AICP_YOLO_RUST_SKIP_BUILD:-0}" == "1" ]]; then
+        echo "ERROR: Rust YOLO runtime bundle is missing or incomplete: ${yolo_install_dir}" >&2
+        exit 1
+      fi
+      AICP_RUST_DOCKER_IMAGE="${AICP_RUST_DOCKER_IMAGE:-narin-rootless-dev:latest}" \
+        "${demo_dir}/yolov8-rust-onnx/build-aarch64-docker.sh"
+    fi
+    if ! aicp_yolo_rust_bundle_ready "${yolo_install_dir}"; then
+      echo "ERROR: Rust YOLO runtime bundle is missing or incomplete: ${yolo_install_dir}" >&2
+      exit 1
+    fi
+    make -C "${demo_dir}" yolov8-init-aarch64
+    mkdir -p "${initramfs_dir}/bin" "${initramfs_dir}/lib" \
+      "${initramfs_dir}/model" "${initramfs_dir}/validation"
+    cp "${demo_dir}/build/aarch64/aicp_yolov8_init" "${initramfs_dir}/init"
+    cp "${yolo_install_dir}/aicp_yolov8_rust_onnx" "${initramfs_dir}/bin/"
+    cp -a "${yolo_install_dir}/lib/." "${initramfs_dir}/lib/"
+    cp -a "${yolo_install_dir}/model/." "${initramfs_dir}/model/"
+    cp -a "${yolo_install_dir}/validation/." "${initramfs_dir}/validation/"
   else
     rm -f "${demo_dir}/build/aarch64/aicp_init"
     make -C "${demo_dir}" linux-init-aarch64 \
@@ -483,6 +509,13 @@ if [[ "${client_impl}" == "rust" ]]; then
     "AICP HELLO"
   wait_for_marker "AICP_RUST_DONE ok="
   done_token="AICP_RUST_DONE"
+elif [[ "${client_impl}" == "yolo-rust" ]]; then
+  wait_for_marker "AICP_YOLO_LINUX_LAUNCH"
+  wait_for_marker "AICP_YOLO_RUST_BEGIN"
+  wait_for_marker "AICP_YOLO_RUST_CONNECTED"
+  wait_for_marker "AICP_YOLO_RUST_CONTROL"
+  wait_for_marker "AICP_YOLO_RUST_DONE ok="
+  done_token="AICP_YOLO_RUST_DONE"
 else
   wait_for_marker "AICP Linux guest client starting"
   wait_for_any_marker "Linux AICP connection" \

@@ -34,6 +34,20 @@ AICP_LINUX_DONE ok=1 failed=0
 scripts/ai-rtos/aicp.sh run linux arceos 20 ai 300
 ```
 
+YOLOv8n ONNX Runtime CPU 推理使用同一 Linux + ArceOS 双 Guest 拓扑，而不是主机
+参考服务。先在可用 Docker 环境中生成 Rust YOLO AArch64 运行包，然后选择
+`yolo-rust` 客户端：
+
+```sh
+apps/ai-rtos-demo/yolov8-onnx-cpu/build-docker.sh
+apps/ai-rtos-demo/yolov8-rust-onnx/build-aarch64-docker.sh
+AICP_CLIENT_IMPL=yolo-rust scripts/ai-rtos/aicp.sh run linux arceos 1 ai 420
+```
+
+成功时 Linux Guest 日志包含 `AICP_YOLO_RUST_RESULT`、
+`AICP_YOLO_RUST_CONTROL`、`AICP_YOLO_RUST_DONE ok=... failed=0`，ArceOS 日志包含
+对应的 `CONTROL seq=`。YOLO 推理时间和 AICP 往返时间分别由这些标记记录。
+
 FreeRTOS 使用同一 runner；它在启动时从 AxVisor 生成的 DTB 发现动态分配的
 VirtIO-MMIO v2 地址与 GIC IRQ，不依赖旧的直通设备地址：
 

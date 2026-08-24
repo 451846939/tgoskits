@@ -100,6 +100,12 @@ require_repo_contains apps/starry/aicp-control/prebuild.sh \
   "Starry QEMU profile must preserve the DHCP-owned interface configuration"
 require_contains yolov8-onnx-cpu/src/main.cc 'aicp_client_session_transact_control' \
   "C++ YOLOv8 client must use the shared AICP transaction core"
+require_repo_contains scripts/ai-rtos/runners/run_axvisor_dual_guest_aicp.sh \
+  'AICP_CLIENT_IMPL must be c, rust, or yolo-rust' \
+  "dual-guest runner must expose the Rust YOLO client profile"
+require_repo_contains scripts/ai-rtos/runners/run_axvisor_dual_guest_aicp.sh \
+  'AICP_YOLO_RUST_DONE' \
+  "dual-guest runner must wait for the YOLO inference control completion marker"
 require_contains rtthread-aicp/main.c '#include "aicp_service.h"' \
   "RT-Thread glue must use the shared RTOS service state machine"
 require_contains zephyr/src/main.c '#include "aicp_service.h"' \

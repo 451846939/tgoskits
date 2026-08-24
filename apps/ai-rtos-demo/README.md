@@ -42,6 +42,18 @@ scripts/ai-rtos/aicp.sh reliability
 scripts/ai-rtos/aicp.sh smoke
 ```
 
+YOLOv8n ONNX Runtime CPU 推理到 ArceOS 控制输出使用同一双 Guest runner。先按照
+`yolov8-onnx-cpu/build-docker.sh` 和 `yolov8-rust-onnx/build-aarch64-docker.sh`
+生成运行包，再执行：
+
+```sh
+AICP_CLIENT_IMPL=yolo-rust scripts/ai-rtos/aicp.sh run linux arceos 1 ai 420
+```
+
+成功日志会同时包含 `AICP_YOLO_RUST_RESULT`、`AICP_YOLO_RUST_CONTROL`、
+`AICP_YOLO_RUST_DONE ok=... failed=0` 与 ArceOS 的 `CONTROL seq=`；这条命令不
+把模型推理替换为固定参数控制策略。
+
 包含闭环、实时 A/B、三种原生 RTOS 周期基线、可靠性和控制效果的完整验证：
 
 ```sh
@@ -56,6 +68,7 @@ scripts/ai-rtos/aicp.sh full
 | Linux（2 vCPU） | FreeRTOS（1 vCPU） | AICP v1 over TCP/IP |
 | Linux（2 vCPU） | RT-Thread（1 vCPU） | AICP v1 over TCP/IP |
 | Linux（2 vCPU） | Zephyr（1 vCPU） | AICP v1 over TCP/IP |
+| Linux YOLOv8n ONNX Runtime（2 vCPU） | ArceOS（1 vCPU） | AICP v1 over TCP/IP |
 
 ArceOS 与 FreeRTOS 使用 AxVisor 的 VirtIO-MMIO v2 虚拟设备和虚拟交换机。RT-Thread
 与 Zephyr 使用 QEMU hub 连接两块分配给 Guest 的 legacy VirtIO-MMIO 设备；三组
