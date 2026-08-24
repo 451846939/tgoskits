@@ -54,8 +54,4 @@ scripts/ai-rtos/aicp.sh full
 | --- | --- | --- |
 | Linux（2 vCPU） | ArceOS（1 vCPU） | AICP v1 over TCP/IP |
 
-## 文档
-
-- 参赛设计报告、测试结果与开发排查记录由参赛队伍在仓库外维护；本目录只保留可执行源码、配置和最小复现说明。
-
 所有新增代码采用 Apache-2.0 许可证。
