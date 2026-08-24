@@ -118,7 +118,81 @@ fn register_unix_namespace() {
 
 #[cfg(feature = "net")]
 fn parse_network_config() -> ax_net::NetworkConfig {
-    ax_net::NetworkConfig::default()
+    match option_env!("AX_IP") {
+        None => ax_net::NetworkConfig::default(),
+        Some(ip) => static_network_config(
+            ip,
+            option_env!("AX_GW"),
+            option_env!("AX_PREFIX_LEN").unwrap_or("24"),
+        )
+        .unwrap_or_else(|error| panic!("invalid static network build configuration: {error}")),
+    }
+}
+
+/// Builds the opt-in static configuration for the first Ethernet interface.
+///
+/// A build that sets `AX_IP` intentionally bypasses DHCP. This prevents a
+/// later DHCP lease from replacing the address selected by a guest topology.
+#[cfg(feature = "net")]
+fn static_network_config(
+    ip: &str,
+    gateway: Option<&str>,
+    prefix_len: &str,
+) -> Result<ax_net::NetworkConfig, &'static str> {
+    let ip = ip.parse().map_err(|_| "AX_IP is not an IPv4 address")?;
+    let gateway = gateway
+        .map(str::parse)
+        .transpose()
+        .map_err(|_| "AX_GW is not an IPv4 address")?
+        .unwrap_or(core::net::Ipv4Addr::UNSPECIFIED);
+    let prefix_len = prefix_len
+        .parse()
+        .map_err(|_| "AX_PREFIX_LEN is not an unsigned integer")?;
+    if prefix_len > 32 {
+        return Err("AX_PREFIX_LEN is greater than 32");
+    }
+
+    Ok(ax_net::NetworkConfig {
+        interfaces: alloc::vec![ax_net::InterfaceConfig {
+            name: "eth0".into(),
+            match_by: ax_net::InterfaceMatcher::ByOrder(0),
+            static_ip: Some(ax_net::StaticIpConfig {
+                ip,
+                prefix_len,
+                gateway,
+            }),
+            dhcp: false,
+            metric: 100,
+            dns_servers: alloc::vec![],
+        }],
+        default_dns_servers: alloc::vec![],
+    })
+}
+
+#[cfg(all(test, feature = "net"))]
+mod network_config_tests {
+    use super::*;
+
+    #[test]
+    fn static_build_config_disables_dhcp_for_eth0() {
+        let config = static_network_config("10.0.3.2", Some("10.0.3.1"), "24").unwrap();
+        let interface = &config.interfaces[0];
+        assert_eq!(interface.name, "eth0");
+        assert!(matches!(
+            interface.match_by,
+            ax_net::InterfaceMatcher::ByOrder(0)
+        ));
+        assert!(!interface.dhcp);
+        let address = interface.static_ip.as_ref().unwrap();
+        assert_eq!(address.ip, core::net::Ipv4Addr::new(10, 0, 3, 2));
+        assert_eq!(address.gateway, core::net::Ipv4Addr::new(10, 0, 3, 1));
+        assert_eq!(address.prefix_len, 24);
+    }
+
+    #[test]
+    fn static_build_config_rejects_invalid_prefix() {
+        assert!(static_network_config("10.0.3.2", None, "33").is_err());
+    }
 }
 
 /// A wireless device that registers *after* `init_network`: its already-wrapped
