@@ -67,7 +67,12 @@ aarch64-linux-gnu-ar rcs "${build}/ffi/libaicp_yolo_ffi.a" "${build}/ffi/ort_shi
 export CARGO_TARGET_DIR="${build}/cargo"
 export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
 export RUSTFLAGS="-L native=${build}/ffi -l static=aicp_yolo_ffi -L native=${ort}/lib -l dylib=onnxruntime -l dylib=m -C link-arg=-Wl,-rpath,/lib"
-cargo build --manifest-path /demo/Cargo.toml --release --target "${target}"
+# The protocol crate is a workspace-relative path dependency.  Build from the
+# read-only repository mount so Cargo resolves that dependency within the same
+# source tree; CARGO_TARGET_DIR above still directs generated artifacts to the
+# writable demo mount.
+cargo build --manifest-path /tgoskits/apps/ai-rtos-demo/yolov8-rust-onnx/Cargo.toml \
+  --release --target "${target}"
 
 cp "${build}/cargo/${target}/release/aicp-yolov8-rust-onnx" "${install}/aicp_yolov8_rust_onnx"
 cp -a "${ort}/lib"/libonnxruntime.so* "${install}/lib/"

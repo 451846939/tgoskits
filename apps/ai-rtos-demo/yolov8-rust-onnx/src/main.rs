@@ -1155,10 +1155,6 @@ fn run(options: &Options) -> io::Result<bool> {
         configure_network(options)?;
     }
     let session = OrtSession::create(&options.model, options.threads)?;
-    let mut client = AicpClient::new(options);
-    if !options.dry_run {
-        client.ensure_connected()?;
-    }
 
     let mut ok = 0u32;
     let mut failed = 0u32;
@@ -1221,6 +1217,11 @@ fn run(options: &Options) -> io::Result<bool> {
             );
             let mut aicp_rtt_ns = 0u64;
             if !options.dry_run {
+                // CPU inference can exceed the RTOS peer's idle receive
+                // timeout. Create the short AICP session only after the
+                // model result is available, so HELLO and CONTROL are
+                // adjacent on the wire.
+                let mut client = AicpClient::new(options);
                 let (status, rtt_ns) = client.transact(mapping.control)?;
                 aicp_rtt_ns = rtt_ns;
                 rtt_sum = rtt_sum.saturating_add(rtt_ns);
