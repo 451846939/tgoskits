@@ -8,6 +8,7 @@
 #include "aicp_stream.h"
 
 #include <errno.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #ifdef __cplusplus
@@ -41,7 +42,11 @@ static inline ptrdiff_t aicp_posix_stream_write(
     size_t length) {
     struct aicp_posix_stream *posix = (struct aicp_posix_stream *)context;
     for (;;) {
+#ifdef MSG_NOSIGNAL
+        const ssize_t result = send(posix->fd, buffer, length, MSG_NOSIGNAL);
+#else
         const ssize_t result = write(posix->fd, buffer, length);
+#endif
         if (result >= 0) {
             return (ptrdiff_t)result;
         }
@@ -54,6 +59,11 @@ static inline ptrdiff_t aicp_posix_stream_write(
 static inline void aicp_posix_stream_init(
     struct aicp_posix_stream *posix,
     int fd) {
+#ifdef SO_NOSIGPIPE
+    const int one = 1;
+
+    (void)setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#endif
     posix->fd = fd;
     posix->stream.read = aicp_posix_stream_read;
     posix->stream.write = aicp_posix_stream_write;

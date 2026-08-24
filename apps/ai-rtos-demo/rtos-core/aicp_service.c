@@ -41,15 +41,18 @@ static int send_status(
     const struct aicp_service_ops *ops,
     const struct aicp_header *request) {
     struct aicp_status_payload payload;
+    uint8_t payload_wire[AICP_STATUS_PAYLOAD_LEN];
+
     control_status(control, &payload);
+    aicp_status_payload_encode(&payload, payload_wire);
     struct aicp_header response = aicp_make_header(
         AICP_MSG_STATUS,
         0,
-        sizeof(payload),
+        AICP_STATUS_PAYLOAD_LEN,
         sequence,
         monotonic_ns(ops),
         AICP_OK);
-    int result = aicp_stream_send_frame(stream, response, &payload);
+    int result = aicp_stream_send_frame(stream, response, payload_wire);
     if (result == 0) {
         emit_event(ops, AICP_SERVICE_STATUS_SENT, request, control, 0, AICP_OK);
     }
@@ -188,7 +191,7 @@ int aicp_service_serve(
             }
             break;
         case AICP_MSG_CONTROL_SET: {
-            if (header.payload_len != sizeof(struct aicp_control_payload)) {
+            if (header.payload_len != AICP_CONTROL_PAYLOAD_LEN) {
                 stats->protocol_errors++;
                 session->sequence.reply = AICP_CACHED_REPLY_ERROR;
                 session->sequence.error_code = AICP_ERR_BAD_PAYLOAD;
@@ -201,7 +204,7 @@ int aicp_service_serve(
             }
 
             struct aicp_control_payload control;
-            memcpy(&control, session->payload, sizeof(control));
+            aicp_control_payload_decode(session->payload, &control);
             control_step(&session->control, &control, header.seq);
             stats->control_requests++;
             emit_event(
