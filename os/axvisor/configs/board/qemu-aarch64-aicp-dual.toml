@@ -1,0 +1,8 @@
+# The AICP integration run boots both guests from memory images.  Do not enable
+# the host filesystem or NVMe driver: neither is assigned to a guest or used by
+# the control loop, and probing the shared root disk would add an unrelated
+# storage dependency to this network-focused test.
+features = []
+log = "Info"
+target = "aarch64-unknown-none-softfloat"
+vm_configs = []
