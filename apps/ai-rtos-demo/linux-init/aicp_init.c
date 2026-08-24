@@ -93,6 +93,15 @@
 #define AICP_INIT_STATIC_ARP 1
 #endif
 
+/*
+ * Some guest environments acquire their address before this client is
+ * started.  In that case the client must keep the runtime-owned network
+ * configuration instead of retrying Linux interface-management ioctls.
+ */
+#ifndef AICP_INIT_SKIP_IFACE_CONFIG
+#define AICP_INIT_SKIP_IFACE_CONFIG 0
+#endif
+
 #ifndef AICP_INIT_ITERATIONS
 #define AICP_INIT_ITERATIONS 40u
 #endif
@@ -256,6 +265,7 @@ static void ensure_virtual_fs(void) {
     }
 }
 
+#if !AICP_INIT_SKIP_IFACE_CONFIG
 static int set_ifaddr(int ctl, const char *ifname, unsigned long request, const char *addr) {
     struct ifreq ifr;
     struct sockaddr_in *sin = (struct sockaddr_in *)&ifr.ifr_addr;
@@ -352,8 +362,15 @@ static int add_static_arp(int ctl) {
     }
     return 0;
 }
+#endif
 
 static int configure_iface(void) {
+#if AICP_INIT_SKIP_IFACE_CONFIG
+    printf("AICP %s netcfg mode=runtime-managed iface=%s\n",
+           AICP_INIT_GUEST_LABEL,
+           AICP_INIT_IFACE);
+    return 0;
+#else
     int ctl = socket(AF_INET, SOCK_DGRAM, 0);
     if (ctl < 0) {
         return -errno;
@@ -384,6 +401,7 @@ static int configure_iface(void) {
 
     close(ctl);
     return ret;
+#endif
 }
 
 static unsigned long long read_stat(const char *name) {

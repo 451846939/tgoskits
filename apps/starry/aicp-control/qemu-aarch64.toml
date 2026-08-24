@@ -19,6 +19,6 @@ uefi = false
 to_bin = true
 shell_prefix = "root@starry:"
 shell_init_cmd = "/usr/bin/aicp-starry-run.sh"
-success_regex = ['(?m)^AICP_STARRY_DONE ok=[1-9][0-9]* failed=0\b']
-fail_regex = ['(?i)\bpanic(?:ked)?\b', '(?m)^AICP_STARRY_DONE ok=[0-9]+ failed=[1-9][0-9]*\b']
+success_regex = ['(?m)^AICP_STARRY_DONE ok=[1-9][0-9]* failed=0(?:$|\s)']
+fail_regex = ['(?i)(?:^|\s)panic(?:ked)?(?:$|\s)', '(?m)^AICP_STARRY_DONE ok=[0-9]+ failed=[1-9][0-9]*(?:$|\s)']
 timeout = 300

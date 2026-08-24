@@ -93,6 +93,11 @@ require_contains linux-init/aicp_init.c 'aicp_client_session_transact_control' \
   "Linux/Starry PID 1 must use the shared AICP transaction core"
 require_contains Makefile '\$\(AICP_STARRY_DEFS\)' \
   "Starry userspace build must consume the generated network and transport definitions"
+require_contains linux-init/aicp_init.c 'AICP_INIT_SKIP_IFACE_CONFIG' \
+  "AICP init must allow runtime-managed guest networking"
+require_repo_contains apps/starry/aicp-control/prebuild.sh \
+  'AICP_INIT_SKIP_IFACE_CONFIG=1' \
+  "Starry QEMU profile must preserve the DHCP-owned interface configuration"
 require_contains yolov8-onnx-cpu/src/main.cc 'aicp_client_session_transact_control' \
   "C++ YOLOv8 client must use the shared AICP transaction core"
 require_contains rtthread-aicp/main.c '#include "aicp_service.h"' \
