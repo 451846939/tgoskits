@@ -137,24 +137,22 @@ impl ArchOps for Aarch64Arch {
             ArmVmExit::ExternalInterrupt { token } => Ok(BoundVcpuExit::Defer(
                 Aarch64DeferredRunWork::ExternalInterrupt { token },
             )),
-            ArmVmExit::WaitForInterrupt => Ok(BoundVcpuExit::Complete(VcpuRunAction {
-                waits_for_event: true,
-                stop_reason: None,
-                resets_vm: false,
-                exits_vcpu: false,
-            })),
+            ArmVmExit::WaitForInterrupt => {
+                vcpu.get_arch_vcpu().arm_timer_wait()?;
+                Ok(BoundVcpuExit::Complete(VcpuRunAction {
+                    event_wait: VcpuEventWait::Poll,
+                    stop_reason: None,
+                    resets_vm: false,
+                    exits_vcpu: false,
+                }))
+            }
             ArmVmExit::CpuDown { state } => {
                 warn!(
                     "VM[{}] run VCpu[{}] CpuDown state {state:#x}",
                     vm.id(),
                     vcpu.id()
                 );
-                Ok(BoundVcpuExit::Complete(VcpuRunAction {
-                    waits_for_event: true,
-                    stop_reason: None,
-                    resets_vm: false,
-                    exits_vcpu: false,
-                }))
+                Ok(BoundVcpuExit::Complete(cpu_down_action()))
             }
             ArmVmExit::CpuUp {
                 target_cpu,
@@ -172,7 +170,7 @@ impl ArchOps for Aarch64Arch {
             ArmVmExit::SystemDown => {
                 warn!("VM[{}] run VCpu[{}] SystemDown", vm.id(), vcpu.id());
                 Ok(BoundVcpuExit::Complete(VcpuRunAction {
-                    waits_for_event: false,
+                    event_wait: VcpuEventWait::None,
                     stop_reason: Some(crate::StopReason::SystemDown),
                     resets_vm: false,
                     exits_vcpu: false,
@@ -187,7 +185,7 @@ impl ArchOps for Aarch64Arch {
                 Ok(BoundVcpuExit::Continue)
             }
             ArmVmExit::Nothing => Ok(BoundVcpuExit::Complete(VcpuRunAction {
-                waits_for_event: false,
+                event_wait: VcpuEventWait::None,
                 stop_reason: None,
                 resets_vm: false,
                 exits_vcpu: false,
@@ -213,14 +211,13 @@ impl ArchOps for Aarch64Arch {
             }
         }
         Ok(VcpuRunAction {
-            waits_for_event: false,
+            event_wait: VcpuEventWait::None,
             stop_reason: None,
             resets_vm: false,
             exits_vcpu: false,
         })
     }
 
-    #[cfg(not(feature = "rt-poll-idle"))]
     fn wait_for_vcpu_event(
         vm: &crate::AxVMRef,
         vcpu: &crate::vm::AxVCpuRef<Self::VCpu>,
@@ -276,6 +273,15 @@ impl ArchOps for Aarch64Arch {
             || timer_wait.is_some_and(|token| vcpu.get_arch_vcpu().timer_wait_completed(token)),
             |condition| vcpu.get_arch_vcpu().wait_for_timer_event(condition),
         );
+    }
+}
+
+fn cpu_down_action() -> VcpuRunAction {
+    VcpuRunAction {
+        event_wait: VcpuEventWait::Block,
+        stop_reason: None,
+        resets_vm: false,
+        exits_vcpu: false,
     }
 }
 
@@ -458,7 +464,6 @@ impl AxvmArmVcpu {
             .is_some_and(|binding| binding.accept_host_irq(token))
     }
 
-    #[cfg(not(feature = "rt-poll-idle"))]
     fn has_pending_interrupt(&self) -> AxVmResult<bool> {
         self.binding()?
             .has_pending_interrupt()
@@ -698,6 +703,11 @@ mod tests {
     #[test]
     fn axvm_arm_vcpu_uses_arm_exit_type() {
         assert_arm_exit_type::<AxvmArmVcpu>();
+    }
+
+    #[test]
+    fn cpu_down_uses_the_blocking_event_wait() {
+        assert_eq!(cpu_down_action().event_wait, VcpuEventWait::Block);
     }
 
     #[test]

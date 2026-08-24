@@ -235,7 +235,6 @@ pub(crate) struct VmRuntimeHandle {
     vcpu_wake_count: Arc<AtomicU64>,
 }
 
-#[cfg(any(not(feature = "rt-poll-idle"), test))]
 pub(crate) struct VcpuEventWaitSnapshot {
     notification_generation: usize,
 }
@@ -258,7 +257,6 @@ impl VcpuTimerWakeHandle {
     }
 }
 
-#[cfg(any(not(feature = "rt-poll-idle"), test))]
 pub(crate) fn wait_for_vcpu_event_if_idle(
     runtime: &VmRuntimeHandle,
     wait_snapshot: &VcpuEventWaitSnapshot,
@@ -560,12 +558,10 @@ impl VmRuntimeHandle {
         }
     }
 
-    #[cfg(any(not(feature = "rt-poll-idle"), test))]
     pub(crate) fn notification_generation(&self) -> usize {
         self.notification_generation.load(Ordering::Acquire)
     }
 
-    #[cfg(any(not(feature = "rt-poll-idle"), test))]
     pub(crate) fn vcpu_event_wait_snapshot(&self) -> VcpuEventWaitSnapshot {
         VcpuEventWaitSnapshot {
             notification_generation: self.notification_generation(),
@@ -611,7 +607,6 @@ impl VmRuntimeHandle {
         self.notify_one();
     }
 
-    #[cfg(any(not(feature = "rt-poll-idle"), test))]
     pub(crate) fn device_poll_requested(&self) -> bool {
         self.device_poll_requested.load(Ordering::Acquire)
     }
@@ -717,7 +712,6 @@ impl VmRuntimeHandle {
     }
 }
 
-#[cfg(any(not(feature = "rt-poll-idle"), test))]
 impl VcpuEventWaitSnapshot {
     pub(crate) fn has_pending_event(&self, runtime: &VmRuntimeHandle) -> bool {
         runtime.device_poll_requested()

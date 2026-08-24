@@ -562,17 +562,11 @@ fn vcpu_run() {
                     }
                     notify_all_vcpus(vm_id);
                 }
-                VcpuRunAction {
-                    waits_for_event: true,
-                    ..
-                } => {
-                    // A CPU-isolated polling vCPU keeps executing after WFI so
-                    // timer and virtual-device state are observed at VM-exit
-                    // boundaries instead of sleeping on the shared host queue.
-                    #[cfg(not(feature = "rt-poll-idle"))]
-                    CurrentArch::wait_for_vcpu_event(&vm, &vcpu, &runtime);
+                VcpuRunAction { event_wait, .. } => {
+                    if event_wait_uses_shared_wait(event_wait) {
+                        CurrentArch::wait_for_vcpu_event(&vm, &vcpu, &runtime);
+                    }
                 }
-                VcpuRunAction { .. } => {}
             }
         }
 
@@ -656,6 +650,19 @@ fn vcpu_run() {
     info!("VM[{}] VCpu[{}] exiting...", vm_id, vcpu_id);
 }
 
+/// Selects the runtime wait path for a vCPU exit action.
+///
+/// The realtime profile may poll an ordinary WFI/WFE exit, but a lifecycle
+/// transition such as PSCI `CPU_OFF` must still block until it is explicitly
+/// resumed or stopped.
+fn event_wait_uses_shared_wait(event_wait: crate::architecture::VcpuEventWait) -> bool {
+    match event_wait {
+        crate::architecture::VcpuEventWait::None => false,
+        crate::architecture::VcpuEventWait::Block => true,
+        crate::architecture::VcpuEventWait::Poll => !cfg!(feature = "rt-poll-idle"),
+    }
+}
+
 fn poll_primary_vcpu_devices_with(runtime: &VmRuntimeHandle, poll_devices: impl FnOnce()) -> bool {
     let consumed_request = runtime.take_device_poll_request();
     poll_devices();
@@ -695,6 +702,21 @@ fn poll_vm_dma_devices(vm: &VMRef) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn powered_down_vcpu_keeps_shared_wait_in_polling_profile() {
+        assert!(event_wait_uses_shared_wait(
+            crate::architecture::VcpuEventWait::Block
+        ));
+    }
+
+    #[test]
+    fn ordinary_idle_wait_uses_profile_selected_path() {
+        assert_eq!(
+            event_wait_uses_shared_wait(crate::architecture::VcpuEventWait::Poll),
+            !cfg!(feature = "rt-poll-idle")
+        );
+    }
 
     #[test]
     fn vcpu_waits_for_runtime_registration_before_entering_guest() {

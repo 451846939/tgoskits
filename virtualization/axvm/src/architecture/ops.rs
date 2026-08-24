@@ -40,7 +40,6 @@ pub(crate) trait ArchOps {
         Ok(())
     }
 
-    #[cfg(not(feature = "rt-poll-idle"))]
     fn wait_for_vcpu_event(
         vm: &crate::AxVMRef,
         _vcpu: &crate::vm::AxVCpuRef<Self::VCpu>,
