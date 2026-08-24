@@ -29,6 +29,18 @@ arch = "aarch64"
 cases = ["smoke", "gicv2-timer-stress", "gicv3-timer-stress"]
 
 [[check]]
+id = "test-axvisor-aarch64-aicp-linux-arceos-loop"
+impact_targets = ["axvisor:aarch64"]
+name = "QEMU aarch64 · Linux-ArceOS AICP control loop"
+timeout_minutes = 30
+command = '''
+echo "==> pull qemu-aarch64 image"
+cargo xtask image pull qemu-aarch64 --extract-dir tmp/images
+echo "==> axvisor Linux-ArceOS AICP TCP/IP control loop"
+scripts/ai-rtos/aicp.sh smoke 3 ai 300
+'''
+
+[[check]]
 id = "test-axvisor-aarch64-qemu-panic-modes"
 impact_targets = ["axvisor:aarch64"]
 name = "QEMU aarch64 · Panic modes"
