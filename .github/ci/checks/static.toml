@@ -19,3 +19,12 @@ upload_xtask_bin_artifact = true
 command = '''
 cargo xtask sync-lint --since "$SINCE_REF"
 '''
+
+[[check]]
+id = "test-aicp-host-protocol"
+name = "AICP host protocol tests"
+runner = "qcs"
+timeout_minutes = 10
+command = '''
+make -C apps/ai-rtos-demo test
+'''
