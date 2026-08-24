@@ -86,7 +86,7 @@ scripts/ai-rtos/aicp.sh run linux arceos 20 fixed 300
 | --- | --- |
 | `aicp.sh smoke` | 主机协议、超时/重连、Linux 2-vCPU 与默认 ArceOS TCP/IP 闭环、网络隔离检查 |
 | `aicp.sh full` | 在 smoke 基础上增加控制效果对比、实时 A/B 与原生 RTOS 周期基线 |
-| `aicp.sh realtime` | 单独执行 AxVisor 实时路径 A/B 测量 |
+| `aicp.sh realtime [次数] [超时秒数] [Linux 压力进程数] [轮数]` | 单独执行 AxVisor 实时路径 A/B 测量；多轮时交替执行对照组和优化组以降低执行顺序影响 |
 | `aicp.sh baseline <rtthread|zephyr|freertos|all>` | 原生 RTOS 周期基线，不宣称为 AxVisor 网络闭环 |
 | `aicp.sh reliability` | 主机侧 AICP 分帧、超时、重连和异常恢复回归 |
 

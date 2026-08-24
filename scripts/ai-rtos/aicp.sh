@@ -16,7 +16,7 @@ usage() {
   scripts/ai-rtos/aicp.sh smoke
   scripts/ai-rtos/aicp.sh full
   scripts/ai-rtos/aicp.sh run linux <arceos|freertos|rtthread|zephyr> [次数] [ai|fixed] [超时秒数]
-  scripts/ai-rtos/aicp.sh realtime [次数] [超时秒数] [Linux 压力进程数]
+  scripts/ai-rtos/aicp.sh realtime [次数] [超时秒数] [Linux 压力进程数] [轮数]
   scripts/ai-rtos/aicp.sh baseline <rtthread|zephyr|freertos|all>
   scripts/ai-rtos/aicp.sh reliability [次数] [超时秒数]
   scripts/ai-rtos/aicp.sh list
@@ -27,7 +27,7 @@ usage() {
   smoke       最小次数验证 Linux 2-vCPU 与默认 ArceOS 控制 Guest 的 TCP/IP 闭环
   full        执行闭环、控制效果对比、实时 A/B 和原生 RTOS 基线
   run         单独运行一组双 Guest，便于演示和排障
-  realtime    执行 AxVisor 实时优化前后 A/B 对比
+  realtime    执行 AxVisor 实时优化前后 A/B 对比；多轮时交替执行对照组和优化组
   baseline    执行原生 RTOS 20 ms 周期任务空载/压力基线
   reliability 执行主机侧协议可靠性与异常恢复测试
   list        显示入口和底层脚本的职责分类
@@ -172,7 +172,7 @@ case "${command_name}" in
     run_pair "$2" "$3" "${@:4}"
     ;;
   realtime)
-    require_arg_count 1 4 "$#"
+    require_arg_count 1 5 "$#"
     exec "${script_dir}/runners/run_axvisor_rt_before_after.sh" "${@:2}"
     ;;
   baseline)
