@@ -150,11 +150,34 @@ fn wait_probe_asset(child: &mut Child, stop: &AtomicBool) -> Option<ExitStatus> 
 mod tests {
     use std::path::PathBuf;
     #[cfg(unix)]
-    use std::time::Instant;
+    use std::{fs, time::Instant};
 
     use serde::Deserialize;
 
     use super::{super::types::DEFAULT_PROBE_SCRIPT, *};
+
+    fn fixture_dir() -> tempfile::TempDir {
+        #[cfg(unix)]
+        {
+            // Some CI runners mount their system temporary directory with
+            // `noexec`. Probe fixtures are deliberately executable, so keep
+            // them below the workspace build directory instead.
+            let root = std::env::current_dir()
+                .unwrap()
+                .join("target")
+                .join("axbuild-http-probe-fixtures");
+            fs::create_dir_all(&root).unwrap();
+            tempfile::Builder::new()
+                .prefix("probe-")
+                .tempdir_in(root)
+                .unwrap()
+        }
+
+        #[cfg(not(unix))]
+        {
+            tempfile::tempdir().unwrap()
+        }
+    }
 
     fn test_config(probe_script: PathBuf) -> AxvisorHttpProbeConfig {
         AxvisorHttpProbeConfig {
@@ -223,7 +246,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn run_executes_the_case_probe_asset_with_env() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = fixture_dir();
         let probe = write_fixture_probe(dir.path(), "http_probe.py", 0);
         let config = test_config(PathBuf::from("http_probe.py"));
         let stop = Arc::new(AtomicBool::new(false));
@@ -244,7 +267,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn run_propagates_nonzero_probe_exit() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = fixture_dir();
         write_fixture_probe(dir.path(), "http_probe.py", 1);
         let config = test_config(PathBuf::from("http_probe.py"));
         let stop = Arc::new(AtomicBool::new(false));
@@ -255,7 +278,7 @@ mod tests {
 
     #[test]
     fn run_rejects_a_missing_probe_asset() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = fixture_dir();
         let config = test_config(PathBuf::from("http_probe.py"));
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -266,7 +289,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn run_kills_the_probe_asset_when_stop_is_requested() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = fixture_dir();
         write_blocking_fixture_probe(dir.path(), "http_probe.py");
         let config = test_config(PathBuf::from("http_probe.py"));
         let case_dir = dir.path().to_path_buf();
@@ -296,7 +319,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn run_does_not_spawn_probe_when_stop_was_already_requested() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = fixture_dir();
         let probe = dir.path().join("http_probe.py");
         std::fs::write(&probe, "#!/bin/sh\nexit 0\n").unwrap();
         let config = test_config(PathBuf::from("http_probe.py"));
