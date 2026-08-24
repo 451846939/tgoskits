@@ -86,6 +86,12 @@ fi
 
 if [[ ! -f "${model_dir}/yolov8n.onnx" ]]; then
   echo "[aicp-yolo-cpu] direct ONNX asset unavailable; exporting with ultralytics"
+  # Export happens on the host side only.  Pull the CPU wheel explicitly so a
+  # GPU-enabled PyTorch resolver cannot download CUDA packages that are never
+  # used by this ONNX Runtime CPU deployment.
+  python3 -m pip install --break-system-packages --no-cache-dir \
+    --index-url https://download.pytorch.org/whl/cpu \
+    torch torchvision
   python3 -m pip install --break-system-packages --no-cache-dir ultralytics onnx
   tmp_export="$(mktemp -d)"
   (

@@ -746,6 +746,28 @@ private:
     };
 };
 
+static int connect_control_client(AicpClient *client, const Options &opt)
+{
+    int ret = -ECONNREFUSED;
+    for (int attempt = 1; attempt <= opt.connect_retries; attempt++) {
+        ret = client->connect_to(opt.aicp_host, opt.aicp_port, opt.connect_timeout_ms);
+        if (ret == 0) {
+            ret = client->send_hello();
+            if (ret == 0) {
+                std::printf("AICP_YOLO_CPU_CONNECTED attempt=%d\n", attempt);
+                return 0;
+            }
+            std::printf("AICP_YOLO_CPU_CONNECT_RETRY attempt=%d stage=hello ret=%d\n", attempt, ret);
+        } else {
+            std::printf("AICP_YOLO_CPU_CONNECT_RETRY attempt=%d stage=connect ret=%d\n", attempt, ret);
+        }
+        if (attempt < opt.connect_retries) {
+            usleep((useconds_t)opt.connect_retry_delay_ms * 1000);
+        }
+    }
+    return ret;
+}
+
 static std::vector<std::string> read_labels(const std::string &path)
 {
     try {
@@ -797,31 +819,6 @@ int main(int argc, char **argv)
 
         std::array<int64_t, 4> input_shape = { 1, 3, opt.input_size, opt.input_size };
         Ort::MemoryInfo memory_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
-
-        AicpClient client;
-        if (!opt.dry_run) {
-            int ret = -ECONNREFUSED;
-            for (int attempt = 1; attempt <= opt.connect_retries; attempt++) {
-                ret = client.connect_to(opt.aicp_host, opt.aicp_port, opt.connect_timeout_ms);
-                if (ret == 0) {
-                    ret = client.send_hello();
-                    if (ret == 0) {
-                        std::printf("AICP_YOLO_CPU_CONNECTED attempt=%d\n", attempt);
-                        break;
-                    }
-                    std::printf("AICP_YOLO_CPU_CONNECT_RETRY attempt=%d stage=hello ret=%d\n", attempt, ret);
-                } else {
-                    std::printf("AICP_YOLO_CPU_CONNECT_RETRY attempt=%d stage=connect ret=%d\n", attempt, ret);
-                }
-                if (attempt < opt.connect_retries) {
-                    usleep((useconds_t)opt.connect_retry_delay_ms * 1000);
-                }
-            }
-            if (ret != 0) {
-                std::printf("AICP_YOLO_CPU_FAIL stage=connect_or_hello ret=%d retries=%d\n", ret, opt.connect_retries);
-                return 1;
-            }
-        }
 
         unsigned ok = 0;
         unsigned failed = 0;
@@ -876,11 +873,22 @@ int main(int argc, char **argv)
                             (unsigned long long)infer_ns);
 
                 if (!opt.dry_run) {
+                    // CPU inference can exceed the RTOS peer's idle receive
+                    // timeout. Establish the short control session only after
+                    // the result is ready, so HELLO and CONTROL are adjacent.
+                    AicpClient client;
+                    int ret = connect_control_client(&client, opt);
+                    if (ret != 0) {
+                        std::printf("AICP_YOLO_CPU_FAIL image=%s stage=connect_or_hello ret=%d retries=%d\n",
+                                    path.c_str(), ret, opt.connect_retries);
+                        failed++;
+                        continue;
+                    }
                     uint64_t rtt_ns = 0;
                     float measured = 0.0f;
                     float error = 0.0f;
                     float output = 0.0f;
-                    int ret = client.send_control(mapping, &rtt_ns, &measured, &error, &output);
+                    ret = client.send_control(mapping, &rtt_ns, &measured, &error, &output);
                     if (ret != 0) {
                         std::printf("AICP_YOLO_CPU_FAIL image=%s stage=aicp_send ret=%d\n", path.c_str(), ret);
                         failed++;
