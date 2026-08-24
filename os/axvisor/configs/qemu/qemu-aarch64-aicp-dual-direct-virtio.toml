@@ -1,0 +1,29 @@
+args = [
+  "-nographic",
+  "-cpu",
+  "cortex-a72",
+  "-machine",
+  "virt,virtualization=on,gic-version=3",
+  "-smp",
+  "4",
+  "-device",
+  "virtio-blk-device,drive=disk0",
+  "-drive",
+  "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-aarch64-alpine.img",
+  # The two assigned virtio-net devices are connected through a QEMU hub;
+  # neither endpoint uses user-mode NAT as its guest data path.
+  "-netdev",
+  "hubport,id=linuxnet,hubid=3",
+  "-device",
+  "virtio-net-device,netdev=linuxnet,mac=52:54:00:aa:03:03,csum=off,guest_csum=off,guest_tso4=off,guest_tso6=off,guest_ecn=off,guest_ufo=off,host_tso4=off,host_tso6=off,host_ecn=off,host_ufo=off,mrg_rxbuf=off",
+  "-netdev",
+  "hubport,id=rtosnet,hubid=3",
+  "-device",
+  "virtio-net-device,netdev=rtosnet,mac=52:54:00:aa:03:02,csum=off,guest_csum=off,guest_tso4=off,guest_tso6=off,guest_ecn=off,guest_ufo=off,host_tso4=off,host_tso6=off,host_ecn=off,host_ufo=off,mrg_rxbuf=on",
+  "-m",
+  "8g",
+]
+fail_regex = []
+success_regex = []
+to_bin = true
+uefi = false

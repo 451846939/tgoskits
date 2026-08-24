@@ -10,7 +10,7 @@ target_sources(app PRIVATE
 )
 
 option(AICP_ZEPHYR_VIRTIO_LEGACY
-  "Use the application-owned legacy virtio-mmio transport for AxVisor"
+  "Use the AxVisor direct virtio-mmio transport"
   OFF
 )
 

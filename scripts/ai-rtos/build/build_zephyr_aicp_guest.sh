@@ -19,7 +19,7 @@ qemu_cortex_a53. The script expects an existing Zephyr workspace:
   export ZEPHYR_REQUIRED_REF=v4.4.0          # optional, defaults to v4.4.0
   export ZEPHYR_TOOLCHAIN_VARIANT=cross-compile
   export CROSS_COMPILE=/path/to/aarch64-linux-musl-
-  export AICP_ZEPHYR_PROFILE=e1000          # e1000 or axvisor-virtio
+  export AICP_ZEPHYR_PROFILE=e1000          # e1000 or axvisor-direct-virtio
 
 Output:
   $ZEPHYR_BUILD_DIR/zephyr/zephyr.bin
@@ -78,7 +78,7 @@ cmake_args=()
 case "${profile}" in
   e1000)
     ;;
-  axvisor-virtio)
+  axvisor-direct-virtio)
     cmake_args+=(
       "-DAICP_ZEPHYR_VIRTIO_LEGACY=ON"
       "-DEXTRA_CONF_FILE=${app_dir}/axvisor-virtio.conf"
@@ -86,7 +86,7 @@ case "${profile}" in
     )
     ;;
   *)
-    echo "ERROR: AICP_ZEPHYR_PROFILE must be e1000 or axvisor-virtio." >&2
+    echo "ERROR: AICP_ZEPHYR_PROFILE must be e1000 or axvisor-direct-virtio." >&2
     exit 2
     ;;
 esac

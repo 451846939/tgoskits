@@ -19,8 +19,9 @@ the topology with AICP_HOST_CPUS, AICP_LINUX_VCPU0_PCPU,
 AICP_LINUX_VCPU1_PCPU, and AICP_RTOS_VCPU0_PCPU.
 
 Set AICP_CLIENT_IMPL=c or AICP_CLIENT_IMPL=rust to select the Linux client.
-Set AICP_RTOS_GUEST=arceos or AICP_RTOS_GUEST=freertos to select the control guest.
-Both guests communicate through AxVisor's isolated virtual switch.
+Set AICP_RTOS_GUEST=arceos, freertos, or zephyr to select the control guest.
+ArceOS and FreeRTOS use AxVisor's isolated virtual switch. Zephyr uses the
+QEMU hub-backed direct VirtIO-MMIO compatibility path.
 EOF
 }
 
@@ -43,8 +44,9 @@ if [[ "${client_impl}" != "c" && "${client_impl}" != "rust" ]]; then
   echo "ERROR: AICP_CLIENT_IMPL must be c or rust, got '${client_impl}'" >&2
   exit 2
 fi
-if [[ "${rtos_guest}" != "arceos" && "${rtos_guest}" != "freertos" ]]; then
-  echo "ERROR: AICP_RTOS_GUEST must be arceos or freertos, got '${rtos_guest}'" >&2
+if [[ "${rtos_guest}" != "arceos" && "${rtos_guest}" != "freertos" && \
+      "${rtos_guest}" != "zephyr" ]]; then
+  echo "ERROR: AICP_RTOS_GUEST must be arceos, freertos, or zephyr, got '${rtos_guest}'" >&2
   exit 2
 fi
 
@@ -75,12 +77,18 @@ linux_vm="${out_dir}/${run_name}-linux.generated.toml"
 rtos_vm="${out_dir}/${run_name}-${rtos_guest}.generated.toml"
 qemu_config="${out_dir}/${run_name}-qemu.generated.toml"
 qemu_template="${repo_root}/os/axvisor/configs/qemu/qemu-aarch64-aicp-dual-net.toml"
+zephyr_host_dtb="${out_dir}/${run_name}-zephyr-host.dtb"
+zephyr_host_base_dtb="${out_dir}/${run_name}-zephyr-host-base.dtb"
+zephyr_host_overlay_dts="${out_dir}/${run_name}-zephyr-reserved-memory-overlay.dts"
+zephyr_host_overlay_dtbo="${out_dir}/${run_name}-zephyr-reserved-memory.dtbo"
 initramfs_dir="${out_dir}/${run_name}-initramfs"
 initramfs="${out_dir}/${run_name}-initramfs.cpio.gz"
 linux_kernel="${bundle_dir}/linux/linux-qemu"
 arceos_bin="${repo_root}/target/aarch64-unknown-linux-musl/release/arceos-aicp-server.bin"
 arceos_build_config="apps/arceos/aicp-server/build-aarch64-unknown-none-softfloat.toml"
 freertos_bin="${out_dir}/build-freertos-aicp/aicp-freertos.bin"
+zephyr_build_dir="${AICP_ZEPHYR_BUILD_DIR:-${out_dir}/build-zephyr-aicp-direct}"
+zephyr_bin="${AICP_ZEPHYR_BIN:-${zephyr_build_dir}/zephyr/zephyr.bin}"
 
 cleanup() {
   aicp_cleanup_process_tree "${qemu_pid:-}"
@@ -105,6 +113,47 @@ require_tool() {
     echo "ERROR: missing required tool: $1" >&2
     exit 1
   fi
+}
+
+prepare_zephyr_direct_virtio_host_dtb() {
+  for tool in qemu-system-aarch64 dtc fdtoverlay; do
+    require_tool "${tool}"
+  done
+
+  rm -f "${zephyr_host_base_dtb}" "${zephyr_host_overlay_dtbo}" "${zephyr_host_dtb}"
+  qemu-system-aarch64 \
+    -display none \
+    -monitor none \
+    -serial null \
+    -cpu cortex-a72 \
+    -machine "virt,virtualization=on,gic-version=3,dumpdtb=${zephyr_host_base_dtb}" \
+    -smp "${host_cpus}" \
+    -m 8g
+
+  cat > "${zephyr_host_overlay_dts}" <<'EOF'
+/dts-v1/;
+/plugin/;
+
+/ {
+    fragment@0 {
+        target-path = "/";
+        __overlay__ {
+            reserved-memory {
+                #address-cells = <2>;
+                #size-cells = <2>;
+                ranges;
+                zephyr@d0000000 {
+                    reg = <0x0 0xd0000000 0x0 0x08000000>;
+                    no-map;
+                };
+            };
+        };
+    };
+};
+EOF
+  dtc -@ -I dts -O dtb -o "${zephyr_host_overlay_dtbo}" "${zephyr_host_overlay_dts}"
+  fdtoverlay -i "${zephyr_host_base_dtb}" -o "${zephyr_host_dtb}" \
+    "${zephyr_host_overlay_dtbo}"
 }
 
 prepare_arceos_raw_image() {
@@ -164,6 +213,24 @@ build_linux_initramfs() {
 }
 
 write_linux_vm_config() {
+  local memory_map_type="0"
+  local device_config
+
+  device_config='passthrough = []
+disabled = []
+
+[[devices.virtual]]
+id = "aicp-net"
+model = "virtio-net"
+guest_mac = [0x52, 0x54, 0x00, 0xaa, 0x03, 0x03]'
+  if [[ "${rtos_guest}" == "zephyr" ]]; then
+    memory_map_type="2"
+    device_config='passthrough = [
+  { path = "/virtio_mmio@a003c00" },
+]
+disabled = []'
+  fi
+
   cat > "${linux_vm}" <<EOF
 [base]
 id = 1
@@ -183,17 +250,11 @@ ramdisk_path = "${initramfs}"
 ramdisk_load_addr = 0x9000_0000
 cmdline = "console=ttyAMA0 earlycon rdinit=/init panic=-1 loglevel=7 aicp.iterations=${iterations} aicp.mode=${mode} aicp.connect_retries=120"
 memory_regions = [
-  [0x8000_0000, 0x2000_0000, 0x7, 0],
+  [0x8000_0000, 0x2000_0000, 0x7, ${memory_map_type}],
 ]
 
 [devices]
-passthrough = []
-disabled = []
-
-[[devices.virtual]]
-id = "aicp-net"
-model = "virtio-net"
-guest_mac = [0x52, 0x54, 0x00, 0xaa, 0x03, 0x03]
+${device_config}
 EOF
 }
 
@@ -204,6 +265,7 @@ write_rtos_vm_config() {
   local dtb_load_addr
   local memory_base
   local memory_size
+  local device_config
   local guest_name
 
   case "${rtos_guest}" in
@@ -214,6 +276,7 @@ write_rtos_vm_config() {
       dtb_load_addr="0xC000_0000"
       memory_base="0xC000_0000"
       memory_size="0x1000_0000"
+      memory_map_type="0"
       guest_name="arceos-aicp-dual-qemu"
       ;;
     freertos)
@@ -223,9 +286,34 @@ write_rtos_vm_config() {
       dtb_load_addr="0xD7E0_0000"
       memory_base="0xD000_0000"
       memory_size="0x0800_0000"
+      memory_map_type="0"
       guest_name="freertos-aicp-dual-qemu"
       ;;
+    zephyr)
+      entry_point="0xD000_1104"
+      kernel_path="${zephyr_bin}"
+      kernel_load_addr="0xD000_0000"
+      dtb_load_addr="0xD7E0_0000"
+      memory_base="0xD000_0000"
+      memory_size="0x0800_0000"
+      memory_map_type="2"
+      guest_name="zephyr-aicp-dual-qemu"
+      ;;
   esac
+
+  device_config='passthrough = []
+disabled = []
+
+[[devices.virtual]]
+id = "aicp-net"
+model = "virtio-net"
+guest_mac = [0x52, 0x54, 0x00, 0xaa, 0x03, 0x02]'
+  if [[ "${rtos_guest}" == "zephyr" ]]; then
+    device_config='passthrough = [
+  { path = "/virtio_mmio@a003a00" },
+]
+disabled = []'
+  fi
 
   cat > "${rtos_vm}" <<EOF
 [base]
@@ -243,17 +331,11 @@ kernel_path = "${kernel_path}"
 kernel_load_addr = ${kernel_load_addr}
 dtb_load_addr = ${dtb_load_addr}
 memory_regions = [
-  [${memory_base}, ${memory_size}, 0x7, 0],
+  [${memory_base}, ${memory_size}, 0x7, ${memory_map_type}],
 ]
 
 [devices]
-passthrough = []
-disabled = []
-
-[[devices.virtual]]
-id = "aicp-net"
-model = "virtio-net"
-guest_mac = [0x52, 0x54, 0x00, 0xaa, 0x03, 0x02]
+${device_config}
 EOF
 }
 
@@ -289,28 +371,48 @@ case "${rtos_guest}" in
       exit 1
     fi
     ;;
+  zephyr)
+    if [[ "${AICP_ZEPHYR_SKIP_BUILD:-0}" != "1" ]]; then
+      echo "[ai-rtos] Building Zephyr RTOS guest with direct VirtIO-MMIO"
+      AICP_ZEPHYR_PROFILE=axvisor-direct-virtio \
+        ZEPHYR_BUILD_DIR="${zephyr_build_dir}" \
+        "${repo_root}/scripts/ai-rtos/build/build_zephyr_aicp_guest.sh"
+    fi
+    if [[ ! -s "${zephyr_bin}" ]]; then
+      echo "ERROR: Zephyr AICP binary is missing or empty: ${zephyr_bin}" >&2
+      exit 1
+    fi
+    ;;
 esac
 
-echo "[ai-rtos] Generating AxVM virtual-device guest configurations"
+echo "[ai-rtos] Generating AxVM guest configurations"
 write_linux_vm_config
 write_rtos_vm_config
 
+if [[ "${rtos_guest}" == "zephyr" ]]; then
+  qemu_template="${repo_root}/os/axvisor/configs/qemu/qemu-aarch64-aicp-dual-direct-virtio.toml"
+  prepare_zephyr_direct_virtio_host_dtb
+fi
 cp "${qemu_template}" "${qemu_config}"
+if [[ "${rtos_guest}" == "zephyr" ]]; then
+  ZEPHYR_HOST_DTB="${zephyr_host_dtb}" perl -0pi -e \
+    's#  "-machine",#  "-dtb",\n  "$ENV{ZEPHYR_HOST_DTB}",\n  "-machine",#' \
+    "${qemu_config}"
+fi
 rm -f "${linux_console_log}"
 AXVISOR_CONSOLE_LOG="${log_file}" LINUX_CONSOLE_LOG="${linux_console_log}" perl -0pi -e \
   's#  "-nographic",#  "-display",\n  "none",\n  "-monitor",\n  "none",\n  "-serial",\n  "file:$ENV{AXVISOR_CONSOLE_LOG}",\n  "-serial",\n  "file:$ENV{LINUX_CONSOLE_LOG}",#' \
   "${qemu_config}"
 
 echo "[ai-rtos] Booting AxVisor Linux + ${rtos_guest} dual guest; log: ${log_file}"
-(
-  cd "${repo_root}"
-  aicp_exec_new_session cargo xtask axvisor qemu \
-    --config "${axvisor_board_config}" \
-    --qemu-config "${qemu_config}" \
-    --vmconfigs "${rtos_vm}" \
-    --vmconfigs "${linux_vm}"
-) > "${log_file}" 2>&1 &
+pushd "${repo_root}" >/dev/null
+aicp_exec_new_session cargo xtask axvisor qemu \
+  --config "${axvisor_board_config}" \
+  --qemu-config "${qemu_config}" \
+  --vmconfigs "${rtos_vm}" \
+  --vmconfigs "${linux_vm}" > "${log_file}" 2>&1 &
 qemu_pid=$!
+popd >/dev/null
 
 case "${rtos_guest}" in
   arceos)
@@ -324,6 +426,10 @@ case "${rtos_guest}" in
     wait_for_marker "AICP_FREERTOS_FDT_VIRTIO base="
     wait_for_marker "AICP_FREERTOS_READY transport=tcp port=8800 ip=10.0.3.2"
     control_marker="AICP_FREERTOS_CONTROL seq="
+    ;;
+  zephyr)
+    wait_for_marker "AICP_ZEPHYR_NET_UP"
+    control_marker="AICP_ZEPHYR_CONTROL seq="
     ;;
 esac
 if [[ "${client_impl}" == "rust" ]]; then
