@@ -9,7 +9,6 @@
 
 #include <string.h>
 
-#define VIRTIO_MMIO_BASE                 0x0a003a00UL
 #define VIRTIO_MMIO_MAGIC_VALUE          0x000U
 #define VIRTIO_MMIO_VERSION              0x004U
 #define VIRTIO_MMIO_DEVICE_ID            0x008U
@@ -17,31 +16,36 @@
 #define VIRTIO_MMIO_DEVICE_FEATURES_SEL  0x014U
 #define VIRTIO_MMIO_DRIVER_FEATURES      0x020U
 #define VIRTIO_MMIO_DRIVER_FEATURES_SEL  0x024U
-#define VIRTIO_MMIO_GUEST_PAGE_SIZE      0x028U
 #define VIRTIO_MMIO_QUEUE_SEL            0x030U
 #define VIRTIO_MMIO_QUEUE_NUM_MAX        0x034U
 #define VIRTIO_MMIO_QUEUE_NUM            0x038U
-#define VIRTIO_MMIO_QUEUE_ALIGN          0x03cU
-#define VIRTIO_MMIO_QUEUE_PFN            0x040U
+#define VIRTIO_MMIO_QUEUE_READY          0x044U
 #define VIRTIO_MMIO_QUEUE_NOTIFY         0x050U
 #define VIRTIO_MMIO_INTERRUPT_STATUS     0x060U
 #define VIRTIO_MMIO_INTERRUPT_ACK        0x064U
 #define VIRTIO_MMIO_STATUS               0x070U
+#define VIRTIO_MMIO_QUEUE_DESC_LOW       0x080U
+#define VIRTIO_MMIO_QUEUE_DESC_HIGH      0x084U
+#define VIRTIO_MMIO_QUEUE_AVAIL_LOW      0x090U
+#define VIRTIO_MMIO_QUEUE_AVAIL_HIGH     0x094U
+#define VIRTIO_MMIO_QUEUE_USED_LOW       0x0A0U
+#define VIRTIO_MMIO_QUEUE_USED_HIGH      0x0A4U
 #define VIRTIO_MMIO_CONFIG               0x100U
 
 #define VIRTIO_MAGIC                     0x74726976U
-#define VIRTIO_LEGACY_VERSION            1U
+#define VIRTIO_MODERN_VERSION             2U
 #define VIRTIO_DEVICE_NET                1U
 #define VIRTIO_STATUS_ACKNOWLEDGE         1U
 #define VIRTIO_STATUS_DRIVER              2U
 #define VIRTIO_STATUS_DRIVER_OK           4U
 #define VIRTIO_STATUS_FEATURES_OK         8U
+#define VIRTIO_F_VERSION_1                ( 1U << 0U )
 #define VIRTIO_NET_F_MAC                  5U
 #define VIRTQ_DESC_F_WRITE                2U
 #define VIRTIO_PAGE_SIZE                  4096U
 #define VIRTIO_QUEUE_SIZE                 16U
 #define VIRTIO_RING_BYTES                 ( 2U * VIRTIO_PAGE_SIZE )
-#define VIRTIO_NET_HEADER_SIZE            10U
+#define VIRTIO_NET_HEADER_SIZE            12U
 #define VIRTIO_MAX_FRAME_SIZE             1536U
 #define VIRTIO_BUFFER_SIZE                ( VIRTIO_NET_HEADER_SIZE + VIRTIO_MAX_FRAME_SIZE )
 #define VIRTIO_RX_QUEUE                   0U
@@ -88,16 +92,24 @@ static uint32_t rx_count;
 static uint32_t tx_count;
 static bool tx_in_flight;
 
+static uintptr_t virtio_mmio_base;
+
 static inline uint32_t mmio_read32( uint32_t offset )
 {
     __asm volatile( "dmb ish" ::: "memory" );
-    return *( volatile uint32_t * )( VIRTIO_MMIO_BASE + offset );
+    return *( volatile uint32_t * )( virtio_mmio_base + offset );
 }
 
 static inline void mmio_write32( uint32_t offset, uint32_t value )
 {
-    *( volatile uint32_t * )( VIRTIO_MMIO_BASE + offset ) = value;
+    *( volatile uint32_t * )( virtio_mmio_base + offset ) = value;
     __asm volatile( "dmb ish" ::: "memory" );
+}
+
+static void mmio_write64( uint32_t low_offset, uint64_t value )
+{
+    mmio_write32( low_offset, ( uint32_t ) value );
+    mmio_write32( low_offset + 4U, ( uint32_t )( value >> 32U ) );
 }
 
 static inline void publish( void )
@@ -128,20 +140,22 @@ static bool queue_activate( uint32_t index, struct virtqueue * queue )
 {
     mmio_write32( VIRTIO_MMIO_QUEUE_SEL, index );
     const uint32_t maximum = mmio_read32( VIRTIO_MMIO_QUEUE_NUM_MAX );
-    if( maximum < VIRTIO_QUEUE_SIZE || mmio_read32( VIRTIO_MMIO_QUEUE_PFN ) != 0U ) {
-        aicp_uart_printf( "AICP_FREERTOS_VIRTIO_QUEUE_FAIL queue=%u max=%u pfn=%x\n",
+    if( maximum < VIRTIO_QUEUE_SIZE || mmio_read32( VIRTIO_MMIO_QUEUE_READY ) != 0U ) {
+        aicp_uart_printf( "AICP_FREERTOS_VIRTIO_QUEUE_FAIL queue=%u max=%u ready=%x\n",
                           index,
                           maximum,
-                          mmio_read32( VIRTIO_MMIO_QUEUE_PFN ) );
+                          mmio_read32( VIRTIO_MMIO_QUEUE_READY ) );
         return false;
     }
     mmio_write32( VIRTIO_MMIO_QUEUE_NUM, VIRTIO_QUEUE_SIZE );
-    mmio_write32( VIRTIO_MMIO_QUEUE_ALIGN, VIRTIO_PAGE_SIZE );
-    mmio_write32( VIRTIO_MMIO_QUEUE_PFN, ( uint32_t )( ( uintptr_t ) queue->area >> 12U ) );
-    aicp_uart_printf( "AICP_FREERTOS_VIRTIO_QUEUE queue=%u size=%u pfn=%x\n",
+    mmio_write64( VIRTIO_MMIO_QUEUE_DESC_LOW, ( uint64_t )( uintptr_t ) queue->desc );
+    mmio_write64( VIRTIO_MMIO_QUEUE_AVAIL_LOW, ( uint64_t )( uintptr_t ) queue->avail_flags );
+    mmio_write64( VIRTIO_MMIO_QUEUE_USED_LOW, ( uint64_t )( uintptr_t ) queue->used_flags );
+    mmio_write32( VIRTIO_MMIO_QUEUE_READY, 1U );
+    aicp_uart_printf( "AICP_FREERTOS_VIRTIO_QUEUE queue=%u size=%u desc=%p\n",
                       index,
                       VIRTIO_QUEUE_SIZE,
-                      mmio_read32( VIRTIO_MMIO_QUEUE_PFN ) );
+                      queue->desc );
     return true;
 }
 
@@ -177,11 +191,17 @@ static bool tx_reap_completion( void )
 
 bool aicp_virtio_net_init( void )
 {
+    uint32_t virtio_irq;
+
     if( device_ready ) {
         return true;
     }
+    if( !aicp_platform_virtio_net_resource( &virtio_mmio_base, &virtio_irq ) ) {
+        aicp_uart_puts( "AICP_FREERTOS_VIRTIO_RESOURCE_FAIL\n" );
+        return false;
+    }
     if( mmio_read32( VIRTIO_MMIO_MAGIC_VALUE ) != VIRTIO_MAGIC ||
-        mmio_read32( VIRTIO_MMIO_VERSION ) != VIRTIO_LEGACY_VERSION ||
+        mmio_read32( VIRTIO_MMIO_VERSION ) != VIRTIO_MODERN_VERSION ||
         mmio_read32( VIRTIO_MMIO_DEVICE_ID ) != VIRTIO_DEVICE_NET ) {
         aicp_uart_printf( "AICP_FREERTOS_VIRTIO_PROBE_FAIL magic=%x version=%u device=%u\n",
                           mmio_read32( VIRTIO_MMIO_MAGIC_VALUE ),
@@ -194,20 +214,27 @@ bool aicp_virtio_net_init( void )
     mmio_write32( VIRTIO_MMIO_STATUS, VIRTIO_STATUS_ACKNOWLEDGE );
     mmio_write32( VIRTIO_MMIO_STATUS, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER );
     mmio_write32( VIRTIO_MMIO_DEVICE_FEATURES_SEL, 0U );
-    const uint32_t offered = mmio_read32( VIRTIO_MMIO_DEVICE_FEATURES );
-    const uint32_t accepted = offered & ( 1U << VIRTIO_NET_F_MAC );
+    const uint32_t offered_low = mmio_read32( VIRTIO_MMIO_DEVICE_FEATURES );
+    const uint32_t accepted_low = offered_low & ( 1U << VIRTIO_NET_F_MAC );
+    mmio_write32( VIRTIO_MMIO_DEVICE_FEATURES_SEL, 1U );
+    const uint32_t offered_high = mmio_read32( VIRTIO_MMIO_DEVICE_FEATURES );
+    if( ( offered_high & VIRTIO_F_VERSION_1 ) == 0U ) {
+        aicp_uart_printf( "AICP_FREERTOS_VIRTIO_FEATURE_FAIL offered_hi=%x\n", offered_high );
+        return false;
+    }
     mmio_write32( VIRTIO_MMIO_DRIVER_FEATURES_SEL, 0U );
-    mmio_write32( VIRTIO_MMIO_DRIVER_FEATURES, accepted );
+    mmio_write32( VIRTIO_MMIO_DRIVER_FEATURES, accepted_low );
+    mmio_write32( VIRTIO_MMIO_DRIVER_FEATURES_SEL, 1U );
+    mmio_write32( VIRTIO_MMIO_DRIVER_FEATURES, VIRTIO_F_VERSION_1 );
     mmio_write32( VIRTIO_MMIO_STATUS,
                   VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK );
     if( ( mmio_read32( VIRTIO_MMIO_STATUS ) & VIRTIO_STATUS_FEATURES_OK ) == 0U ) {
         aicp_uart_printf( "AICP_FREERTOS_VIRTIO_FEATURE_FAIL offered=%x accepted=%x\n",
-                          offered,
-                          accepted );
+                          offered_low,
+                          accepted_low );
         return false;
     }
 
-    mmio_write32( VIRTIO_MMIO_GUEST_PAGE_SIZE, VIRTIO_PAGE_SIZE );
     queue_layout( &rx_queue, rx_ring_area );
     queue_layout( &tx_queue, tx_ring_area );
     tx_in_flight = false;
@@ -229,18 +256,21 @@ bool aicp_virtio_net_init( void )
     mmio_write32( VIRTIO_MMIO_STATUS,
                   VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER |
                       VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK );
-    aicp_platform_enable_net_irq();
+    if( !aicp_platform_enable_net_irq() ) {
+        aicp_uart_puts( "AICP_FREERTOS_VIRTIO_IRQ_ENABLE_FAIL\n" );
+        return false;
+    }
     device_ready = true;
     aicp_uart_printf(
         "AICP_FREERTOS_VIRTIO_READY base=%p mac=%x:%x:%x:%x:%x:%x features=%x\n",
-        ( void * ) VIRTIO_MMIO_BASE,
-        *( volatile uint8_t * )( VIRTIO_MMIO_BASE + VIRTIO_MMIO_CONFIG + 0U ),
-        *( volatile uint8_t * )( VIRTIO_MMIO_BASE + VIRTIO_MMIO_CONFIG + 1U ),
-        *( volatile uint8_t * )( VIRTIO_MMIO_BASE + VIRTIO_MMIO_CONFIG + 2U ),
-        *( volatile uint8_t * )( VIRTIO_MMIO_BASE + VIRTIO_MMIO_CONFIG + 3U ),
-        *( volatile uint8_t * )( VIRTIO_MMIO_BASE + VIRTIO_MMIO_CONFIG + 4U ),
-        *( volatile uint8_t * )( VIRTIO_MMIO_BASE + VIRTIO_MMIO_CONFIG + 5U ),
-        accepted );
+        ( void * ) virtio_mmio_base,
+        *( volatile uint8_t * )( virtio_mmio_base + VIRTIO_MMIO_CONFIG + 0U ),
+        *( volatile uint8_t * )( virtio_mmio_base + VIRTIO_MMIO_CONFIG + 1U ),
+        *( volatile uint8_t * )( virtio_mmio_base + VIRTIO_MMIO_CONFIG + 2U ),
+        *( volatile uint8_t * )( virtio_mmio_base + VIRTIO_MMIO_CONFIG + 3U ),
+        *( volatile uint8_t * )( virtio_mmio_base + VIRTIO_MMIO_CONFIG + 4U ),
+        *( volatile uint8_t * )( virtio_mmio_base + VIRTIO_MMIO_CONFIG + 5U ),
+        accepted_low );
     return true;
 }
 

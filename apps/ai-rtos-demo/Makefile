@@ -21,6 +21,7 @@ MODEL_RUNNER := $(BIN_DIR)/aicp_model_runner
 PROTO_TEST := $(BIN_DIR)/aicp_protocol_test
 SERVICE_TEST := $(BIN_DIR)/aicp_service_test
 CLIENT_TEST := $(BIN_DIR)/aicp_client_test
+FREERTOS_FDT_TEST := $(BIN_DIR)/freertos_fdt_virtio_test
 RUST_CLIENT := $(BIN_DIR)/aicp_rust_client
 RUST_AARCH64_CLIENT := $(AARCH64_BIN_DIR)/aicp_rust_client
 AARCH64_CLIENT := $(AARCH64_BIN_DIR)/aicp_client
@@ -35,7 +36,7 @@ AICP_MODE ?= ai
 AICP_CSV ?= $(BIN_DIR)/aicp_latency.csv
 AICP_SUMMARY ?= $(BIN_DIR)/aicp_summary.txt
 
-.PHONY: all clean smoke protocol-test service-test client-test test model-runner model-compare rust-client rust-client-aarch64 model-runner-aarch64 cross-aarch64 linux-init-aarch64 starry-init-aarch64 yolov8-init-aarch64
+.PHONY: all clean smoke protocol-test service-test client-test freertos-fdt-test test model-runner model-compare rust-client rust-client-aarch64 model-runner-aarch64 cross-aarch64 linux-init-aarch64 starry-init-aarch64 yolov8-init-aarch64
 
 all: $(CLIENT) $(SERVER) $(MODEL_RUNNER)
 
@@ -63,6 +64,9 @@ $(SERVICE_TEST): tests/aicp_service_test.c $(AICP_SERVICE_CORE) $(AICP_SERVICE_H
 $(CLIENT_TEST): tests/aicp_client_test.c $(AICP_CLIENT_CORE) aicp/aicp_client.h $(AICP_POSIX_HEADERS) | $(BIN_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -pthread -o $@ tests/aicp_client_test.c $(AICP_CLIENT_CORE)
 
+$(FREERTOS_FDT_TEST): tests/freertos_fdt_virtio_test.c freertos/fdt_virtio.c freertos/fdt_virtio.h | $(BIN_DIR)
+	$(CC) $(CPPFLAGS) -I./freertos $(CFLAGS) -o $@ tests/freertos_fdt_virtio_test.c freertos/fdt_virtio.c
+
 $(RUST_CLIENT): rust-client/src/main.rs rust-client/Cargo.toml ../../components/aicp-protocol/src/lib.rs ../../components/aicp-protocol/Cargo.toml | $(BIN_DIR)
 	cargo build --manifest-path rust-client/Cargo.toml --release
 	cp rust-client/target/release/aicp_rust_client $@
@@ -83,7 +87,10 @@ service-test: $(SERVICE_TEST)
 client-test: $(CLIENT_TEST)
 	$(CLIENT_TEST)
 
-test: protocol-test service-test client-test
+freertos-fdt-test: $(FREERTOS_FDT_TEST)
+	$(FREERTOS_FDT_TEST)
+
+test: protocol-test service-test client-test freertos-fdt-test
 
 model-runner: $(MODEL_RUNNER)
 	$(MODEL_RUNNER)

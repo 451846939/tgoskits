@@ -3,6 +3,8 @@
 
 #include "platform.h"
 
+#include "fdt_virtio.h"
+
 #include "FreeRTOS.h"
 #include "task.h"
 
@@ -28,12 +30,13 @@
 #define GIC_ICFGR1              0x0C04UL
 #define GIC_IGROUPMODR0         0x0D00UL
 #define TIMER_IRQ_ID            27U
-#define VIRTIO_NET_IRQ_ID       77U
 #define GIC_PRIORITY_SHIFT      3U
 #define GIC_LOWEST_USABLE_PRIO  ( ( configUNIQUE_INTERRUPT_PRIORITIES - 2U ) << GIC_PRIORITY_SHIFT )
 #define NSEC_PER_SEC            1000000000ULL
 
 static const void * boot_dtb;
+static struct aicp_virtio_mmio_resource virtio_net_resource;
+static bool virtio_net_resource_ready;
 static uint64_t tick_cycles;
 static uint64_t next_tick_deadline;
 
@@ -261,32 +264,67 @@ static void gic_init( void )
                       ( unsigned long ) sre );
 }
 
-void aicp_platform_enable_net_irq( void )
+bool aicp_platform_virtio_net_resource( uintptr_t * base, uint32_t * irq )
 {
-    const uint32_t bit = 1U << ( VIRTIO_NET_IRQ_ID % 32U );
-    const uintptr_t group = GICD_BASE + GIC_IGROUPR0 + 4U * ( VIRTIO_NET_IRQ_ID / 32U );
-    const uintptr_t enable = GICD_BASE + GIC_ISENABLER0 + 4U * ( VIRTIO_NET_IRQ_ID / 32U );
-    const uintptr_t pending = GICD_BASE + GIC_ICPENDR0 + 4U * ( VIRTIO_NET_IRQ_ID / 32U );
-    const uintptr_t config = GICD_BASE + 0x0c00U + 4U * ( VIRTIO_NET_IRQ_ID / 16U );
-    const uint32_t shift = ( VIRTIO_NET_IRQ_ID % 16U ) * 2U;
+    if( !virtio_net_resource_ready || base == NULL || irq == NULL ) {
+        return false;
+    }
+    *base = virtio_net_resource.base;
+    *irq = virtio_net_resource.irq;
+    return true;
+}
+
+bool aicp_platform_enable_net_irq( void )
+{
+    uintptr_t base;
+    uint32_t irq;
+    uint32_t bit;
+    uintptr_t group;
+    uintptr_t enable;
+    uintptr_t pending;
+    uintptr_t config;
+    uint32_t shift;
+
+    if( !aicp_platform_virtio_net_resource( &base, &irq ) ) {
+        return false;
+    }
+    ( void ) base;
+    bit = 1U << ( irq % 32U );
+    group = GICD_BASE + GIC_IGROUPR0 + 4U * ( irq / 32U );
+    enable = GICD_BASE + GIC_ISENABLER0 + 4U * ( irq / 32U );
+    pending = GICD_BASE + GIC_ICPENDR0 + 4U * ( irq / 32U );
+    config = GICD_BASE + 0x0c00U + 4U * ( irq / 16U );
+    shift = ( irq % 16U ) * 2U;
 
     mmio_write32( group, mmio_read32( group ) | bit );
     mmio_write32( config, mmio_read32( config ) & ~( 3U << shift ) );
     mmio_write32( pending, bit );
-    *( volatile uint8_t * )( GICD_BASE + GIC_IPRIORITYR + VIRTIO_NET_IRQ_ID ) =
+    *( volatile uint8_t * )( GICD_BASE + GIC_IPRIORITYR + irq ) =
         ( uint8_t ) GIC_LOWEST_USABLE_PRIO;
     mmio_write32( enable, bit );
     __asm volatile( "dsb sy; isb" ::: "memory" );
     aicp_uart_printf( "AICP_FREERTOS_NET_IRQ_ENABLED intid=%u priority=%u\n",
-                      VIRTIO_NET_IRQ_ID,
+                      irq,
                       ( unsigned int ) GIC_LOWEST_USABLE_PRIO );
+    return true;
 }
 
-void aicp_platform_init( void )
+bool aicp_platform_init( void )
 {
-    ( void ) boot_dtb;
     aicp_uart_puts( "AICP_FREERTOS_BOOT platform=qemu-virt arch=aarch64\n" );
+#ifndef AICP_FREERTOS_BASELINE
+    virtio_net_resource_ready =
+        aicp_fdt_find_virtio_mmio( boot_dtb, &virtio_net_resource );
+    if( !virtio_net_resource_ready ) {
+        aicp_uart_puts( "AICP_FREERTOS_FDT_VIRTIO_NOT_FOUND\n" );
+        return false;
+    }
+    aicp_uart_printf( "AICP_FREERTOS_FDT_VIRTIO base=%p irq=%u\n",
+                      ( void * ) virtio_net_resource.base,
+                      virtio_net_resource.irq );
+#endif
     gic_init();
+    return true;
 }
 
 void vConfigureTickInterrupt( void )
@@ -361,7 +399,7 @@ void vApplicationIRQHandler( uint32_t iar )
         if( timer_irq_count <= 3U ) {
             aicp_uart_printf( "AICP_FREERTOS_TIMER_IRQ_RETURN count=%u\n", timer_irq_count );
         }
-    } else if( intid == VIRTIO_NET_IRQ_ID ) {
+    } else if( virtio_net_resource_ready && intid == virtio_net_resource.irq ) {
         aicp_virtio_net_isr();
     } else if( unexpected_irq_count < 3U ) {
         unexpected_irq_count++;

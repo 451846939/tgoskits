@@ -15,7 +15,7 @@ usage() {
   scripts/ai-rtos/aicp.sh prepare
   scripts/ai-rtos/aicp.sh smoke
   scripts/ai-rtos/aicp.sh full
-  scripts/ai-rtos/aicp.sh run linux arceos [次数] [ai|fixed] [超时秒数]
+  scripts/ai-rtos/aicp.sh run linux <arceos|freertos> [次数] [ai|fixed] [超时秒数]
   scripts/ai-rtos/aicp.sh realtime [次数] [超时秒数] [Linux 压力进程数]
   scripts/ai-rtos/aicp.sh baseline <rtthread|zephyr|freertos|all>
   scripts/ai-rtos/aicp.sh reliability [次数] [超时秒数]
@@ -24,7 +24,7 @@ usage() {
 常用命令：
   doctor      只检查宿主工具和环境，不下载、不构建
   prepare     拉取 QEMU 镜像并生成基础 Guest 配置
-  smoke       最小次数验证 Linux 2-vCPU 与 ArceOS 控制 Guest 的 TCP/IP 闭环
+  smoke       最小次数验证 Linux 2-vCPU 与默认 ArceOS 控制 Guest 的 TCP/IP 闭环
   full        执行闭环、控制效果对比、实时 A/B 和原生 RTOS 基线
   run         单独运行一组双 Guest，便于演示和排障
   realtime    执行 AxVisor 实时优化前后 A/B 对比
@@ -115,11 +115,11 @@ run_pair() {
   shift 2
 
   case "${ai_guest}:${rtos_guest}" in
-    linux:arceos)
-      exec "${script_dir}/runners/run_axvisor_dual_guest_aicp.sh" "$@"
+    linux:arceos|linux:freertos)
+      AICP_RTOS_GUEST="${rtos_guest}" exec "${script_dir}/runners/run_axvisor_dual_guest_aicp.sh" "$@"
       ;;
     *)
-      echo "ERROR：当前最新 dev 已验证的虚拟网卡闭环仅支持 linux + arceos；请求的是 ${ai_guest} + ${rtos_guest}" >&2
+      echo "ERROR：当前最新 dev 已验证的虚拟网卡闭环支持 linux + arceos 或 linux + freertos；请求的是 ${ai_guest} + ${rtos_guest}" >&2
       usage >&2
       exit 2
       ;;
@@ -134,7 +134,7 @@ list_scripts() {
 内部编排器：
   runners/run_full_qemu_validation.sh  smoke/full 全矩阵编排和阶段日志汇总
 双 Guest 主线：
-  runners/run_axvisor_dual_guest_aicp.sh  Linux + ArceOS
+  runners/run_axvisor_dual_guest_aicp.sh  Linux + ArceOS/FreeRTOS
 
 专项验证：
   runners/run_axvisor_rt_before_after.sh     AxVisor 实时优化 A/B

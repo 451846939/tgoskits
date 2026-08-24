@@ -25,6 +25,7 @@ add_executable(aicp-freertos.elf
   boot.S
   vectors.S
   libc.c
+  fdt_virtio.c
   platform.c
   virtio_net.c
   NetworkInterface.c

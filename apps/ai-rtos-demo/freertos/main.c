@@ -339,7 +339,7 @@ int main( void )
     static const uint8_t mac[ 6 ] = { 0x52U, 0x54U, 0x00U, 0xaaU, 0x03U, 0x02U };
 #endif
 
-    aicp_platform_init();
+    configASSERT( aicp_platform_init() );
     aicp_uart_puts( "AICP_FREERTOS_SCHEDULER_START tick_hz=1000\n" );
 #ifdef AICP_FREERTOS_BASELINE
     configASSERT( xTaskCreate( baseline_periodic_task,

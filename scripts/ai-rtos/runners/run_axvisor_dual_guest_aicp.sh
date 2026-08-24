@@ -12,13 +12,14 @@ Usage:
 
 Boots two AxVisor guests in one QEMU AArch64 run:
   Linux AI guest    10.0.3.3/24, 2 vCPUs pinned to pCPU2,pCPU3
-  ArceOS RTOS guest 10.0.3.2/24, 1 vCPU pinned to pCPU1
+  RTOS guest        10.0.3.2/24, 1 vCPU pinned to pCPU1
 
 The default four-core layout reserves pCPU0 for AxVisor housekeeping. Override
 the topology with AICP_HOST_CPUS, AICP_LINUX_VCPU0_PCPU,
 AICP_LINUX_VCPU1_PCPU, and AICP_RTOS_VCPU0_PCPU.
 
 Set AICP_CLIENT_IMPL=c or AICP_CLIENT_IMPL=rust to select the Linux client.
+Set AICP_RTOS_GUEST=arceos or AICP_RTOS_GUEST=freertos to select the control guest.
 Both guests communicate through AxVisor's isolated virtual switch.
 EOF
 }
@@ -32,6 +33,7 @@ iterations="${1:-40}"
 mode="${2:-ai}"
 boot_timeout_s="${3:-180}"
 client_impl="${AICP_CLIENT_IMPL:-c}"
+rtos_guest="${AICP_RTOS_GUEST:-arceos}"
 
 if [[ "${mode}" != "ai" && "${mode}" != "fixed" ]]; then
   usage >&2
@@ -39,6 +41,10 @@ if [[ "${mode}" != "ai" && "${mode}" != "fixed" ]]; then
 fi
 if [[ "${client_impl}" != "c" && "${client_impl}" != "rust" ]]; then
   echo "ERROR: AICP_CLIENT_IMPL must be c or rust, got '${client_impl}'" >&2
+  exit 2
+fi
+if [[ "${rtos_guest}" != "arceos" && "${rtos_guest}" != "freertos" ]]; then
+  echo "ERROR: AICP_RTOS_GUEST must be arceos or freertos, got '${rtos_guest}'" >&2
   exit 2
 fi
 
@@ -66,7 +72,7 @@ run_name="axvisor-dual-guest-aicp-${client_impl}"
 log_file="${log_dir}/${run_name}-${stamp}.log"
 linux_console_log="${log_dir}/${run_name}-linux-console-${stamp}.log"
 linux_vm="${out_dir}/${run_name}-linux.generated.toml"
-rtos_vm="${out_dir}/${run_name}-arceos.generated.toml"
+rtos_vm="${out_dir}/${run_name}-${rtos_guest}.generated.toml"
 qemu_config="${out_dir}/${run_name}-qemu.generated.toml"
 qemu_template="${repo_root}/os/axvisor/configs/qemu/qemu-aarch64-aicp-dual-net.toml"
 initramfs_dir="${out_dir}/${run_name}-initramfs"
@@ -74,6 +80,7 @@ initramfs="${out_dir}/${run_name}-initramfs.cpio.gz"
 linux_kernel="${bundle_dir}/linux/linux-qemu"
 arceos_bin="${repo_root}/target/aarch64-unknown-linux-musl/release/arceos-aicp-server.bin"
 arceos_build_config="apps/arceos/aicp-server/build-aarch64-unknown-none-softfloat.toml"
+freertos_bin="${out_dir}/build-freertos-aicp/aicp-freertos.bin"
 
 cleanup() {
   aicp_cleanup_process_tree "${qemu_pid:-}"
@@ -191,23 +198,52 @@ EOF
 }
 
 write_rtos_vm_config() {
+  local entry_point
+  local kernel_path
+  local kernel_load_addr
+  local dtb_load_addr
+  local memory_base
+  local memory_size
+  local guest_name
+
+  case "${rtos_guest}" in
+    arceos)
+      entry_point="0xC020_0000"
+      kernel_path="${arceos_bin}"
+      kernel_load_addr="0xC020_0000"
+      dtb_load_addr="0xC000_0000"
+      memory_base="0xC000_0000"
+      memory_size="0x1000_0000"
+      guest_name="arceos-aicp-dual-qemu"
+      ;;
+    freertos)
+      entry_point="0xD000_1000"
+      kernel_path="${freertos_bin}"
+      kernel_load_addr="0xD000_0000"
+      dtb_load_addr="0xD7E0_0000"
+      memory_base="0xD000_0000"
+      memory_size="0x0800_0000"
+      guest_name="freertos-aicp-dual-qemu"
+      ;;
+  esac
+
   cat > "${rtos_vm}" <<EOF
 [base]
 id = 2
-name = "arceos-aicp-dual-qemu"
+name = "${guest_name}"
 guest_type = "virtualized"
 cpu_num = 1
 phys_cpu_ids = [${rtos_vcpu0_pcpu}]
 phys_cpu_sets = [${rtos_vcpu0_mask}]
 
 [kernel]
-entry_point = 0xC020_0000
+entry_point = ${entry_point}
 image_location = "memory"
-kernel_path = "${arceos_bin}"
-kernel_load_addr = 0xC020_0000
-dtb_load_addr = 0xC000_0000
+kernel_path = "${kernel_path}"
+kernel_load_addr = ${kernel_load_addr}
+dtb_load_addr = ${dtb_load_addr}
 memory_regions = [
-  [0xC000_0000, 0x1000_0000, 0x7, 0],
+  [${memory_base}, ${memory_size}, 0x7, 0],
 ]
 
 [devices]
@@ -233,15 +269,27 @@ fi
 echo "[ai-rtos] Building ${client_impl} Linux guest initramfs"
 build_linux_initramfs
 
-echo "[ai-rtos] Building ArceOS RTOS guest"
-(
-  cd "${repo_root}"
-  cargo xtask arceos build \
-    -p arceos-aicp-server \
-    --arch aarch64 \
-    --config "${arceos_build_config}"
-)
-prepare_arceos_raw_image
+case "${rtos_guest}" in
+  arceos)
+    echo "[ai-rtos] Building ArceOS RTOS guest"
+    (
+      cd "${repo_root}"
+      cargo xtask arceos build \
+        -p arceos-aicp-server \
+        --arch aarch64 \
+        --config "${arceos_build_config}"
+    )
+    prepare_arceos_raw_image
+    ;;
+  freertos)
+    echo "[ai-rtos] Building FreeRTOS RTOS guest"
+    "${repo_root}/scripts/ai-rtos/build/build_freertos_aicp_guest.sh"
+    if [[ ! -s "${freertos_bin}" ]]; then
+      echo "ERROR: FreeRTOS AICP binary is missing or empty: ${freertos_bin}" >&2
+      exit 1
+    fi
+    ;;
+esac
 
 echo "[ai-rtos] Generating AxVM virtual-device guest configurations"
 write_linux_vm_config
@@ -253,7 +301,7 @@ AXVISOR_CONSOLE_LOG="${log_file}" LINUX_CONSOLE_LOG="${linux_console_log}" perl 
   's#  "-nographic",#  "-display",\n  "none",\n  "-monitor",\n  "none",\n  "-serial",\n  "file:$ENV{AXVISOR_CONSOLE_LOG}",\n  "-serial",\n  "file:$ENV{LINUX_CONSOLE_LOG}",#' \
   "${qemu_config}"
 
-echo "[ai-rtos] Booting AxVisor Linux + ArceOS dual guest; log: ${log_file}"
+echo "[ai-rtos] Booting AxVisor Linux + ${rtos_guest} dual guest; log: ${log_file}"
 (
   cd "${repo_root}"
   aicp_exec_new_session cargo xtask axvisor qemu \
@@ -264,10 +312,20 @@ echo "[ai-rtos] Booting AxVisor Linux + ArceOS dual guest; log: ${log_file}"
 ) > "${log_file}" 2>&1 &
 qemu_pid=$!
 
-aicp_wait_for_arceos_ready_in_logs \
-  "$((SECONDS + boot_timeout_s))" "${qemu_pid}" 180 \
-  2 "${log_file}" "${linux_console_log}"
-wait_for_marker "AICP_RTOS_NET_READY iface=eth0 ip=10.0.3.2/24"
+case "${rtos_guest}" in
+  arceos)
+    aicp_wait_for_arceos_ready_in_logs \
+      "$((SECONDS + boot_timeout_s))" "${qemu_pid}" 180 \
+      2 "${log_file}" "${linux_console_log}"
+    wait_for_marker "AICP_RTOS_NET_READY iface=eth0 ip=10.0.3.2/24"
+    control_marker="CONTROL seq="
+    ;;
+  freertos)
+    wait_for_marker "AICP_FREERTOS_FDT_VIRTIO base="
+    wait_for_marker "AICP_FREERTOS_READY transport=tcp port=8800 ip=10.0.3.2"
+    control_marker="AICP_FREERTOS_CONTROL seq="
+    ;;
+esac
 if [[ "${client_impl}" == "rust" ]]; then
   wait_for_marker "AICP_RUST_GUEST_INIT begin=1"
   wait_for_marker "AICP_RUST_GUEST_NETCFG step=SIOCSIFFLAGS ret=0"
@@ -293,8 +351,8 @@ if ! LC_ALL=C grep -a -q "${done_token} ok=.*failed=0" "${log_file}" "${linux_co
   tail -n 100 "${linux_console_log}" >&2 || true
   exit 1
 fi
-if ! LC_ALL=C grep -a -q "CONTROL seq=" "${log_file}"; then
-  echo "[ai-rtos] FAIL: ArceOS guest did not execute control messages" >&2
+if ! LC_ALL=C grep -a -q "${control_marker}" "${log_file}"; then
+  echo "[ai-rtos] FAIL: ${rtos_guest} guest did not execute control messages" >&2
   tail -n 180 "${log_file}" >&2 || true
   exit 1
 fi
@@ -305,7 +363,7 @@ if LC_ALL=C grep -a -Eq 'VM\[[0-9]+\].*(Fault|BadState)|emu_device mmio .* faile
 fi
 
 LC_ALL=C grep -a "${done_token}" "${log_file}" "${linux_console_log}" | tail -n 1
-echo "[ai-rtos] PASS: Linux (${client_impl}) and ArceOS completed the AICP TCP/IP closed loop"
+echo "[ai-rtos] PASS: Linux (${client_impl}) and ${rtos_guest} completed the AICP TCP/IP closed loop"
 echo "[ai-rtos] AxVisor log: ${log_file}"
 echo "[ai-rtos] Linux console log: ${linux_console_log}"
 echo "log=${log_file}"
