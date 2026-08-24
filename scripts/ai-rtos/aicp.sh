@@ -15,7 +15,7 @@ usage() {
   scripts/ai-rtos/aicp.sh prepare
   scripts/ai-rtos/aicp.sh smoke
   scripts/ai-rtos/aicp.sh full
-  scripts/ai-rtos/aicp.sh run linux <arceos|freertos|zephyr> [次数] [ai|fixed] [超时秒数]
+  scripts/ai-rtos/aicp.sh run linux <arceos|freertos|rtthread|zephyr> [次数] [ai|fixed] [超时秒数]
   scripts/ai-rtos/aicp.sh realtime [次数] [超时秒数] [Linux 压力进程数]
   scripts/ai-rtos/aicp.sh baseline <rtthread|zephyr|freertos|all>
   scripts/ai-rtos/aicp.sh reliability [次数] [超时秒数]
@@ -115,11 +115,11 @@ run_pair() {
   shift 2
 
   case "${ai_guest}:${rtos_guest}" in
-    linux:arceos|linux:freertos|linux:zephyr)
+    linux:arceos|linux:freertos|linux:rtthread|linux:zephyr)
       AICP_RTOS_GUEST="${rtos_guest}" exec "${script_dir}/runners/run_axvisor_dual_guest_aicp.sh" "$@"
       ;;
     *)
-      echo "ERROR：当前虚拟网卡闭环仅支持 linux + arceos、freertos 或 zephyr；请求的是 ${ai_guest} + ${rtos_guest}" >&2
+      echo "ERROR：当前虚拟网卡闭环仅支持 linux + arceos、freertos、rtthread 或 zephyr；请求的是 ${ai_guest} + ${rtos_guest}" >&2
       usage >&2
       exit 2
       ;;
@@ -134,7 +134,7 @@ list_scripts() {
 内部编排器：
   runners/run_full_qemu_validation.sh  smoke/full 全矩阵编排和阶段日志汇总
 双 Guest 主线：
-  runners/run_axvisor_dual_guest_aicp.sh  Linux + ArceOS/FreeRTOS/Zephyr
+  runners/run_axvisor_dual_guest_aicp.sh  Linux + ArceOS/FreeRTOS/RT-Thread/Zephyr
 
 专项验证：
   runners/run_axvisor_rt_before_after.sh     AxVisor 实时优化 A/B

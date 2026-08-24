@@ -19,9 +19,9 @@ the topology with AICP_HOST_CPUS, AICP_LINUX_VCPU0_PCPU,
 AICP_LINUX_VCPU1_PCPU, and AICP_RTOS_VCPU0_PCPU.
 
 Set AICP_CLIENT_IMPL=c or AICP_CLIENT_IMPL=rust to select the Linux client.
-Set AICP_RTOS_GUEST=arceos, freertos, or zephyr to select the control guest.
+Set AICP_RTOS_GUEST=arceos, freertos, rtthread, or zephyr to select the control guest.
 ArceOS and FreeRTOS use AxVisor's isolated virtual switch. Zephyr uses the
-QEMU hub-backed direct VirtIO-MMIO compatibility path.
+QEMU hub-backed direct VirtIO-MMIO compatibility path, as does RT-Thread.
 EOF
 }
 
@@ -45,8 +45,8 @@ if [[ "${client_impl}" != "c" && "${client_impl}" != "rust" ]]; then
   exit 2
 fi
 if [[ "${rtos_guest}" != "arceos" && "${rtos_guest}" != "freertos" && \
-      "${rtos_guest}" != "zephyr" ]]; then
-  echo "ERROR: AICP_RTOS_GUEST must be arceos, freertos, or zephyr, got '${rtos_guest}'" >&2
+      "${rtos_guest}" != "rtthread" && "${rtos_guest}" != "zephyr" ]]; then
+  echo "ERROR: AICP_RTOS_GUEST must be arceos, freertos, rtthread, or zephyr, got '${rtos_guest}'" >&2
   exit 2
 fi
 
@@ -77,16 +77,18 @@ linux_vm="${out_dir}/${run_name}-linux.generated.toml"
 rtos_vm="${out_dir}/${run_name}-${rtos_guest}.generated.toml"
 qemu_config="${out_dir}/${run_name}-qemu.generated.toml"
 qemu_template="${repo_root}/os/axvisor/configs/qemu/qemu-aarch64-aicp-dual-net.toml"
-zephyr_host_dtb="${out_dir}/${run_name}-zephyr-host.dtb"
-zephyr_host_base_dtb="${out_dir}/${run_name}-zephyr-host-base.dtb"
-zephyr_host_overlay_dts="${out_dir}/${run_name}-zephyr-reserved-memory-overlay.dts"
-zephyr_host_overlay_dtbo="${out_dir}/${run_name}-zephyr-reserved-memory.dtbo"
+direct_host_dtb="${out_dir}/${run_name}-direct-host.dtb"
+direct_host_base_dtb="${out_dir}/${run_name}-direct-host-base.dtb"
+direct_host_overlay_dts="${out_dir}/${run_name}-direct-reserved-memory-overlay.dts"
+direct_host_overlay_dtbo="${out_dir}/${run_name}-direct-reserved-memory.dtbo"
 initramfs_dir="${out_dir}/${run_name}-initramfs"
 initramfs="${out_dir}/${run_name}-initramfs.cpio.gz"
 linux_kernel="${bundle_dir}/linux/linux-qemu"
 arceos_bin="${repo_root}/target/aarch64-unknown-linux-musl/release/arceos-aicp-server.bin"
 arceos_build_config="apps/arceos/aicp-server/build-aarch64-unknown-none-softfloat.toml"
 freertos_bin="${out_dir}/build-freertos-aicp/aicp-freertos.bin"
+rtthread_build_dir="${AICP_RTTHREAD_BUILD_DIR:-${out_dir}/build-rtthread-aicp-direct}"
+rtthread_bin="${AICP_RTTHREAD_BIN:-${rtthread_build_dir}/rtthread.bin}"
 zephyr_build_dir="${AICP_ZEPHYR_BUILD_DIR:-${out_dir}/build-zephyr-aicp-direct}"
 zephyr_bin="${AICP_ZEPHYR_BIN:-${zephyr_build_dir}/zephyr/zephyr.bin}"
 
@@ -115,22 +117,26 @@ require_tool() {
   fi
 }
 
-prepare_zephyr_direct_virtio_host_dtb() {
+prepare_direct_virtio_host_dtb() {
+  local memory_base="$1"
+  local memory_size="$2"
+  local node_name="$3"
+
   for tool in qemu-system-aarch64 dtc fdtoverlay; do
     require_tool "${tool}"
   done
 
-  rm -f "${zephyr_host_base_dtb}" "${zephyr_host_overlay_dtbo}" "${zephyr_host_dtb}"
+  rm -f "${direct_host_base_dtb}" "${direct_host_overlay_dtbo}" "${direct_host_dtb}"
   qemu-system-aarch64 \
     -display none \
     -monitor none \
     -serial null \
     -cpu cortex-a72 \
-    -machine "virt,virtualization=on,gic-version=3,dumpdtb=${zephyr_host_base_dtb}" \
+    -machine "virt,virtualization=on,gic-version=3,dumpdtb=${direct_host_base_dtb}" \
     -smp "${host_cpus}" \
     -m 8g
 
-  cat > "${zephyr_host_overlay_dts}" <<'EOF'
+  cat > "${direct_host_overlay_dts}" <<EOF
 /dts-v1/;
 /plugin/;
 
@@ -142,8 +148,8 @@ prepare_zephyr_direct_virtio_host_dtb() {
                 #address-cells = <2>;
                 #size-cells = <2>;
                 ranges;
-                zephyr@d0000000 {
-                    reg = <0x0 0xd0000000 0x0 0x08000000>;
+                ${node_name}@${memory_base#0x} {
+                    reg = <0x0 ${memory_base} 0x0 ${memory_size}>;
                     no-map;
                 };
             };
@@ -151,9 +157,9 @@ prepare_zephyr_direct_virtio_host_dtb() {
     };
 };
 EOF
-  dtc -@ -I dts -O dtb -o "${zephyr_host_overlay_dtbo}" "${zephyr_host_overlay_dts}"
-  fdtoverlay -i "${zephyr_host_base_dtb}" -o "${zephyr_host_dtb}" \
-    "${zephyr_host_overlay_dtbo}"
+  dtc -@ -I dts -O dtb -o "${direct_host_overlay_dtbo}" "${direct_host_overlay_dts}"
+  fdtoverlay -i "${direct_host_base_dtb}" -o "${direct_host_dtb}" \
+    "${direct_host_overlay_dtbo}"
 }
 
 prepare_arceos_raw_image() {
@@ -223,7 +229,7 @@ disabled = []
 id = "aicp-net"
 model = "virtio-net"
 guest_mac = [0x52, 0x54, 0x00, 0xaa, 0x03, 0x03]'
-  if [[ "${rtos_guest}" == "zephyr" ]]; then
+  if [[ "${rtos_guest}" == "rtthread" || "${rtos_guest}" == "zephyr" ]]; then
     memory_map_type="2"
     device_config='passthrough = [
   { path = "/virtio_mmio@a003c00" },
@@ -289,6 +295,16 @@ write_rtos_vm_config() {
       memory_map_type="0"
       guest_name="freertos-aicp-dual-qemu"
       ;;
+    rtthread)
+      entry_point="0xC000_0000"
+      kernel_path="${rtthread_bin}"
+      kernel_load_addr="0xC000_0000"
+      dtb_load_addr="0xCFE0_0000"
+      memory_base="0xC000_0000"
+      memory_size="0x1000_0000"
+      memory_map_type="2"
+      guest_name="rtthread-aicp-dual-qemu"
+      ;;
     zephyr)
       entry_point="0xD000_1104"
       kernel_path="${zephyr_bin}"
@@ -308,7 +324,7 @@ disabled = []
 id = "aicp-net"
 model = "virtio-net"
 guest_mac = [0x52, 0x54, 0x00, 0xaa, 0x03, 0x02]'
-  if [[ "${rtos_guest}" == "zephyr" ]]; then
+  if [[ "${rtos_guest}" == "rtthread" || "${rtos_guest}" == "zephyr" ]]; then
     device_config='passthrough = [
   { path = "/virtio_mmio@a003a00" },
 ]
@@ -383,20 +399,41 @@ case "${rtos_guest}" in
       exit 1
     fi
     ;;
+  rtthread)
+    if [[ "${AICP_RTTHREAD_SKIP_BUILD:-0}" != "1" ]]; then
+      echo "[ai-rtos] Building RT-Thread RTOS guest with direct VirtIO-MMIO"
+      RTTHREAD_BUILD_DIR="${rtthread_build_dir}" \
+        RTTHREAD_RAM_BASE=0xC0000000 \
+        RTTHREAD_TEXT_OFFSET=0x0 \
+        RTTHREAD_GIC_VERSION=3 \
+        RTTHREAD_VIRTIO_MMIO_BASE=0x0a003a00 \
+        RTTHREAD_VIRTIO_MAX_NR=1 \
+        RTTHREAD_VIRTIO_IRQ_BASE=77 \
+        "${repo_root}/scripts/ai-rtos/build/build_rtthread_aicp_guest.sh"
+    fi
+    if [[ ! -s "${rtthread_bin}" ]]; then
+      echo "ERROR: RT-Thread AICP binary is missing or empty: ${rtthread_bin}" >&2
+      exit 1
+    fi
+    ;;
 esac
 
 echo "[ai-rtos] Generating AxVM guest configurations"
 write_linux_vm_config
 write_rtos_vm_config
 
-if [[ "${rtos_guest}" == "zephyr" ]]; then
+if [[ "${rtos_guest}" == "rtthread" || "${rtos_guest}" == "zephyr" ]]; then
   qemu_template="${repo_root}/os/axvisor/configs/qemu/qemu-aarch64-aicp-dual-direct-virtio.toml"
-  prepare_zephyr_direct_virtio_host_dtb
+  if [[ "${rtos_guest}" == "rtthread" ]]; then
+    prepare_direct_virtio_host_dtb 0xc0000000 0x10000000 rtthread
+  else
+    prepare_direct_virtio_host_dtb 0xd0000000 0x08000000 zephyr
+  fi
 fi
 cp "${qemu_template}" "${qemu_config}"
-if [[ "${rtos_guest}" == "zephyr" ]]; then
-  ZEPHYR_HOST_DTB="${zephyr_host_dtb}" perl -0pi -e \
-    's#  "-machine",#  "-dtb",\n  "$ENV{ZEPHYR_HOST_DTB}",\n  "-machine",#' \
+if [[ "${rtos_guest}" == "rtthread" || "${rtos_guest}" == "zephyr" ]]; then
+  DIRECT_HOST_DTB="${direct_host_dtb}" perl -0pi -e \
+    's#  "-machine",#  "-dtb",\n  "$ENV{DIRECT_HOST_DTB}",\n  "-machine",#' \
     "${qemu_config}"
 fi
 rm -f "${linux_console_log}"
@@ -426,6 +463,11 @@ case "${rtos_guest}" in
     wait_for_marker "AICP_FREERTOS_FDT_VIRTIO base="
     wait_for_marker "AICP_FREERTOS_READY transport=tcp port=8800 ip=10.0.3.2"
     control_marker="AICP_FREERTOS_CONTROL seq="
+    ;;
+  rtthread)
+    wait_for_marker "AICP_RTTHREAD_NET_UP"
+    wait_for_marker "AICP_RTTHREAD_READY transport=tcp port=8800"
+    control_marker="AICP_RTTHREAD_CONTROL seq="
     ;;
   zephyr)
     wait_for_marker "AICP_ZEPHYR_NET_UP"

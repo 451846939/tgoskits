@@ -11,6 +11,7 @@ source_dir="${RTTHREAD_SOURCE_DIR:-${repo_root}/tmp/rt-thread-${revision}}"
 bsp_dir="${source_dir}/bsp/qemu-virt64-aarch64"
 build_dir="${RTTHREAD_BUILD_DIR:-${repo_root}/tmp/rtthread-aicp-build}"
 ram_base="${RTTHREAD_RAM_BASE:-0x40000000}"
+text_offset="${RTTHREAD_TEXT_OFFSET:-0x80000}"
 gic_version="${RTTHREAD_GIC_VERSION:-2}"
 virtio_mmio_base="${RTTHREAD_VIRTIO_MMIO_BASE:-0x0a000000}"
 virtio_max_nr="${RTTHREAD_VIRTIO_MAX_NR:-32}"
@@ -22,6 +23,10 @@ source "${repo_root}/scripts/ai-rtos/lib/third_party_source_guard.sh"
 
 if [[ ! "${ram_base}" =~ ^0x[0-9a-fA-F]+$ ]]; then
   echo "ERROR: RTTHREAD_RAM_BASE must be a hexadecimal address, got '${ram_base}'" >&2
+  exit 2
+fi
+if [[ ! "${text_offset}" =~ ^0x[0-9a-fA-F]+$ ]]; then
+  echo "ERROR: RTTHREAD_TEXT_OFFSET must be a hexadecimal address, got '${text_offset}'" >&2
   exit 2
 fi
 if [[ "${gic_version}" != "2" && "${gic_version}" != "3" ]]; then
@@ -90,6 +95,7 @@ VIRTIO_MMIO_BASE="${virtio_mmio_base}" \
   cd "${build_dir}"
   RTT_ROOT="${source_dir}" \
     RTTHREAD_RAM_BASE="${ram_base}" \
+    RTTHREAD_TEXT_OFFSET="${text_offset}" \
     RTTHREAD_GIC_VERSION="${gic_version}" \
     "${venv}/bin/python" - <<'PY'
 import os
@@ -101,6 +107,7 @@ kconf.load_config(".config")
 gic_version = os.environ["RTTHREAD_GIC_VERSION"]
 values = {
     "ARCH_RAM_OFFSET": os.environ["RTTHREAD_RAM_BASE"],
+    "ARCH_TEXT_OFFSET": os.environ["RTTHREAD_TEXT_OFFSET"],
     "BSP_USING_GICV2": "y" if gic_version == "2" else "n",
     "BSP_USING_GICV3": "y" if gic_version == "3" else "n",
     "BSP_USING_VIRTIO_NET": "y",
@@ -146,7 +153,7 @@ cp "${repo_root}/apps/ai-rtos-demo/rtos-core/control_loop.h" \
 cp "${repo_root}/apps/ai-rtos-demo/rtthread-aicp/drv_virtio_aicp.c" \
   "${build_dir}/drivers/drv_virtio.c"
 
-echo "[ai-rtos] 构建 RT-Thread AICP Guest revision=${revision} ram_base=${ram_base} gic=v${gic_version} virtio_base=${virtio_mmio_base} virtio_count=${virtio_max_nr} virtio_irq=${virtio_irq_base}"
+echo "[ai-rtos] 构建 RT-Thread AICP Guest revision=${revision} ram_base=${ram_base} text_offset=${text_offset} gic=v${gic_version} virtio_base=${virtio_mmio_base} virtio_count=${virtio_max_nr} virtio_irq=${virtio_irq_base}"
 (
   cd "${build_dir}"
   RTT_ROOT="${source_dir}" \

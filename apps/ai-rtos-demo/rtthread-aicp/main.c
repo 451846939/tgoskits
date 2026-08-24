@@ -16,9 +16,9 @@
 
 #define AICP_PORT 8800
 #define NETWORK_WAIT_ROUNDS 300
-#define AICP_RTTHREAD_STATIC_IP "10.0.2.15"
+#define AICP_RTTHREAD_STATIC_IP "10.0.3.2"
 #define AICP_RTTHREAD_STATIC_NETMASK "255.255.255.0"
-#define AICP_RTTHREAD_STATIC_GATEWAY "10.0.2.2"
+#define AICP_RTTHREAD_STATIC_GATEWAY "10.0.3.1"
 
 void aicp_virtio_net_get_stats(rt_uint32_t *irq_count,
                                rt_uint32_t *rx_frames,

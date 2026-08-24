@@ -1,6 +1,6 @@
 # AI/RTOS 多客户机控制演示
 
-该目录保存 AICP 应用层协议、Linux 智能计算程序、ArceOS/FreeRTOS/Zephyr 控制服务、YOLOv8 推理程序、原生 RTOS 基线和主机测试工具。当前最新 `dev` 已实际验证 Linux 分别与 ArceOS、FreeRTOS、Zephyr 的虚拟化闭环；RT-Thread 目录仍只保留平台适配或原生基线，不作为可复现的 AxVisor 网络闭环声明。
+该目录保存 AICP 应用层协议、Linux 智能计算程序、ArceOS/FreeRTOS/RT-Thread/Zephyr 控制服务、YOLOv8 推理程序、原生 RTOS 基线和主机测试工具。当前最新 `dev` 已实际验证 Linux 分别与 ArceOS、FreeRTOS、RT-Thread、Zephyr 的虚拟化闭环。
 
 ## 工程分层
 
@@ -54,10 +54,11 @@ scripts/ai-rtos/aicp.sh full
 | --- | --- | --- |
 | Linux（2 vCPU） | ArceOS（1 vCPU） | AICP v1 over TCP/IP |
 | Linux（2 vCPU） | FreeRTOS（1 vCPU） | AICP v1 over TCP/IP |
+| Linux（2 vCPU） | RT-Thread（1 vCPU） | AICP v1 over TCP/IP |
 | Linux（2 vCPU） | Zephyr（1 vCPU） | AICP v1 over TCP/IP |
 
-ArceOS 与 FreeRTOS 使用 AxVisor 的 VirtIO-MMIO v2 虚拟设备和虚拟交换机。Zephyr
-使用 QEMU hub 连接两块分配给 Guest 的 legacy VirtIO-MMIO 设备；它同样以 TCP/IP
-作为主数据通道，但该兼容路径不宣称使用 AxVisor 内建 v2 虚拟交换机。
+ArceOS 与 FreeRTOS 使用 AxVisor 的 VirtIO-MMIO v2 虚拟设备和虚拟交换机。RT-Thread
+与 Zephyr 使用 QEMU hub 连接两块分配给 Guest 的 legacy VirtIO-MMIO 设备；三组
+均以 TCP/IP 作为主数据通道，但后两组兼容路径不宣称使用 AxVisor 内建 v2 虚拟交换机。
 
 所有新增代码采用 Apache-2.0 许可证。

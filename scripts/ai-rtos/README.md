@@ -1,10 +1,10 @@
 # AICP 验证入口
 
 本目录只保留当前 `dev` 可复现的 AxVisor 多客户机智能控制验证入口。
-已验证主链路为 Linux（2 vCPU）到 ArceOS、FreeRTOS 或 Zephyr（各 1 vCPU）的 AICP v1 over TCP/IP：Linux
+已验证主链路为 Linux（2 vCPU）到 ArceOS、FreeRTOS、RT-Thread 或 Zephyr（各 1 vCPU）的 AICP v1 over TCP/IP：Linux
 运行轻量神经网络控制策略，控制 Guest 接收控制参数、执行控制环并回传状态。
-ArceOS 与 FreeRTOS 两组使用 AxVisor 的 `virtio-net` 虚拟设备和虚拟交换机；Zephyr
-组使用 QEMU hub 与分配给两个 Guest 的 legacy VirtIO-MMIO 网卡。三组主数据通道均为
+ArceOS 与 FreeRTOS 两组使用 AxVisor 的 `virtio-net` 虚拟设备和虚拟交换机；RT-Thread
+与 Zephyr 组使用 QEMU hub 与分配给两个 Guest 的 legacy VirtIO-MMIO 网卡。四组主数据通道均为
 TCP/IP，不使用 vsock、共享内存或 HyperCall。
 
 顶层只有 `aicp.sh` 这一公开命令入口。`runners/`、`build/`、`checks/`、
@@ -39,6 +39,13 @@ VirtIO-MMIO v2 地址与 GIC IRQ，不依赖旧的直通设备地址：
 
 ```sh
 scripts/ai-rtos/aicp.sh run linux freertos 20 ai 300
+```
+
+RT-Thread 使用 legacy VirtIO-MMIO 直通兼容路径。构建脚本会固定 RT-Thread v5.2.1、
+GICv3、`0xc0000000` 身份映射 RAM 与零文本偏移，并把 QEMU 的两块直通网卡接入同一 hub：
+
+```sh
+scripts/ai-rtos/aicp.sh run linux rtthread 20 ai 300
 ```
 
 Zephyr 使用 legacy VirtIO-MMIO 直通兼容路径，并由 QEMU hub 连接 Linux 与 Zephyr
@@ -76,6 +83,7 @@ scripts/ai-rtos/aicp.sh run linux arceos 20 fixed 300
 | Linux AI Guest | 2 / pCPU2、pCPU3 | `10.0.3.3/24` / `52:54:00:aa:03:03` |
 | ArceOS control Guest | 1 / pCPU1 | `10.0.3.2/24` / `52:54:00:aa:03:02` |
 | FreeRTOS control Guest | 1 / pCPU1 | `10.0.3.2/24` / `52:54:00:aa:03:02` |
+| RT-Thread control Guest | 1 / pCPU1 | `10.0.3.2/24` / `52:54:00:aa:03:02` |
 | Zephyr control Guest | 1 / pCPU1 | `10.0.3.2/24` / `52:54:00:aa:03:02` |
 
 pCPU0 留给 AxVisor 管理和后台工作。可通过 `AICP_HOST_CPUS`、
@@ -86,9 +94,9 @@ pCPU0 留给 AxVisor 管理和后台工作。可通过 `AICP_HOST_CPUS`、
 
 最新上游 AxVisor 的内建 virtio-net 是 VirtIO 1.x（MMIO version 2）。FreeRTOS
 已经适配新版队列寄存器、12 字节协商后的网络头，并从 DTB 获取动态 MMIO/IRQ，
-可通过 `aicp.sh run linux freertos` 复现。Zephyr 仍使用 legacy VirtIO-MMIO 直通
-设备，因此 runner 为它选择 QEMU hub 兼容拓扑，而不是内建 v2 虚拟交换机；它可通过
-`aicp.sh run linux zephyr` 单独复现，但不在默认 `smoke` 或 `full` 矩阵中。RT-Thread
-尚未完成当前 `dev` 的网络闭环适配，原生周期基线仅用于任务一对照。
+可通过 `aicp.sh run linux freertos` 复现。RT-Thread 和 Zephyr 使用 legacy
+VirtIO-MMIO 直通设备，因此 runner 为它们选择 QEMU hub 兼容拓扑，而不是内建 v2 虚拟
+交换机；两者均可通过相应的 `aicp.sh run linux <guest>` 命令单独复现，但不在默认
+`smoke` 或 `full` 矩阵中。原生周期基线仅用于任务一对照。
 
 构建产物、运行日志和结果均在 `tmp/ai-rtos/`，不会写入第三方 RTOS 源码树。
