@@ -5,6 +5,7 @@
 #ifndef TGOSKITS_AI_RTOS_DEMO_AICP_H
 #define TGOSKITS_AI_RTOS_DEMO_AICP_H
 
+#include <float.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -17,6 +18,8 @@ extern "C" {
 #define AICP_VERSION 1u
 #define AICP_HEADER_LEN 32u
 #define AICP_MAX_PAYLOAD 4096u
+#define AICP_CONTROL_PAYLOAD_LEN 24u
+#define AICP_STATUS_PAYLOAD_LEN 24u
 
 enum aicp_msg_type {
     AICP_MSG_HELLO = 0x01,
@@ -76,6 +79,10 @@ struct aicp_status_payload {
     uint32_t applied_seq;
 };
 
+_Static_assert(
+    sizeof(float) == sizeof(uint32_t) && FLT_RADIX == 2 && FLT_MANT_DIG == 24,
+    "AICP payloads require IEEE-754 binary32 floats");
+
 static inline uint16_t aicp_bswap16(uint16_t v) {
     return (uint16_t)((v << 8) | (v >> 8));
 }
@@ -103,6 +110,83 @@ static inline uint64_t aicp_htobe64(uint64_t v) { return aicp_bswap64(v); }
 static inline uint16_t aicp_be16toh(uint16_t v) { return aicp_htobe16(v); }
 static inline uint32_t aicp_be32toh(uint32_t v) { return aicp_htobe32(v); }
 static inline uint64_t aicp_be64toh(uint64_t v) { return aicp_htobe64(v); }
+
+static inline void aicp_wire_encode_u32(uint8_t out[sizeof(uint32_t)], uint32_t value) {
+    const uint32_t wire = aicp_htobe32(value);
+
+    memcpy(out, &wire, sizeof(wire));
+}
+
+static inline uint32_t aicp_wire_decode_u32(const uint8_t in[sizeof(uint32_t)]) {
+    uint32_t wire;
+
+    memcpy(&wire, in, sizeof(wire));
+    return aicp_be32toh(wire);
+}
+
+static inline void aicp_wire_encode_f32(uint8_t out[sizeof(uint32_t)], float value) {
+    uint32_t bits;
+
+    memcpy(&bits, &value, sizeof(bits));
+    aicp_wire_encode_u32(out, bits);
+}
+
+static inline float aicp_wire_decode_f32(const uint8_t in[sizeof(uint32_t)]) {
+    const uint32_t bits = aicp_wire_decode_u32(in);
+    float value;
+
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+/*
+ * AICP control and status payloads are fixed 24-byte wire records. Each
+ * float is IEEE-754 binary32 and every scalar is encoded in network byte
+ * order; the C struct layout is never sent directly.
+ */
+static inline void aicp_control_payload_encode(
+    const struct aicp_control_payload *payload,
+    uint8_t out[AICP_CONTROL_PAYLOAD_LEN]) {
+    aicp_wire_encode_f32(out + 0, payload->target);
+    aicp_wire_encode_f32(out + 4, payload->kp);
+    aicp_wire_encode_f32(out + 8, payload->ki);
+    aicp_wire_encode_f32(out + 12, payload->kd);
+    aicp_wire_encode_f32(out + 16, payload->feed_forward);
+    aicp_wire_encode_u32(out + 20, payload->mode);
+}
+
+static inline void aicp_control_payload_decode(
+    const uint8_t in[AICP_CONTROL_PAYLOAD_LEN],
+    struct aicp_control_payload *payload) {
+    payload->target = aicp_wire_decode_f32(in + 0);
+    payload->kp = aicp_wire_decode_f32(in + 4);
+    payload->ki = aicp_wire_decode_f32(in + 8);
+    payload->kd = aicp_wire_decode_f32(in + 12);
+    payload->feed_forward = aicp_wire_decode_f32(in + 16);
+    payload->mode = aicp_wire_decode_u32(in + 20);
+}
+
+static inline void aicp_status_payload_encode(
+    const struct aicp_status_payload *payload,
+    uint8_t out[AICP_STATUS_PAYLOAD_LEN]) {
+    aicp_wire_encode_f32(out + 0, payload->setpoint);
+    aicp_wire_encode_f32(out + 4, payload->measured);
+    aicp_wire_encode_f32(out + 8, payload->control_output);
+    aicp_wire_encode_f32(out + 12, payload->error);
+    aicp_wire_encode_u32(out + 16, payload->mode);
+    aicp_wire_encode_u32(out + 20, payload->applied_seq);
+}
+
+static inline void aicp_status_payload_decode(
+    const uint8_t in[AICP_STATUS_PAYLOAD_LEN],
+    struct aicp_status_payload *payload) {
+    payload->setpoint = aicp_wire_decode_f32(in + 0);
+    payload->measured = aicp_wire_decode_f32(in + 4);
+    payload->control_output = aicp_wire_decode_f32(in + 8);
+    payload->error = aicp_wire_decode_f32(in + 12);
+    payload->mode = aicp_wire_decode_u32(in + 16);
+    payload->applied_seq = aicp_wire_decode_u32(in + 20);
+}
 
 static inline uint16_t aicp_crc16_ccitt_update(uint16_t crc, const void *data, size_t len) {
     const uint8_t *p = (const uint8_t *)data;

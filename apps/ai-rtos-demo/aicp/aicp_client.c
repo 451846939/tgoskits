@@ -74,15 +74,17 @@ int aicp_client_session_transact_control(
         return -EINVAL;
     }
 
+    uint8_t control_wire[AICP_CONTROL_PAYLOAD_LEN];
+    aicp_control_payload_encode(control, control_wire);
     const uint64_t start = monotonic_ns(ops);
     const struct aicp_header request = aicp_make_header(
         AICP_MSG_CONTROL_SET,
         AICP_FLAG_ACK_REQUIRED,
-        sizeof(*control),
+        AICP_CONTROL_PAYLOAD_LEN,
         (*next_seq)++,
         start,
         AICP_OK);
-    int result = send_request(stream, &request, control, ops);
+    int result = send_request(stream, &request, control_wire, ops);
     if (result != 0) {
         return result;
     }
@@ -110,10 +112,10 @@ int aicp_client_session_transact_control(
         return -EPROTO;
     }
     if (response.msg_type != AICP_MSG_STATUS || response.seq != request.seq ||
-        response.payload_len != sizeof(*status)) {
+        response.payload_len != AICP_STATUS_PAYLOAD_LEN) {
         return -EPROTO;
     }
 
-    memcpy(status, payload, sizeof(*status));
+    aicp_status_payload_decode(payload, status);
     return 0;
 }

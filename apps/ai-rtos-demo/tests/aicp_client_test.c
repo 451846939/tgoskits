@@ -53,17 +53,19 @@ static int send_response(
     struct aicp_header response,
     const struct aicp_status_payload *status) {
     uint8_t wire[AICP_HEADER_LEN];
+    uint8_t status_wire[AICP_STATUS_PAYLOAD_LEN];
 
     response.magic = AICP_MAGIC;
     response.header_len = AICP_HEADER_LEN;
-    response.crc16 = aicp_frame_crc(response, status);
+    aicp_status_payload_encode(status, status_wire);
+    response.crc16 = aicp_frame_crc(response, status_wire);
     aicp_header_encode(&response, wire);
 
     int result = aicp_stream_write_full(stream, wire, sizeof(wire));
     if (result != 0) {
         return result;
     }
-    return aicp_stream_write_full(stream, status, sizeof(*status));
+    return aicp_stream_write_full(stream, status_wire, sizeof(status_wire));
 }
 
 static void *serve_client(void *argument) {
@@ -84,8 +86,18 @@ static void *serve_client(void *argument) {
     test->result = aicp_stream_recv_frame(
         &stream.stream, &request, payload, sizeof(payload));
     if (test->result != 0 || request.msg_type != AICP_MSG_CONTROL_SET ||
-        request.payload_len != sizeof(struct aicp_control_payload)) {
+        request.payload_len != AICP_CONTROL_PAYLOAD_LEN) {
         test->result = -1;
+        return NULL;
+    }
+    static const uint8_t expected_control_wire[] = {
+        0x3e, 0x80, 0x00, 0x00, 0x3f, 0x00, 0x00, 0x00,
+        0x3d, 0xcc, 0xcc, 0xcd, 0x3c, 0x23, 0xd7, 0x0a,
+        0x3e, 0x4c, 0xcc, 0xcd, 0x00, 0x00, 0x00, 0x01,
+    };
+    if (memcmp(payload, expected_control_wire, sizeof(expected_control_wire)) != 0) {
+        test->result = -1;
+        (void)shutdown(test->socket, SHUT_RDWR);
         return NULL;
     }
 
@@ -102,7 +114,7 @@ static void *serve_client(void *argument) {
     struct aicp_header response = aicp_make_header(
         AICP_MSG_STATUS,
         0,
-        sizeof(status),
+        AICP_STATUS_PAYLOAD_LEN,
         response_seq,
         1234,
         AICP_OK);

@@ -11,6 +11,19 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/wait.h>
+
+struct write_counter {
+    unsigned calls;
+};
+
+static ptrdiff_t count_writes(void *context, const void *buffer, size_t length) {
+    struct write_counter *counter = context;
+
+    (void)buffer;
+    counter->calls++;
+    return (ptrdiff_t)length;
+}
 
 static int make_pair(int fds[2]) {
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
@@ -104,9 +117,16 @@ static int test_round_trip_frame(void) {
         .feed_forward = 0.1f,
         .mode = 1,
     };
+    uint8_t payload_wire[AICP_CONTROL_PAYLOAD_LEN];
+    aicp_control_payload_encode(&payload, payload_wire);
     struct aicp_header hdr = aicp_make_header(
-        AICP_MSG_CONTROL_SET, AICP_FLAG_ACK_REQUIRED, sizeof(payload), 31, 5678, AICP_OK);
-    if (aicp_posix_send_frame(fds[0], hdr, &payload) != 0) {
+        AICP_MSG_CONTROL_SET,
+        AICP_FLAG_ACK_REQUIRED,
+        AICP_CONTROL_PAYLOAD_LEN,
+        31,
+        5678,
+        AICP_OK);
+    if (aicp_posix_send_frame(fds[0], hdr, payload_wire) != 0) {
         perror("aicp_send_frame");
         close_pair(fds);
         return 1;
@@ -120,11 +140,12 @@ static int test_round_trip_frame(void) {
         fprintf(stderr, "recv failed: %d\n", ret);
         return 1;
     }
-    if (out.seq != 31 || out.msg_type != AICP_MSG_CONTROL_SET || out.payload_len != sizeof(payload)) {
+    if (out.seq != 31 || out.msg_type != AICP_MSG_CONTROL_SET ||
+        out.payload_len != AICP_CONTROL_PAYLOAD_LEN) {
         fprintf(stderr, "decoded header mismatch\n");
         return 1;
     }
-    if (memcmp(rx, &payload, sizeof(payload)) != 0) {
+    if (memcmp(rx, payload_wire, sizeof(payload_wire)) != 0) {
         fprintf(stderr, "payload mismatch\n");
         return 1;
     }
@@ -200,6 +221,66 @@ static int test_rejects_oversized_payload_before_reading_body(void) {
     int failed = expect_recv_error(fds[1], -EMSGSIZE, "oversized payload");
     close_pair(fds);
     return failed;
+}
+
+static int test_send_rejects_oversized_payload_before_crc(void) {
+    struct write_counter counter = {0};
+    struct aicp_stream stream = {
+        .write = count_writes,
+        .context = &counter,
+    };
+    uint8_t payload[AICP_MAX_PAYLOAD + 1u] = {0};
+    const struct aicp_header header = aicp_make_header(
+        AICP_MSG_CONTROL_SET,
+        AICP_FLAG_ACK_REQUIRED,
+        sizeof(payload),
+        43,
+        1234,
+        AICP_OK);
+
+    const int result = aicp_stream_send_frame(&stream, header, payload);
+    if (result != -EMSGSIZE || counter.calls != 0) {
+        fprintf(stderr,
+                "oversized send: expected -EMSGSIZE without writes, got result=%d calls=%u\n",
+                result,
+                counter.calls);
+        return 1;
+    }
+    return 0;
+}
+
+static int test_peer_close_write_returns_epipe_without_sigpipe(void) {
+    int fds[2];
+    if (make_pair(fds) != 0) {
+        return 1;
+    }
+
+    const pid_t child = fork();
+    if (child < 0) {
+        perror("fork");
+        close_pair(fds);
+        return 1;
+    }
+    if (child == 0) {
+        const uint8_t payload = 0x5a;
+
+        close(fds[1]);
+        const int result = aicp_posix_write_full(fds[0], &payload, sizeof(payload));
+        close(fds[0]);
+        _exit(result == -EPIPE ? 0 : 1);
+    }
+
+    close_pair(fds);
+    int status = 0;
+    if (waitpid(child, &status, 0) != child) {
+        perror("waitpid");
+        return 1;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fprintf(stderr, "closed peer write did not return -EPIPE safely: status=%d\n", status);
+        return 1;
+    }
+    return 0;
 }
 
 static int test_version_error_reply(void) {
@@ -278,7 +359,7 @@ static int test_bad_payload_error_reply(void) {
     struct aicp_header decoded = {0};
     int ret = aicp_posix_recv_frame(
         fds[1], &decoded, decoded_payload, sizeof(decoded_payload));
-    if (ret != 0 || decoded.payload_len == sizeof(struct aicp_control_payload)) {
+    if (ret != 0 || decoded.payload_len == AICP_CONTROL_PAYLOAD_LEN) {
         fprintf(stderr, "bad payload decode failed ret=%d len=%u\n", ret, decoded.payload_len);
         close_pair(fds);
         return 1;
@@ -486,6 +567,8 @@ int main(void) {
         {"crc_detects_corruption", test_crc_detects_corruption},
         {"rejects_bad_magic", test_rejects_bad_magic},
         {"rejects_oversized_payload", test_rejects_oversized_payload_before_reading_body},
+        {"send_rejects_oversized_payload", test_send_rejects_oversized_payload_before_crc},
+        {"peer_close_write_returns_epipe", test_peer_close_write_returns_epipe_without_sigpipe},
         {"version_error_reply", test_version_error_reply},
         {"bad_type_error_reply", test_bad_type_error_reply},
         {"bad_payload_error_reply", test_bad_payload_error_reply},

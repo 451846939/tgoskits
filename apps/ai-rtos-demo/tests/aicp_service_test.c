@@ -86,11 +86,11 @@ static int expect_reply(
         return 1;
     }
     if (status != NULL) {
-        if (header.payload_len != sizeof(*status)) {
+        if (header.payload_len != AICP_STATUS_PAYLOAD_LEN) {
             fprintf(stderr, "unexpected status payload length: %u\n", header.payload_len);
             return 1;
         }
-        memcpy(status, payload, sizeof(*status));
+        aicp_status_payload_decode(payload, status);
     }
     return 0;
 }
@@ -104,14 +104,16 @@ static int send_control(int socket, uint32_t sequence, float target) {
         .feed_forward = 0.05f,
         .mode = 1,
     };
+    uint8_t payload_wire[AICP_CONTROL_PAYLOAD_LEN];
+    aicp_control_payload_encode(&payload, payload_wire);
     struct aicp_header header = aicp_make_header(
         AICP_MSG_CONTROL_SET,
         AICP_FLAG_ACK_REQUIRED,
-        sizeof(payload),
+        AICP_CONTROL_PAYLOAD_LEN,
         sequence,
         sequence * 1000,
         AICP_OK);
-    return aicp_posix_send_frame(socket, header, &payload);
+    return aicp_posix_send_frame(socket, header, payload_wire);
 }
 
 static int run_service_sequence_test(void) {

@@ -87,6 +87,9 @@ static inline int aicp_stream_send_frame(
     struct aicp_stream *stream,
     struct aicp_header header,
     const void *payload) {
+    if (header.payload_len > AICP_MAX_PAYLOAD) {
+        return -EMSGSIZE;
+    }
     if (header.payload_len != 0 && payload == NULL) {
         return -EINVAL;
     }

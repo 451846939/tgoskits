@@ -8,6 +8,8 @@ pub const MAGIC: u16 = 0xA1C0;
 pub const VERSION: u8 = 1;
 pub const HEADER_LEN: usize = 32;
 pub const MAX_PAYLOAD: usize = 4096;
+pub const CONTROL_PAYLOAD_LEN: usize = 24;
+pub const STATUS_PAYLOAD_LEN: usize = 24;
 
 pub const MSG_HELLO: u8 = 0x01;
 pub const MSG_CONTROL_SET: u8 = 0x02;
@@ -36,6 +38,78 @@ pub struct Header {
     pub error_code: u16,
     pub crc16: u16,
     pub reserved: u32,
+}
+
+/// Fixed AICP control payload.
+///
+/// The on-wire representation contains five IEEE-754 binary32 values and one
+/// `u32`, all in network byte order. It never depends on Rust struct layout.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ControlPayload {
+    pub target: f32,
+    pub kp: f32,
+    pub ki: f32,
+    pub kd: f32,
+    pub feed_forward: f32,
+    pub mode: u32,
+}
+
+/// Fixed AICP status payload.
+///
+/// The on-wire representation contains four IEEE-754 binary32 values and two
+/// `u32` values, all in network byte order.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StatusPayload {
+    pub setpoint: f32,
+    pub measured: f32,
+    pub control_output: f32,
+    pub error: f32,
+    pub mode: u32,
+    pub applied_seq: u32,
+}
+
+pub fn encode_control_payload(payload: ControlPayload) -> [u8; CONTROL_PAYLOAD_LEN] {
+    let mut output = [0u8; CONTROL_PAYLOAD_LEN];
+    output[0..4].copy_from_slice(&payload.target.to_bits().to_be_bytes());
+    output[4..8].copy_from_slice(&payload.kp.to_bits().to_be_bytes());
+    output[8..12].copy_from_slice(&payload.ki.to_bits().to_be_bytes());
+    output[12..16].copy_from_slice(&payload.kd.to_bits().to_be_bytes());
+    output[16..20].copy_from_slice(&payload.feed_forward.to_bits().to_be_bytes());
+    output[20..24].copy_from_slice(&payload.mode.to_be_bytes());
+    output
+}
+
+pub fn decode_control_payload(input: &[u8; CONTROL_PAYLOAD_LEN]) -> ControlPayload {
+    ControlPayload {
+        target: f32::from_bits(u32::from_be_bytes(input[0..4].try_into().unwrap())),
+        kp: f32::from_bits(u32::from_be_bytes(input[4..8].try_into().unwrap())),
+        ki: f32::from_bits(u32::from_be_bytes(input[8..12].try_into().unwrap())),
+        kd: f32::from_bits(u32::from_be_bytes(input[12..16].try_into().unwrap())),
+        feed_forward: f32::from_bits(u32::from_be_bytes(input[16..20].try_into().unwrap())),
+        mode: u32::from_be_bytes(input[20..24].try_into().unwrap()),
+    }
+}
+
+pub fn encode_status_payload(payload: StatusPayload) -> [u8; STATUS_PAYLOAD_LEN] {
+    let mut output = [0u8; STATUS_PAYLOAD_LEN];
+    output[0..4].copy_from_slice(&payload.setpoint.to_bits().to_be_bytes());
+    output[4..8].copy_from_slice(&payload.measured.to_bits().to_be_bytes());
+    output[8..12].copy_from_slice(&payload.control_output.to_bits().to_be_bytes());
+    output[12..16].copy_from_slice(&payload.error.to_bits().to_be_bytes());
+    output[16..20].copy_from_slice(&payload.mode.to_be_bytes());
+    output[20..24].copy_from_slice(&payload.applied_seq.to_be_bytes());
+    output
+}
+
+pub fn decode_status_payload(input: &[u8; STATUS_PAYLOAD_LEN]) -> StatusPayload {
+    StatusPayload {
+        setpoint: f32::from_bits(u32::from_be_bytes(input[0..4].try_into().unwrap())),
+        measured: f32::from_bits(u32::from_be_bytes(input[4..8].try_into().unwrap())),
+        control_output: f32::from_bits(u32::from_be_bytes(input[8..12].try_into().unwrap())),
+        error: f32::from_bits(u32::from_be_bytes(input[12..16].try_into().unwrap())),
+        mode: u32::from_be_bytes(input[16..20].try_into().unwrap()),
+        applied_seq: u32::from_be_bytes(input[20..24].try_into().unwrap()),
+    }
 }
 
 impl Header {
@@ -290,6 +364,25 @@ mod tests {
     fn header_round_trip() {
         let header = test_header(5);
         assert_eq!(decode_header(&encode_header(header)), header);
+    }
+
+    #[test]
+    fn control_payload_matches_c_wire_vector() {
+        let payload = ControlPayload {
+            target: 0.25,
+            kp: 0.5,
+            ki: 0.1,
+            kd: 0.01,
+            feed_forward: 0.2,
+            mode: 1,
+        };
+        let expected = [
+            0x3e, 0x80, 0x00, 0x00, 0x3f, 0x00, 0x00, 0x00, 0x3d, 0xcc, 0xcc, 0xcd, 0x3c, 0x23,
+            0xd7, 0x0a, 0x3e, 0x4c, 0xcc, 0xcd, 0x00, 0x00, 0x00, 0x01,
+        ];
+
+        assert_eq!(encode_control_payload(payload), expected);
+        assert_eq!(decode_control_payload(&expected), payload);
     }
 
     #[test]
