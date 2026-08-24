@@ -1,0 +1,36 @@
+// Copyright 2026 The TGOSKits Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#ifndef AICP_STARRY_PROFILE_H
+#define AICP_STARRY_PROFILE_H
+
+#ifndef AICP_INIT_GUEST_LABEL
+#define AICP_INIT_GUEST_LABEL "StarryOS guest"
+#endif
+
+#ifndef AICP_INIT_ROLE
+#define AICP_INIT_ROLE "starryos-guest-init"
+#endif
+
+#ifndef AICP_INIT_DONE_TOKEN
+#define AICP_INIT_DONE_TOKEN "AICP_STARRY_DONE"
+#endif
+
+#ifndef AICP_INIT_STATUS_TOKEN
+#define AICP_INIT_STATUS_TOKEN "AICP_STARRY_STATUS"
+#endif
+
+#ifndef AICP_INIT_FILE_TOKEN
+#define AICP_INIT_FILE_TOKEN "AICP_STARRY_FILE"
+#endif
+
+#ifndef AICP_INIT_NETDIAG_TOKEN
+#define AICP_INIT_NETDIAG_TOKEN "AICP_STARRY_NETDIAG"
+#endif
+
+#ifndef AICP_INIT_STRESS_TOKEN
+#define AICP_INIT_STRESS_TOKEN "AICP_STARRY_STRESS"
+#endif
+
+#endif
