@@ -61,6 +61,8 @@ pub(crate) use host::{
     task::{AxTaskExt, AxTaskRef, TaskInner, WaitQueue, WaitQueueHandle as HostWaitQueueHandle},
 };
 pub use lifecycle::{StopReason, VmStatus};
+#[allow(deprecated)]
+pub use manager::notify_vm_vcpu;
 pub use manager::{
     AxvmRuntime, current_vcpu_id, current_vm_id, dispatch_current_vcpu_interrupt, get_vm_by_id,
     get_vm_list, inject_current_vcpu_interrupt, kick_vm_vcpu, register_vm,
@@ -72,3 +74,20 @@ pub use vm::{
 
 /// The architecture-independent per-CPU type.
 pub(crate) type AxVMPerCpu = vcpu::AxPerCpu<arch::current::ArchPerCpu>;
+
+/// Check and dispatch pending AxVM timer events on the current CPU.
+pub fn check_timer_events() {
+    timer::check_events();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AxVmResult, VMId, kick_vm_vcpu, notify_vm_vcpu};
+
+    #[test]
+    #[allow(deprecated)]
+    fn legacy_notify_vm_vcpu_remains_a_public_compatible_entry_point() {
+        let _: fn(VMId, usize) -> AxVmResult = notify_vm_vcpu;
+        let _: fn(VMId, usize) -> AxVmResult = kick_vm_vcpu;
+    }
+}

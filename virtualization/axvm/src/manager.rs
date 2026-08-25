@@ -89,6 +89,16 @@ pub fn kick_vm_vcpu(vm_id: VMId, vcpu_id: usize) -> AxVmResult {
     crate::runtime::vcpus::notify_waiters_and_kick_vcpu(vm_id, vcpu_id)
 }
 
+/// Kick a target vCPU after waking the VM-wide shared wait queue.
+///
+/// This compatibility entry point preserves the established public API. New
+/// callers should use [`kick_vm_vcpu`], whose name makes the host-IPI effect
+/// explicit.
+#[deprecated(note = "use `kick_vm_vcpu` instead")]
+pub fn notify_vm_vcpu(vm_id: VMId, vcpu_id: usize) -> AxVmResult {
+    kick_vm_vcpu(vm_id, vcpu_id)
+}
+
 /// Return the current VM ID from the vCPU currently executing on this CPU.
 pub fn current_vm_id() -> Option<VMId> {
     with_current_vcpu::<ArchVCpu, _>(|vcpu| vcpu.map(|vcpu| vcpu.vm_id()))
