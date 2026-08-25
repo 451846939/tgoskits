@@ -1,6 +1,6 @@
-# CPU-isolated profile: a pinned vCPU stays runnable across guest WFI/standby.
-# Timer and virtual-device state are checked at VM-exit boundaries instead of
-# adding a shared wait-queue wakeup to the control path.
+# AArch64 build-wide bounded polling profile. Ordinary WFI/standby may poll
+# only within the configured runtime budget, then return to the shared wait
+# queue. This build flag does not establish pCPU exclusivity.
 features = ["rt-poll-idle"]
 log = "Info"
 target = "aarch64-unknown-none-softfloat"

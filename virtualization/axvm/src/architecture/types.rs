@@ -43,6 +43,7 @@ pub(crate) enum VcpuEventWait {
 
 impl VcpuEventWait {
     /// Returns whether this action uses the runtime's shared event wait queue.
+    #[cfg(any(not(feature = "rt-poll-idle"), not(target_arch = "aarch64"), test))]
     pub(crate) const fn uses_shared_wait(self) -> bool {
         match self {
             Self::None => false,

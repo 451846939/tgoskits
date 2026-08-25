@@ -578,19 +578,6 @@ impl VmRuntimeHandle {
         }
     }
 
-    /// Wakes vCPUs after an interrupt or device event has been published.
-    ///
-    /// The control profile deliberately preserves the old broadcast wake
-    /// behavior. The polling profile does not block on guest-idle exits, but
-    /// still uses this notification for startup and lifecycle transitions.
-    pub(crate) fn notify_vcpu(&self, _vcpu_id: usize) {
-        self.notification_generation.fetch_add(1, Ordering::Release);
-        #[cfg(feature = "rt-poll-idle")]
-        self.wait_queue.notify_all(true);
-        #[cfg(not(feature = "rt-poll-idle"))]
-        self.wait_queue.notify_all(false);
-    }
-
     pub(crate) fn notify_all(&self) {
         self.vcpu_wake_count.fetch_add(1, Ordering::Relaxed);
         self.notification_generation.fetch_add(1, Ordering::Release);

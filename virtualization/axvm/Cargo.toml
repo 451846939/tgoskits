@@ -18,9 +18,9 @@ host-test = [
     "vpci-test-device",
 ]
 vpci-test-device = []
-# Keep CPU-isolated vCPUs runnable across guest WFI/standby exits. The vCPU
-# loop continues to poll architectural timer and virtual-device state instead
-# of entering the shared host wait queue.
+# On AArch64, use a bounded polling interval for ordinary guest WFI/standby
+# exits before returning to the shared host wait queue. This does not alter
+# lifecycle waits or non-AArch64 guest-idle behavior.
 rt-poll-idle = []
 sstc = ["riscv_vcpu/sstc"]
 tls = ["ax-std/tls", "cpu-local/tls"]

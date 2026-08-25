@@ -163,6 +163,8 @@ Assigned physical SPI 使用经过所有权校验的 HW-backed LR：
 
 对于 WFI，`ArmTimerSnapshot::earliest_deadline` 同时考虑 CNTV 与 CNTP。Disabled、masked 或已经过期的 timer 不调度未来唤醒。
 
+`rt-poll-idle` 是 AArch64 build-wide profile，只改变普通 WFI/WFE 与 PSCI standby 的宿主等待策略：每个 vCPU 可在一个有限 polling 窗口内推进本 CPU 的 timer wheel；窗口到期，或运行时已经发布当前 CPU 的抢占请求时，必须回到既有共享 wait queue。同一 AxVisor binary 不能把该 profile 混用于部分 AArch64 VM，A/B 对比必须用相同 guest/topology 的独立 control 和 polling build。PSCI `CPU_OFF`、VM suspend、stop 与 reset 始终使用共享等待或生命周期路径，不能因为该 feature 变为 runnable。该 feature 不提供 pCPU 独占承诺，也不改变其他架构的 idle 语义；中断和设备事件仍通过共享通知 generation 与目标 pCPU IPI 传递。
+
 每个已调度 callback 携带：
 
 - 一个由 `Aarch64TimerBinding` 分配的 WFI 等待代次；
