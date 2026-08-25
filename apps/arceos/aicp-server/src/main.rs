@@ -33,6 +33,10 @@ const MAX_AICP_DATAGRAM_LEN: usize = HEADER_LEN + MAX_PAYLOAD;
 // A one-byte sentinel distinguishes a maximum valid datagram from a datagram
 // that the socket layer truncated to the same length.
 const UDP_RECEIVE_BUFFER_LEN: usize = MAX_AICP_DATAGRAM_LEN + 1;
+/// Static address assigned to the standalone ArceOS AICP guest by its QEMU
+/// user-network configuration. `.2` is the user-network gateway; the guest
+/// must use a distinct address so hostfwd reaches the TCP listener.
+const AICP_SERVER_IPV4_OCTETS: [u8; 4] = [10, 0, 3, 15];
 
 static PERIODIC_PROBE_ACTIVE: AtomicBool = AtomicBool::new(false);
 
@@ -43,7 +47,7 @@ fn configure_aicp_network() -> io::Result<()> {
         .find(|interface| interface.name == "eth0")
         .ok_or_else(|| io::Error::other("AICP network interface eth0 is unavailable"))?;
 
-    let ip = std::net::Ipv4Addr::new(10, 0, 3, 2);
+    let ip = std::net::Ipv4Addr::from(AICP_SERVER_IPV4_OCTETS);
     let configured = interface
         .ipv4
         .ok_or_else(|| io::Error::other("AICP static IPv4 is missing on eth0"))?;

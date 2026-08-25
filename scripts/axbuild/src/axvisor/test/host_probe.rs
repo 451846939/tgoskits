@@ -31,13 +31,11 @@ use std::{
 
 use anyhow::{Context, bail};
 
-use super::types::AxvisorHttpProbeConfig;
-
 /// The probe callback invoked by the guard once the forwarded port accepts
 /// connections. Returns the verdict (`Ok` = pass, `Err` = fail). The probe is a
 /// `FnOnce` so it may own everything it needs (base address, token, config
 /// paths) and runs on the guard's worker thread.
-pub(crate) type HostHttpProbeFn = Box<dyn FnOnce() -> anyhow::Result<()> + Send + 'static>;
+pub(crate) type HostTcpProbeFn = Box<dyn FnOnce() -> anyhow::Result<()> + Send + 'static>;
 
 /// Sleep between readiness retries.
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(100);
@@ -55,13 +53,13 @@ const QMP_READ_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// time out.
 const QMP_QUIT_RETRIES: usize = 4;
 
-pub(crate) struct HostHttpProbeGuard {
+pub(crate) struct HostTcpProbeGuard {
     stop: Arc<AtomicBool>,
     result: Arc<Mutex<Option<anyhow::Result<()>>>>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
-impl HostHttpProbeGuard {
+impl HostTcpProbeGuard {
     /// Spawn the probe runner thread and return a guard that owns its
     /// lifecycle.
     ///
@@ -77,15 +75,16 @@ impl HostHttpProbeGuard {
     /// abort the probe thread on its next poll instead of waiting out the
     /// deadline. The runner owns it: it stores `true` when the case is over.
     pub(crate) fn start(
-        config: &AxvisorHttpProbeConfig,
         host_port: u16,
+        guest_port: u16,
+        connect_timeout_secs: u64,
         case_name: &str,
         qmp_socket: Option<PathBuf>,
         stop: Arc<AtomicBool>,
-        probe: HostHttpProbeFn,
+        probe: HostTcpProbeFn,
     ) -> anyhow::Result<Self> {
         let addr = format!("127.0.0.1:{host_port}");
-        let connect_timeout = Duration::from_secs(config.connect_timeout_secs);
+        let connect_timeout = Duration::from_secs(connect_timeout_secs);
         let thread_stop = stop.clone();
         let result = Arc::new(Mutex::new(None));
         let thread_result = result.clone();
@@ -129,7 +128,7 @@ impl HostHttpProbeGuard {
             bail!("host http probe for `{case_name}` did not become ready");
         }
 
-        println!("  host http probe: {addr} -> guest:{}", config.guest_port);
+        println!("  host TCP probe: {addr} -> guest:{guest_port}");
         Ok(Self {
             stop,
             result,
@@ -146,7 +145,7 @@ impl HostHttpProbeGuard {
     }
 }
 
-impl Drop for HostHttpProbeGuard {
+impl Drop for HostTcpProbeGuard {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         if let Some(thread) = self.thread.take() {

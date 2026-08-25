@@ -12,6 +12,13 @@ args = [
 ]
 uefi = false
 to_bin = true
-success_regex = ["AICP_RTOS_READY"]
+# The host probe is the success condition. It sends a TCP AICP HELLO through
+# the configured hostfwd and validates the returned STATUS before QMP quits
+# QEMU, so a serial ready log alone cannot pass this standalone test.
+success_regex = []
 fail_regex = ["(?i)\\bpanic(?:ked)?\\b"]
 timeout = 60
+
+[host_aicp_probe]
+host_port = 18800
+connect_timeout_secs = 50

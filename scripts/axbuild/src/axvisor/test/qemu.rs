@@ -392,12 +392,13 @@ impl Axvisor {
             let probe_owned = probe_config.clone();
             let probe_case_dir = case.case.case.case_dir.clone();
             let probe_stop = stop.clone();
-            let probe: host_probe::HostHttpProbeFn = Box::new(move || {
+            let probe: host_probe::HostTcpProbeFn = Box::new(move || {
                 super::http_probe::run(&probe_addr, &probe_owned, &probe_case_dir, probe_stop)
             });
-            host_probe_guard = Some(host_probe::HostHttpProbeGuard::start(
-                &probe_config,
+            host_probe_guard = Some(host_probe::HostTcpProbeGuard::start(
                 host_port,
+                probe_config.guest_port,
+                probe_config.connect_timeout_secs,
                 &case.case.case.name,
                 Some(qmp_socket),
                 stop,

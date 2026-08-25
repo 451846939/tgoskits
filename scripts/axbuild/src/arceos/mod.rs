@@ -1,4 +1,11 @@
-use std::path::{Path, PathBuf};
+use std::{
+    io::{Read, Write},
+    net::TcpStream,
+    path::{Path, PathBuf},
+    sync::{Arc, atomic::AtomicBool},
+    thread,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, anyhow, bail};
 use clap::{Args, Subcommand};
@@ -8,12 +15,166 @@ use ostool::{
 };
 
 use crate::{
+    axvisor::test::host_probe::{HostTcpProbeFn, HostTcpProbeGuard},
     context::{
         AppContext, BuildCliArgs, ResolvedBuildRequest, SnapshotPersistence,
         resolve_arceos_arch_and_target,
     },
     test::host_http::HostHttpServerGuard,
 };
+
+const DEFAULT_AICP_HOST_PROBE_PORT: u16 = 18_800;
+const DEFAULT_AICP_HOST_PROBE_CONNECT_TIMEOUT_SECS: u64 = 120;
+const AICP_HOST_PROBE_IO_TIMEOUT: Duration = Duration::from_secs(3);
+const AICP_HOST_PROBE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+const AICP_HOST_PROBE_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Host-side AICP handshake probe for an ArceOS QEMU application.
+///
+/// The QEMU config owns whether this is enabled. Keeping the transport check in
+/// axbuild means the standalone application command verifies the same hostfwd
+/// path that users and CI invoke, rather than relying on a serial ready marker.
+#[derive(Clone, Debug, serde::Deserialize)]
+struct AicpHostProbeConfig {
+    #[serde(default = "default_aicp_host_probe_port")]
+    host_port: u16,
+    #[serde(default = "default_aicp_host_probe_connect_timeout_secs")]
+    connect_timeout_secs: u64,
+}
+
+fn default_aicp_host_probe_port() -> u16 {
+    DEFAULT_AICP_HOST_PROBE_PORT
+}
+
+fn default_aicp_host_probe_connect_timeout_secs() -> u64 {
+    DEFAULT_AICP_HOST_PROBE_CONNECT_TIMEOUT_SECS
+}
+
+fn load_aicp_host_probe_config(
+    qemu_config_path: Option<&Path>,
+) -> anyhow::Result<Option<AicpHostProbeConfig>> {
+    #[derive(serde::Deserialize)]
+    struct ProbeSection {
+        #[serde(default)]
+        host_aicp_probe: Option<AicpHostProbeConfig>,
+    }
+
+    let Some(path) = qemu_config_path else {
+        return Ok(None);
+    };
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    Ok(toml::from_str::<ProbeSection>(&contents)
+        .with_context(|| format!("failed to parse {}", path.display()))?
+        .host_aicp_probe)
+}
+
+fn start_qemu_aicp_host_probe(
+    request: &ResolvedBuildRequest,
+    qemu: &mut ostool::run::qemu::QemuConfig,
+) -> anyhow::Result<Option<HostTcpProbeGuard>> {
+    let Some(config) = load_aicp_host_probe_config(request.qemu_config.as_deref())? else {
+        return Ok(None);
+    };
+
+    let qmp_socket = std::env::temp_dir().join(format!(
+        "arceos-aicp-qmp-{}-{}.sock",
+        request.package,
+        std::process::id()
+    ));
+    qemu.args.extend([
+        "-qmp".to_string(),
+        format!("unix:{},server=on,wait=off", qmp_socket.to_string_lossy()),
+    ]);
+    let host_port = config.host_port;
+    let probe: HostTcpProbeFn = Box::new(move || run_aicp_hello_probe(host_port));
+    let stop = Arc::new(AtomicBool::new(false));
+    HostTcpProbeGuard::start(
+        host_port,
+        8800,
+        config.connect_timeout_secs,
+        &request.package,
+        Some(qmp_socket),
+        stop,
+        probe,
+    )
+    .map(Some)
+}
+
+fn run_aicp_hello_probe(host_port: u16) -> anyhow::Result<()> {
+    let started = Instant::now();
+    loop {
+        match run_aicp_hello_probe_attempt(host_port) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                if started.elapsed() >= AICP_HOST_PROBE_RESPONSE_TIMEOUT {
+                    return Err(error).context(
+                        "AICP server accepted TCP but did not complete a HELLO/STATUS exchange",
+                    );
+                }
+                thread::sleep(AICP_HOST_PROBE_RETRY_INTERVAL);
+            }
+        }
+    }
+}
+
+fn run_aicp_hello_probe_attempt(host_port: u16) -> anyhow::Result<()> {
+    use aicp_rust_protocol::{
+        ERROR_OK, HEADER_LEN, Header, MSG_HELLO, MSG_STATUS, STATUS_PAYLOAD_LEN, decode_header,
+        decode_status_payload, encode_frame, validate_frame,
+    };
+
+    let mut stream = TcpStream::connect(("127.0.0.1", host_port))
+        .with_context(|| format!("failed to connect AICP hostfwd at 127.0.0.1:{host_port}"))?;
+    stream
+        .set_read_timeout(Some(AICP_HOST_PROBE_IO_TIMEOUT))
+        .context("failed to set AICP probe read timeout")?;
+    stream
+        .set_write_timeout(Some(AICP_HOST_PROBE_IO_TIMEOUT))
+        .context("failed to set AICP probe write timeout")?;
+
+    let mut request = [0_u8; HEADER_LEN];
+    let request_len = encode_frame(
+        Header::new(MSG_HELLO, 0, 0, 1, 0, ERROR_OK),
+        &[],
+        &mut request,
+    )
+    .context("failed to encode AICP HELLO")?;
+    stream
+        .write_all(&request[..request_len])
+        .context("failed to send AICP HELLO")?;
+
+    let mut header_wire = [0_u8; HEADER_LEN];
+    stream
+        .read_exact(&mut header_wire)
+        .context("failed to read AICP STATUS header")?;
+    let header = decode_header(&header_wire);
+    let payload_len = header.payload_len as usize;
+    if payload_len != STATUS_PAYLOAD_LEN {
+        bail!(
+            "AICP HELLO response has payload length {payload_len}, expected {STATUS_PAYLOAD_LEN}"
+        );
+    }
+    let mut payload = [0_u8; STATUS_PAYLOAD_LEN];
+    stream
+        .read_exact(&mut payload)
+        .context("failed to read AICP STATUS payload")?;
+    validate_frame(header, &payload).context("invalid AICP HELLO response frame")?;
+    if header.msg_type != MSG_STATUS || header.seq != 1 || header.error_code != ERROR_OK {
+        bail!(
+            "unexpected AICP HELLO response: type={} seq={} error={}",
+            header.msg_type,
+            header.seq,
+            header.error_code
+        );
+    }
+    let status = decode_status_payload(&payload);
+    println!(
+        "AICP_HOST_PROBE_PASSED seq={} mode={} applied_seq={}",
+        header.seq, status.mode, status.applied_seq
+    );
+    Ok(())
+}
 
 mod board;
 pub mod build;
@@ -456,9 +617,36 @@ impl ArceOS {
         crate::test::qemu::apply_smp_qemu_arg(&mut qemu, request.smp);
         rootfs::prepare_default_qemu_fat32_rootfs(self.app.workspace_root(), &qemu)?;
         let _host_http_server = start_qemu_host_http_server(&request)?;
+        if load_aicp_host_probe_config(request.qemu_config.as_deref())?.is_none() {
+            return self
+                .app
+                .qemu(cargo, request.build_info_path, Some(qemu))
+                .await;
+        }
+
+        // Build before starting the probe guard. A cold target build can be
+        // longer than the guest-network readiness deadline, but it is not a
+        // guest reachability failure and must not consume that deadline.
+        let output = self
+            .app
+            .build(cargo, request.build_info_path.clone())
+            .await?;
         self.app
-            .qemu(cargo, request.build_info_path, Some(qemu))
-            .await
+            .prepare_elf_artifact(output.elf_path().to_path_buf(), qemu.to_bin)
+            .await?;
+        let host_probe_guard = start_qemu_aicp_host_probe(&request, &mut qemu)?;
+        let qemu_result = self.app.run_prepared_qemu(qemu, None).await;
+        let probe_configured = host_probe_guard.is_some();
+        let probe_result = host_probe_guard
+            .as_ref()
+            .and_then(HostTcpProbeGuard::take_result);
+        drop(host_probe_guard);
+        qemu_result?;
+        match (probe_configured, probe_result) {
+            (false, _) => Ok(()),
+            (true, Some(result)) => result,
+            (true, None) => bail!("AICP host probe produced no verdict"),
+        }
     }
 
     async fn run_build_request(&mut self, request: ResolvedBuildRequest) -> anyhow::Result<()> {
@@ -585,6 +773,67 @@ mod tests {
 
     fn parse(args: impl IntoIterator<Item = &'static str>) -> Command {
         Cli::try_parse_from(args).unwrap().command
+    }
+
+    #[test]
+    fn standalone_aicp_qemu_config_enables_the_host_handshake_probe() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let workspace = manifest_dir
+            .parent()
+            .and_then(Path::parent)
+            .expect("axbuild must be under the workspace scripts directory");
+        let config = load_aicp_host_probe_config(Some(
+            &workspace.join("apps/arceos/aicp-server/qemu-aarch64.toml"),
+        ))
+        .unwrap()
+        .expect("standalone AICP config must enable its host probe");
+        assert_eq!(config.host_port, 18_800);
+        assert_eq!(config.connect_timeout_secs, 50);
+    }
+
+    #[test]
+    fn aicp_host_probe_requires_a_status_reply_to_hello() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            thread,
+        };
+
+        use aicp_rust_protocol::{
+            ERROR_OK, HEADER_LEN, Header, MSG_HELLO, MSG_STATUS, STATUS_PAYLOAD_LEN, StatusPayload,
+            decode_header, encode_frame, encode_status_payload,
+        };
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; HEADER_LEN];
+            stream.read_exact(&mut request).unwrap();
+            let request = decode_header(&request);
+            assert_eq!(request.msg_type, MSG_HELLO);
+            assert_eq!(request.seq, 1);
+
+            let payload = encode_status_payload(StatusPayload {
+                setpoint: 0.0,
+                measured: 0.0,
+                control_output: 0.0,
+                error: 0.0,
+                mode: 0,
+                applied_seq: 1,
+            });
+            let mut reply = [0_u8; HEADER_LEN + STATUS_PAYLOAD_LEN];
+            let reply_len = encode_frame(
+                Header::new(MSG_STATUS, 0, STATUS_PAYLOAD_LEN as u32, 1, 0, ERROR_OK),
+                &payload,
+                &mut reply,
+            )
+            .unwrap();
+            stream.write_all(&reply[..reply_len]).unwrap();
+        });
+
+        run_aicp_hello_probe(port).unwrap();
+        server.join().unwrap();
     }
 
     #[test]
