@@ -1,0 +1,21 @@
+args = [
+  "-nographic",
+  "-cpu",
+  "cortex-a72",
+  "-machine",
+  "virt,virtualization=on,gic-version=3",
+  "-smp",
+  "4",
+  # This host-only NIC is not assigned to either guest. Guest-to-guest AICP
+  # traffic uses the configured AxVisor virtual switch instead.
+  "-netdev",
+  "user,id=hostnet",
+  "-device",
+  "virtio-net-device,netdev=hostnet,mac=52:54:00:aa:03:01",
+  "-m",
+  "4g",
+]
+fail_regex = []
+success_regex = []
+to_bin = true
+uefi = false

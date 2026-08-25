@@ -1,0 +1,6 @@
+# The AICP integration run boots both guests from memory images. Do not enable
+# host filesystem or NVMe support: the control loop uses only virtual NICs.
+features = []
+log = "Info"
+target = "aarch64-unknown-none-softfloat"
+vm_configs = []
