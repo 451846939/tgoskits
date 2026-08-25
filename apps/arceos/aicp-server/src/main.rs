@@ -11,11 +11,14 @@ use std::{
 };
 
 use aicp_rust_protocol::{
-    ERROR_BAD_PAYLOAD, ERROR_BAD_TYPE, ERROR_CRC, ERROR_OK, ERROR_SEQUENCE, ERROR_VERSION,
-    HEADER_LEN, Header, MAX_PAYLOAD, MSG_CONTROL_SET, MSG_ERROR, MSG_HEARTBEAT, MSG_HELLO,
-    MSG_STATUS, ProtocolError, VERSION, decode_frame, decode_header, encode_frame, encode_header,
-    frame_crc, validate_header_shape,
+    CONTROL_PAYLOAD_LEN, ControlPayload, ERROR_BAD_PAYLOAD, ERROR_BAD_TYPE, ERROR_CRC, ERROR_OK,
+    ERROR_SEQUENCE, ERROR_VERSION, HEADER_LEN, Header, MAX_PAYLOAD, MSG_CONTROL_SET, MSG_ERROR,
+    MSG_HEARTBEAT, MSG_HELLO, MSG_STATUS, ProtocolError, STATUS_PAYLOAD_LEN, StatusPayload,
+    VERSION, decode_control_payload, decode_frame, decode_header, encode_frame, encode_header,
+    encode_status_payload, frame_crc, validate_header_shape,
 };
+#[cfg(test)]
+use aicp_rust_protocol::{decode_status_payload, encode_control_payload};
 #[cfg(feature = "arceos")]
 use ax_std as _;
 
@@ -63,28 +66,6 @@ fn udp_drop_every() -> u32 {
 
 fn seq_is_newer(seq: u32, previous: u32) -> bool {
     (seq.wrapping_sub(previous) as i32) > 0
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct ControlPayload {
-    target: f32,
-    kp: f32,
-    ki: f32,
-    kd: f32,
-    feed_forward: f32,
-    mode: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct StatusPayload {
-    setpoint: f32,
-    measured: f32,
-    control_output: f32,
-    error: f32,
-    mode: u32,
-    applied_seq: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -327,28 +308,13 @@ fn protocol_io_error(error: ProtocolError) -> io::Error {
 }
 
 fn control_from_payload(payload: &[u8]) -> Option<ControlPayload> {
-    if payload.len() != 24 {
-        return None;
-    }
-    Some(ControlPayload {
-        target: f32::from_ne_bytes(payload[0..4].try_into().ok()?),
-        kp: f32::from_ne_bytes(payload[4..8].try_into().ok()?),
-        ki: f32::from_ne_bytes(payload[8..12].try_into().ok()?),
-        kd: f32::from_ne_bytes(payload[12..16].try_into().ok()?),
-        feed_forward: f32::from_ne_bytes(payload[16..20].try_into().ok()?),
-        mode: u32::from_ne_bytes(payload[20..24].try_into().ok()?),
-    })
+    let wire: &[u8; CONTROL_PAYLOAD_LEN] = payload.try_into().ok()?;
+
+    Some(decode_control_payload(wire))
 }
 
-fn status_to_payload(status: StatusPayload) -> [u8; 24] {
-    let mut out = [0u8; 24];
-    out[0..4].copy_from_slice(&status.setpoint.to_ne_bytes());
-    out[4..8].copy_from_slice(&status.measured.to_ne_bytes());
-    out[8..12].copy_from_slice(&status.control_output.to_ne_bytes());
-    out[12..16].copy_from_slice(&status.error.to_ne_bytes());
-    out[16..20].copy_from_slice(&status.mode.to_ne_bytes());
-    out[20..24].copy_from_slice(&status.applied_seq.to_ne_bytes());
-    out
+fn status_to_payload(status: StatusPayload) -> [u8; STATUS_PAYLOAD_LEN] {
+    encode_status_payload(status)
 }
 
 fn send_error(stream: &mut TcpStream, seq: u32, code: u16) -> io::Result<()> {
@@ -742,13 +708,7 @@ mod tests {
             feed_forward: 0.03,
             mode: 1,
         };
-        let mut payload = [0u8; 24];
-        payload[0..4].copy_from_slice(&control.target.to_ne_bytes());
-        payload[4..8].copy_from_slice(&control.kp.to_ne_bytes());
-        payload[8..12].copy_from_slice(&control.ki.to_ne_bytes());
-        payload[12..16].copy_from_slice(&control.kd.to_ne_bytes());
-        payload[16..20].copy_from_slice(&control.feed_forward.to_ne_bytes());
-        payload[20..24].copy_from_slice(&control.mode.to_ne_bytes());
+        let payload = encode_control_payload(control);
 
         let request = make_header(MSG_CONTROL_SET, payload.len(), 42, ERROR_OK);
         write_frame(&mut client, request, &payload);
@@ -767,7 +727,8 @@ mod tests {
         let (result, state) = server.join().unwrap();
         assert!(result.is_err());
         assert_eq!(state.applied_seq, 42);
-        assert_eq!(state.status().measured.to_ne_bytes(), first_status[4..8]);
+        let first_status = decode_status_payload(first_status.as_slice().try_into().unwrap());
+        assert_eq!(state.status().measured, first_status.measured);
     }
 
     #[test]
@@ -782,7 +743,14 @@ mod tests {
             }
             service.state
         });
-        let first_control = [0u8; 24];
+        let first_control = encode_control_payload(ControlPayload {
+            target: 0.0,
+            kp: 0.0,
+            ki: 0.0,
+            kd: 0.0,
+            feed_forward: 0.0,
+            mode: 0,
+        });
         let mut first_client = TcpStream::connect(address).unwrap();
         write_frame(
             &mut first_client,
@@ -794,7 +762,14 @@ mod tests {
         assert_eq!(first_response.msg_type, MSG_STATUS);
         drop(first_client);
 
-        let second_control = [1u8; 24];
+        let second_control = encode_control_payload(ControlPayload {
+            target: 0.5,
+            kp: 0.6,
+            ki: 0.1,
+            kd: 0.01,
+            feed_forward: 0.05,
+            mode: 1,
+        });
         let mut second_client = TcpStream::connect(address).unwrap();
         write_frame(
             &mut second_client,
@@ -812,7 +787,8 @@ mod tests {
         assert_eq!(response.msg_type, MSG_STATUS);
         assert_eq!(response.seq, 1);
         assert_eq!(response.error_code, ERROR_OK);
-        assert_eq!(response_payload[..response_len][20..24], 1u32.to_ne_bytes());
+        let status = decode_status_payload(response_payload[..response_len].try_into().unwrap());
+        assert_eq!(status.applied_seq, 1);
         drop(second_client);
         assert_eq!(server.join().unwrap().applied_seq, 1);
     }
@@ -828,7 +804,14 @@ mod tests {
             (result, service.state)
         });
         let mut client = TcpStream::connect(address).unwrap();
-        let payload = [0u8; 24];
+        let payload = encode_control_payload(ControlPayload {
+            target: 0.0,
+            kp: 0.0,
+            ki: 0.0,
+            kd: 0.0,
+            feed_forward: 0.0,
+            mode: 0,
+        });
         write_frame(
             &mut client,
             make_header(MSG_CONTROL_SET, payload.len(), 2, ERROR_OK),
