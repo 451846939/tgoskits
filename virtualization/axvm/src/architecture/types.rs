@@ -13,6 +13,19 @@ pub(crate) struct VcpuRunAction {
     pub(crate) exits_vcpu: bool,
 }
 
+impl VcpuRunAction {
+    /// Keeps a powered-down vCPU asleep until a lifecycle event resumes it.
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) const fn cpu_down() -> Self {
+        Self {
+            event_wait: VcpuEventWait::Block,
+            stop_reason: None,
+            resets_vm: false,
+            exits_vcpu: false,
+        }
+    }
+}
+
 /// How the runtime resumes a vCPU that yielded for an event.
 ///
 /// `Poll` is reserved for ordinary guest-idle exits. A vCPU that was powered
@@ -26,6 +39,17 @@ pub(crate) enum VcpuEventWait {
     Block,
     /// Poll timer and virtual-device state between guest entries.
     Poll,
+}
+
+impl VcpuEventWait {
+    /// Returns whether this action uses the runtime's shared event wait queue.
+    pub(crate) const fn uses_shared_wait(self) -> bool {
+        match self {
+            Self::None => false,
+            Self::Block => true,
+            Self::Poll => !cfg!(feature = "rt-poll-idle"),
+        }
+    }
 }
 
 /// Result of handling one exit while the vCPU is still bound to the host CPU.

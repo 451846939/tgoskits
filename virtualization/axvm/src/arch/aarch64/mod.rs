@@ -152,7 +152,7 @@ impl ArchOps for Aarch64Arch {
                     vm.id(),
                     vcpu.id()
                 );
-                Ok(BoundVcpuExit::Complete(cpu_down_action()))
+                Ok(BoundVcpuExit::Complete(VcpuRunAction::cpu_down()))
             }
             ArmVmExit::CpuUp {
                 target_cpu,
@@ -273,15 +273,6 @@ impl ArchOps for Aarch64Arch {
             || timer_wait.is_some_and(|token| vcpu.get_arch_vcpu().timer_wait_completed(token)),
             |condition| vcpu.get_arch_vcpu().wait_for_timer_event(condition),
         );
-    }
-}
-
-fn cpu_down_action() -> VcpuRunAction {
-    VcpuRunAction {
-        event_wait: VcpuEventWait::Block,
-        stop_reason: None,
-        resets_vm: false,
-        exits_vcpu: false,
     }
 }
 
@@ -707,7 +698,7 @@ mod tests {
 
     #[test]
     fn cpu_down_uses_the_blocking_event_wait() {
-        assert_eq!(cpu_down_action().event_wait, VcpuEventWait::Block);
+        assert_eq!(VcpuRunAction::cpu_down().event_wait, VcpuEventWait::Block);
     }
 
     #[test]
