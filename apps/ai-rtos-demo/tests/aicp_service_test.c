@@ -147,6 +147,13 @@ static int run_service_sequence_test(void) {
         aicp_make_header(AICP_MSG_HELLO, 0, 0, 1, 1000, AICP_OK);
     failed |= aicp_posix_send_frame(sockets[0], hello, NULL) != 0;
 
+    struct aicp_status_payload hello_status;
+    failed |= expect_reply(sockets[0], AICP_MSG_STATUS, 1, AICP_OK, &hello_status);
+    if (hello_status.applied_seq != 0) {
+        fprintf(stderr, "HELLO reply unexpectedly reports applied_seq=%u\n", hello_status.applied_seq);
+        failed = 1;
+    }
+
     struct aicp_status_payload first_status;
     failed |= send_control(sockets[0], 2, 0.75f) != 0;
     failed |= expect_reply(sockets[0], AICP_MSG_STATUS, 2, AICP_OK, &first_status);
@@ -209,7 +216,7 @@ static int run_service_sequence_test(void) {
     }
     if (context.events[AICP_SERVICE_HELLO] != 1 ||
         context.events[AICP_SERVICE_CONTROL_APPLIED] != 1 ||
-        context.events[AICP_SERVICE_STATUS_SENT] != 2 ||
+        context.events[AICP_SERVICE_STATUS_SENT] != 3 ||
         context.events[AICP_SERVICE_ERROR_SENT] != 6 ||
         context.events[AICP_SERVICE_DUPLICATE] != 3 ||
         context.events[AICP_SERVICE_STALE] != 1 ||

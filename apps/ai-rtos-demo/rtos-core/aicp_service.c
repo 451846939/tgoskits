@@ -182,6 +182,11 @@ int aicp_service_serve(
         switch (header.msg_type) {
         case AICP_MSG_HELLO:
             emit_event(ops, AICP_SERVICE_HELLO, &header, &session->control, 0, AICP_OK);
+            session->sequence.reply = AICP_CACHED_REPLY_STATUS;
+            result = send_status(stream, &session->control, header.seq, ops, &header);
+            if (result != 0) {
+                return result;
+            }
             break;
         case AICP_MSG_HEARTBEAT:
             session->sequence.reply = AICP_CACHED_REPLY_STATUS;

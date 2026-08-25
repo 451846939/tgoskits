@@ -42,6 +42,39 @@ static int send_request(
     return result;
 }
 
+static int receive_status_response(
+    struct aicp_stream *stream,
+    const struct aicp_header *request,
+    struct aicp_status_payload *status,
+    uint64_t *rtt_ns,
+    uint64_t start,
+    const struct aicp_client_ops *ops) {
+    uint8_t payload[AICP_MAX_PAYLOAD];
+    struct aicp_header response;
+    int result = aicp_stream_recv_frame(stream, &response, payload, sizeof(payload));
+    emit_event(
+        ops,
+        AICP_CLIENT_RX_COMPLETE,
+        request,
+        result == 0 ? &response : NULL,
+        result);
+    if (result != 0) {
+        return result;
+    }
+
+    if (rtt_ns != NULL) {
+        *rtt_ns = monotonic_ns(ops) - start;
+    }
+    if (response.version != AICP_VERSION || response.msg_type == AICP_MSG_ERROR ||
+        response.msg_type != AICP_MSG_STATUS || response.seq != request->seq ||
+        response.payload_len != AICP_STATUS_PAYLOAD_LEN) {
+        return -EPROTO;
+    }
+
+    aicp_status_payload_decode(payload, status);
+    return 0;
+}
+
 int aicp_client_session_send_hello(
     struct aicp_stream *stream,
     uint32_t *next_seq,
@@ -61,6 +94,32 @@ int aicp_client_session_send_hello(
         monotonic_ns(ops),
         AICP_OK);
     return send_request(stream, &request, payload, ops);
+}
+
+int aicp_client_session_handshake(
+    struct aicp_stream *stream,
+    uint32_t *next_seq,
+    const void *payload,
+    uint32_t payload_len,
+    struct aicp_status_payload *status,
+    const struct aicp_client_ops *ops) {
+    if (next_seq == NULL || status == NULL || (payload_len != 0 && payload == NULL) ||
+        payload_len > AICP_MAX_PAYLOAD) {
+        return -EINVAL;
+    }
+
+    const struct aicp_header request = aicp_make_header(
+        AICP_MSG_HELLO,
+        0,
+        payload_len,
+        (*next_seq)++,
+        monotonic_ns(ops),
+        AICP_OK);
+    int result = send_request(stream, &request, payload, ops);
+    if (result != 0) {
+        return result;
+    }
+    return receive_status_response(stream, &request, status, NULL, 0, ops);
 }
 
 int aicp_client_session_transact_control(
@@ -89,33 +148,5 @@ int aicp_client_session_transact_control(
         return result;
     }
 
-    uint8_t payload[AICP_MAX_PAYLOAD];
-    struct aicp_header response;
-    result = aicp_stream_recv_frame(stream, &response, payload, sizeof(payload));
-    emit_event(
-        ops,
-        AICP_CLIENT_RX_COMPLETE,
-        &request,
-        result == 0 ? &response : NULL,
-        result);
-    if (result != 0) {
-        return result;
-    }
-
-    if (rtt_ns != NULL) {
-        *rtt_ns = monotonic_ns(ops) - start;
-    }
-    if (response.version != AICP_VERSION) {
-        return -EPROTO;
-    }
-    if (response.msg_type == AICP_MSG_ERROR) {
-        return -EPROTO;
-    }
-    if (response.msg_type != AICP_MSG_STATUS || response.seq != request.seq ||
-        response.payload_len != AICP_STATUS_PAYLOAD_LEN) {
-        return -EPROTO;
-    }
-
-    aicp_status_payload_decode(payload, status);
-    return 0;
+    return receive_status_response(stream, &request, status, rtt_ns, start, ops);
 }

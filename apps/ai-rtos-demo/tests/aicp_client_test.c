@@ -83,6 +83,26 @@ static void *serve_client(void *argument) {
         return NULL;
     }
 
+    const struct aicp_status_payload hello_status = {
+        .setpoint = 0.0f,
+        .measured = 0.0f,
+        .control_output = 0.0f,
+        .error = 0.0f,
+        .mode = 0,
+        .applied_seq = request.seq,
+    };
+    struct aicp_header hello_response = aicp_make_header(
+        AICP_MSG_STATUS,
+        0,
+        AICP_STATUS_PAYLOAD_LEN,
+        request.seq,
+        1000,
+        AICP_OK);
+    test->result = send_response(&stream.stream, hello_response, &hello_status);
+    if (test->result != 0) {
+        return NULL;
+    }
+
     test->result = aicp_stream_recv_frame(
         &stream.stream, &request, payload, sizeof(payload));
     if (test->result != 0 || request.msg_type != AICP_MSG_CONTROL_SET ||
@@ -154,8 +174,9 @@ static int run_case(int corrupt_response_seq, int corrupt_response_version) {
     const char hello[] = "{\"role\":\"client-test\"}";
     struct aicp_posix_stream stream;
     aicp_posix_stream_init(&stream, sockets[0]);
-    int result = aicp_client_session_send_hello(
-        &stream.stream, &seq, hello, sizeof(hello), &ops);
+    struct aicp_status_payload hello_status;
+    int result = aicp_client_session_handshake(
+        &stream.stream, &seq, hello, sizeof(hello), &hello_status, &ops);
 
     const struct aicp_control_payload control = {
         .target = 0.25f,
@@ -189,7 +210,10 @@ static int run_case(int corrupt_response_seq, int corrupt_response_version) {
     const int expected = expect_protocol_error ? -EPROTO : 0;
     if (result != expected || server.result != 0 || seq != 3 ||
         trace.tx_begin != 2 || trace.tx_complete != 2 ||
-        trace.rx_complete != 1) {
+        trace.rx_complete != 2) {
+        return -1;
+    }
+    if (hello_status.applied_seq != 1) {
         return -1;
     }
     if (expect_protocol_error &&

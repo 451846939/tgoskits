@@ -43,6 +43,15 @@ int aicp_client_session_send_hello(
     uint32_t payload_len,
     const struct aicp_client_ops *ops);
 
+/// Sends HELLO and consumes the STATUS reply that establishes a TCP session.
+int aicp_client_session_handshake(
+    struct aicp_stream *stream,
+    uint32_t *next_seq,
+    const void *payload,
+    uint32_t payload_len,
+    struct aicp_status_payload *status,
+    const struct aicp_client_ops *ops);
+
 int aicp_client_session_transact_control(
     struct aicp_stream *stream,
     uint32_t *next_seq,
