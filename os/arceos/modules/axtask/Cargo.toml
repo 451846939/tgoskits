@@ -31,7 +31,11 @@ tls = ["ax-hal/tls"]
 # that another crate (e.g. starry-kernel) must implement; otherwise the link
 # step will fail with an unresolved symbol. Pure ArceOS unikernels leave this
 # off and pay no cost.
+<<<<<<< HEAD
 tracepoint-hooks = []
+# Context-switch accounting is opt-in so production builds keep the counter
+# update out of the scheduler hot path. Multitasking is mandatory at runtime.
+scheduler-metrics = []
 uspace = ["ax-hal/uspace"]
 
 sched-cfs = ["preempt"]

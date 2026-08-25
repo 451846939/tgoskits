@@ -237,6 +237,25 @@ pub fn cpu_busy_ticks(cpu: usize) -> u64 {
         .map_or(0, |t| t.load(core::sync::atomic::Ordering::Relaxed))
 }
 
+/// Returns completed scheduler context switches on CPU `cpu`.
+///
+/// Available only with the opt-in `scheduler-metrics` feature. Sampling callers
+/// must compare two snapshots taken over the same measurement window.
+#[cfg(feature = "scheduler-metrics")]
+pub fn cpu_context_switches(cpu: usize) -> u64 {
+    crate::run_queue::CONTEXT_SWITCHES
+        .get(cpu)
+        .map_or(0, |counter| {
+            counter.load(core::sync::atomic::Ordering::Relaxed)
+        })
+}
+
+#[cfg(feature = "irq")]
+#[doc(hidden)]
+pub fn note_programmed_timer_deadline_nanos(deadline_nanos: u64) {
+    crate::timers::note_programmed_deadline_nanos(deadline_nanos);
+}
+
 /// Adds the given task to the run queue, returns the task reference.
 pub fn spawn_task(task: TaskInner) -> AxTaskRef {
     spawn_task_with(task, |_| {})

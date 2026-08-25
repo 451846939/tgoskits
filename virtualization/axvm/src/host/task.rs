@@ -26,7 +26,7 @@ pub(crate) fn yield_now() {
     arceos::yield_now();
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(feature = "rt-poll-idle", target_arch = "aarch64"))]
 pub(crate) fn preemption_pending() -> bool {
     arceos::preemption_pending()
 }

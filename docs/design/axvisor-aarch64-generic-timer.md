@@ -165,6 +165,8 @@ Assigned physical SPI 使用经过所有权校验的 HW-backed LR：
 
 `rt-poll-idle` 是 AArch64 build-wide profile，只改变普通 WFI/WFE 与 PSCI standby 的宿主等待策略：每个 vCPU 可在一个有限 polling 窗口内推进本 CPU 的 timer wheel；窗口到期，或运行时已经发布当前 CPU 的抢占请求时，必须回到既有共享 wait queue。同一 AxVisor binary 不能把该 profile 混用于部分 AArch64 VM，A/B 对比必须用相同 guest/topology 的独立 control 和 polling build。PSCI `CPU_OFF`、VM suspend、stop 与 reset 始终使用共享等待或生命周期路径，不能因为该 feature 变为 runnable。该 feature 不提供 pCPU 独占承诺，也不改变其他架构的 idle 语义；中断和设备事件仍通过共享通知 generation 与目标 pCPU IPI 传递。
 
+`shared-wait-periodic-wake` 与 `poll-idle-periodic-wake` 是同一个 AArch64 Linux guest、两个 vCPU（分别绑定 host pCPU1、pCPU2）和同一个 1 ms absolute-deadline workload 的独立 QEMU build。每轮 2,000 次、共三轮；guest 输出 wake latency 与 period jitter 的 p50/p95/p99/max、deadline miss、每个 guest CPU 的 `/proc/stat` tick 增量及 guest context-switch 总数。测试专用的 Axvisor observer 同时固定在 pCPU1，输出相同窗口内的 pCPU1/pCPU2 non-idle tick、context-switch 增量及 pCPU1 worker 的最大 sleep 延迟。busy tick 是原始调度 tick 计数，必须结合目标平台 tick frequency 换算占用率。这些 QEMU 结果只能用于同环境 A/B 路径比较；硬件实时结论仍须保留目标板卡的原始日志与环境信息，不能由嵌套仿真替代。
+
 每个已调度 callback 携带：
 
 - 一个由 `Aarch64TimerBinding` 分配的 WFI 等待代次；

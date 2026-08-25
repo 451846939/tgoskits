@@ -44,6 +44,8 @@ mod manager;
 mod network_console;
 #[cfg(feature = "browser-console")]
 mod network_status;
+#[cfg(feature = "rt-poll-idle-observability")]
+mod realtime_observability;
 mod shell;
 
 #[cfg(any(feature = "backtrace", feature = "test-panic-no-backtrace"))]
@@ -105,6 +107,9 @@ fn main() {
     info!("Starting virtualization...");
     let manager = manager::AxvmManager::new()
         .unwrap_or_else(|error| panic!("failed to initialize AxVM manager: {error:#}"));
+
+    #[cfg(feature = "rt-poll-idle-observability")]
+    realtime_observability::start();
 
     manager.init_default_vms();
 

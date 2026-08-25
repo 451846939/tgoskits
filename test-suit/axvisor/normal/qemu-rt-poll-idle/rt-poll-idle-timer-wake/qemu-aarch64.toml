@@ -17,6 +17,7 @@ fail_regex = [
   "(?i)kernel panic",
   "(?i)login incorrect",
   "(?i)permission denied",
+  "(?m)^AXVISOR_GUEST_ASSERTION_CASE_UNKNOWN\\s*$",
   "(?m)^TIMER_STRESS_FAILED\\s*$",
 ]
 success_regex = ["(?m)^AXVISOR_RT_POLL_IDLE_TIMER_WAKE_PASSED\\s*$"]

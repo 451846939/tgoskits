@@ -100,14 +100,11 @@ impl IdlePollPolicy {
 ///
 /// # Arguments
 ///
-/// * `vm_id` - The ID of the VM whose VCpu wait queue is used to block the current thread.
 /// * `condition` - A closure that returns a boolean value indicating whether the condition is met.
-fn wait_for<F>(vm_vcpus: &VmRuntimeHandle, _vcpu_id: usize, condition: F)
+fn wait_for<F>(vm_vcpus: &VmRuntimeHandle, condition: F)
 where
     F: Fn() -> bool,
 {
-    // Polling applies only after guest WFI/standby. Lifecycle transitions
-    // still use the shared condition wait so CPU_ON and suspend remain safe.
     vm_vcpus.wait_until(condition);
 }
 
@@ -128,7 +125,7 @@ pub(crate) fn notify_primary_vcpu(vm_id: usize) {
         return;
     };
     match vm.runtime_handle() {
-        Ok(runtime) => runtime.notify_all(),
+        Ok(runtime) => runtime.notify_one(),
         Err(err) => warn!("VM[{vm_id}] vCPU runtime not found: {err:?}"),
     }
 }
@@ -506,7 +503,7 @@ fn vcpu_run() {
 
     info!("VM[{}] VCpu[{}] waiting for running", vm.id(), vcpu.id());
     let cpu_on_start_ack = runtime.cpu_on_start_ack(vcpu_id);
-    wait_for(&runtime, vcpu_id, || {
+    wait_for(&runtime, || {
         vcpu_start_is_ready(vm.running(), runtime.has_vcpu_task(vcpu_id))
             || cpu_on_start_ack
                 .as_ref()
@@ -671,7 +668,7 @@ fn vcpu_run() {
             // `guest_park_count`, correctly reporting that the pause did not
             // genuinely complete instead of passing on a fake.
             let parked = Cell::new(false);
-            wait_for(&runtime, vcpu_id, || {
+            wait_for(&runtime, || {
                 if !vm.suspending() {
                     return true;
                 }
