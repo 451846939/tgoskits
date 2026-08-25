@@ -5,7 +5,10 @@
 use std::{
     io::{self, Read, Write},
     net::{SocketAddr, TcpListener, TcpStream, UdpSocket},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -26,6 +29,10 @@ const CONTROL_PERIOD_NS: u64 = 20_000_000;
 const PERIODIC_REPORT_SAMPLES: usize = 128;
 const PERIODIC_SAMPLE_LOG_INTERVAL: usize = 32;
 const PERIODIC_OUTLIER_NS: u64 = 5_000_000;
+const MAX_AICP_DATAGRAM_LEN: usize = HEADER_LEN + MAX_PAYLOAD;
+// A one-byte sentinel distinguishes a maximum valid datagram from a datagram
+// that the socket layer truncated to the same length.
+const UDP_RECEIVE_BUFFER_LEN: usize = MAX_AICP_DATAGRAM_LEN + 1;
 
 static PERIODIC_PROBE_ACTIVE: AtomicBool = AtomicBool::new(false);
 
@@ -361,6 +368,15 @@ fn udp_parse_datagram(buf: &[u8]) -> Result<(Header, &[u8]), u16> {
     })
 }
 
+fn datagram_sequence(datagram: &[u8]) -> u32 {
+    if datagram.len() < HEADER_LEN {
+        return 0;
+    }
+    let mut wire = [0u8; HEADER_LEN];
+    wire.copy_from_slice(&datagram[..HEADER_LEN]);
+    decode_header(&wire).seq
+}
+
 fn serve_udp(socket: UdpSocket) -> io::Result<()> {
     let mut state = ControlState::default();
     let mut timing = TimingState::default();
@@ -368,21 +384,20 @@ fn serve_udp(socket: UdpSocket) -> io::Result<()> {
     let mut last_peer = None::<SocketAddr>;
     let mut last_dropped_seq = None::<u32>;
     let drop_every = udp_drop_every();
-    let mut buf = vec![0u8; HEADER_LEN + MAX_PAYLOAD];
+    let mut buf = vec![0u8; UDP_RECEIVE_BUFFER_LEN];
 
     println!("AICP ArceOS RTOS UDP server listening on 0.0.0.0:8800");
     loop {
         let (len, peer) = socket.recv_from(&mut buf)?;
+        if len > MAX_AICP_DATAGRAM_LEN {
+            let seq = datagram_sequence(&buf[..len]);
+            udp_send_error(&socket, peer, seq, ERROR_BAD_PAYLOAD)?;
+            continue;
+        }
         let (hdr, payload) = match udp_parse_datagram(&buf[..len]) {
             Ok(frame) => frame,
             Err(code) => {
-                let seq = if len >= HEADER_LEN {
-                    let mut wire = [0u8; HEADER_LEN];
-                    wire.copy_from_slice(&buf[..HEADER_LEN]);
-                    decode_header(&wire).seq
-                } else {
-                    0
-                };
+                let seq = datagram_sequence(&buf[..len]);
                 udp_send_error(&socket, peer, seq, code)?;
                 continue;
             }
@@ -468,6 +483,16 @@ struct TcpControlService {
     timing: TimingState,
 }
 
+type SharedTcpControlService = Arc<Mutex<TcpControlService>>;
+
+fn lock_control_service(
+    service: &SharedTcpControlService,
+) -> io::Result<std::sync::MutexGuard<'_, TcpControlService>> {
+    service
+        .lock()
+        .map_err(|_| io::Error::other("AICP control service lock is poisoned"))
+}
+
 #[derive(Default)]
 struct TcpConnectionSession {
     last_seq: Option<u32>,
@@ -518,7 +543,7 @@ impl TcpConnectionSession {
     }
 }
 
-fn serve_client(service: &mut TcpControlService, mut stream: TcpStream) -> io::Result<()> {
+fn serve_client(service: &SharedTcpControlService, mut stream: TcpStream) -> io::Result<()> {
     let mut payload = [0u8; MAX_PAYLOAD];
     let mut session = TcpConnectionSession::default();
 
@@ -539,8 +564,15 @@ fn serve_client(service: &mut TcpControlService, mut stream: TcpStream) -> io::R
             continue;
         }
         match hdr.msg_type {
-            MSG_HELLO => println!("AICP HELLO seq={} payload_len={}", hdr.seq, len),
-            MSG_HEARTBEAT => session.send_status(&mut stream, service.state.status(), hdr.seq)?,
+            MSG_HELLO => {
+                println!("AICP HELLO seq={} payload_len={}", hdr.seq, len);
+                let status = lock_control_service(service)?.state.status();
+                session.send_status(&mut stream, status, hdr.seq)?;
+            }
+            MSG_HEARTBEAT => {
+                let status = lock_control_service(service)?.state.status();
+                session.send_status(&mut stream, status, hdr.seq)?;
+            }
             MSG_CONTROL_SET => {
                 PERIODIC_PROBE_ACTIVE.store(true, Ordering::Release);
                 let start = Instant::now();
@@ -548,6 +580,7 @@ fn serve_client(service: &mut TcpControlService, mut stream: TcpStream) -> io::R
                     session.send_error(&mut stream, hdr.seq, ERROR_BAD_PAYLOAD)?;
                     continue;
                 };
+                let mut service = lock_control_service(service)?;
                 let status = service.state.step(control, hdr.seq);
                 let service_ns = duration_ns(start.elapsed());
                 println!(
@@ -555,11 +588,21 @@ fn serve_client(service: &mut TcpControlService, mut stream: TcpStream) -> io::R
                     hdr.seq, status.setpoint, status.measured, status.control_output
                 );
                 service.timing.observe(hdr.seq, start, service_ns);
+                drop(service);
                 session.send_status(&mut stream, status, hdr.seq)?;
             }
             _ => session.send_error(&mut stream, hdr.seq, ERROR_BAD_TYPE)?,
         }
     }
+}
+
+fn serve_accepted_client(service: SharedTcpControlService, stream: TcpStream, addr: SocketAddr) {
+    println!("AICP client connected: {addr}");
+    thread::spawn(move || {
+        if let Err(err) = serve_client(&service, stream) {
+            println!("AICP client closed: {err:?}");
+        }
+    });
 }
 
 fn main() -> io::Result<()> {
@@ -576,19 +619,20 @@ fn main() -> io::Result<()> {
     let listener = TcpListener::bind("0.0.0.0:8800")?;
     println!("AICP ArceOS RTOS TCP server listening on 0.0.0.0:8800");
     println!("AICP_RTOS_READY");
-    let mut service = TcpControlService::default();
+    let service = Arc::new(Mutex::new(TcpControlService::default()));
     loop {
         let (stream, addr) = listener.accept()?;
-        println!("AICP client connected: {addr}");
-        if let Err(err) = serve_client(&mut service, stream) {
-            println!("AICP client closed: {err:?}");
-        }
+        serve_accepted_client(Arc::clone(&service), stream, addr);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn shared_service() -> SharedTcpControlService {
+        Arc::new(Mutex::new(TcpControlService::default()))
+    }
 
     fn write_frame(stream: &mut TcpStream, mut header: Header, payload: &[u8]) {
         header.payload_len = payload.len() as u32;
@@ -642,6 +686,22 @@ mod tests {
     }
 
     #[test]
+    fn udp_receive_buffer_detects_a_trailing_byte_after_a_maximum_frame() {
+        assert_eq!(UDP_RECEIVE_BUFFER_LEN, MAX_AICP_DATAGRAM_LEN + 1);
+
+        let payload = vec![0u8; MAX_PAYLOAD];
+        let mut frame = udp_datagram(
+            make_header(MSG_HEARTBEAT, payload.len(), 9, ERROR_OK),
+            &payload,
+        )
+        .unwrap();
+        frame.push(0);
+
+        assert_eq!(frame.len(), UDP_RECEIVE_BUFFER_LEN);
+        assert!(udp_parse_datagram(&frame).is_err());
+    }
+
+    #[test]
     fn periodic_samples_are_bounded_by_the_reporting_window() {
         let mut samples = PeriodicSamples::new();
         let wake_capacity = samples.wake_lateness.capacity();
@@ -663,8 +723,8 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            let mut service = TcpControlService::default();
-            serve_client(&mut service, stream)
+            let service = shared_service();
+            serve_client(&service, stream)
         });
         let mut client = TcpStream::connect(address).unwrap();
 
@@ -695,9 +755,10 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            let mut service = TcpControlService::default();
-            let result = serve_client(&mut service, stream);
-            (result, service.state)
+            let service = shared_service();
+            let result = serve_client(&service, stream);
+            let state = lock_control_service(&service).unwrap().state;
+            (result, state)
         });
         let mut client = TcpStream::connect(address).unwrap();
         let control = ControlPayload {
@@ -732,16 +793,16 @@ mod tests {
     }
 
     #[test]
-    fn tcp_reconnect_accepts_a_fresh_sequence_after_hello() {
+    fn tcp_hello_consumes_its_sequence_and_prevents_control_replay() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
-            let mut service = TcpControlService::default();
+            let service = shared_service();
             for _ in 0..2 {
                 let (stream, _) = listener.accept().unwrap();
-                assert!(serve_client(&mut service, stream).is_err());
+                assert!(serve_client(&service, stream).is_err());
             }
-            service.state
+            lock_control_service(&service).unwrap().state
         });
         let first_control = encode_control_payload(ControlPayload {
             target: 0.0,
@@ -776,6 +837,14 @@ mod tests {
             make_header(MSG_HELLO, 0, 1, ERROR_OK),
             b"",
         );
+        let (hello_response, hello_response_len) =
+            recv_frame(&mut second_client, &mut response_payload).unwrap();
+        assert_eq!(hello_response.msg_type, MSG_STATUS);
+        assert_eq!(hello_response.seq, 1);
+        let hello_status =
+            decode_status_payload(response_payload[..hello_response_len].try_into().unwrap());
+        assert_eq!(hello_status.applied_seq, 10);
+
         write_frame(
             &mut second_client,
             make_header(MSG_CONTROL_SET, second_control.len(), 1, ERROR_OK),
@@ -788,9 +857,41 @@ mod tests {
         assert_eq!(response.seq, 1);
         assert_eq!(response.error_code, ERROR_OK);
         let status = decode_status_payload(response_payload[..response_len].try_into().unwrap());
-        assert_eq!(status.applied_seq, 1);
+        assert_eq!(status.applied_seq, 10);
         drop(second_client);
-        assert_eq!(server.join().unwrap().applied_seq, 1);
+        assert_eq!(server.join().unwrap().applied_seq, 10);
+    }
+
+    #[test]
+    fn partial_tcp_frame_does_not_prevent_a_second_client_from_using_the_service() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let service = shared_service();
+
+        let mut stalled_client = TcpStream::connect(address).unwrap();
+        let (stalled_stream, stalled_addr) = listener.accept().unwrap();
+        serve_accepted_client(Arc::clone(&service), stalled_stream, stalled_addr);
+        stalled_client.write_all(&[0xaa]).unwrap();
+
+        let mut active_client = TcpStream::connect(address).unwrap();
+        active_client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let (active_stream, active_addr) = listener.accept().unwrap();
+        serve_accepted_client(Arc::clone(&service), active_stream, active_addr);
+        write_frame(
+            &mut active_client,
+            make_header(MSG_HELLO, 0, 1, ERROR_OK),
+            b"",
+        );
+
+        let mut payload = [0u8; MAX_PAYLOAD];
+        let (response, _) = recv_frame(&mut active_client, &mut payload).unwrap();
+        assert_eq!(response.msg_type, MSG_STATUS);
+        assert_eq!(response.seq, 1);
+
+        drop(active_client);
+        drop(stalled_client);
     }
 
     #[test]
@@ -799,9 +900,10 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            let mut service = TcpControlService::default();
-            let result = serve_client(&mut service, stream);
-            (result, service.state)
+            let service = shared_service();
+            let result = serve_client(&service, stream);
+            let state = lock_control_service(&service).unwrap().state;
+            (result, state)
         });
         let mut client = TcpStream::connect(address).unwrap();
         let payload = encode_control_payload(ControlPayload {
