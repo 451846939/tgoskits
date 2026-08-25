@@ -63,17 +63,16 @@ impl IdlePollPolicy {
     ) -> bool {
         use crate::architecture::VcpuEventWait;
 
-        if preemption_pending {
-            self.deadline_ns = None;
-            return true;
-        }
-
         match event_wait {
             VcpuEventWait::None => {
                 self.deadline_ns = None;
                 false
             }
             VcpuEventWait::Block => {
+                self.deadline_ns = None;
+                true
+            }
+            VcpuEventWait::Poll if preemption_pending => {
                 self.deadline_ns = None;
                 true
             }
@@ -835,6 +834,21 @@ mod tests {
             shared_wait_count.set(shared_wait_count.get() + 1);
         });
         assert_eq!(shared_wait_count.get(), 1);
+    }
+
+    #[cfg(all(feature = "rt-poll-idle", any(target_arch = "aarch64", test)))]
+    #[test]
+    fn idle_poll_policy_never_waits_for_non_idle_exits_when_preemption_is_pending() {
+        use crate::architecture::VcpuEventWait;
+
+        let mut policy = IdlePollPolicy::default();
+        let shared_wait_count = std::cell::Cell::new(0);
+
+        policy.wait_for_event_if_required(VcpuEventWait::None, 10, true, || {
+            shared_wait_count.set(shared_wait_count.get() + 1);
+        });
+
+        assert_eq!(shared_wait_count.get(), 0);
     }
 
     #[test]
