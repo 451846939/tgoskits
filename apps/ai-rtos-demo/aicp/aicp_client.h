@@ -36,13 +36,6 @@ struct aicp_client_ops {
     void *context;
 };
 
-int aicp_client_session_send_hello(
-    struct aicp_stream *stream,
-    uint32_t *next_seq,
-    const void *payload,
-    uint32_t payload_len,
-    const struct aicp_client_ops *ops);
-
 /// Sends HELLO and consumes the STATUS reply that establishes a TCP session.
 int aicp_client_session_handshake(
     struct aicp_stream *stream,

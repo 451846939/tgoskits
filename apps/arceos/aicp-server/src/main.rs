@@ -340,13 +340,19 @@ fn udp_datagram(hdr: Header, payload: &[u8]) -> io::Result<Vec<u8>> {
     Ok(out)
 }
 
+#[derive(Clone, Copy)]
+enum ControlReply {
+    Status(StatusPayload),
+    Error(u16),
+}
+
 fn udp_send_status(
     socket: &UdpSocket,
     peer: SocketAddr,
-    state: &ControlState,
+    status: StatusPayload,
     seq: u32,
 ) -> io::Result<()> {
-    let payload = status_to_payload(state.status());
+    let payload = status_to_payload(status);
     let frame = udp_datagram(
         make_header(MSG_STATUS, payload.len(), seq, ERROR_OK),
         &payload,
@@ -358,6 +364,55 @@ fn udp_send_error(socket: &UdpSocket, peer: SocketAddr, seq: u32, code: u16) -> 
     let payload = b"{\"error\":\"invalid AICP datagram\"}";
     let frame = udp_datagram(make_header(MSG_ERROR, payload.len(), seq, code), payload)?;
     socket.send_to(&frame, peer).map(|_| ())
+}
+
+fn udp_send_reply(
+    socket: &UdpSocket,
+    peer: SocketAddr,
+    seq: u32,
+    reply: ControlReply,
+) -> io::Result<()> {
+    match reply {
+        ControlReply::Status(status) => udp_send_status(socket, peer, status, seq),
+        ControlReply::Error(code) => udp_send_error(socket, peer, seq, code),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UdpSequenceState {
+    New,
+    Duplicate,
+    OutOfOrder,
+}
+
+#[derive(Default)]
+struct UdpPeerSession {
+    last_seq: Option<u32>,
+    last_peer: Option<SocketAddr>,
+    last_reply: Option<ControlReply>,
+}
+
+impl UdpPeerSession {
+    fn classify(&self, peer: SocketAddr, seq: u32) -> UdpSequenceState {
+        if self.last_peer != Some(peer) {
+            return UdpSequenceState::New;
+        }
+        match self.last_seq {
+            Some(previous) if seq == previous => UdpSequenceState::Duplicate,
+            Some(previous) if !seq_is_newer(seq, previous) => UdpSequenceState::OutOfOrder,
+            _ => UdpSequenceState::New,
+        }
+    }
+
+    fn record(&mut self, peer: SocketAddr, seq: u32, reply: ControlReply) {
+        self.last_peer = Some(peer);
+        self.last_seq = Some(seq);
+        self.last_reply = Some(reply);
+    }
+
+    fn cached_reply(&self) -> Option<ControlReply> {
+        self.last_reply
+    }
 }
 
 fn udp_parse_datagram(buf: &[u8]) -> Result<(Header, &[u8]), u16> {
@@ -380,8 +435,7 @@ fn datagram_sequence(datagram: &[u8]) -> u32 {
 fn serve_udp(socket: UdpSocket) -> io::Result<()> {
     let mut state = ControlState::default();
     let mut timing = TimingState::default();
-    let mut last_seq = None::<u32>;
-    let mut last_peer = None::<SocketAddr>;
+    let mut session = UdpPeerSession::default();
     let mut last_dropped_seq = None::<u32>;
     let drop_every = udp_drop_every();
     let mut buf = vec![0u8; UDP_RECEIVE_BUFFER_LEN];
@@ -403,21 +457,21 @@ fn serve_udp(socket: UdpSocket) -> io::Result<()> {
             }
         };
 
-        if last_peer == Some(peer) && last_seq == Some(hdr.seq) {
-            println!("AICP UDP duplicate seq={} peer={}", hdr.seq, peer);
-            udp_send_status(&socket, peer, &state, hdr.seq)?;
-            continue;
-        }
-        if last_peer == Some(peer)
-            && let Some(previous) = last_seq
-            && !seq_is_newer(hdr.seq, previous)
-        {
-            println!(
-                "AICP UDP out_of_order seq={} previous={} peer={}",
-                hdr.seq, previous, peer
-            );
-            udp_send_error(&socket, peer, hdr.seq, ERROR_SEQUENCE)?;
-            continue;
+        match session.classify(peer, hdr.seq) {
+            UdpSequenceState::Duplicate => {
+                println!("AICP UDP duplicate seq={} peer={}", hdr.seq, peer);
+                let reply = session.cached_reply().ok_or_else(|| {
+                    io::Error::other("AICP UDP duplicate is missing its cached reply")
+                })?;
+                udp_send_reply(&socket, peer, hdr.seq, reply)?;
+                continue;
+            }
+            UdpSequenceState::OutOfOrder => {
+                println!("AICP UDP out_of_order seq={} peer={}", hdr.seq, peer);
+                udp_send_error(&socket, peer, hdr.seq, ERROR_SEQUENCE)?;
+                continue;
+            }
+            UdpSequenceState::New => {}
         }
 
         match hdr.msg_type {
@@ -428,20 +482,22 @@ fn serve_udp(socket: UdpSocket) -> io::Result<()> {
                     payload.len(),
                     peer
                 );
-                last_seq = Some(hdr.seq);
-                last_peer = Some(peer);
-                udp_send_status(&socket, peer, &state, hdr.seq)?;
+                let reply = ControlReply::Status(state.status());
+                session.record(peer, hdr.seq, reply);
+                udp_send_reply(&socket, peer, hdr.seq, reply)?;
             }
             MSG_HEARTBEAT => {
-                last_seq = Some(hdr.seq);
-                last_peer = Some(peer);
-                udp_send_status(&socket, peer, &state, hdr.seq)?;
+                let reply = ControlReply::Status(state.status());
+                session.record(peer, hdr.seq, reply);
+                udp_send_reply(&socket, peer, hdr.seq, reply)?;
             }
             MSG_CONTROL_SET => {
                 PERIODIC_PROBE_ACTIVE.store(true, Ordering::Release);
                 let start = Instant::now();
                 let Some(control) = control_from_payload(payload) else {
-                    udp_send_error(&socket, peer, hdr.seq, ERROR_BAD_PAYLOAD)?;
+                    let reply = ControlReply::Error(ERROR_BAD_PAYLOAD);
+                    session.record(peer, hdr.seq, reply);
+                    udp_send_reply(&socket, peer, hdr.seq, reply)?;
                     continue;
                 };
                 let status = state.step(control, hdr.seq);
@@ -451,8 +507,8 @@ fn serve_udp(socket: UdpSocket) -> io::Result<()> {
                     hdr.seq, status.setpoint, status.measured, status.control_output
                 );
                 timing.observe(hdr.seq, start, service_ns);
-                last_seq = Some(hdr.seq);
-                last_peer = Some(peer);
+                let reply = ControlReply::Status(status);
+                session.record(peer, hdr.seq, reply);
                 if drop_every != 0
                     && hdr.seq.is_multiple_of(drop_every)
                     && last_dropped_seq != Some(hdr.seq)
@@ -464,17 +520,15 @@ fn serve_udp(socket: UdpSocket) -> io::Result<()> {
                     );
                     continue;
                 }
-                udp_send_status(&socket, peer, &state, hdr.seq)?;
+                udp_send_reply(&socket, peer, hdr.seq, reply)?;
             }
-            _ => udp_send_error(&socket, peer, hdr.seq, ERROR_BAD_TYPE)?,
+            _ => {
+                let reply = ControlReply::Error(ERROR_BAD_TYPE);
+                session.record(peer, hdr.seq, reply);
+                udp_send_reply(&socket, peer, hdr.seq, reply)?;
+            }
         }
     }
-}
-
-#[derive(Clone, Copy)]
-enum TcpReply {
-    Status(StatusPayload),
-    Error(u16),
 }
 
 #[derive(Default)]
@@ -496,7 +550,7 @@ fn lock_control_service(
 #[derive(Default)]
 struct TcpConnectionSession {
     last_seq: Option<u32>,
-    last_reply: Option<TcpReply>,
+    last_reply: Option<ControlReply>,
 }
 
 impl TcpConnectionSession {
@@ -505,7 +559,7 @@ impl TcpConnectionSession {
             return Ok(());
         };
         match self.last_reply {
-            Some(TcpReply::Status(status)) => {
+            Some(ControlReply::Status(status)) => {
                 let payload = status_to_payload(status);
                 send_frame(
                     stream,
@@ -513,7 +567,7 @@ impl TcpConnectionSession {
                     &payload,
                 )
             }
-            Some(TcpReply::Error(code)) => send_error(stream, seq, code),
+            Some(ControlReply::Error(code)) => send_error(stream, seq, code),
             None => Ok(()),
         }
     }
@@ -531,14 +585,14 @@ impl TcpConnectionSession {
             &payload,
         )?;
         self.last_seq = Some(seq);
-        self.last_reply = Some(TcpReply::Status(status));
+        self.last_reply = Some(ControlReply::Status(status));
         Ok(())
     }
 
     fn send_error(&mut self, stream: &mut TcpStream, seq: u32, code: u16) -> io::Result<()> {
         send_error(stream, seq, code)?;
         self.last_seq = Some(seq);
-        self.last_reply = Some(TcpReply::Error(code));
+        self.last_reply = Some(ControlReply::Error(code));
         Ok(())
     }
 }
@@ -699,6 +753,40 @@ mod tests {
 
         assert_eq!(frame.len(), UDP_RECEIVE_BUFFER_LEN);
         assert!(udp_parse_datagram(&frame).is_err());
+    }
+
+    #[test]
+    fn udp_invalid_control_consumes_its_sequence_and_replays_the_error() {
+        let peer = "127.0.0.1:8800".parse().unwrap();
+        let seq = 9;
+        let mut session = UdpPeerSession::default();
+        let mut state = ControlState::default();
+
+        assert!(control_from_payload(&[0; CONTROL_PAYLOAD_LEN - 1]).is_none());
+        session.record(peer, seq, ControlReply::Error(ERROR_BAD_PAYLOAD));
+
+        assert_eq!(session.classify(peer, seq), UdpSequenceState::Duplicate);
+        assert!(matches!(
+            session.cached_reply(),
+            Some(ControlReply::Error(ERROR_BAD_PAYLOAD))
+        ));
+
+        let valid = encode_control_payload(ControlPayload {
+            target: 0.8,
+            kp: 0.72,
+            ki: 0.08,
+            kd: 0.02,
+            feed_forward: 0.03,
+            mode: 1,
+        });
+        let valid = control_from_payload(&valid).unwrap();
+        match session.classify(peer, seq) {
+            UdpSequenceState::New => {
+                state.step(valid, seq);
+            }
+            UdpSequenceState::Duplicate | UdpSequenceState::OutOfOrder => {}
+        }
+        assert_eq!(state.status().applied_seq, 0);
     }
 
     #[test]

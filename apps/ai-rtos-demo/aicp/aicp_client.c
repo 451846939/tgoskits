@@ -75,27 +75,6 @@ static int receive_status_response(
     return 0;
 }
 
-int aicp_client_session_send_hello(
-    struct aicp_stream *stream,
-    uint32_t *next_seq,
-    const void *payload,
-    uint32_t payload_len,
-    const struct aicp_client_ops *ops) {
-    if (next_seq == NULL || (payload_len != 0 && payload == NULL) ||
-        payload_len > AICP_MAX_PAYLOAD) {
-        return -EINVAL;
-    }
-
-    const struct aicp_header request = aicp_make_header(
-        AICP_MSG_HELLO,
-        0,
-        payload_len,
-        (*next_seq)++,
-        monotonic_ns(ops),
-        AICP_OK);
-    return send_request(stream, &request, payload, ops);
-}
-
 int aicp_client_session_handshake(
     struct aicp_stream *stream,
     uint32_t *next_seq,
