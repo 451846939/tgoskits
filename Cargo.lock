@@ -1298,7 +1298,6 @@ name = "axbuild"
 version = "0.5.2"
 dependencies = [
  "addr2line 0.26.1",
- "aicp-rust-protocol",
  "anyhow",
  "axvmconfig",
  "cargo_metadata",

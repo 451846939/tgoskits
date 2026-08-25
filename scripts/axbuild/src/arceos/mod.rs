@@ -119,10 +119,13 @@ fn run_aicp_hello_probe(host_port: u16) -> anyhow::Result<()> {
 }
 
 fn run_aicp_hello_probe_attempt(host_port: u16) -> anyhow::Result<()> {
-    use aicp_rust_protocol::{
-        ERROR_OK, HEADER_LEN, Header, MSG_HELLO, MSG_STATUS, STATUS_PAYLOAD_LEN, decode_header,
-        decode_status_payload, encode_frame, validate_frame,
-    };
+    const HEADER_LEN: usize = 32;
+    const STATUS_PAYLOAD_LEN: usize = 24;
+    const MAGIC: u16 = 0xA1C0;
+    const VERSION: u8 = 1;
+    const MSG_HELLO: u8 = 1;
+    const MSG_STATUS: u8 = 3;
+    const ERROR_OK: u16 = 0;
 
     let mut stream = TcpStream::connect(("127.0.0.1", host_port))
         .with_context(|| format!("failed to connect AICP hostfwd at 127.0.0.1:{host_port}"))?;
@@ -134,22 +137,33 @@ fn run_aicp_hello_probe_attempt(host_port: u16) -> anyhow::Result<()> {
         .context("failed to set AICP probe write timeout")?;
 
     let mut request = [0_u8; HEADER_LEN];
-    let request_len = encode_frame(
-        Header::new(MSG_HELLO, 0, 0, 1, 0, ERROR_OK),
-        &[],
-        &mut request,
-    )
-    .context("failed to encode AICP HELLO")?;
+    request[0..2].copy_from_slice(&MAGIC.to_be_bytes());
+    request[2] = VERSION;
+    request[3] = MSG_HELLO;
+    request[6..8].copy_from_slice(&(HEADER_LEN as u16).to_be_bytes());
+    request[12..16].copy_from_slice(&1_u32.to_be_bytes());
+    request[24..26].copy_from_slice(&ERROR_OK.to_be_bytes());
+    let request_crc = aicp_frame_crc(&request, &[]);
+    request[26..28].copy_from_slice(&request_crc.to_be_bytes());
     stream
-        .write_all(&request[..request_len])
+        .write_all(&request)
         .context("failed to send AICP HELLO")?;
 
     let mut header_wire = [0_u8; HEADER_LEN];
     stream
         .read_exact(&mut header_wire)
         .context("failed to read AICP STATUS header")?;
-    let header = decode_header(&header_wire);
-    let payload_len = header.payload_len as usize;
+    let magic = u16::from_be_bytes(header_wire[0..2].try_into().unwrap());
+    let version = header_wire[2];
+    let message_type = header_wire[3];
+    let header_len = u16::from_be_bytes(header_wire[6..8].try_into().unwrap()) as usize;
+    let payload_len = u32::from_be_bytes(header_wire[8..12].try_into().unwrap()) as usize;
+    let sequence = u32::from_be_bytes(header_wire[12..16].try_into().unwrap());
+    let error_code = u16::from_be_bytes(header_wire[24..26].try_into().unwrap());
+    let crc16 = u16::from_be_bytes(header_wire[26..28].try_into().unwrap());
+    if magic != MAGIC || version != VERSION || header_len != HEADER_LEN {
+        bail!("invalid AICP HELLO response header");
+    }
     if payload_len != STATUS_PAYLOAD_LEN {
         bail!(
             "AICP HELLO response has payload length {payload_len}, expected {STATUS_PAYLOAD_LEN}"
@@ -159,21 +173,46 @@ fn run_aicp_hello_probe_attempt(host_port: u16) -> anyhow::Result<()> {
     stream
         .read_exact(&mut payload)
         .context("failed to read AICP STATUS payload")?;
-    validate_frame(header, &payload).context("invalid AICP HELLO response frame")?;
-    if header.msg_type != MSG_STATUS || header.seq != 1 || header.error_code != ERROR_OK {
+    if aicp_frame_crc(&header_wire, &payload) != crc16 {
+        bail!("AICP HELLO response has an invalid CRC");
+    }
+    if message_type != MSG_STATUS || sequence != 1 || error_code != ERROR_OK {
         bail!(
             "unexpected AICP HELLO response: type={} seq={} error={}",
-            header.msg_type,
-            header.seq,
-            header.error_code
+            message_type,
+            sequence,
+            error_code
         );
     }
-    let status = decode_status_payload(&payload);
+    let mode = u32::from_be_bytes(payload[16..20].try_into().unwrap());
+    let applied_seq = u32::from_be_bytes(payload[20..24].try_into().unwrap());
     println!(
         "AICP_HOST_PROBE_PASSED seq={} mode={} applied_seq={}",
-        header.seq, status.mode, status.applied_seq
+        sequence, mode, applied_seq
     );
     Ok(())
+}
+
+/// CRC-16/CCITT-FALSE for the fixed AICP frame layout. The host probe is a
+/// consumer-side integration check, so it keeps only the wire operations it
+/// must verify and deliberately does not expose another protocol API from
+/// axbuild.
+fn aicp_frame_crc(header: &[u8; 32], payload: &[u8]) -> u16 {
+    let mut wire = *header;
+    wire[26] = 0;
+    wire[27] = 0;
+    let mut crc = 0xffff_u16;
+    for byte in wire.into_iter().chain(payload.iter().copied()) {
+        crc ^= (byte as u16) << 8;
+        for _ in 0..8 {
+            crc = if crc & 0x8000 != 0 {
+                (crc << 1) ^ 0x1021
+            } else {
+                crc << 1
+            };
+        }
+    }
+    crc
 }
 
 mod board;
@@ -799,10 +838,12 @@ mod tests {
             thread,
         };
 
-        use aicp_rust_protocol::{
-            ERROR_OK, HEADER_LEN, Header, MSG_HELLO, MSG_STATUS, STATUS_PAYLOAD_LEN, StatusPayload,
-            decode_header, encode_frame, encode_status_payload,
-        };
+        const HEADER_LEN: usize = 32;
+        const STATUS_PAYLOAD_LEN: usize = 24;
+        const MAGIC: u16 = 0xA1C0;
+        const VERSION: u8 = 1;
+        const MSG_HELLO: u8 = 1;
+        const MSG_STATUS: u8 = 3;
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -810,26 +851,23 @@ mod tests {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = [0_u8; HEADER_LEN];
             stream.read_exact(&mut request).unwrap();
-            let request = decode_header(&request);
-            assert_eq!(request.msg_type, MSG_HELLO);
-            assert_eq!(request.seq, 1);
+            assert_eq!(request[3], MSG_HELLO);
+            assert_eq!(u32::from_be_bytes(request[12..16].try_into().unwrap()), 1);
 
-            let payload = encode_status_payload(StatusPayload {
-                setpoint: 0.0,
-                measured: 0.0,
-                control_output: 0.0,
-                error: 0.0,
-                mode: 0,
-                applied_seq: 1,
-            });
+            let mut payload = [0_u8; STATUS_PAYLOAD_LEN];
+            payload[20..24].copy_from_slice(&1_u32.to_be_bytes());
             let mut reply = [0_u8; HEADER_LEN + STATUS_PAYLOAD_LEN];
-            let reply_len = encode_frame(
-                Header::new(MSG_STATUS, 0, STATUS_PAYLOAD_LEN as u32, 1, 0, ERROR_OK),
-                &payload,
-                &mut reply,
-            )
-            .unwrap();
-            stream.write_all(&reply[..reply_len]).unwrap();
+            reply[0..2].copy_from_slice(&MAGIC.to_be_bytes());
+            reply[2] = VERSION;
+            reply[3] = MSG_STATUS;
+            reply[6..8].copy_from_slice(&(HEADER_LEN as u16).to_be_bytes());
+            reply[8..12].copy_from_slice(&(STATUS_PAYLOAD_LEN as u32).to_be_bytes());
+            reply[12..16].copy_from_slice(&1_u32.to_be_bytes());
+            let reply_header: &[u8; HEADER_LEN] = reply[..HEADER_LEN].try_into().unwrap();
+            let reply_crc = aicp_frame_crc(reply_header, &payload);
+            reply[26..28].copy_from_slice(&reply_crc.to_be_bytes());
+            reply[HEADER_LEN..].copy_from_slice(&payload);
+            stream.write_all(&reply).unwrap();
         });
 
         run_aicp_hello_probe(port).unwrap();
