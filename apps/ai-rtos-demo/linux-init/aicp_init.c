@@ -733,10 +733,10 @@ static int expect_reply(
         return -EPROTO;
     }
     if (expected_type == AICP_MSG_STATUS) {
-        if (header.payload_len != sizeof(*status) || status == NULL) {
+        if (header.payload_len != AICP_STATUS_PAYLOAD_LEN || status == NULL) {
             return -EPROTO;
         }
-        memcpy(status, payload, sizeof(*status));
+        aicp_status_payload_decode(payload, status);
     }
     return 0;
 }
@@ -795,6 +795,8 @@ static int run_rtthread_reliability_tests(void) {
         .feed_forward = 0.05f,
         .mode = 1u,
     };
+    uint8_t control_wire[AICP_CONTROL_PAYLOAD_LEN];
+    aicp_control_payload_encode(&control, control_wire);
     uint8_t bad_payload[4] = {0xde, 0xad, 0xbe, 0xef};
     unsigned passed = 0;
     uint32_t seq = 1;
@@ -823,8 +825,8 @@ static int run_rtthread_reliability_tests(void) {
     }
 
     struct aicp_header control_header = make_header(
-        AICP_MSG_CONTROL_SET, AICP_FLAG_ACK_REQUIRED, sizeof(control), seq++);
-    ret = send_frame(fd, control_header, &control);
+        AICP_MSG_CONTROL_SET, AICP_FLAG_ACK_REQUIRED, AICP_CONTROL_PAYLOAD_LEN, seq++);
+    ret = send_frame(fd, control_header, control_wire);
     if (ret == 0) {
         ret = expect_reply(fd, AICP_MSG_STATUS, control_header.seq, AICP_OK,
                            &control_status);
@@ -834,7 +836,7 @@ static int run_rtthread_reliability_tests(void) {
     }
 
     control_header.flags |= AICP_FLAG_RETRANSMIT;
-    ret = send_frame(fd, control_header, &control);
+    ret = send_frame(fd, control_header, control_wire);
     if (ret == 0) {
         ret = expect_reply(fd, AICP_MSG_STATUS, control_header.seq, AICP_OK,
                            &duplicate_status);
@@ -1137,13 +1139,20 @@ static int udp_transact_control(
     struct aicp_status_payload *status,
     uint64_t *rtt_ns) {
     uint8_t rx_payload[AICP_MAX_PAYLOAD];
+    uint8_t control_wire[AICP_CONTROL_PAYLOAD_LEN];
     struct aicp_header rx;
     uint32_t control_seq = (*seq)++;
 
+    aicp_control_payload_encode(control, control_wire);
+
     int ret = udp_exchange(
         peer,
-        make_header(AICP_MSG_CONTROL_SET, AICP_FLAG_ACK_REQUIRED, sizeof(*control), control_seq),
-        control,
+        make_header(
+            AICP_MSG_CONTROL_SET,
+            AICP_FLAG_ACK_REQUIRED,
+            AICP_CONTROL_PAYLOAD_LEN,
+            control_seq),
+        control_wire,
         &rx,
         rx_payload,
         sizeof(rx_payload),
@@ -1153,10 +1162,10 @@ static int udp_transact_control(
     if (ret != 0) {
         return ret;
     }
-    if (rx.payload_len != sizeof(*status)) {
+    if (rx.payload_len != AICP_STATUS_PAYLOAD_LEN) {
         return -EPROTO;
     }
-    memcpy(status, rx_payload, sizeof(*status));
+    aicp_status_payload_decode(rx_payload, status);
     return 0;
 }
 
@@ -1165,11 +1174,17 @@ static int udp_test_stale_sequence(
     uint32_t stale_seq,
     const struct aicp_control_payload *control) {
     uint8_t rx_payload[AICP_MAX_PAYLOAD];
+    uint8_t control_wire[AICP_CONTROL_PAYLOAD_LEN];
     struct aicp_header rx;
+    aicp_control_payload_encode(control, control_wire);
     int ret = udp_exchange(
         peer,
-        make_header(AICP_MSG_CONTROL_SET, AICP_FLAG_ACK_REQUIRED, sizeof(*control), stale_seq),
-        control,
+        make_header(
+            AICP_MSG_CONTROL_SET,
+            AICP_FLAG_ACK_REQUIRED,
+            AICP_CONTROL_PAYLOAD_LEN,
+            stale_seq),
+        control_wire,
         &rx,
         rx_payload,
         sizeof(rx_payload),
