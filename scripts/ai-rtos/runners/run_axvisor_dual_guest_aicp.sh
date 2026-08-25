@@ -85,7 +85,7 @@ prepare_arceos_binary() {
 prepare_linux_initramfs() {
   rm -rf "${initramfs_dir}"
   mkdir -p "${initramfs_dir}"
-  make -C "${demo_dir}" linux-init-aarch64 \
+  make -B -C "${demo_dir}" linux-init-aarch64 \
     CFLAGS="-O2 -g -Wall -Wextra -Werror -std=c11 -DAICP_INIT_ITERATIONS=${iterations}u -DAICP_INIT_MODE=\\\"${mode}\\\" -DAICP_INIT_STRESS_PROCS=0u"
   cp "${demo_dir}/build/aarch64/aicp_init" "${initramfs_dir}/init"
   chmod +x "${initramfs_dir}/init"
