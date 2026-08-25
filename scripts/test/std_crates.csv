@@ -24,6 +24,7 @@ riscv_vplic
 rsext4
 scope-local
 starry-signal
+starry-kernel
 starry-vm
 ax-timer-list
 ax-alloc

@@ -273,7 +273,10 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
 
         let error = run("127.0.0.1:12345", &config, dir.path(), stop).unwrap_err();
-        assert!(error.to_string().contains("exited with code 1"));
+        assert!(
+            error.to_string().contains("exited with code 1"),
+            "unexpected probe error: {error:#}"
+        );
     }
 
     #[test]

@@ -8,7 +8,6 @@ description = "ArceOS hardware abstraction layer, provides unified APIs for plat
 license.workspace = true
 
 [features]
-axtest = ["irq"]
 smp = [
     "axplat-dyn/smp",
     "ax-plat/smp",
@@ -65,22 +64,3 @@ thiserror.workspace = true
 
 [build-dependencies]
 quote = { workspace = true }
-
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(axtest)'] }
-
-[[test]]
-name = "axtest"
-path = "tests/axtest.rs"
-harness = false
-required-features = ["axtest"]
-
-[dev-dependencies.axtest]
-path = "../../../../components/axtest/axtest"
-
-[dev-dependencies.ax-std]
-path = "../../ulib/axstd"
-features = ["default"]
-
-[dev-dependencies.ax-hal]
-path = "."

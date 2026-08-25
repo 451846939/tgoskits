@@ -37,19 +37,9 @@ use starry_signal::{
     api::{ProcessSignalManager, SignalActions, ThreadSignalManager},
 };
 
-#[cfg(axtest)]
-pub(crate) use self::pid::pid_identity_state_machine_rules_hold_for_test;
 pub use self::{
     cred::*, futex::*, ops::*, posix_timer::PosixTimerTable, process::*, resources::*, seccomp::*,
     signal::*, stat::*, timer::*, user::*,
-};
-#[cfg(test)]
-pub(crate) use self::{
-    ops::decode_wait_status_rules_hold_for_test,
-    posix_timer::posix_timer_clock_validation_rules_hold_for_test,
-    seccomp::seccomp_action_and_precedence_rules_hold_for_test,
-    seccomp::seccomp_bpf_constants_hold_for_test,
-    timer::itimer_type_signo_and_time_conversion_rules_hold_for_test,
 };
 pub(crate) use self::{pid::*, process_identity::*};
 use crate::{
@@ -2344,77 +2334,17 @@ impl Drop for ProcessData {
     }
 }
 
-#[cfg(axtest)]
-pub(crate) fn thread_page_table_lease_follows_task_lifetime_for_test() -> bool {
-    crate::cgroup::init();
-    let identity = PidReservation::reserve(&ROOT_PID_NS, PidReservationKind::ProcessLeader)
-        .unwrap()
-        .publish()
-        .unwrap();
-    let tid_lease = identity.acquire_role::<Tid>().unwrap();
-    let tgid_lease = identity.acquire_role::<Tgid>().unwrap();
-    let process = Process::new_for_axtest(identity.clone());
-
-    let mut old_aspace = crate::mm::new_user_aspace_empty().unwrap();
-    crate::mm::copy_from_kernel(&mut old_aspace).unwrap();
-    let old_aspace = Arc::new(Mutex::new(old_aspace));
-    let old_page_table_root = old_aspace.lock().page_table_root();
-    let old_aspace_weak = Arc::downgrade(&old_aspace);
-    let process_data = ProcessData::new(
-        process,
-        identity.clone(),
-        tgid_lease,
-        ProcessDataInit {
-            image: ProcessImage::new(
-                String::new(),
-                Arc::new(Vec::new()),
-                Arc::new(Vec::new()),
-                Vec::new(),
-                String::new(),
-                String::new(),
-            ),
-            aspace: old_aspace.clone(),
-            signal_actions: Arc::default(),
-            exit_signal: None,
-            wait_parent_tid: TidNumber::from(identity.root_number()),
-            vm_aspace_shared: false,
-        },
-    );
-    let thread = Thread::new(
-        identity.clone(),
-        tid_lease,
-        process_data.clone(),
-        None,
-        SignalSet::default(),
-        Scope::new(),
-    );
-
-    let replacement = Arc::new(Mutex::new(crate::mm::new_user_aspace_empty().unwrap()));
-    crate::mm::attach_process_slot(&replacement);
-    let retired = {
-        let mut guard = process_data.aspace.lock();
-        core::mem::replace(&mut *guard, replacement)
-    };
-    crate::mm::release_process_slot(&retired);
-    drop(retired);
-    drop(old_aspace);
-
-    let retained_root_until_task_reclamation = old_aspace_weak
-        .upgrade()
-        .is_some_and(|aspace| aspace.lock().page_table_root() == old_page_table_root);
-    identity.mark_task_exited();
-    drop(thread);
-    let released_with_task = old_aspace_weak.upgrade().is_none();
-    drop(process_data);
-    retained_root_until_task_reclamation && released_with_task
-}
-
 #[cfg(test)]
 mod tests {
+    #[cfg(axtest)]
+    use super::*;
+    #[cfg(not(axtest))]
     use core::sync::atomic::{AtomicBool, Ordering};
 
+    #[cfg(not(axtest))]
     use super::NextSignalCheckBlock;
 
+    #[cfg(not(axtest))]
     #[test]
     fn old_global_signal_check_block_leaks_between_threads() {
         static OLD_BLOCK_NEXT_SIGNAL_CHECK: AtomicBool = AtomicBool::new(false);
@@ -2439,6 +2369,7 @@ mod tests {
         assert!(!unblock_next_signal());
     }
 
+    #[cfg(not(axtest))]
     #[test]
     fn per_thread_signal_check_block_is_isolated() {
         let thread_a = NextSignalCheckBlock::new();
@@ -2452,5 +2383,70 @@ mod tests {
         );
         assert!(thread_a.unblock());
         assert!(!thread_a.unblock());
+    }
+
+    #[cfg(axtest)]
+    #[axtest::axtest]
+    fn thread_page_table_lease_follows_task_lifetime() {
+        crate::cgroup::init();
+        let identity = PidReservation::reserve(&ROOT_PID_NS, PidReservationKind::ProcessLeader)
+            .unwrap()
+            .publish()
+            .unwrap();
+        let tid_lease = identity.acquire_role::<Tid>().unwrap();
+        let tgid_lease = identity.acquire_role::<Tgid>().unwrap();
+        let process = process::new_isolated_process_for_test(identity.clone());
+
+        let mut old_aspace = crate::mm::new_user_aspace_empty().unwrap();
+        crate::mm::copy_from_kernel(&mut old_aspace).unwrap();
+        let old_aspace = Arc::new(Mutex::new(old_aspace));
+        let old_page_table_root = old_aspace.lock().page_table_root();
+        let old_aspace_weak = Arc::downgrade(&old_aspace);
+        let process_data = ProcessData::new(
+            process,
+            identity.clone(),
+            tgid_lease,
+            ProcessDataInit {
+                image: ProcessImage::new(
+                    String::new(),
+                    Arc::new(Vec::new()),
+                    Arc::new(Vec::new()),
+                    Vec::new(),
+                    String::new(),
+                    String::new(),
+                ),
+                aspace: old_aspace.clone(),
+                signal_actions: Arc::default(),
+                exit_signal: None,
+                wait_parent_tid: TidNumber::from(identity.root_number()),
+                vm_aspace_shared: false,
+            },
+        );
+        let thread = Thread::new(
+            identity.clone(),
+            tid_lease,
+            process_data.clone(),
+            None,
+            SignalSet::default(),
+            Scope::new(),
+        );
+
+        let replacement = Arc::new(Mutex::new(crate::mm::new_user_aspace_empty().unwrap()));
+        crate::mm::attach_process_slot(&replacement);
+        let retired = {
+            let mut guard = process_data.aspace.lock();
+            core::mem::replace(&mut *guard, replacement)
+        };
+        crate::mm::release_process_slot(&retired);
+        drop(retired);
+        drop(old_aspace);
+
+        assert!(old_aspace_weak
+            .upgrade()
+            .is_some_and(|aspace| aspace.lock().page_table_root() == old_page_table_root));
+        identity.mark_task_exited();
+        drop(thread);
+        assert!(old_aspace_weak.upgrade().is_none());
+        drop(process_data);
     }
 }

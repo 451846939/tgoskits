@@ -383,8 +383,8 @@ impl Pollable for Directory {
 
     fn register(&self, _context: &mut Context<'_>, _events: IoEvents) {}
 }
-#[cfg(test)]
-pub(crate) fn metadata_to_kstat_conversion_rules_hold_for_test() -> bool {
+#[cfg(all(test, not(axtest)))]
+fn metadata_to_kstat_conversion_rules_hold_for_test() -> bool {
     use core::time::Duration;
 
     use axfs_ng_vfs::{DeviceId, Metadata};
@@ -420,4 +420,12 @@ pub(crate) fn metadata_to_kstat_conversion_rules_hold_for_test() -> bool {
         && kstat.blocks == 8
         // mode should have type bits (S_IFREG=0100000) OR'd with 0644.
         && (kstat.mode >> 12) == (axfs_ng_vfs::NodeType::RegularFile as u32)
+}
+
+#[cfg(all(test, not(axtest)))]
+mod tests {
+    #[test]
+    fn metadata_to_kstat_conversion_rules_hold() {
+        assert!(super::metadata_to_kstat_conversion_rules_hold_for_test());
+    }
 }

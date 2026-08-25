@@ -56,10 +56,6 @@ host-test = [
   "ax-percpu?/host-test",
 ]
 test = ["host-test"]
-axtest = ["multitask", "preempt"]
-
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(axtest)'] }
 
 [dependencies]
 ax-alloc = {workspace = true, optional = true}
@@ -93,16 +89,3 @@ ax-hal = { path = "../axhal", features = ["fp-simd"] }
 
 [build-dependencies]
 quote = { workspace = true }
-
-[[test]]
-name = "axtest"
-path = "tests/axtest.rs"
-harness = false
-required-features = ["axtest"]
-
-[dev-dependencies.axtest]
-path = "../../../../components/axtest/axtest"
-
-[dev-dependencies.ax-std]
-path = "../../ulib/axstd"
-features = ["default"]

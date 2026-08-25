@@ -137,24 +137,6 @@ pub fn runtime_preempt_current() {
     crate::task::TaskInner::current_check_preempt_pending();
 }
 
-/// Marks the current task for a deterministic preemption safe-point test.
-#[cfg(all(axtest, feature = "preempt"))]
-pub(crate) fn request_current_preemption_for_test() {
-    current().set_preempt_pending(true);
-}
-
-/// Records that the current task's first-entry scheduler frame was consumed.
-#[cfg(axtest)]
-pub(crate) fn record_initial_scheduler_frame_consumed_for_test() {
-    current().record_initial_scheduler_frame_consumed_for_test();
-}
-
-/// Reports whether the current task consumed its first-entry scheduler frame.
-#[cfg(axtest)]
-pub(crate) fn initial_scheduler_frame_consumed_for_test() -> bool {
-    current().initial_scheduler_frame_consumed_for_test()
-}
-
 #[cfg(feature = "lockdep")]
 #[doc(hidden)]
 pub fn collect_current_task_held_locks(snapshot: &mut crate::sync::HeldLockSnapshot) {
@@ -719,20 +701,6 @@ pub fn run_idle() -> ! {
         #[cfg(all(feature = "irq", not(feature = "host-test")))]
         ax_hal::asm::wait_for_irqs();
     }
-}
-
-#[cfg(all(axtest, feature = "axtest"))]
-pub(crate) fn axtask_api_atomic_context_structs_hold_for_test() -> bool {
-    // Test that in_atomic_context function exists and returns bool
-    let is_atomic = super::in_atomic_context();
-    // Should be false in test context (not in IRQ/preempt-disabled region)
-    assert!(is_atomic == true || is_atomic == false);
-
-    // Test that default_task_stack_size returns a reasonable value
-    let stack_size = super::default_task_stack_size();
-    assert!(stack_size > 0);
-
-    true
 }
 
 #[cfg(test)]

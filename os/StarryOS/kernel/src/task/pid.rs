@@ -983,8 +983,8 @@ impl PidIdentity {
         Some(f(zombie))
     }
 
-    #[cfg(any(test, axtest))]
-    pub(super) fn bind_zombie_for_axtest(
+    #[cfg(all(test, not(axtest)))]
+    pub(super) fn bind_zombie_for_test(
         &self,
         process: Arc<Process>,
         exit_event: Arc<PollSet>,
@@ -1268,8 +1268,8 @@ impl PidView {
     }
 }
 
-#[cfg(axtest)]
-pub(crate) fn pid_identity_state_machine_rules_hold_for_test() -> bool {
+#[cfg(all(test, not(axtest)))]
+fn pid_identity_state_machine_rules_hold_for_test() -> bool {
     let root = Arc::new(PidNamespace::new_root());
     let root_init = PidReservation::reserve(&root, PidReservationKind::ProcessLeader)
         .unwrap()
@@ -1344,45 +1344,11 @@ pub(crate) fn pid_identity_state_machine_rules_hold_for_test() -> bool {
     group_only.mark_task_exited();
     group_only_pgid.release();
 
-    let descendant = PidReservation::reserve(&child, PidReservationKind::Thread)
-        .unwrap()
-        .publish()
-        .unwrap();
-    let descendant_tid = descendant.acquire_role::<Tid>().unwrap();
-    let release_descendant = Arc::new(core::sync::atomic::AtomicBool::new(false));
-    let descendant_body = descendant.clone();
-    let release_descendant_body = release_descendant.clone();
-    let descendant_task = ax_task::spawn(move || {
-        while !release_descendant_body.load(Ordering::Acquire) {
-            ax_task::yield_now();
-        }
-        descendant_body.mark_task_exited();
-        descendant_tid.release();
-    });
-    descendant.attach_task(&descendant_task);
-
-    let shutdown = child.begin_shutdown(child_init.id()).unwrap();
-    if !matches!(
-        PidReservation::reserve(&child, PidReservationKind::Thread),
-        Err(StarryError::NoMemory)
-    ) {
-        return false;
-    }
-    release_descendant.store(true, Ordering::Release);
-    shutdown.wait_for_live_descendants();
-    descendant_task.join();
-    if view.visible_number(&child_init).is_some() || view.nspid_chain(&child_init).is_some() {
-        return false;
-    }
     child_init.mark_task_exited();
     drop(group);
     drop(session);
     child_tid.release();
     child_tgid.release();
-    drop(shutdown);
-    if child.lifecycle() != PidNamespaceLifecycle::Dead {
-        return false;
-    }
 
     let old = PidReservation::reserve(&root, PidReservationKind::Thread)
         .unwrap()
@@ -1429,13 +1395,71 @@ pub(crate) fn pid_identity_state_machine_rules_hold_for_test() -> bool {
     generation_is_stable && failed_publication_was_removed
 }
 
-#[cfg(any(test, axtest))]
-pub(crate) fn new_test_pid_namespace() -> PidNamespaceRef {
+#[cfg(all(test, axtest))]
+fn pid_namespace_descendant_shutdown_waits_for_runtime_exit_for_test() -> bool {
+    let root = Arc::new(PidNamespace::new_root());
+    let root_init = PidReservation::reserve(&root, PidReservationKind::ProcessLeader)
+        .unwrap()
+        .publish()
+        .unwrap();
+    let root_tid = root_init.acquire_role::<Tid>().unwrap();
+    let root_tgid = root_init.acquire_role::<Tgid>().unwrap();
+    let child = PidNamespace::new_child(root);
+    let child_init = PidReservation::reserve(&child, PidReservationKind::ProcessLeader)
+        .unwrap()
+        .publish()
+        .unwrap();
+    let child_tid = child_init.acquire_role::<Tid>().unwrap();
+    let child_tgid = child_init.acquire_role::<Tgid>().unwrap();
+    let view = PidView::new(child.clone());
+
+    let descendant = PidReservation::reserve(&child, PidReservationKind::Thread)
+        .unwrap()
+        .publish()
+        .unwrap();
+    let descendant_tid = descendant.acquire_role::<Tid>().unwrap();
+    let release_descendant = Arc::new(core::sync::atomic::AtomicBool::new(false));
+    let descendant_body = descendant.clone();
+    let release_descendant_body = release_descendant.clone();
+    let descendant_task = ax_task::spawn(move || {
+        while !release_descendant_body.load(Ordering::Acquire) {
+            ax_task::yield_now();
+        }
+        descendant_body.mark_task_exited();
+        descendant_tid.release();
+    });
+    descendant.attach_task(&descendant_task);
+
+    let shutdown = child.begin_shutdown(child_init.id()).unwrap();
+    let rejects_new_descendants = matches!(
+        PidReservation::reserve(&child, PidReservationKind::Thread),
+        Err(StarryError::NoMemory)
+    );
+    release_descendant.store(true, Ordering::Release);
+    shutdown.wait_for_live_descendants();
+    let descendant_exit = descendant_task.join() == 0;
+    let init_hidden = view.visible_number(&child_init).is_none()
+        && view.nspid_chain(&child_init).is_none();
+
+    child_init.mark_task_exited();
+    child_tid.release();
+    child_tgid.release();
+    drop(shutdown);
+    let namespace_dead = child.lifecycle() == PidNamespaceLifecycle::Dead;
+    root_init.mark_task_exited();
+    root_tid.release();
+    root_tgid.release();
+
+    rejects_new_descendants && descendant_exit && init_hidden && namespace_dead
+}
+
+#[cfg(all(test, not(axtest)))]
+pub(super) fn new_test_pid_namespace() -> PidNamespaceRef {
     Arc::new(PidNamespace::new_root())
 }
 
-#[cfg(any(test, axtest))]
-pub(crate) fn new_test_process_identity(
+#[cfg(all(test, not(axtest)))]
+pub(super) fn new_test_process_identity(
     namespace: &PidNamespaceRef,
 ) -> (Arc<PidIdentity>, PidRoleLease<Tgid>) {
     let identity = PidReservation::reserve(namespace, PidReservationKind::ProcessLeader)
@@ -1448,12 +1472,16 @@ pub(crate) fn new_test_process_identity(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(test, not(axtest)))]
     extern crate std;
 
+    #[cfg(all(test, not(axtest)))]
     use alloc::vec;
 
+    #[cfg(all(test, not(axtest)))]
     use super::*;
 
+    #[cfg(all(test, not(axtest)))]
     fn root_process() -> (
         PidNamespaceRef,
         Arc<PidIdentity>,
@@ -1470,6 +1498,7 @@ mod tests {
         (root, identity, tid, tgid)
     }
 
+    #[cfg(all(test, not(axtest)))]
     #[test]
     fn multi_namespace_reservation_drop_rolls_back_every_slot() {
         let (root, _root_init, _root_tid, _root_tgid) = root_process();
@@ -1486,6 +1515,7 @@ mod tests {
         assert!(child.lookup(child_number).is_none());
     }
 
+    #[cfg(all(test, not(axtest)))]
     #[test]
     fn reservation_is_invisible_until_publication() {
         let (root, _root_init, _root_tid, _root_tgid) = root_process();
@@ -1501,15 +1531,21 @@ mod tests {
         pgid.release();
     }
 
+    #[cfg(all(test, not(axtest)))]
     #[test]
     fn pidfd_arc_resists_reused_number_aba() {
-        let (root, identity, tid, tgid) = root_process();
+        let (root, _root_init, _root_tid, _root_tgid) = root_process();
+        let identity = PidReservation::reserve(&root, PidReservationKind::Thread)
+            .unwrap()
+            .publish()
+            .unwrap();
+        let tid = identity.acquire_role::<Tid>().unwrap();
+        identity.state.lock().runtime = RuntimeTaskLink::Live(WeakAxTaskRef::new());
         let number = identity.visible_number(&root).unwrap();
         let old_identity_id = identity.id();
         let pidfd_identity = identity.clone();
         identity.mark_task_exited();
         tid.release();
-        tgid.release();
         assert!(root.lookup(number).is_none());
         assert!(root.lookup_identity(old_identity_id).is_none());
 
@@ -1518,6 +1554,7 @@ mod tests {
             .publish()
             .unwrap();
         let replacement_tid = replacement.acquire_role::<Tid>().unwrap();
+        replacement.state.lock().runtime = RuntimeTaskLink::Live(WeakAxTaskRef::new());
         assert_eq!(replacement.visible_number(&root), Some(number));
         assert_ne!(replacement.id(), pidfd_identity.id());
         assert!(Arc::ptr_eq(
@@ -1529,9 +1566,16 @@ mod tests {
         replacement_tid.release();
     }
 
+    #[cfg(all(test, not(axtest)))]
     #[test]
     fn live_process_stays_visible_after_its_leader_runtime_exits() {
-        let (root, identity, tid, tgid) = root_process();
+        let (root, _root_init, _root_tid, _root_tgid) = root_process();
+        let identity = PidReservation::reserve(&root, PidReservationKind::ProcessLeader)
+            .unwrap()
+            .publish()
+            .unwrap();
+        let tid = identity.acquire_role::<Tid>().unwrap();
+        let tgid = identity.acquire_role::<Tgid>().unwrap();
         let number = identity.root_number();
         {
             let mut state = identity.state.lock();
@@ -1549,6 +1593,7 @@ mod tests {
         tgid.release();
     }
 
+    #[cfg(all(test, not(axtest)))]
     #[test]
     fn role_typed_views_reject_a_number_with_the_wrong_role() {
         let (root, root_identity, root_tid, root_tgid) = root_process();
@@ -1588,6 +1633,7 @@ mod tests {
         root_tgid.release();
     }
 
+    #[cfg(all(test, not(axtest)))]
     #[test]
     fn observer_view_projects_each_namespace_number_and_hides_dead_namespace() {
         let (root, _root_init, _root_tid, _root_tgid) = root_process();
@@ -1618,7 +1664,7 @@ mod tests {
         assert_eq!(child_view.nspid_chain(&identity), Some(vec![child_number]));
 
         let shutdown = child.begin_shutdown(identity.id()).unwrap();
-        shutdown.wait_for_live_descendants();
+        child.finish_shutdown(identity.id());
         assert_eq!(child.lifecycle(), PidNamespaceLifecycle::Dead);
         assert_eq!(child_view.visible_number(&identity), None);
         assert_eq!(child_view.nspid_chain(&identity), None);
@@ -1628,6 +1674,7 @@ mod tests {
         drop(shutdown);
     }
 
+    #[cfg(all(test, not(axtest)))]
     #[test]
     fn pgid_and_sid_roles_keep_a_reaped_number_published() {
         let (root, identity, tid, tgid) = root_process();
@@ -1644,6 +1691,7 @@ mod tests {
         assert!(root.lookup(number).is_none());
     }
 
+    #[cfg(all(test, not(axtest)))]
     #[test]
     fn namespace_shutdown_rejects_new_reservations() {
         let (root, _root_init, _root_tid, _root_tgid) = root_process();
@@ -1659,11 +1707,23 @@ mod tests {
             PidReservation::reserve(&child, PidReservationKind::ProcessLeader),
             Err(StarryError::NoMemory)
         ));
-        shutdown.wait_for_live_descendants();
+        child.finish_shutdown(init.id());
         init.mark_task_exited();
         tid.release();
         tgid.release();
         drop(shutdown);
         assert_eq!(child.lifecycle(), PidNamespaceLifecycle::Dead);
+    }
+
+    #[cfg(all(test, not(axtest)))]
+    #[test]
+    fn pid_identity_state_machine_rules_hold() {
+        assert!(super::pid_identity_state_machine_rules_hold_for_test());
+    }
+
+    #[cfg(all(test, axtest))]
+    #[axtest::axtest]
+    fn pid_namespace_descendant_shutdown_waits_for_runtime_exit() {
+        assert!(super::pid_namespace_descendant_shutdown_waits_for_runtime_exit_for_test());
     }
 }

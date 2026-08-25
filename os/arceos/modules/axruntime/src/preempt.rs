@@ -71,14 +71,10 @@ impl ax_task::runtime_preempt::RuntimePreemption for RuntimePreemptionOps {
             .unwrap_or_else(|error| panic!("initial preemption handoff is invalid: {error}"));
         publish_current_preemption_pending();
         finish_initial_scheduler_baton();
-        #[cfg(axtest)]
-        {
-            assert!(
-                !ax_hal::asm::irqs_enabled(),
-                "first-entry scheduler frame must finish before IRQ enable"
-            );
-            ax_task::axtest_support::record_initial_scheduler_frame_consumed();
-        }
+        debug_assert!(
+            !ax_hal::asm::irqs_enabled(),
+            "first-entry scheduler frame must finish before IRQ enable"
+        );
     }
 }
 

@@ -18,7 +18,13 @@ task-affinity = ["ax-std", "ax-std/multitask"]
 task-wait-queue = ["ax-std", "ax-std/multitask", "ax-std/irq"]
 task-wait-queue-remote-wake = ["ax-std", "ax-std/multitask", "ax-std/irq", "ax-std/ipi"]
 task-ipi = ["ax-std", "ax-std/alloc", "ax-std/multitask", "ax-std/irq", "ax-std/ipi"]
-task-irq = ["ax-std", "ax-std/multitask", "ax-std/irq"]
+task-irq = [
+    "ax-std",
+    "ax-std/multitask",
+    "ax-std/irq",
+    "ax-std/sched-rr",
+    "dep:axpoll",
+]
 task-tls = ["ax-std", "ax-std/tls", "ax-std/alloc", "ax-std/multitask"]
 task-parallel = ["ax-std", "dep:rand", "ax-std/alloc", "ax-std/multitask", "ax-std/irq"]
 task-priority = ["ax-std", "ax-std/alloc", "ax-std/multitask"]
@@ -42,6 +48,10 @@ lockdep-detect = [
     "ax-std/multitask",
     "ax-std/lockdep",
 ]
+# `task-irq` needs the preemptive round-robin runtime. Cargo features are
+# additive, so enabling it here would also run the FIFO-oriented bulk cases
+# under that scheduler. The xtask default run dispatches this existing selector
+# as a separate kernel after the `all` kernel.
 all = [
     "memtest",
     "task-yield",
@@ -49,7 +59,6 @@ all = [
     "task-wait-queue",
     "task-wait-queue-remote-wake",
     "task-ipi",
-    "task-irq",
     "task-tls",
     "task-parallel",
     "task-priority",
@@ -69,5 +78,6 @@ ax-hal = { workspace = true, optional = true }
 ax-std = { workspace = true, optional = true, features = ["default"] }
 axbacktrace = { workspace = true, optional = true }
 axfs-ng-vfs = { workspace = true, optional = true }
+axpoll = { workspace = true, optional = true }
 embedded-graphics = { version = "0.8", optional = true }
 rand = { version = "0.8", default-features = false, features = ["small_rng"], optional = true }

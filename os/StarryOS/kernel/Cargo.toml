@@ -244,9 +244,12 @@ ax-std = { path = "../../arceos/ulib/axstd", default-features = false, features 
     "irq",
 ] }
 
+[target.'cfg(not(target_os = "none"))'.dev-dependencies]
+ax-runtime = { workspace = true, features = ["host-test", "smp"] }
+
 [[test]]
 name = "axtest_kernel"
-path = "tests/axtest_kernel.rs"
+path = "src/axtest_kernel.rs"
 harness = false
 required-features = ["axtest", "smp"]
 

@@ -34,16 +34,16 @@ use crate::{
 pub const FIOCLEX: u32 = 0x5451;
 pub const FIONCLEX: u32 = 0x5450;
 
-#[cfg(test)]
-pub(crate) fn ctl_ioctl_constants_hold_for_test() -> bool {
-    // Verify ioctl command constants
-    assert!(FIOCLEX == 0x5451);
-    assert!(FIONCLEX == 0x5450);
-
-    // FIONBIO and FIOASYNC from linux_raw_sys
+#[cfg(all(test, not(axtest)))]
+fn ctl_ioctl_constants_hold_for_test() -> bool {
     use linux_raw_sys::ioctl::{FIOASYNC, FIONBIO};
-    assert!(FIONBIO == 0x5421);
-    assert!(FIOASYNC == 0x5452);
+
+    const {
+        assert!(FIOCLEX == 0x5451);
+        assert!(FIONCLEX == 0x5450);
+        assert!(FIONBIO == 0x5421);
+        assert!(FIOASYNC == 0x5452);
+    }
 
     true
 }
@@ -912,4 +912,12 @@ pub fn sys_syncfs(fd: c_int) -> StarryResult<isize> {
         d.inner().filesystem().flush()?;
     }
     Ok(0)
+}
+
+#[cfg(all(test, not(axtest)))]
+mod tests {
+    #[test]
+    fn ctl_ioctl_constants_hold() {
+        assert!(super::ctl_ioctl_constants_hold_for_test());
+    }
 }

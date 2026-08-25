@@ -61,12 +61,15 @@ fn axfs_vfs_enables_sleepable_mutexes() {
 }
 
 #[test]
-fn axfs_ng_axtest_excludes_the_host_sync_backend() {
+fn axfs_ng_host_tests_use_host_sync_without_axtest() {
     let workspace = crate::context::workspace_root_path().unwrap();
     let manifest_path = workspace.join("fs/ax-fs-ng/Cargo.toml");
     let manifest: toml::Value =
         toml::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
-    let host_test_features = manifest["features"]["host-test"]
+    let features = manifest["features"]
+        .as_table()
+        .expect("ax-fs-ng must declare a feature table");
+    let host_test_features = features["host-test"]
         .as_array()
         .expect("ax-fs-ng must expose an explicit host-test feature");
 
@@ -78,22 +81,39 @@ fn axfs_ng_axtest_excludes_the_host_sync_backend() {
         "{} must enable the host synchronization backend only through host-test",
         manifest_path.display()
     );
-
-    let dev_ax_sync_features = manifest
-        .get("dev-dependencies")
-        .and_then(toml::Value::as_table)
-        .and_then(|dependencies| dependencies.get("ax-sync"))
-        .and_then(toml::Value::as_table)
-        .and_then(|dependency| dependency.get("features"))
-        .and_then(toml::Value::as_array);
     assert!(
-        dev_ax_sync_features.is_none_or(|features| {
-            features
-                .iter()
-                .filter_map(toml::Value::as_str)
-                .all(|feature| feature != "host-test")
-        }),
-        "{} must not enable ax-sync/host-test for bare-metal axtest targets",
+        !features.contains_key("axtest"),
+        "{} must not expose an axtest feature",
+        manifest_path.display()
+    );
+
+    let dev_ax_sync_features = manifest["target"]["cfg(not(target_os = \"none\"))"]
+        ["dev-dependencies"]["ax-sync"]["features"]
+        .as_array()
+        .expect("host tests must enable the host synchronization backend");
+    assert!(
+        dev_ax_sync_features
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .any(|feature| feature == "host-test"),
+        "{} must let ordinary host cargo tests link ax-sync",
+        manifest_path.display()
+    );
+    assert!(
+        manifest
+            .get("dev-dependencies")
+            .and_then(toml::Value::as_table)
+            .and_then(|dependencies| dependencies.get("ax-sync"))
+            .and_then(toml::Value::as_table)
+            .and_then(|dependency| dependency.get("features"))
+            .and_then(toml::Value::as_array)
+            .is_none_or(|features| {
+                features
+                    .iter()
+                    .filter_map(toml::Value::as_str)
+                    .all(|feature| feature != "host-test")
+            }),
+        "{} must keep the host backend target-specific",
         manifest_path.display()
     );
 }

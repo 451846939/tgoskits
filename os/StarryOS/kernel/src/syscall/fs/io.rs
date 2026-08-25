@@ -1082,16 +1082,16 @@ pub fn sys_splice(
     isize::try_from(n).map_err(|_| StarryError::InvalidInput)
 }
 
-#[cfg(test)]
-pub(crate) fn io_rwf_flags_validation_rules_hold_for_test() -> bool {
+#[cfg(all(test, not(axtest)))]
+fn io_rwf_flags_validation_rules_hold_for_test() -> bool {
     // validate_rwf_flags: only flags==0 is accepted.
     validate_rwf_flags(0).is_ok()
         && validate_rwf_flags(1).is_err()
         && validate_rwf_flags(u32::MAX).is_err()
 }
 
-#[cfg(test)]
-pub(crate) fn io_offset_from_hilo_rules_hold_for_test() -> bool {
+#[cfg(all(test, not(axtest)))]
+fn io_offset_from_hilo_rules_hold_for_test() -> bool {
     // Test offset_from_hilo function
     // On 64-bit, offset_from_hilo should return pos_l directly
     let result = offset_from_hilo(1000, 0);
@@ -1101,4 +1101,17 @@ pub(crate) fn io_offset_from_hilo_rules_hold_for_test() -> bool {
     assert!(neg_result == -1);
 
     true
+}
+
+#[cfg(all(test, not(axtest)))]
+mod tests {
+    #[test]
+    fn io_rwf_flags_validation_rules_hold() {
+        assert!(super::io_rwf_flags_validation_rules_hold_for_test());
+    }
+
+    #[test]
+    fn io_offset_from_hilo_rules_hold() {
+        assert!(super::io_offset_from_hilo_rules_hold_for_test());
+    }
 }

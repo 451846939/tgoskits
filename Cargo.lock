@@ -410,6 +410,7 @@ dependencies = [
  "ax-std",
  "axbacktrace",
  "axfs-ng-vfs",
+ "axpoll",
  "embedded-graphics",
  "rand 0.8.7",
 ]
@@ -894,13 +895,10 @@ dependencies = [
 name = "ax-fs-ng"
 version = "0.9.1"
 dependencies = [
- "ax-hal",
  "ax-io",
  "ax-lazyinit",
- "ax-std",
  "ax-sync",
  "axfs-ng-vfs",
- "axtest",
  "bitflags 2.13.1",
  "cfg-if",
  "chrono",
@@ -923,15 +921,12 @@ version = "0.6.0"
 dependencies = [
  "ax-alloc",
  "ax-cpu",
- "ax-hal",
  "ax-lazyinit",
  "ax-memory-addr",
  "ax-percpu",
  "ax-plat",
- "ax-std",
  "ax-sync",
  "axplat-dyn",
- "axtest",
  "cfg-if",
  "cpu-local",
  "fdt-parser",
@@ -1229,11 +1224,9 @@ dependencies = [
  "ax-mm",
  "ax-percpu",
  "ax-sched",
- "ax-std",
  "ax-timer-list",
  "axpanic",
  "axpoll",
- "axtest",
  "cfg-if",
  "extern-trait",
  "futures-util",
@@ -1280,11 +1273,8 @@ name = "axbacktrace"
 version = "0.4.9"
 dependencies = [
  "addr2line 0.26.1",
- "ax-hal",
  "ax-lazyinit",
- "ax-std",
  "axpanic",
- "axtest",
  "cfg-if",
  "gimli 0.33.0",
  "log",

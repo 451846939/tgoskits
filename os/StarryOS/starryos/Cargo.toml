@@ -45,10 +45,12 @@ stack-protector = ["ax-std/stack-protector", "starry-kernel/stack-protector"]
 [[bin]]
 name = "starryos"
 path = "src/main.rs"
+test = false
 
 [[bin]]
 name = "xtask"
 path = "xtask/main.rs"
+test = false
 
 [dependencies]
 # Starry is a freestanding PIE. Keep host `std` compatibility and kernel TLS

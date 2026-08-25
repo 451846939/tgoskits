@@ -20,7 +20,6 @@
 //! - `tls`: Enable kernel space thread-local storage support.
 //! - `rtc`: Enable real-time clock support.
 //! - `uspace`: Enable user space support.
-//! - `axtest`: Enable internal AxTest cases.
 //!
 //! [ArceOS]: https://github.com/arceos-org/arceos
 //! [cargo test]: https://doc.rust-lang.org/cargo/guide/tests.html
@@ -53,21 +52,6 @@ pub mod mem;
 pub mod percpu;
 pub mod pmu;
 pub mod time;
-
-/// White-box checks used only by the Cargo axtest integration target.
-#[cfg(all(axtest, feature = "axtest"))]
-#[doc(hidden)]
-pub mod axtest_support {
-    /// Observes IRQ state during dispatch, preemption release, and return.
-    pub fn observe_irq_entry_state_for_test() -> (bool, bool, bool) {
-        let observation = super::irq::observe_irq_entry_state_for_test();
-        (
-            observation.dispatch_irqs_enabled,
-            observation.after_preempt_release_irqs_enabled,
-            observation.return_irqs_enabled,
-        )
-    }
-}
 
 #[cfg(feature = "tls")]
 pub mod tls;

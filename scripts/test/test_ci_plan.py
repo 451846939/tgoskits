@@ -495,7 +495,7 @@ command = "true"
         self.assertEqual(plan["arceos_matrix"]["include"], [])
         self.assertEqual(plan["axvisor_matrix"]["include"], [])
 
-    def test_arceos_qemu_jobs_run_same_arch_axtests_serially(self) -> None:
+    def test_arceos_qemu_jobs_run_suites_without_workspace_axtests(self) -> None:
         plan = ci_plan.build_main_plan(self.upstream)
         rows = {row["id"]: row for row in plan["arceos_matrix"]["include"]}
         expected_arches = {
@@ -508,15 +508,8 @@ command = "true"
         for check_id, arch in expected_arches.items():
             command = rows[check_id]["command"]
             arceos_command = f"cargo xtask arceos test qemu --arch {arch}"
-            axtest_command = (
-                "cargo xtask ktest qemu --workspace --exclude starry-kernel "
-                f"--exclude axvisor --arch {arch}"
-            )
             self.assertIn(arceos_command, command)
-            self.assertIn(axtest_command, command)
-            self.assertLess(
-                command.index(arceos_command), command.index(axtest_command)
-            )
+            self.assertNotIn("cargo xtask ktest qemu --workspace", command)
             self.assertEqual(rows[check_id]["cache_key"], "")
 
     def test_fork_repository_filters_owner_checks_and_falls_back_from_qcs(

@@ -150,8 +150,8 @@ impl CachedFileShared {
     }
 }
 
-#[cfg(any(test, all(axtest, feature = "axtest")))]
-pub(crate) fn reclaim_releases_registry_spin_lock_for_test() -> bool {
+#[cfg(test)]
+fn reclaim_releases_registry_spin_lock_for_test() -> bool {
     const RECLAIM_PAGES: usize = 32;
 
     let file = Arc::new(CachedFileShared::new_unbounded(

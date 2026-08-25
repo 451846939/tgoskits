@@ -55,6 +55,25 @@ const AX_TASK_FEATURE_PROFILES: &[PackageFeatureProfile] = &[
     },
 ];
 
+const AX_HAL_FEATURE_PROFILES: &[PackageFeatureProfile] = &[PackageFeatureProfile {
+    name: "host-test+irq",
+    no_default_features: false,
+    features: &["host-test", "irq"],
+    name_filter: None,
+    expected_tests: &[
+        "boot::tests::boot_entropy_is_unavailable_without_firmware",
+        "boot::tests::bootargs_facade_is_available",
+        "cache::tests::all_cpu_tlb_shootdown_propagates_remote_failure",
+        "cache::tests::all_cpu_tlb_shootdown_skips_offline_cpus_then_flushes_local",
+        "cache::tests::large_tlb_ranges_switch_to_one_full_invalidation",
+        "cache::tests::local_mmu_cache_update_aligns_the_fault_address_once",
+        "cache::tests::targeted_tlb_shootdown_skips_unselected_remote_and_local_cpus",
+        "irq::tests::irq_entry_preserves_disabled_caller_state",
+        "irq::tests::irq_entry_preserves_enabled_caller_state",
+        "topology::tests::dummy_topology_only_maps_the_boot_cpu",
+    ],
+}];
+
 const AX_DRIVER_FEATURE_PROFILES: &[PackageFeatureProfile] = &[
     PackageFeatureProfile {
         name: "host-test+rtc+starfive-jh7110-dwmmc",
@@ -96,21 +115,22 @@ const FS_FEATURE_PROFILES: &[PackageFeatureProfile] = &[PackageFeatureProfile {
     expected_tests: &[],
 }];
 
-const STARRY_KERNEL_FEATURE_PROFILES: &[PackageFeatureProfile] = &[PackageFeatureProfile {
-    name: "std-tests-only",
-    no_default_features: false,
-    features: &[],
-    name_filter: Some("std_tests::"),
-    expected_tests: &[],
-}];
-
 const AX_FS_NG_FEATURE_PROFILES: &[PackageFeatureProfile] = &[
     PackageFeatureProfile {
-        name: "host-test",
+        name: "host-test+vfs",
         no_default_features: false,
-        features: &["host-test"],
+        features: &["host-test", "vfs"],
         name_filter: None,
         expected_tests: &[],
+    },
+    PackageFeatureProfile {
+        name: "host-test+vfs-reclaim-discovery",
+        no_default_features: false,
+        features: &["host-test", "vfs"],
+        name_filter: Some("reclaim_releases_registry_spin_lock_before_sleepable_file_locks"),
+        expected_tests: &[
+            "file::cache::reclaim::tests::reclaim_releases_registry_spin_lock_before_sleepable_file_locks",
+        ],
     },
     PackageFeatureProfile {
         name: "host-test-resource-rollback-discovery",
@@ -181,16 +201,15 @@ const AXBUILD_FEATURE_PROFILES: &[PackageFeatureProfile] = &[
         expected_tests: &[],
     },
     PackageFeatureProfile {
-        name: "ax-fs-ng-axtest-feature-discovery",
+        name: "ax-fs-ng-host-test-boundary-discovery",
         no_default_features: false,
         features: &[],
-        name_filter: Some("axfs_ng_axtest_excludes_the_host_sync_backend"),
+        name_filter: Some("axfs_ng_host_tests_use_host_sync_without_axtest"),
         expected_tests: &[
-            "build::tests::std_features::axfs_ng_axtest_excludes_the_host_sync_backend",
+            "build::tests::std_features::axfs_ng_host_tests_use_host_sync_without_axtest",
         ],
     },
 ];
-
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum CargoTestAction {
     List,
@@ -465,13 +484,13 @@ fn package_feature_profiles(package: &str) -> Option<&'static [PackageFeaturePro
         | "buddy-slab-allocator" => Some(HOST_TEST_FEATURE_PROFILES),
         "ax-fs-ng" => Some(AX_FS_NG_FEATURE_PROFILES),
         "ax-io" | "axbacktrace" => Some(ALLOC_FEATURE_PROFILES),
+        "ax-hal" => Some(AX_HAL_FEATURE_PROFILES),
         "ax-task" => Some(AX_TASK_FEATURE_PROFILES),
         "ax-driver" => Some(AX_DRIVER_FEATURE_PROFILES),
         "nvme-driver" => Some(NVME_FEATURE_PROFILES),
         "sdmmc-protocol" => Some(SDMMC_RDIF_FEATURE_PROFILES),
         "axbuild" => Some(AXBUILD_FEATURE_PROFILES),
         "axvisor" => Some(FS_FEATURE_PROFILES),
-        "starry-kernel" => Some(STARRY_KERNEL_FEATURE_PROFILES),
         _ => None,
     }
 }
@@ -674,6 +693,11 @@ mod tests {
             }
             self
         }
+
+        fn with_ax_hal_discovery(self) -> Self {
+            let profile = &AX_HAL_FEATURE_PROFILES[0];
+            self.with_listing("ax-hal", profile, profile.expected_tests)
+        }
     }
 
     impl CargoRunner for FakeCargoRunner {
@@ -806,8 +830,13 @@ mod tests {
     fn std_test_runner_collects_all_failures() {
         let root = PathBuf::from("/tmp/workspace");
         let packages = vec!["ax-api".to_string(), "ax-hal".to_string()];
+        let ax_hal_profile = &AX_HAL_FEATURE_PROFILES[0];
         let mut runner = FakeCargoRunner::succeeding()
-            .with_status(CargoTestInvocation::default_for("ax-hal"), false);
+            .with_ax_hal_discovery()
+            .with_status(
+                CargoTestInvocation::for_profile("ax-hal", ax_hal_profile, CargoTestAction::Run),
+                false,
+            );
 
         let failed = run_std_tests(&mut runner, &root, &packages).unwrap();
 
@@ -823,7 +852,22 @@ mod tests {
                         CargoTestAction::Run,
                     ),
                 ),
-                (root, CargoTestInvocation::default_for("ax-hal")),
+                (
+                    root.clone(),
+                    CargoTestInvocation::for_profile(
+                        "ax-hal",
+                        ax_hal_profile,
+                        CargoTestAction::List,
+                    ),
+                ),
+                (
+                    root,
+                    CargoTestInvocation::for_profile(
+                        "ax-hal",
+                        ax_hal_profile,
+                        CargoTestAction::Run,
+                    ),
+                ),
             ]
         );
     }
@@ -832,7 +876,7 @@ mod tests {
     fn std_test_runner_returns_empty_failures_when_all_pass() {
         let root = PathBuf::from("/tmp/workspace");
         let packages = vec!["ax-api".to_string(), "ax-hal".to_string()];
-        let mut runner = FakeCargoRunner::succeeding();
+        let mut runner = FakeCargoRunner::succeeding().with_ax_hal_discovery();
 
         let failed = run_std_tests(&mut runner, &root, &packages).unwrap();
 
@@ -840,16 +884,31 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_package_keeps_default_cargo_test_command() {
+    fn ax_hal_uses_the_host_irq_profile_and_discovers_required_tests() {
         let root = PathBuf::from("/tmp/workspace");
         let packages = vec!["ax-hal".to_string()];
-        let mut runner = FakeCargoRunner::succeeding();
+        let mut runner = FakeCargoRunner::succeeding().with_ax_hal_discovery();
 
         let failed = run_std_tests(&mut runner, &root, &packages).unwrap();
 
         assert!(failed.is_empty());
-        assert_eq!(runner.invocations.len(), 1);
-        assert_eq!(runner.invocations[0].1.args(), vec!["test", "-p", "ax-hal"]);
+        assert_eq!(runner.invocations.len(), 2);
+        assert_eq!(
+            runner.invocations[0].1.args(),
+            vec![
+                "test",
+                "-p",
+                "ax-hal",
+                "--features",
+                "host-test,irq",
+                "--",
+                "--list",
+            ]
+        );
+        assert_eq!(
+            runner.invocations[1].1.args(),
+            vec!["test", "-p", "ax-hal", "--features", "host-test,irq"]
+        );
     }
 
     #[test]
@@ -1017,11 +1076,12 @@ mod tests {
         assert!(expected.contains(
             "sdio::tests::rdif_lifecycle::ready_online_smp_repeats_info_without_reissuing_resources"
         ));
-        assert!(
-            expected.contains(
-                "build::tests::std_features::axfs_ng_axtest_excludes_the_host_sync_backend"
-            )
-        );
+        assert!(expected.contains(
+            "build::tests::std_features::axfs_ng_host_tests_use_host_sync_without_axtest"
+        ));
+        assert!(expected.contains(
+            "file::cache::reclaim::tests::reclaim_releases_registry_spin_lock_before_sleepable_file_locks"
+        ));
     }
 
     #[test]
@@ -1127,7 +1187,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_aggregate_packages_run_only_their_standard_test_subset() {
+    fn runtime_aggregate_packages_use_their_required_host_profiles() {
         let root = PathBuf::from("/tmp/workspace");
         let packages = ["axvisor", "starry-kernel"].map(str::to_string).to_vec();
         let mut runner = FakeCargoRunner::succeeding();
@@ -1144,7 +1204,7 @@ mod tests {
             args,
             vec![
                 vec!["test", "-p", "axvisor", "--features", "fs"],
-                vec!["test", "-p", "starry-kernel", "std_tests::"],
+                vec!["test", "-p", "starry-kernel"],
             ]
         );
     }
