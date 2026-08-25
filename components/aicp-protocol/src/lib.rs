@@ -16,14 +16,19 @@ pub const MSG_CONTROL_SET: u8 = 0x02;
 pub const MSG_STATUS: u8 = 0x03;
 pub const MSG_ERROR: u8 = 0x04;
 pub const MSG_HEARTBEAT: u8 = 0x05;
+pub const MSG_ACK: u8 = 0x06;
 
 pub const ERROR_OK: u16 = 0;
 pub const ERROR_VERSION: u16 = 1;
 pub const ERROR_CRC: u16 = 2;
 pub const ERROR_BAD_TYPE: u16 = 3;
 pub const ERROR_BAD_PAYLOAD: u16 = 4;
+pub const ERROR_TIMEOUT: u16 = 5;
+pub const ERROR_INTERNAL: u16 = 6;
 pub const ERROR_SEQUENCE: u16 = 7;
 pub const FLAG_ACK_REQUIRED: u16 = 1 << 0;
+pub const FLAG_RETRANSMIT: u16 = 1 << 1;
+pub const FLAG_TIME_SYNC: u16 = 1 << 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Header {
