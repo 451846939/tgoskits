@@ -79,9 +79,15 @@ struct aicp_status_payload {
     uint32_t applied_seq;
 };
 
+#ifdef __cplusplus
+static_assert(
+    sizeof(float) == sizeof(uint32_t) && FLT_RADIX == 2 && FLT_MANT_DIG == 24,
+    "AICP payloads require IEEE-754 binary32 floats");
+#else
 _Static_assert(
     sizeof(float) == sizeof(uint32_t) && FLT_RADIX == 2 && FLT_MANT_DIG == 24,
     "AICP payloads require IEEE-754 binary32 floats");
+#endif
 
 static inline uint16_t aicp_bswap16(uint16_t v) {
     return (uint16_t)((v << 8) | (v >> 8));
