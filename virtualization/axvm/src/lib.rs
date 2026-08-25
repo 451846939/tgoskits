@@ -82,12 +82,12 @@ pub fn check_timer_events() {
 
 #[cfg(test)]
 mod tests {
-    use super::{AxVmResult, VMId, kick_vm_vcpu, notify_vm_vcpu};
+    use super::{AxVmResult, VMId, kick_vm_vcpu};
 
     #[test]
     #[allow(deprecated)]
     fn legacy_notify_vm_vcpu_remains_a_public_compatible_entry_point() {
-        let _: fn(VMId, usize) -> AxVmResult = notify_vm_vcpu;
+        let _: fn(VMId, usize) -> AxVmResult = super::notify_vm_vcpu;
         let _: fn(VMId, usize) -> AxVmResult = kick_vm_vcpu;
     }
 }
