@@ -294,7 +294,7 @@ impl Aarch64TimerBinding {
                         operation: "arm blocked-vCPU architectural timer",
                         detail: std::format!("stable hard timer arm failed: {error}"),
                     }
-                })?;
+            })?;
             return Ok(Some(wait_token));
         }
 

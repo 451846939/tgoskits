@@ -168,9 +168,12 @@ pub(crate) fn queue_pending_interrupt(
     Ok(())
 }
 
-/// Wake and kick a target vCPU after an architecture IRQ backend has
-/// published pending state outside the generic runtime queue.
-pub(crate) fn notify_vcpu(vm_id: usize, vcpu_id: usize) -> AxVmResult {
+/// Notify every shared waiter, then kick the target vCPU's host CPU.
+///
+/// The vCPU ID selects the IPI destination only. The runtime wait queue is
+/// still VM-wide, so this function deliberately retains broadcast wake
+/// semantics until AxVM gains per-vCPU wait queues.
+pub(crate) fn notify_waiters_and_kick_vcpu(vm_id: usize, vcpu_id: usize) -> AxVmResult {
     let vm = crate::get_vm_by_id(vm_id)
         .ok_or_else(|| ax_err_type!(NotFound, format!("VM[{vm_id}] not found")))?;
     if !matches!(vm.status(), VmStatus::Running | VmStatus::Paused) {

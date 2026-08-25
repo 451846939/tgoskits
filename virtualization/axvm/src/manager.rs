@@ -81,10 +81,12 @@ pub(crate) fn inject_interrupt(vm_id: VMId, vcpu_id: usize, vector: usize) -> Ax
     crate::runtime::vcpus::queue_interrupt(vm_id, vcpu_id, vector)
 }
 
-/// Wake and kick a target vCPU whose architecture backend already published
-/// pending interrupt state.
-pub fn notify_vm_vcpu(vm_id: VMId, vcpu_id: usize) -> AxVmResult {
-    crate::runtime::vcpus::notify_vcpu(vm_id, vcpu_id)
+/// Kick a target vCPU after waking the VM-wide shared wait queue.
+///
+/// The vCPU ID selects the host IPI destination; it does not select a private
+/// wait queue because AxVM currently has only a VM-wide queue.
+pub fn kick_vm_vcpu(vm_id: VMId, vcpu_id: usize) -> AxVmResult {
+    crate::runtime::vcpus::notify_waiters_and_kick_vcpu(vm_id, vcpu_id)
 }
 
 /// Return the current VM ID from the vCPU currently executing on this CPU.
