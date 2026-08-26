@@ -10,6 +10,7 @@ SERVICE_TEST := $(BIN_DIR)/aicp_service_test
 CLIENT_TEST := $(BIN_DIR)/aicp_client_test
 MODEL_TEST := $(BIN_DIR)/aicp_model_test
 REFERENCE_SERVER := $(BIN_DIR)/aicp_reference_server
+LINUX_CLIENT := $(BIN_DIR)/aicp_linux_client
 AARCH64_BIN_DIR ?= $(BIN_DIR)/aarch64
 AARCH64_INIT := $(AARCH64_BIN_DIR)/aicp_init
 
@@ -20,7 +21,7 @@ AICP_SERVICE_HEADERS := rtos-core/aicp_service.h rtos-core/control_loop.h
 AICP_CONTROL_POLICY := ai-model/control_policy.c ai-model/simple_nn.c
 AICP_CONTROL_POLICY_HEADERS := ai-model/control_policy.h ai-model/simple_nn.h
 
-.PHONY: protocol-test service-test client-test model-test test reference-server linux-init-aarch64 clean FORCE
+.PHONY: protocol-test service-test client-test model-test test reference-server linux-client linux-init-aarch64 clean FORCE
 
 $(BIN_DIR):
 	mkdir -p $@
@@ -43,6 +44,9 @@ $(MODEL_TEST): tests/aicp_model_test.c $(AICP_CONTROL_POLICY) $(AICP_CONTROL_POL
 $(REFERENCE_SERVER): host-tools/aicp_reference_server.c $(AICP_SERVICE_CORE) $(AICP_SERVICE_HEADERS) $(AICP_POSIX_HEADERS) | $(BIN_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ host-tools/aicp_reference_server.c $(AICP_SERVICE_CORE) $(LDLIBS)
 
+$(LINUX_CLIENT): linux-client/main.c aicp/aicp_client.c aicp/aicp_client.h $(AICP_CONTROL_POLICY) $(AICP_CONTROL_POLICY_HEADERS) $(AICP_POSIX_HEADERS) | $(BIN_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ linux-client/main.c aicp/aicp_client.c $(AICP_CONTROL_POLICY) $(LDLIBS)
+
 $(AARCH64_INIT): FORCE linux-init/aicp_init.c $(AICP_CONTROL_POLICY) $(AICP_CONTROL_POLICY_HEADERS) aicp/aicp_client.c aicp/aicp_client.h $(AICP_POSIX_HEADERS) | $(AARCH64_BIN_DIR)
 	$(CROSS_CC) $(CPPFLAGS) $(CFLAGS) -static -o $@ linux-init/aicp_init.c aicp/aicp_client.c $(AICP_CONTROL_POLICY) $(LDLIBS)
 
@@ -63,6 +67,8 @@ model-test: $(MODEL_TEST)
 test: protocol-test service-test client-test model-test
 
 reference-server: $(REFERENCE_SERVER)
+
+linux-client: $(LINUX_CLIENT)
 
 linux-init-aarch64: $(AARCH64_INIT)
 
