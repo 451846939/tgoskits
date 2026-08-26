@@ -812,12 +812,13 @@ impl Drop for TcpClientSessionPermit {
 }
 
 fn serve_accepted_client(service: SharedTcpControlService, stream: TcpStream, addr: SocketAddr) {
-    let Some(_permit) = TcpClientSessionPermit::try_acquire() else {
+    let Some(permit) = TcpClientSessionPermit::try_acquire() else {
         println!("AICP client rejected: session limit reached for {addr}");
         return;
     };
     println!("AICP client connected: {addr}");
     thread::spawn(move || {
+        let _permit = permit;
         if let Err(err) = serve_client(&service, stream) {
             println!("AICP client closed: {err:?}");
         }
