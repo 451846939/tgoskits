@@ -42,6 +42,12 @@ impl TcpStream {
         Ok(api::ax_tcp_peer_addr(&self.0)?)
     }
 
+    /// Moves this TCP stream into or out of nonblocking mode.
+    pub fn set_nonblocking(&self, nonblocking: bool) -> StdResult {
+        api::ax_tcp_set_nonblocking(&self.0, nonblocking)?;
+        Ok(())
+    }
+
     /// Shuts down the connection.
     pub fn shutdown(&self) -> StdResult {
         api::ax_tcp_shutdown(&self.0)?;

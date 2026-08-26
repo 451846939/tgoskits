@@ -3,11 +3,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
+    collections::BTreeMap,
     io::{self, Read, Write},
     net::{SocketAddr, TcpListener, TcpStream, UdpSocket},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -33,12 +34,18 @@ const MAX_AICP_DATAGRAM_LEN: usize = HEADER_LEN + MAX_PAYLOAD;
 // A one-byte sentinel distinguishes a maximum valid datagram from a datagram
 // that the socket layer truncated to the same length.
 const UDP_RECEIVE_BUFFER_LEN: usize = MAX_AICP_DATAGRAM_LEN + 1;
+const MAX_UDP_PEER_SESSIONS: usize = 16;
+const MAX_TCP_CLIENT_SESSIONS: usize = 16;
+const TCP_IO_TIMEOUT: Duration = Duration::from_secs(2);
+const TCP_IO_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 /// Static address assigned to the standalone ArceOS AICP guest by its QEMU
 /// user-network configuration. `.2` is the user-network gateway; the guest
 /// must use a distinct address so hostfwd reaches the TCP listener.
+#[cfg(feature = "arceos")]
 const AICP_SERVER_IPV4_OCTETS: [u8; 4] = [10, 0, 3, 15];
 
 static PERIODIC_PROBE_ACTIVE: AtomicBool = AtomicBool::new(false);
+static ACTIVE_TCP_CLIENT_SESSIONS: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(feature = "arceos")]
 fn configure_aicp_network() -> io::Result<()> {
@@ -294,24 +301,85 @@ fn make_header(msg_type: u8, payload_len: usize, seq: u32, error_code: u16) -> H
 fn send_frame(stream: &mut TcpStream, mut hdr: Header, payload: &[u8]) -> io::Result<()> {
     hdr.payload_len = payload.len() as u32;
     hdr.crc16 = frame_crc(hdr, payload);
-    stream.write_all(&encode_header(hdr))?;
-    stream.write_all(payload)
+    write_all_before_deadline(stream, &encode_header(hdr), TCP_IO_TIMEOUT)?;
+    write_all_before_deadline(stream, payload, TCP_IO_TIMEOUT)
 }
 
+#[cfg(test)]
 fn recv_frame(
     stream: &mut TcpStream,
     payload: &mut [u8; MAX_PAYLOAD],
 ) -> io::Result<(Header, usize)> {
+    recv_frame_before_deadline(stream, payload, TCP_IO_TIMEOUT)
+}
+
+fn recv_frame_before_deadline(
+    stream: &mut TcpStream,
+    payload: &mut [u8; MAX_PAYLOAD],
+    timeout: Duration,
+) -> io::Result<(Header, usize)> {
     let mut wire = [0u8; HEADER_LEN];
-    stream.read_exact(&mut wire)?;
+    read_exact_before_deadline(stream, &mut wire, timeout)?;
     let hdr = decode_header(&wire);
     validate_header_shape(hdr).map_err(protocol_io_error)?;
     let len = hdr.payload_len as usize;
-    stream.read_exact(&mut payload[..len])?;
+    read_exact_before_deadline(stream, &mut payload[..len], timeout)?;
     if hdr.crc16 != frame_crc(hdr, &payload[..len]) {
         return Err(protocol_io_error(ProtocolError::CrcMismatch));
     }
     Ok((hdr, len))
+}
+
+fn read_exact_before_deadline(
+    stream: &mut TcpStream,
+    buf: &mut [u8],
+    timeout: Duration,
+) -> io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut received = 0;
+    while received != buf.len() {
+        match stream.read(&mut buf[received..]) {
+            Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
+            Ok(len) => received += len,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                wait_for_tcp_io(deadline)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn write_all_before_deadline(
+    stream: &mut TcpStream,
+    buf: &[u8],
+    timeout: Duration,
+) -> io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut written = 0;
+    while written != buf.len() {
+        match stream.write(&buf[written..]) {
+            Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
+            Ok(len) => written += len,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                wait_for_tcp_io(deadline)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn wait_for_tcp_io(deadline: Instant) -> io::Result<()> {
+    let now = Instant::now();
+    if now >= deadline {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "AICP TCP I/O deadline expired",
+        ));
+    }
+    thread::sleep((deadline - now).min(TCP_IO_RETRY_INTERVAL));
+    Ok(())
 }
 
 fn protocol_io_error(error: ProtocolError) -> io::Error {
@@ -389,18 +457,23 @@ enum UdpSequenceState {
     OutOfOrder,
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy)]
 struct UdpPeerSession {
     last_seq: Option<u32>,
-    last_peer: Option<SocketAddr>,
     last_reply: Option<ControlReply>,
+    last_activity: Instant,
 }
 
 impl UdpPeerSession {
-    fn classify(&self, peer: SocketAddr, seq: u32) -> UdpSequenceState {
-        if self.last_peer != Some(peer) {
-            return UdpSequenceState::New;
+    fn new(now: Instant) -> Self {
+        Self {
+            last_seq: None,
+            last_reply: None,
+            last_activity: now,
         }
+    }
+
+    fn classify(&self, seq: u32) -> UdpSequenceState {
         match self.last_seq {
             Some(previous) if seq == previous => UdpSequenceState::Duplicate,
             Some(previous) if !seq_is_newer(seq, previous) => UdpSequenceState::OutOfOrder,
@@ -408,14 +481,50 @@ impl UdpPeerSession {
         }
     }
 
-    fn record(&mut self, peer: SocketAddr, seq: u32, reply: ControlReply) {
-        self.last_peer = Some(peer);
+    fn record(&mut self, seq: u32, reply: ControlReply, now: Instant) {
         self.last_seq = Some(seq);
         self.last_reply = Some(reply);
+        self.last_activity = now;
     }
 
     fn cached_reply(&self) -> Option<ControlReply> {
         self.last_reply
+    }
+}
+
+#[derive(Default)]
+struct UdpPeerSessions {
+    peers: BTreeMap<SocketAddr, UdpPeerSession>,
+}
+
+impl UdpPeerSessions {
+    fn classify(&mut self, peer: SocketAddr, seq: u32, now: Instant) -> UdpSequenceState {
+        self.session_for(peer, now).classify(seq)
+    }
+
+    fn record(&mut self, peer: SocketAddr, seq: u32, reply: ControlReply, now: Instant) {
+        self.session_for(peer, now).record(seq, reply, now);
+    }
+
+    fn cached_reply(&mut self, peer: SocketAddr, now: Instant) -> Option<ControlReply> {
+        let session = self.session_for(peer, now);
+        session.last_activity = now;
+        session.cached_reply()
+    }
+
+    fn session_for(&mut self, peer: SocketAddr, now: Instant) -> &mut UdpPeerSession {
+        if !self.peers.contains_key(&peer) && self.peers.len() == MAX_UDP_PEER_SESSIONS {
+            let oldest_peer = self
+                .peers
+                .iter()
+                .min_by_key(|(_, session)| session.last_activity)
+                .map(|(peer, _)| *peer)
+                .expect("a full peer map has an oldest peer");
+            self.peers.remove(&oldest_peer);
+        }
+        self.peers
+            .entry(peer)
+            .or_insert_with(|| UdpPeerSession::new(now))
     }
 }
 
@@ -439,7 +548,7 @@ fn datagram_sequence(datagram: &[u8]) -> u32 {
 fn serve_udp(socket: UdpSocket) -> io::Result<()> {
     let mut state = ControlState::default();
     let mut timing = TimingState::default();
-    let mut session = UdpPeerSession::default();
+    let mut sessions = UdpPeerSessions::default();
     let mut last_dropped_seq = None::<u32>;
     let drop_every = udp_drop_every();
     let mut buf = vec![0u8; UDP_RECEIVE_BUFFER_LEN];
@@ -461,10 +570,11 @@ fn serve_udp(socket: UdpSocket) -> io::Result<()> {
             }
         };
 
-        match session.classify(peer, hdr.seq) {
+        let now = Instant::now();
+        match sessions.classify(peer, hdr.seq, now) {
             UdpSequenceState::Duplicate => {
                 println!("AICP UDP duplicate seq={} peer={}", hdr.seq, peer);
-                let reply = session.cached_reply().ok_or_else(|| {
+                let reply = sessions.cached_reply(peer, now).ok_or_else(|| {
                     io::Error::other("AICP UDP duplicate is missing its cached reply")
                 })?;
                 udp_send_reply(&socket, peer, hdr.seq, reply)?;
@@ -487,12 +597,12 @@ fn serve_udp(socket: UdpSocket) -> io::Result<()> {
                     peer
                 );
                 let reply = ControlReply::Status(state.status());
-                session.record(peer, hdr.seq, reply);
+                sessions.record(peer, hdr.seq, reply, now);
                 udp_send_reply(&socket, peer, hdr.seq, reply)?;
             }
             MSG_HEARTBEAT => {
                 let reply = ControlReply::Status(state.status());
-                session.record(peer, hdr.seq, reply);
+                sessions.record(peer, hdr.seq, reply, now);
                 udp_send_reply(&socket, peer, hdr.seq, reply)?;
             }
             MSG_CONTROL_SET => {
@@ -500,7 +610,7 @@ fn serve_udp(socket: UdpSocket) -> io::Result<()> {
                 let start = Instant::now();
                 let Some(control) = control_from_payload(payload) else {
                     let reply = ControlReply::Error(ERROR_BAD_PAYLOAD);
-                    session.record(peer, hdr.seq, reply);
+                    sessions.record(peer, hdr.seq, reply, now);
                     udp_send_reply(&socket, peer, hdr.seq, reply)?;
                     continue;
                 };
@@ -512,7 +622,7 @@ fn serve_udp(socket: UdpSocket) -> io::Result<()> {
                 );
                 timing.observe(hdr.seq, start, service_ns);
                 let reply = ControlReply::Status(status);
-                session.record(peer, hdr.seq, reply);
+                sessions.record(peer, hdr.seq, reply, now);
                 if drop_every != 0
                     && hdr.seq.is_multiple_of(drop_every)
                     && last_dropped_seq != Some(hdr.seq)
@@ -528,7 +638,7 @@ fn serve_udp(socket: UdpSocket) -> io::Result<()> {
             }
             _ => {
                 let reply = ControlReply::Error(ERROR_BAD_TYPE);
-                session.record(peer, hdr.seq, reply);
+                sessions.record(peer, hdr.seq, reply, now);
                 udp_send_reply(&socket, peer, hdr.seq, reply)?;
             }
         }
@@ -601,12 +711,21 @@ impl TcpConnectionSession {
     }
 }
 
-fn serve_client(service: &SharedTcpControlService, mut stream: TcpStream) -> io::Result<()> {
+fn serve_client(service: &SharedTcpControlService, stream: TcpStream) -> io::Result<()> {
+    serve_client_with_timeout(service, stream, TCP_IO_TIMEOUT)
+}
+
+fn serve_client_with_timeout(
+    service: &SharedTcpControlService,
+    mut stream: TcpStream,
+    timeout: Duration,
+) -> io::Result<()> {
+    enable_tcp_deadline_mode(&stream)?;
     let mut payload = [0u8; MAX_PAYLOAD];
     let mut session = TcpConnectionSession::default();
 
     loop {
-        let (hdr, len) = recv_frame(&mut stream, &mut payload)?;
+        let (hdr, len) = recv_frame_before_deadline(&mut stream, &mut payload, timeout)?;
         if hdr.version != VERSION {
             send_error(&mut stream, hdr.seq, ERROR_VERSION)?;
             continue;
@@ -654,7 +773,49 @@ fn serve_client(service: &SharedTcpControlService, mut stream: TcpStream) -> io:
     }
 }
 
+#[cfg(feature = "arceos")]
+fn enable_tcp_deadline_mode(stream: &TcpStream) -> io::Result<()> {
+    stream.set_nonblocking(true)
+}
+
+#[cfg(not(feature = "arceos"))]
+fn enable_tcp_deadline_mode(stream: &TcpStream) -> io::Result<()> {
+    stream.set_nonblocking(true)
+}
+
+struct TcpClientSessionPermit;
+
+impl TcpClientSessionPermit {
+    fn try_acquire() -> Option<Self> {
+        let mut active = ACTIVE_TCP_CLIENT_SESSIONS.load(Ordering::Acquire);
+        loop {
+            if active == MAX_TCP_CLIENT_SESSIONS {
+                return None;
+            }
+            match ACTIVE_TCP_CLIENT_SESSIONS.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Self),
+                Err(current) => active = current,
+            }
+        }
+    }
+}
+
+impl Drop for TcpClientSessionPermit {
+    fn drop(&mut self) {
+        ACTIVE_TCP_CLIENT_SESSIONS.fetch_sub(1, Ordering::Release);
+    }
+}
+
 fn serve_accepted_client(service: SharedTcpControlService, stream: TcpStream, addr: SocketAddr) {
+    let Some(_permit) = TcpClientSessionPermit::try_acquire() else {
+        println!("AICP client rejected: session limit reached for {addr}");
+        return;
+    };
     println!("AICP client connected: {addr}");
     thread::spawn(move || {
         if let Err(err) = serve_client(&service, stream) {
@@ -763,15 +924,19 @@ mod tests {
     fn udp_invalid_control_consumes_its_sequence_and_replays_the_error() {
         let peer = "127.0.0.1:8800".parse().unwrap();
         let seq = 9;
-        let mut session = UdpPeerSession::default();
+        let now = Instant::now();
+        let mut sessions = UdpPeerSessions::default();
         let mut state = ControlState::default();
 
         assert!(control_from_payload(&[0; CONTROL_PAYLOAD_LEN - 1]).is_none());
-        session.record(peer, seq, ControlReply::Error(ERROR_BAD_PAYLOAD));
+        sessions.record(peer, seq, ControlReply::Error(ERROR_BAD_PAYLOAD), now);
 
-        assert_eq!(session.classify(peer, seq), UdpSequenceState::Duplicate);
+        assert_eq!(
+            sessions.classify(peer, seq, now),
+            UdpSequenceState::Duplicate
+        );
         assert!(matches!(
-            session.cached_reply(),
+            sessions.cached_reply(peer, now),
             Some(ControlReply::Error(ERROR_BAD_PAYLOAD))
         ));
 
@@ -784,13 +949,33 @@ mod tests {
             mode: 1,
         });
         let valid = control_from_payload(&valid).unwrap();
-        match session.classify(peer, seq) {
+        match sessions.classify(peer, seq, now) {
             UdpSequenceState::New => {
                 state.step(valid, seq);
             }
             UdpSequenceState::Duplicate | UdpSequenceState::OutOfOrder => {}
         }
         assert_eq!(state.status().applied_seq, 0);
+    }
+
+    #[test]
+    fn udp_replay_protection_survives_another_peers_request() {
+        let peer_a = "127.0.0.1:8800".parse().unwrap();
+        let peer_b = "127.0.0.1:8801".parse().unwrap();
+        let now = Instant::now();
+        let mut sessions = UdpPeerSessions::default();
+
+        sessions.record(peer_a, 10, ControlReply::Error(ERROR_BAD_PAYLOAD), now);
+        sessions.record(peer_b, 1, ControlReply::Error(ERROR_BAD_TYPE), now);
+
+        assert_eq!(
+            sessions.classify(peer_a, 10, now),
+            UdpSequenceState::Duplicate
+        );
+        assert!(matches!(
+            sessions.cached_reply(peer_a, now),
+            Some(ControlReply::Error(ERROR_BAD_PAYLOAD))
+        ));
     }
 
     #[test]
@@ -984,6 +1169,44 @@ mod tests {
 
         drop(active_client);
         drop(stalled_client);
+    }
+
+    #[test]
+    fn partial_tcp_frame_times_out_before_the_next_client_is_served() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let service = shared_service();
+        let server = thread::spawn(move || {
+            let (stalled_stream, _) = listener.accept().unwrap();
+            let timeout = Duration::from_millis(50);
+            let stalled = serve_client_with_timeout(&service, stalled_stream, timeout);
+            assert_eq!(stalled.unwrap_err().kind(), io::ErrorKind::TimedOut);
+
+            let (active_stream, _) = listener.accept().unwrap();
+            serve_client_with_timeout(&service, active_stream, timeout)
+        });
+
+        let mut stalled_client = TcpStream::connect(address).unwrap();
+        stalled_client.write_all(&[0xaa]).unwrap();
+        thread::sleep(Duration::from_millis(100));
+
+        let mut active_client = TcpStream::connect(address).unwrap();
+        active_client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        write_frame(
+            &mut active_client,
+            make_header(MSG_HELLO, 0, 1, ERROR_OK),
+            b"",
+        );
+        let mut payload = [0u8; MAX_PAYLOAD];
+        let (response, _) = recv_frame(&mut active_client, &mut payload).unwrap();
+        assert_eq!(response.msg_type, MSG_STATUS);
+        assert_eq!(response.seq, 1);
+
+        drop(active_client);
+        drop(stalled_client);
+        assert!(server.join().unwrap().is_err());
     }
 
     #[test]
