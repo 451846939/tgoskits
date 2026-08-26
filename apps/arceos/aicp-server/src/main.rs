@@ -38,11 +38,11 @@ const MAX_UDP_PEER_SESSIONS: usize = 16;
 const MAX_TCP_CLIENT_SESSIONS: usize = 16;
 const TCP_IO_TIMEOUT: Duration = Duration::from_secs(2);
 const TCP_IO_RETRY_INTERVAL: Duration = Duration::from_millis(10);
-/// Static address assigned to the standalone ArceOS AICP guest by its QEMU
-/// user-network configuration. `.2` is the user-network gateway; the guest
-/// must use a distinct address so hostfwd reaches the TCP listener.
+/// Static address assigned to an ArceOS AICP guest by its build configuration.
+/// The standalone QEMU profile uses `.15`; the AxVisor dual-guest profile uses
+/// `.2` so that the Linux guest can reach the service over the virtual switch.
 #[cfg(feature = "arceos")]
-const AICP_SERVER_IPV4_OCTETS: [u8; 4] = [10, 0, 3, 15];
+const DEFAULT_AICP_SERVER_IPV4: &str = "10.0.3.15";
 
 static PERIODIC_PROBE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static ACTIVE_TCP_CLIENT_SESSIONS: AtomicUsize = AtomicUsize::new(0);
@@ -54,7 +54,10 @@ fn configure_aicp_network() -> io::Result<()> {
         .find(|interface| interface.name == "eth0")
         .ok_or_else(|| io::Error::other("AICP network interface eth0 is unavailable"))?;
 
-    let ip = std::net::Ipv4Addr::from(AICP_SERVER_IPV4_OCTETS);
+    let ip: std::net::Ipv4Addr = option_env!("AICP_SERVER_IPV4")
+        .unwrap_or(DEFAULT_AICP_SERVER_IPV4)
+        .parse()
+        .map_err(|_| io::Error::other("AICP_SERVER_IPV4 is not a valid IPv4 address"))?;
     let configured = interface
         .ipv4
         .ok_or_else(|| io::Error::other("AICP static IPv4 is missing on eth0"))?;

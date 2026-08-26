@@ -280,7 +280,7 @@ fi
 echo "[ai-rtos] Building Linux guest initramfs"
 prepare_linux_initramfs
 echo "[ai-rtos] Building ArceOS control guest"
-(cd "${repo_root}" && cargo xtask arceos build -p arceos-aicp-server --arch aarch64 --config apps/arceos/aicp-server/build-aarch64-unknown-none-softfloat.toml)
+(cd "${repo_root}" && cargo xtask arceos build -p arceos-aicp-server --arch aarch64 --config apps/arceos/aicp-server/build-aarch64-unknown-none-softfloat-dual-guest.toml)
 prepare_arceos_binary
 write_guest_configs
 

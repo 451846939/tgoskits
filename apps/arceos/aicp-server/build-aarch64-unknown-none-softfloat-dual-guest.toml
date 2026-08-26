@@ -1,0 +1,10 @@
+env = { AX_IP = "10.0.3.2", AX_GW = "10.0.3.1", AX_PREFIX_LEN = "24", AICP_SERVER_IPV4 = "10.0.3.2" }
+
+# The dual-guest runner connects a Linux client directly to this guest over
+# AxVisor's virtual switch. It therefore uses a distinct address from the
+# standalone QEMU/user-network profile.
+features = []
+log = "Info"
+max_cpu_num = 1
+target = "aarch64-unknown-none-softfloat"
+to_bin = true
