@@ -250,12 +250,6 @@ pub fn cpu_context_switches(cpu: usize) -> u64 {
         })
 }
 
-#[cfg(feature = "irq")]
-#[doc(hidden)]
-pub fn note_programmed_timer_deadline_nanos(deadline_nanos: u64) {
-    crate::timers::note_programmed_deadline_nanos(deadline_nanos);
-}
-
 /// Adds the given task to the run queue, returns the task reference.
 pub fn spawn_task(task: TaskInner) -> AxTaskRef {
     spawn_task_with(task, |_| {})

@@ -717,13 +717,6 @@ fn vcpu_run() {
             break;
         }
 
-        // A polling vCPU cannot rely on the shared wait queue to re-enter its
-        // owner CPU's timer worker. Poll that CPU's timer wheel before the
-        // next guest entry so a guest WFI is released once its virtual timer
-        // deadline becomes due.
-        #[cfg(all(feature = "rt-poll-idle", target_arch = "aarch64"))]
-        crate::check_timer_events();
-
         // AxVM may run on ArceOS's cooperative FIFO scheduler. Polling does
         // not enter the shared wait queue, but it still gives local host
         // services a scheduling point after checking the timer wheel.

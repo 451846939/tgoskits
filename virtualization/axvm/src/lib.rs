@@ -75,11 +75,6 @@ pub use vm::{
 /// The architecture-independent per-CPU type.
 pub(crate) type AxVMPerCpu = vcpu::AxPerCpu<arch::current::ArchPerCpu>;
 
-/// Check and dispatch pending AxVM timer events on the current CPU.
-pub fn check_timer_events() {
-    timer::check_events();
-}
-
 #[cfg(test)]
 mod tests {
     use super::{AxVmResult, VMId, kick_vm_vcpu};

@@ -137,15 +137,12 @@ impl ArchOps for Aarch64Arch {
             ArmVmExit::ExternalInterrupt { token } => Ok(BoundVcpuExit::Defer(
                 Aarch64DeferredRunWork::ExternalInterrupt { token },
             )),
-            ArmVmExit::WaitForInterrupt => {
-                vcpu.get_arch_vcpu().arm_timer_wait()?;
-                Ok(BoundVcpuExit::Complete(VcpuRunAction {
-                    event_wait: VcpuEventWait::Poll,
-                    stop_reason: None,
-                    resets_vm: false,
-                    exits_vcpu: false,
-                }))
-            }
+            ArmVmExit::WaitForInterrupt => Ok(BoundVcpuExit::Complete(VcpuRunAction {
+                event_wait: VcpuEventWait::Poll,
+                stop_reason: None,
+                resets_vm: false,
+                exits_vcpu: false,
+            })),
             ArmVmExit::CpuDown { state } => {
                 warn!(
                     "VM[{}] run VCpu[{}] CpuDown state {state:#x}",
