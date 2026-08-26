@@ -3,6 +3,7 @@
 use core::time::Duration;
 
 const OBSERVED_CPUS: [usize; 2] = [1, 2];
+const EXPECTED_VCPU_CPU_SETS: [usize; 2] = [0b10, 0b100];
 const SAME_CORE_WORKER_CPU: usize = OBSERVED_CPUS[0];
 const SAMPLE_COUNT: usize = 6_000;
 const PERIOD: Duration = Duration::from_millis(1);
@@ -32,10 +33,33 @@ impl CpuSnapshot {
 }
 
 pub(crate) fn start() {
+    if !has_expected_vcpu_affinity() {
+        error!(
+            "AXVISOR_RT_HOST_SCHED_FAILED expected vCPU masks {:#x?}",
+            EXPECTED_VCPU_CPU_SETS
+        );
+        return;
+    }
+    println!(
+        "AXVISOR_RT_HOST_AFFINITY vcpu0_mask={:#x} vcpu1_mask={:#x}",
+        EXPECTED_VCPU_CPU_SETS[0], EXPECTED_VCPU_CPU_SETS[1]
+    );
     std::thread::Builder::new()
         .name("axvisor-rt-observe".into())
         .spawn(run_same_core_worker)
         .unwrap_or_else(|error| panic!("failed to start realtime observer: {error}"));
+}
+
+fn has_expected_vcpu_affinity() -> bool {
+    let Some(vm) = crate::manager::AxvmManager::vm_by_id(1) else {
+        return false;
+    };
+    let snapshots = vm.vcpu_snapshots();
+    snapshots.len() == EXPECTED_VCPU_CPU_SETS.len()
+        && snapshots
+            .iter()
+            .zip(EXPECTED_VCPU_CPU_SETS)
+            .all(|(vcpu, expected_mask)| vcpu.phys_cpu_set == Some(expected_mask))
 }
 
 fn run_same_core_worker() {

@@ -3,9 +3,9 @@ id = 1
 name = "linux-rt-poll-idle"
 guest_type = "passthrough"
 cpu_num = 2
-# This QEMU test assigns Linux vCPUs to pCPU1 and pCPU2, leaving pCPU0 for
-# AxVisor management, device, and interrupt work. It is a test topology, not
-# a runtime admission check for exclusive CPU ownership.
+# Keep vCPU0 and vCPU1 on host pCPU1 and pCPU2 respectively, leaving pCPU0
+# for AxVisor management, device, and interrupt work.
+phys_cpu_sets = [2, 4]
 phys_cpu_ids = [1, 2]
 
 [kernel]

@@ -3,6 +3,9 @@ id = 1
 name = "linux-rt-latency-bench-control"
 guest_type = "passthrough"
 cpu_num = 2
+# Keep vCPU0 and vCPU1 on distinct host CPUs while CPU0 remains available to
+# the AxVisor management and device paths.
+phys_cpu_sets = [2, 4]
 phys_cpu_ids = [1, 2]
 
 [kernel]
