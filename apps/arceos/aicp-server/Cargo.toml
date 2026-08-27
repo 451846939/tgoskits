@@ -14,7 +14,6 @@ arceos = [
     "ax-std/arceos",
     "ax-std/net",
     "ax-std/virtio-net",
-    "ax-std/multitask",
     "ax-std/tls",
 ]
 
@@ -24,4 +23,4 @@ ax-net = { workspace = true, optional = true }
 ax-std = { workspace = true, optional = true }
 
 [package.metadata.axstd]
-features = ["log-level-info", "net", "virtio-net", "multitask", "tls"]
+features = ["log-level-info", "net", "virtio-net", "tls"]

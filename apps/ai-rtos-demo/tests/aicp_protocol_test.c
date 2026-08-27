@@ -251,7 +251,13 @@ static int test_send_rejects_oversized_payload_before_crc(void) {
 
 static int test_peer_close_write_returns_epipe_without_sigpipe(void) {
     int fds[2];
+    int ready[2];
     if (make_pair(fds) != 0) {
+        return 1;
+    }
+    if (pipe(ready) != 0) {
+        perror("pipe");
+        close_pair(fds);
         return 1;
     }
 
@@ -259,18 +265,37 @@ static int test_peer_close_write_returns_epipe_without_sigpipe(void) {
     if (child < 0) {
         perror("fork");
         close_pair(fds);
+        close(ready[0]);
+        close(ready[1]);
         return 1;
     }
     if (child == 0) {
         const uint8_t payload = 0x5a;
+        uint8_t release;
 
         close(fds[1]);
+        close(ready[1]);
+        if (read(ready[0], &release, sizeof(release)) != (ssize_t)sizeof(release)) {
+            close(ready[0]);
+            close(fds[0]);
+            _exit(1);
+        }
+        close(ready[0]);
         const int result = aicp_posix_write_full(fds[0], &payload, sizeof(payload));
         close(fds[0]);
         _exit(result == -EPIPE ? 0 : 1);
     }
 
     close_pair(fds);
+    close(ready[0]);
+    const uint8_t release = 1;
+    if (write(ready[1], &release, sizeof(release)) != (ssize_t)sizeof(release)) {
+        perror("write");
+        close(ready[1]);
+        (void)waitpid(child, NULL, 0);
+        return 1;
+    }
+    close(ready[1]);
     int status = 0;
     if (waitpid(child, &status, 0) != child) {
         perror("waitpid");
