@@ -110,8 +110,6 @@ fn main() {
 
     manager.init_default_vms();
 
-    manager.init_default_vms();
-
     #[cfg(feature = "rt-poll-idle-observability")]
     realtime_observability::start();
 
