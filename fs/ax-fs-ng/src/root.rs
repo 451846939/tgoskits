@@ -808,9 +808,9 @@ mod tests {
     use core::{any::Any, time::Duration};
 
     use axfs_ng_vfs::{
-        DeviceId, DirEntry, DirEntrySink, DirNode, DirNodeOps, FileNode, FileNodeOps, Filesystem,
-        FilesystemOps, FsIoEvents, FsPollable, Metadata, MetadataUpdate, NodeFlags, NodeOps,
-        Reference, StatFs, VfsResult, WeakDirEntry,
+        DeviceId, DirEntry, DirEntrySink, DirNode, DirNodeOps, DirectoryCursor, FileNode,
+        FileNodeOps, Filesystem, FilesystemOps, FsIoEvents, FsPollable, Metadata, MetadataUpdate,
+        NodeFlags, NodeOps, Reference, RenameOptions, StatFs, VfsResult, WeakDirEntry,
     };
     use rdif_block::{
         BatchSubmitResult, BlkError, BlockController, CompletionSink, ControllerEvent,
@@ -968,7 +968,11 @@ mod tests {
     }
 
     impl DirNodeOps for ReadonlyDir {
-        fn read_dir(&self, _offset: u64, _sink: &mut dyn DirEntrySink) -> VfsResult<usize> {
+        fn read_dir(
+            &self,
+            _cursor: DirectoryCursor,
+            _sink: &mut dyn DirEntrySink,
+        ) -> VfsResult<usize> {
             Ok(0)
         }
 
@@ -1018,6 +1022,17 @@ mod tests {
             Err(VfsError::ReadOnlyFilesystem)
         }
 
+        fn create_symlink(
+            &self,
+            _name: &str,
+            _target: &str,
+            _permission: NodePermission,
+            _uid: u32,
+            _gid: u32,
+        ) -> VfsResult<DirEntry> {
+            Err(VfsError::ReadOnlyFilesystem)
+        }
+
         fn link(&self, _name: &str, _node: &DirEntry) -> VfsResult<DirEntry> {
             Err(VfsError::ReadOnlyFilesystem)
         }
@@ -1026,7 +1041,13 @@ mod tests {
             Err(VfsError::ReadOnlyFilesystem)
         }
 
-        fn rename(&self, _src_name: &str, _dst_dir: &DirNode, _dst_name: &str) -> VfsResult<()> {
+        fn rename(
+            &self,
+            _src_name: &str,
+            _dst_dir: &DirNode,
+            _dst_name: &str,
+            _options: RenameOptions,
+        ) -> VfsResult<()> {
             Err(VfsError::ReadOnlyFilesystem)
         }
     }
@@ -1094,10 +1115,6 @@ mod tests {
         }
 
         fn set_len(&self, _len: u64) -> VfsResult<()> {
-            Err(VfsError::ReadOnlyFilesystem)
-        }
-
-        fn set_symlink(&self, _target: &str) -> VfsResult<()> {
             Err(VfsError::ReadOnlyFilesystem)
         }
     }
@@ -1209,6 +1226,26 @@ mod tests {
             512
         }
 
+        #[cfg(feature = "ext4")]
+        fn physical_block_size(&self) -> usize {
+            512
+        }
+
+        #[cfg(feature = "ext4")]
+        fn is_read_only(&self) -> bool {
+            false
+        }
+
+        #[cfg(feature = "ext4")]
+        fn supports_flush(&self) -> bool {
+            true
+        }
+
+        #[cfg(feature = "ext4")]
+        fn supports_fua(&self) -> bool {
+            false
+        }
+
         fn read_block(&mut self, block_id: u64, buf: &mut [u8]) -> BlockResult {
             if self.remaining_failures > 0 {
                 self.remaining_failures -= 1;
@@ -1240,6 +1277,11 @@ mod tests {
                 .ok_or(BlockError::InvalidRequest)?;
             target.copy_from_slice(buf);
             Ok(())
+        }
+
+        #[cfg(feature = "ext4")]
+        fn write_block_fua(&mut self, _block_id: u64, _buf: &[u8]) -> BlockResult {
+            Err(BlockError::Unsupported)
         }
 
         #[cfg(any(feature = "ext4", feature = "fat"))]

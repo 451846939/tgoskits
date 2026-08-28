@@ -89,6 +89,22 @@ pub(super) fn register_cached_file(file: &Arc<CachedFileShared>) {
     GLOBAL_CACHED_FILES.write().push(file.clone());
 }
 
+/// Drops the reclaim registry's ownership after the backing inode is reaped.
+///
+/// The removed `Arc` is dropped only after releasing the registry spin lock:
+/// destroying a cached file can take its sleepable page-cache lock.
+#[cfg(feature = "ext4")]
+pub(super) fn release_unlinked_cached_file(file: &Arc<CachedFileShared>) {
+    let removed = {
+        let mut registry = GLOBAL_CACHED_FILES.write();
+        registry
+            .iter()
+            .position(|cached| Arc::ptr_eq(cached, file))
+            .map(|index| registry.remove(index))
+    };
+    drop(removed);
+}
+
 pub fn sync_all_cached_files(_data_only: bool) -> VfsResult<()> {
     let files = GLOBAL_CACHED_FILES.read().clone();
     let mut first_error = None;
@@ -216,5 +232,22 @@ mod tests {
         with_test_page_provider(true, |_| {
             assert!(reclaim_releases_registry_spin_lock_for_test());
         });
+    }
+
+    #[cfg(feature = "ext4")]
+    #[test]
+    fn global_registry_does_not_keep_unlinked_cached_file_alive() {
+        let cached = Arc::new(CachedFileShared::new_unbounded(0));
+        let lifetime = Arc::downgrade(&cached);
+        register_cached_file(&cached);
+        cached.mark_unlinked();
+        release_unlinked_cached_file(&cached);
+        drop(cached);
+
+        assert!(
+            lifetime.upgrade().is_none(),
+            "the reclaim registry must not own the inode page cache"
+        );
+        prune_cached_files();
     }
 }

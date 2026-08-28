@@ -1,11 +1,12 @@
-extern crate alloc;
-
 use alloc::{string::ToString, vec, vec::Vec};
+
+use crate as rsext4;
+use crate::{RenameOptions, rename};
 
 #[test]
 fn rsext4_crc_and_error_rules_hold() {
     use rsext4::{
-        Errno, Ext4Error,
+        Ext4Error, Ext4ErrorKind,
         crc32c::{
             crc32c, crc32c_append, crc32c_finalize, crc32c_init, ext4_crc32c_seed_from_superblock,
             ext4_superblock_has_metadata_csum,
@@ -35,70 +36,64 @@ fn rsext4_crc_and_error_rules_hold() {
     assert!(ext4_superblock_has_metadata_csum(&superblock));
     assert_eq!(ext4_crc32c_seed_from_superblock(&superblock), 0xA1B2_C3D4);
 
-    assert_eq!(Errno::EINVAL.as_i32(), 22);
-    assert_eq!(Errno::EPERM.as_i32(), 1);
-    assert_eq!(Errno::EIO.as_i32(), 5);
-    assert_eq!(Errno::ENOSPC.as_i32(), 28);
-    assert_eq!(Errno::EOPNOTSUPP.as_i32(), 95);
-    assert_eq!(Errno::ETIMEDOUT.as_i32(), 110);
-    assert_eq!(Errno::EUCLEAN.as_i32(), 117);
-    assert_eq!(Errno::from_i32(22), Some(Errno::EINVAL));
-    assert_eq!(Errno::from_i32(999), None);
-    assert_eq!(Errno::EWOULDBLOCK.as_i32(), Errno::EAGAIN.as_i32());
-    assert_eq!(Errno::EINVAL.name(), "EINVAL");
-    assert!(Errno::EINVAL.description().contains("Invalid"));
-
     let error = Ext4Error::buffer_too_small(4, 8);
-    assert_eq!(error.code, Errno::EINVAL);
-    assert!(error.to_string().contains("provided=4"));
-    assert_eq!(Ext4Error::permission_denied().code, Errno::EACCES);
+    assert_eq!(error.kind(), Ext4ErrorKind::InvalidInput);
+    assert!(error.to_string().contains("provided: 4"));
+    assert_eq!(
+        Ext4Error::permission_denied().kind(),
+        Ext4ErrorKind::PermissionDenied
+    );
     assert!(
         Ext4Error::block_out_of_range(3, 2)
             .to_string()
-            .contains("block_id=3")
+            .contains("block_id: 3")
     );
     assert!(
         Ext4Error::invalid_block_size(1024, 4096)
             .to_string()
-            .contains("expected=4096")
+            .contains("expected: 4096")
     );
     assert!(
         Ext4Error::alignment(3, 4)
             .to_string()
-            .contains("alignment=4")
+            .contains("alignment: 4")
     );
-    assert!(Ext4Error::invalid_input().to_string().contains("EINVAL"));
+    assert!(
+        Ext4Error::invalid_input()
+            .to_string()
+            .contains("invalid input")
+    );
 
     let error_cases = [
-        (Ext4Error::not_found(), Errno::ENOENT),
-        (Ext4Error::already_exists(), Errno::EEXIST),
-        (Ext4Error::not_dir(), Errno::ENOTDIR),
-        (Ext4Error::is_dir(), Errno::EISDIR),
-        (Ext4Error::io(), Errno::EIO),
-        (Ext4Error::badf(), Errno::EBADF),
-        (Ext4Error::busy(), Errno::EBUSY),
-        (Ext4Error::not_empty(), Errno::ENOTEMPTY),
-        (Ext4Error::no_space(), Errno::ENOSPC),
-        (Ext4Error::read_only(), Errno::EROFS),
-        (Ext4Error::unsupported(), Errno::EOPNOTSUPP),
-        (Ext4Error::timeout(), Errno::ETIMEDOUT),
-        (Ext4Error::corrupted(), Errno::EUCLEAN),
-        (Ext4Error::checksum(), Errno::EUCLEAN),
-        (Ext4Error::bad_superblock(), Errno::EINVAL),
-        (Ext4Error::invalid_magic(), Errno::EINVAL),
-        (Ext4Error::already_mounted(), Errno::EBUSY),
+        (Ext4Error::not_found(), Ext4ErrorKind::NotFound),
+        (Ext4Error::already_exists(), Ext4ErrorKind::AlreadyExists),
+        (Ext4Error::not_dir(), Ext4ErrorKind::NotDirectory),
+        (Ext4Error::is_dir(), Ext4ErrorKind::IsDirectory),
+        (Ext4Error::io(), Ext4ErrorKind::Io),
+        (Ext4Error::badf(), Ext4ErrorKind::BadFileDescriptor),
+        (Ext4Error::busy(), Ext4ErrorKind::Busy),
+        (Ext4Error::not_empty(), Ext4ErrorKind::NotEmpty),
+        (Ext4Error::no_space(), Ext4ErrorKind::NoSpace),
+        (Ext4Error::read_only(), Ext4ErrorKind::ReadOnly),
+        (Ext4Error::unsupported(), Ext4ErrorKind::Unsupported),
+        (Ext4Error::timeout(), Ext4ErrorKind::Timeout),
+        (Ext4Error::corrupted(), Ext4ErrorKind::Corrupted),
+        (Ext4Error::checksum(), Ext4ErrorKind::ChecksumMismatch),
+        (Ext4Error::bad_superblock(), Ext4ErrorKind::BadSuperblock),
+        (Ext4Error::invalid_magic(), Ext4ErrorKind::InvalidMagic),
+        (Ext4Error::already_mounted(), Ext4ErrorKind::Busy),
     ];
     for (error, errno) in error_cases {
-        assert_eq!(error.code, errno);
-        assert!(error.context.is_none());
+        assert_eq!(error.kind(), errno);
+        assert!(error.context().is_none());
     }
-    let operated = Ext4Error::from(Errno::EIO).with_operation("read_inode");
-    assert!(operated.to_string().contains("op=read_inode"));
+    let operated = Ext4Error::io().with_operation("read_inode");
+    assert!(operated.to_string().contains("op: \"read_inode\""));
 }
 
 #[test]
 fn rsext4_superblock_geometry_rules_hold() {
-    use rsext4::{GROUP_DESC_SIZE, GROUP_DESC_SIZE_OLD, superblock::Ext4Superblock};
+    use rsext4::{GROUP_DESC_SIZE_OLD, superblock::Ext4Superblock};
 
     let mut superblock = Ext4Superblock {
         s_magic: Ext4Superblock::EXT4_SUPER_MAGIC,
@@ -125,14 +120,15 @@ fn rsext4_superblock_geometry_rules_hold() {
     assert_eq!(superblock.blocks_per_group(), 8_192);
     assert_eq!(superblock.inodes_per_group(), 8_192);
     assert_eq!(superblock.inode_size(), 256);
-    assert_eq!(superblock.get_desc_size(), 64);
-    assert_eq!(superblock.descs_per_block(), 64);
+    assert_eq!(superblock.get_desc_size(), GROUP_DESC_SIZE_OLD);
+    assert_eq!(superblock.descs_per_block(), 128);
     assert_eq!(superblock.inode_table_blocks(), 512);
 
-    superblock.s_desc_size = 0;
-    assert_eq!(superblock.get_desc_size(), GROUP_DESC_SIZE_OLD);
     superblock.s_feature_incompat |= Ext4Superblock::EXT4_FEATURE_INCOMPAT_64BIT;
-    assert_eq!(superblock.get_desc_size(), GROUP_DESC_SIZE);
+    assert_eq!(superblock.get_desc_size(), 64);
+    assert_eq!(superblock.descs_per_block(), 64);
+    superblock.s_desc_size = 0;
+    assert_eq!(superblock.get_desc_size(), 0);
     assert!(superblock.has_feature_incompat(Ext4Superblock::EXT4_FEATURE_INCOMPAT_64BIT));
     assert!(!superblock.has_journal());
     superblock.s_feature_compat |= Ext4Superblock::EXT4_FEATURE_COMPAT_HAS_JOURNAL;
@@ -228,9 +224,9 @@ fn rsext4_inode_extent_timestamp_rules_hold() {
     assert_eq!(inode.i_crtime, 0);
     inode.write_extend_header();
     inode.i_flags |= Ext4Inode::EXT4_EXTENTS_FL;
-    assert!(inode.have_extend_header_and_use_extend());
+    assert!(inode.uses_extents());
     inode.i_block[0] = 0;
-    assert!(!inode.have_extend_header_and_use_extend());
+    assert!(inode.uses_extents());
 
     let flags = Ext4Inode::EXT4_DIRSYNC_FL | Ext4Inode::EXT4_TOPDIR_FL | Ext4Inode::EXT4_NOATIME_FL;
     assert_eq!(
@@ -363,6 +359,7 @@ fn rsext4_entries_and_directory_iterator_rules_hold() {
             DirEntryIterator, Ext4DirEntry2, Ext4DirEntryInfo, Ext4DirEntryTail, Ext4ExtentStatus,
             htree_dir,
         },
+        hashtree::calculate_hash,
     };
 
     let entry = Ext4DirEntry2::new(
@@ -426,7 +423,7 @@ fn rsext4_entries_and_directory_iterator_rules_hold() {
     assert!(entries[0].0.is_dot());
     assert!(entries[1].0.is_dotdot());
     assert_eq!(entries[2].0.name_str(), Some("file"));
-    assert_eq!(entries[2].1, 16);
+    assert_eq!(entries[2].1, 24);
 
     let found = rsext4::entries::classic_dir::find_entry(&block, b"file").unwrap();
     assert_eq!(found.inode, 11);
@@ -441,20 +438,26 @@ fn rsext4_entries_and_directory_iterator_rules_hold() {
     write_dirent(&mut bad, 1, 7, Ext4DirEntry2::EXT4_FT_REG_FILE, b"x");
     assert!(Ext4DirEntryInfo::parse_from_bytes(&bad).is_none());
 
-    let seed = [1, 2, 3, 4];
+    let seed = [0; 4];
     assert_eq!(
-        htree_dir::calculate_hash(b"abc", htree_dir::Ext4DxRootInfo::DX_HASH_LEGACY, &seed),
-        ((b'a' as u32) * 33 + b'b' as u32) * 33 + b'c' as u32
+        calculate_hash(b"abc", htree_dir::Ext4DxRootInfo::DX_HASH_LEGACY, &seed)
+            .unwrap()
+            .major,
+        0x75af_d992
     );
-    assert_ne!(
-        htree_dir::calculate_hash(b"abc", htree_dir::Ext4DxRootInfo::DX_HASH_HALF_MD4, &seed),
-        0
+    assert_eq!(
+        calculate_hash(b"abc", htree_dir::Ext4DxRootInfo::DX_HASH_HALF_MD4, &seed)
+            .unwrap()
+            .major,
+        0xd196_a868
     );
-    assert_ne!(
-        htree_dir::calculate_hash(b"abc", htree_dir::Ext4DxRootInfo::DX_HASH_TEA, &seed),
-        0
+    assert_eq!(
+        calculate_hash(b"abc", htree_dir::Ext4DxRootInfo::DX_HASH_TEA, &seed)
+            .unwrap()
+            .major,
+        0xb143_5ec4
     );
-    assert_eq!(htree_dir::calculate_hash(b"abc", 99, &seed), 0);
+    assert!(calculate_hash(b"abc", 99, &seed).is_err());
 
     let status = Ext4ExtentStatus {
         es_lblk: 1,
@@ -474,7 +477,7 @@ fn rsext4_disk_format_and_journal_struct_rules_hold() {
             CommitHeader, JBD2_BLOCKTYPE_COMMIT, JBD2_BLOCKTYPE_DESCRIPTOR, JBD2_CRC32C_CHKSUM,
             JBD2_MAGIC, JBD2_TAG_SIZE, Jbd2JournalBlockTail, Jbd2JournalRevokeHeadS,
             Jbd2JournalRevokeTail, JournalBlockTag3S, JournalBlockTagS, JournalHeaderS,
-            JournalSuperBllockS,
+            JournalSuperBlock,
         },
     };
 
@@ -540,7 +543,7 @@ fn rsext4_disk_format_and_journal_struct_rules_hold() {
     assert_eq!(parsed_header.h_magic, JBD2_MAGIC);
     assert_eq!(parsed_header.h_sequence, 0x1122_3344);
 
-    let mut journal_sb = JournalSuperBllockS {
+    let mut journal_sb = JournalSuperBlock {
         s_header: journal_header,
         s_blocksize: BLOCK_SIZE_U32,
         s_maxlen: 1024,
@@ -554,7 +557,7 @@ fn rsext4_disk_format_and_journal_struct_rules_hold() {
     };
     let mut journal_bytes = [0_u8; 1024];
     journal_sb.to_disk_bytes(&mut journal_bytes);
-    let parsed_sb = JournalSuperBllockS::from_disk_bytes(&journal_bytes);
+    let parsed_sb = JournalSuperBlock::from_disk_bytes(&journal_bytes);
     assert_eq!(parsed_sb.s_blocksize, BLOCK_SIZE_U32);
     assert_eq!(parsed_sb.s_sequence, 0x0102_0304);
     assert_eq!(parsed_sb.s_users[0], 0x55);
@@ -646,19 +649,20 @@ fn rsext4_disk_format_and_journal_struct_rules_hold() {
 #[test]
 fn rsext4_checksum_blockgroup_and_api_helpers_hold() {
     use rsext4::{
-        BLOCK_SIZE, Errno, Ext4Error,
-        api::OpenFile,
+        BLOCK_SIZE, Ext4Error, Ext4ErrorKind,
         bitmap::bitmap_utils::set_bit,
-        blockdev::{BlockBuffer, BlockDevice},
+        blockdev::{BlockBuffer, BlockIo},
         blockgroup_description::{BlockGroupDescTable, BlockGroupDescTableMut, Ext4GroupDesc},
         bmalloc::{AbsoluteBN, BGIndex, InodeNumber, RelativeBN, RelativeInodeIndex},
         disknode::{Ext4Inode, Ext4Timestamp},
         endian::DiskFormat,
         entries::Ext4DirEntryTail,
+        io::SectorId,
+        runtime::Clock,
         superblock::Ext4Superblock,
     };
 
-    let mut block_buffer = BlockBuffer::new();
+    let mut block_buffer = BlockBuffer::new(BLOCK_SIZE);
     assert_eq!(block_buffer.len(), BLOCK_SIZE);
     assert!(!block_buffer.is_empty());
     assert!(block_buffer.as_slice().iter().all(|byte| *byte == 0));
@@ -678,12 +682,12 @@ fn rsext4_checksum_blockgroup_and_api_helpers_hold() {
         AbsoluteBN::new(u64::from(u32::MAX) + 1)
             .to_u32()
             .unwrap_err()
-            .code,
-        Errno::EOVERFLOW
+            .kind(),
+        Ext4ErrorKind::Overflow
     );
     assert_eq!(
-        AbsoluteBN::new(0).to_group(1, 8192).unwrap_err().code,
-        Errno::EINVAL
+        AbsoluteBN::new(0).to_group(1, 8192).unwrap_err().kind(),
+        Ext4ErrorKind::InvalidInput
     );
 
     let inode_index = RelativeInodeIndex::new(123);
@@ -691,7 +695,10 @@ fn rsext4_checksum_blockgroup_and_api_helpers_hold() {
     let (decoded_inode_group, decoded_inode_index) = inode_num.to_group(2048).unwrap();
     assert_eq!(decoded_inode_group, group);
     assert_eq!(decoded_inode_index, inode_index);
-    assert_eq!(InodeNumber::new(0).unwrap_err().code, Errno::EINVAL);
+    assert_eq!(
+        InodeNumber::new(0).unwrap_err().kind(),
+        Ext4ErrorKind::InvalidInput
+    );
     assert_eq!(inode_num.as_u64(), u64::from(inode_num.raw()));
 
     let descs = [
@@ -765,6 +772,7 @@ fn rsext4_checksum_blockgroup_and_api_helpers_hold() {
     );
 
     let mut block = vec![0_u8; BLOCK_SIZE];
+    block[BLOCK_SIZE - 8..BLOCK_SIZE - 6].copy_from_slice(&12_u16.to_le_bytes());
     block[BLOCK_SIZE - 5] = Ext4DirEntryTail::RESERVED_FT;
     rsext4::checksum::update_ext4_dirblock_csum32(&superblock, 2, 3, &mut block);
     assert!(rsext4::checksum::verify_ext4_dirblock_checksum(
@@ -799,14 +807,16 @@ fn rsext4_checksum_blockgroup_and_api_helpers_hold() {
         inode.i_generation,
         &inode,
         256,
-    );
+    )
+    .unwrap();
     rsext4::checksum::ext4_update_inode_checksum(
         &superblock,
         inode_num,
         inode.i_generation,
         &mut inode,
         256,
-    );
+    )
+    .unwrap();
     assert_eq!(inode.l_i_checksum_lo, (checksum & 0xffff) as u16);
     assert_eq!(inode.i_checksum_hi, (checksum >> 16) as u16);
 
@@ -814,21 +824,12 @@ fn rsext4_checksum_blockgroup_and_api_helpers_hold() {
     rsext4::checksum::ext4_update_superblock_checksum(&mut superblock);
     assert_ne!(superblock.s_checksum, old_checksum);
 
-    let mut file = OpenFile {
-        inode_num,
-        path: "/alpha".to_string(),
-        inode,
-        offset: 0,
-    };
-    rsext4::lseek(&mut file, 1234).unwrap();
-    assert_eq!(file.offset, 1234);
-
     struct ReadonlyDevice;
-    impl BlockDevice for ReadonlyDevice {
+    impl BlockIo for ReadonlyDevice {
         fn write(
             &mut self,
             _buffer: &[u8],
-            _block_id: AbsoluteBN,
+            _block_id: crate::io::SectorId,
             _count: u32,
         ) -> rsext4::Ext4Result<()> {
             Err(Ext4Error::read_only())
@@ -837,48 +838,49 @@ fn rsext4_checksum_blockgroup_and_api_helpers_hold() {
         fn read(
             &mut self,
             buffer: &mut [u8],
-            _block_id: AbsoluteBN,
+            _block_id: crate::io::SectorId,
             _count: u32,
         ) -> rsext4::Ext4Result<()> {
             buffer.fill(0x5a);
             Ok(())
         }
 
-        fn open(&mut self) -> rsext4::Ext4Result<()> {
+        fn geometry(&self) -> crate::io::DeviceGeometry {
+            crate::io::DeviceGeometry::new(512, 99)
+        }
+
+        fn capabilities(&self) -> crate::io::DeviceCapabilities {
+            crate::io::DeviceCapabilities {
+                read_only: { true },
+                flush: true,
+                ..crate::io::DeviceCapabilities::default()
+            }
+        }
+
+        fn flush(&mut self) -> crate::Ext4Result<()> {
             Ok(())
         }
+    }
 
-        fn close(&mut self) -> rsext4::Ext4Result<()> {
-            Ok(())
-        }
-
-        fn total_blocks(&self) -> u64 {
-            99
-        }
-
-        fn current_time(&self) -> rsext4::Ext4Result<Ext4Timestamp> {
+    impl crate::runtime::Clock for ReadonlyDevice {
+        fn now(&self) -> rsext4::Ext4Result<Ext4Timestamp> {
             Ok(Ext4Timestamp::new(12, 34))
-        }
-
-        fn is_readonly(&self) -> bool {
-            true
         }
     }
 
     let mut dev = ReadonlyDevice;
-    assert_eq!(dev.block_size(), 512);
-    assert!(dev.is_open());
-    assert!(dev.is_readonly());
-    assert_eq!(dev.total_blocks(), 99);
+    assert_eq!(dev.geometry().logical_block_size, 512);
+    assert!(dev.capabilities().read_only);
+    assert_eq!(dev.geometry().block_count, 99);
     dev.flush().unwrap();
     let mut buf = [0_u8; 4];
-    dev.read(&mut buf, AbsoluteBN::new(0), 1).unwrap();
+    dev.read(&mut buf, SectorId::new(0), 1).unwrap();
     assert_eq!(buf, [0x5a; 4]);
     assert_eq!(
-        dev.write(&buf, AbsoluteBN::new(0), 1).unwrap_err().code,
-        Errno::EROFS
+        dev.write(&buf, SectorId::new(0), 1).unwrap_err().kind(),
+        Ext4ErrorKind::ReadOnly
     );
-    assert_eq!(dev.current_time().unwrap(), Ext4Timestamp::new(12, 34));
+    assert_eq!(dev.now().unwrap(), Ext4Timestamp::new(12, 34));
 
     let mut bitmap = [0_u8; 2];
     assert!(set_bit(&mut bitmap, 15));
@@ -890,8 +892,8 @@ fn rsext4_journal_device_overlay_rules_hold() {
     use core::cell::Cell;
 
     use rsext4::{
-        BLOCK_SIZE, BlockDevice, Ext4Result, Jbd2Dev, bmalloc::AbsoluteBN, disknode::Ext4Timestamp,
-        jbd2::jbdstruct::JournalSuperBllockS,
+        BLOCK_SIZE, BlockIo, Ext4Result, Jbd2Dev, bmalloc::AbsoluteBN, disknode::Ext4Timestamp,
+        jbd2::jbdstruct::JournalSuperBlock, runtime::Clock,
     };
 
     struct JournalMemoryDevice {
@@ -918,8 +920,13 @@ fn rsext4_journal_device_overlay_rules_hold() {
         }
     }
 
-    impl BlockDevice for JournalMemoryDevice {
-        fn write(&mut self, buffer: &[u8], block_id: AbsoluteBN, count: u32) -> Ext4Result<()> {
+    impl BlockIo for JournalMemoryDevice {
+        fn write(
+            &mut self,
+            buffer: &[u8],
+            block_id: crate::io::SectorId,
+            count: u32,
+        ) -> Ext4Result<()> {
             let required = BLOCK_SIZE * count as usize;
             if buffer.len() < required {
                 return Err(rsext4::Ext4Error::buffer_too_small(buffer.len(), required));
@@ -929,14 +936,19 @@ fn rsext4_journal_device_overlay_rules_hold() {
             if end > self.blocks.len() {
                 return Err(rsext4::Ext4Error::block_out_of_range(
                     block_id.raw().min(u64::from(u32::MAX)) as u32,
-                    self.total_blocks(),
+                    self.geometry().block_count,
                 ));
             }
             self.blocks[start..end].copy_from_slice(&buffer[..required]);
             Ok(())
         }
 
-        fn read(&mut self, buffer: &mut [u8], block_id: AbsoluteBN, count: u32) -> Ext4Result<()> {
+        fn read(
+            &mut self,
+            buffer: &mut [u8],
+            block_id: crate::io::SectorId,
+            count: u32,
+        ) -> Ext4Result<()> {
             let required = BLOCK_SIZE * count as usize;
             if buffer.len() < required {
                 return Err(rsext4::Ext4Error::buffer_too_small(buffer.len(), required));
@@ -946,77 +958,77 @@ fn rsext4_journal_device_overlay_rules_hold() {
             if end > self.blocks.len() {
                 return Err(rsext4::Ext4Error::block_out_of_range(
                     block_id.raw().min(u64::from(u32::MAX)) as u32,
-                    self.total_blocks(),
+                    self.geometry().block_count,
                 ));
             }
             buffer[..required].copy_from_slice(&self.blocks[start..end]);
             Ok(())
         }
 
-        fn open(&mut self) -> Ext4Result<()> {
+        fn geometry(&self) -> crate::io::DeviceGeometry {
+            crate::io::DeviceGeometry::new(BLOCK_SIZE as u32, {
+                (self.blocks.len() / BLOCK_SIZE) as u64
+            })
+        }
+
+        fn capabilities(&self) -> crate::io::DeviceCapabilities {
+            crate::io::DeviceCapabilities {
+                read_only: { self.readonly },
+
+                flush: true,
+
+                ..crate::io::DeviceCapabilities::default()
+            }
+        }
+
+        fn flush(&mut self) -> crate::Ext4Result<()> {
             Ok(())
         }
+    }
 
-        fn close(&mut self) -> Ext4Result<()> {
-            Ok(())
-        }
-
-        fn total_blocks(&self) -> u64 {
-            (self.blocks.len() / BLOCK_SIZE) as u64
-        }
-
-        fn block_size(&self) -> u32 {
-            BLOCK_SIZE as u32
-        }
-
-        fn current_time(&self) -> Ext4Result<Ext4Timestamp> {
+    impl crate::runtime::Clock for JournalMemoryDevice {
+        fn now(&self) -> Ext4Result<Ext4Timestamp> {
             let sec = self.now.get();
             self.now.set(sec + 1);
             Ok(Ext4Timestamp::new(sec, 0))
-        }
-
-        fn is_readonly(&self) -> bool {
-            self.readonly
         }
     }
 
     let mut dev = Jbd2Dev::initial_jbd2dev(0, JournalMemoryDevice::new(32), false);
     assert!(!dev.is_use_journal());
     assert_eq!(dev.journal_sequence(), None);
-    dev.journal_replay();
+    let _ = dev.journal_replay_checked();
     assert_eq!(dev.total_blocks(), 32);
     assert_eq!(dev.block_size(), BLOCK_SIZE as u32);
-    assert_eq!(
-        dev.current_time().unwrap(),
-        Ext4Timestamp::new(1_900_000_000, 0)
-    );
+    assert_eq!(dev.now().unwrap(), Ext4Timestamp::new(1_900_000_000, 0));
 
-    dev.read_block(AbsoluteBN::new(1)).unwrap();
-    dev.buffer_mut()[0] = 0x11;
-    dev.write_block(AbsoluteBN::new(1), false).unwrap();
+    let mut direct = vec![0_u8; BLOCK_SIZE];
+    direct[0] = 0x11;
+    dev.write_blocks(&direct, AbsoluteBN::new(1), 1, false)
+        .unwrap();
     dev.read_block(AbsoluteBN::new(1)).unwrap();
     assert_eq!(dev.buffer()[0], 0x11);
     dev.read_block(AbsoluteBN::new(3)).unwrap();
-    let mut direct = vec![0_u8; BLOCK_SIZE];
     direct[0] = 0x66;
     dev.write_blocks(&direct, AbsoluteBN::new(3), 1, false)
         .unwrap();
     assert_eq!(dev.buffer()[0], 0x66);
 
-    dev.set_journal_use(true);
-    dev.journal_replay();
-    let journal_superblock = JournalSuperBllockS {
+    dev.set_journal_use(true).unwrap();
+    let journal_superblock = JournalSuperBlock {
         s_sequence: 7,
-        s_maxlen: 8,
+        s_maxlen: 16,
         ..Default::default()
     };
-    dev.set_journal_superblock(journal_superblock, AbsoluteBN::new(16));
+    dev.set_journal_superblock(journal_superblock, AbsoluteBN::new(16))
+        .unwrap();
     assert!(dev.is_use_journal());
     assert_eq!(dev.journal_sequence(), Some(7));
 
-    dev.read_block(AbsoluteBN::new(2)).unwrap();
-    dev.buffer_mut()[0] = 0x22;
-    dev.write_block(AbsoluteBN::new(2), true).unwrap();
+    let mut metadata = vec![0_u8; BLOCK_SIZE];
+    metadata[0] = 0x22;
+    dev.write_blocks(&metadata, AbsoluteBN::new(2), 1, true)
+        .unwrap();
     dev.read_block(AbsoluteBN::new(2)).unwrap();
     assert_eq!(dev.buffer()[0], 0x22);
 
@@ -1045,19 +1057,23 @@ fn rsext4_journal_device_overlay_rules_hold() {
             .is_err()
     );
 
-    dev.set_journal_use(false);
+    dev.umount_commit().unwrap();
+    dev.set_journal_use(false).unwrap();
     assert!(
         dev.write_blocks(&direct[..8], AbsoluteBN::new(4), 1, false)
             .is_err()
     );
     dev.flush().unwrap();
     let inner = dev.into_inner();
-    assert_eq!(inner.total_blocks(), 32);
+    assert_eq!(inner.geometry().block_count, 32);
 
     let mut readonly_dev = Jbd2Dev::initial_jbd2dev(0, JournalMemoryDevice::new_readonly(8), false);
-    readonly_dev.read_block(AbsoluteBN::new(1)).unwrap();
-    readonly_dev.buffer_mut()[0] = 0xaa;
-    assert!(readonly_dev.write_block(AbsoluteBN::new(1), false).is_err());
+    direct[0] = 0xaa;
+    assert!(
+        readonly_dev
+            .write_blocks(&direct, AbsoluteBN::new(1), 1, false)
+            .is_err()
+    );
     assert!(
         readonly_dev
             .write_blocks(&replacement, AbsoluteBN::new(1), 1, false)
@@ -1073,10 +1089,11 @@ fn rsext4_journal_device_overlay_rules_hold() {
 #[test]
 fn rsext4_extent_tree_parse_store_and_hash_tree_rules_hold() {
     use rsext4::{
-        bmalloc::AbsoluteBN,
+        BLOCK_SIZE,
+        bmalloc::{AbsoluteBN, InodeNumber},
         disknode::{Ext4Extent, Ext4ExtentHeader, Ext4ExtentIdx, Ext4Inode},
         endian::DiskFormat,
-        entries::{Ext4DirEntry2, Ext4DirEntryInfo, Ext4DxEntry, Ext4DxRootInfo},
+        entries::{Ext4DirEntry2, Ext4DxEntry},
         extents_tree::{ExtentNode, ExtentRun, ExtentTree},
         hashtree::{
             Ext4InodeHashTreeExt, HashTreeError, HashTreeManager, HashTreeNode,
@@ -1093,8 +1110,8 @@ fn rsext4_extent_tree_parse_store_and_hash_tree_rules_hold() {
         eh_generation: 1,
     };
     leaf_header.to_disk_bytes(&mut leaf_bytes[0..12]);
-    Ext4Extent::new(8, 200, 2).to_disk_bytes(&mut leaf_bytes[12..24]);
-    Ext4Extent::new(3, 100, 4).to_disk_bytes(&mut leaf_bytes[24..36]);
+    Ext4Extent::new(3, 100, 4).to_disk_bytes(&mut leaf_bytes[12..24]);
+    Ext4Extent::new(8, 200, 2).to_disk_bytes(&mut leaf_bytes[24..36]);
 
     let leaf = ExtentTree::parse_node(&leaf_bytes).unwrap();
     assert!(leaf.is_leaf());
@@ -1117,16 +1134,16 @@ fn rsext4_extent_tree_parse_store_and_hash_tree_rules_hold() {
     };
     index_header.to_disk_bytes(&mut index_bytes[0..12]);
     Ext4ExtentIdx {
-        ei_block: 9,
-        ei_leaf_lo: 0x2222_3333,
-        ei_leaf_hi: 0x1111,
+        ei_block: 1,
+        ei_leaf_lo: 0x5555_6666,
+        ei_leaf_hi: 0x4444,
         ei_unused: 0,
     }
     .to_disk_bytes(&mut index_bytes[12..24]);
     Ext4ExtentIdx {
-        ei_block: 1,
-        ei_leaf_lo: 0x5555_6666,
-        ei_leaf_hi: 0x4444,
+        ei_block: 9,
+        ei_leaf_lo: 0x2222_3333,
+        ei_leaf_hi: 0x1111,
         ei_unused: 0,
     }
     .to_disk_bytes(&mut index_bytes[24..36]);
@@ -1142,25 +1159,25 @@ fn rsext4_extent_tree_parse_store_and_hash_tree_rules_hold() {
 
     let mut bad = leaf_bytes;
     bad[0] = 0;
-    assert!(ExtentTree::parse_node(&bad).is_none());
+    assert!(ExtentTree::parse_node(&bad).is_err());
     let mut overflow = leaf_bytes;
     overflow[2..4].copy_from_slice(&5_u16.to_le_bytes());
     overflow[4..6].copy_from_slice(&4_u16.to_le_bytes());
-    assert!(ExtentTree::parse_node(&overflow).is_none());
-    assert!(ExtentTree::parse_node(&leaf_bytes[..20]).is_none());
+    assert!(ExtentTree::parse_node(&overflow).is_err());
+    assert!(ExtentTree::parse_node(&leaf_bytes[..20]).is_err());
 
     let mut inode = Ext4Inode::empty_for_reuse(32);
     inode.i_flags |= Ext4Inode::EXT4_EXTENTS_FL;
     {
-        let mut tree = ExtentTree::new(&mut inode);
-        tree.store_root_to_inode(&leaf);
+        let mut tree = ExtentTree::new(&mut inode, BLOCK_SIZE);
+        tree.store_root_to_inode(&leaf).unwrap();
         let mut loaded = tree.load_root_from_inode().unwrap();
         assert!(loaded.is_leaf());
         let header = loaded.header_mut();
         header.eh_generation = 99;
         assert_eq!(loaded.header().eh_generation, 99);
     }
-    assert!(inode.have_extend_header_and_use_extend());
+    assert!(inode.uses_extents());
 
     let run = ExtentRun {
         logical_start: 3,
@@ -1173,11 +1190,8 @@ fn rsext4_extent_tree_parse_store_and_hash_tree_rules_hold() {
 
     let mut inode = Ext4Inode::default();
     assert!(!inode.is_htree_indexed());
-    assert_eq!(inode.get_htree_root_info(), None);
     inode.i_flags |= Ext4Inode::EXT4_INDEX_FL;
     assert!(inode.is_htree_indexed());
-    let (_, indirect_levels) = inode.get_htree_root_info().unwrap();
-    assert_eq!(indirect_levels, 0);
 
     let errors = [
         (HashTreeError::InvalidHashTree, "Invalid hash tree format"),
@@ -1194,7 +1208,7 @@ fn rsext4_extent_tree_parse_store_and_hash_tree_rules_hold() {
         assert_eq!(error.to_string(), text);
     }
 
-    let manager = HashTreeManager::new([1, 2, 3, 4], Ext4DxRootInfo::DX_HASH_LEGACY, 0);
+    let manager = HashTreeManager::new([1, 2, 3, 4]);
     let _ = manager;
     let root_node = HashTreeNode::Root {
         hash_version: 1,
@@ -1203,15 +1217,6 @@ fn rsext4_extent_tree_parse_store_and_hash_tree_rules_hold() {
     };
     let internal_node = HashTreeNode::Internal {
         entries: vec![Ext4DxEntry { hash: 9, block: 3 }],
-        level: 1,
-    };
-    let leaf_node = HashTreeNode::Leaf {
-        block_num: AbsoluteBN::new(4),
-        entries: vec![Ext4DirEntryInfo {
-            inode: 5,
-            file_type: Ext4DirEntry2::EXT4_FT_REG_FILE,
-            name: b"leaf",
-        }],
     };
     match root_node {
         HashTreeNode::Root {
@@ -1226,30 +1231,20 @@ fn rsext4_extent_tree_parse_store_and_hash_tree_rules_hold() {
         _ => panic!("expected root hash tree node"),
     }
     match internal_node {
-        HashTreeNode::Internal { entries, level } => {
+        HashTreeNode::Internal { entries } => {
             assert_eq!(entries[0].hash, 9);
-            assert_eq!(level, 1);
         }
         _ => panic!("expected internal hash tree node"),
     }
-    match leaf_node {
-        HashTreeNode::Leaf { block_num, entries } => {
-            assert_eq!(block_num.raw(), 4);
-            assert_eq!(entries[0].name, b"leaf");
-        }
-        _ => panic!("expected leaf hash tree node"),
-    }
 
     let result = HashTreeSearchResult {
-        entry: Ext4DirEntryInfo {
-            inode: 8,
-            file_type: Ext4DirEntry2::EXT4_FT_DIR,
-            name: b"dir",
-        },
+        inode: InodeNumber::new(8).unwrap(),
+        file_type: Ext4DirEntry2::EXT4_FT_DIR,
         block_num: AbsoluteBN::new(12),
         offset: 16,
     };
-    assert_eq!(result.entry.name, b"dir");
+    assert_eq!(result.inode.raw(), 8);
+    assert_eq!(result.file_type, Ext4DirEntry2::EXT4_FT_DIR);
     assert_eq!(result.block_num.raw(), 12);
     assert_eq!(result.offset, 16);
 }
@@ -1285,21 +1280,21 @@ fn rsext4_tool_layout_and_blockgroup_disk_rules_hold() {
     };
     let layout0 = tool::calc_group_layout(0, &superblock, 8192, 64, 3, 4, 5, RESERVED_GDT_BLOCKS);
     assert_eq!(layout0.group_start_block, 0);
-    assert_eq!(layout0.group_blcok_bitmap_startblocks, 3);
-    assert_eq!(layout0.group_inode_bitmap_startblocks, 4);
-    assert_eq!(layout0.group_inode_table_startblocks, 5);
+    assert_eq!(layout0.group_block_bitmap_start_block, 3);
+    assert_eq!(layout0.group_inode_bitmap_start_block, 4);
+    assert_eq!(layout0.group_inode_table_start_block, 5);
 
     let sparse = tool::calc_group_layout(3, &superblock, 8192, 64, 3, 4, 5, 2);
     assert_eq!(sparse.group_start_block, 3 * 8192);
-    assert_eq!(sparse.group_blcok_bitmap_startblocks, 3 * 8192 + 1 + 2);
-    assert_eq!(sparse.group_inode_bitmap_startblocks, 3 * 8192 + 1 + 2 + 1);
+    assert_eq!(sparse.group_block_bitmap_start_block, 3 * 8192 + 1 + 2);
+    assert_eq!(sparse.group_inode_bitmap_start_block, 3 * 8192 + 1 + 2 + 1);
     assert_eq!(sparse.metadata_blocks_in_group, 1 + 2 + 1 + 1 + 64);
 
     superblock.s_feature_ro_compat = 0;
     let dense = tool::calc_group_layout(3, &superblock, 8192, 64, 3, 4, 5, 2);
-    assert_eq!(dense.group_blcok_bitmap_startblocks, 3 * 8192);
-    assert_eq!(dense.group_inode_bitmap_startblocks, 3 * 8192 + 1);
-    assert_eq!(dense.group_inode_table_startblocks, 3 * 8192 + 2);
+    assert_eq!(dense.group_block_bitmap_start_block, 3 * 8192);
+    assert_eq!(dense.group_inode_bitmap_start_block, 3 * 8192 + 1);
+    assert_eq!(dense.group_inode_table_start_block, 3 * 8192 + 2);
     assert_eq!(dense.metadata_blocks_in_group, 1 + 1 + 64);
 
     // Simplified group desc test - just verify basic functionality
@@ -1421,7 +1416,7 @@ fn rsext4_path_and_bitmap_rules_hold() {
 #[test]
 fn rsext4_bmalloc_allocator_rules_hold() {
     use rsext4::{
-        Errno,
+        Ext4ErrorKind,
         blockgroup_description::Ext4GroupDesc,
         bmalloc::{
             AbsoluteBN, BGIndex, BlockAllocator, InodeAllocator, InodeNumber, RelativeBN,
@@ -1458,8 +1453,8 @@ fn rsext4_bmalloc_allocator_rules_hold() {
         block_allocator
             .alloc_block_in_group(&mut block_bitmap, group, &no_space_desc)
             .unwrap_err()
-            .code,
-        Errno::ENOSPC
+            .kind(),
+        Ext4ErrorKind::NoSpace
     );
 
     let range = block_allocator
@@ -1477,15 +1472,15 @@ fn rsext4_bmalloc_allocator_rules_hold() {
         block_allocator
             .alloc_contiguous_blocks(&mut block_bitmap, group, 0)
             .unwrap_err()
-            .code,
-        Errno::EINVAL
+            .kind(),
+        Ext4ErrorKind::InvalidInput
     );
     assert_eq!(
         block_allocator
             .global_to_group(AbsoluteBN::new(0))
             .unwrap_err()
-            .code,
-        Errno::EINVAL
+            .kind(),
+        Ext4ErrorKind::InvalidInput
     );
 
     let inode_superblock = Ext4Superblock {
@@ -1532,13 +1527,16 @@ fn rsext4_bmalloc_allocator_rules_hold() {
                 &Ext4GroupDesc::default()
             )
             .unwrap_err()
-            .code,
-        Errno::ENOSPC
+            .kind(),
+        Ext4ErrorKind::NoSpace
     );
-    assert_eq!(InodeNumber::new(0).unwrap_err().code, Errno::EINVAL);
     assert_eq!(
-        InodeNumber::new(1).unwrap().to_group(0).unwrap_err().code,
-        Errno::EINVAL
+        InodeNumber::new(0).unwrap_err().kind(),
+        Ext4ErrorKind::InvalidInput
+    );
+    assert_eq!(
+        InodeNumber::new(1).unwrap().to_group(0).unwrap_err().kind(),
+        Ext4ErrorKind::InvalidInput
     );
 }
 
@@ -1663,21 +1661,37 @@ fn rsext4_blockgroup_table_and_stats_rules_hold() {
     new_superblock.s_feature_ro_compat |= Ext4Superblock::EXT4_FEATURE_RO_COMPAT_METADATA_CSUM;
     new_superblock.s_feature_incompat |= Ext4Superblock::EXT4_FEATURE_INCOMPAT_CSUM_SEED;
     new_superblock.s_checksum_seed = 0x3141_5926;
-    checksum_desc.update_checksum(&new_superblock, 2, Some(&[0xaa; 16]), Some(&[0x55; 16]));
-    assert!(checksum_desc.verify_checksum(&new_superblock, 2).is_ok());
-    checksum_desc.bg_checksum ^= 1;
-    assert!(checksum_desc.verify_checksum(&new_superblock, 2).is_err());
+    let mut checksum_record = [0u8; 64];
+    checksum_desc
+        .encode_with_checksum(
+            &new_superblock,
+            2,
+            &mut checksum_record,
+            Some(&[0xaa; 16]),
+            Some(&[0x55; 16]),
+        )
+        .unwrap();
+    assert!(
+        checksum_desc
+            .verify_checksum_in_bytes(&new_superblock, 2, &checksum_record)
+            .is_ok()
+    );
+    checksum_record[30] ^= 1;
+    assert!(
+        checksum_desc
+            .verify_checksum_in_bytes(&new_superblock, 2, &checksum_record)
+            .is_err()
+    );
 }
 
 #[test]
 fn rsext4_extent_tree_lookup_and_run_rules_hold() {
     use rsext4::{
-        BLOCK_SIZE, BlockDevice, Ext4Result, Jbd2Dev,
+        BLOCK_SIZE, BlockIo, Ext4Result, Jbd2Dev,
         bmalloc::AbsoluteBN,
         disknode::{Ext4Extent, Ext4ExtentHeader, Ext4ExtentIdx, Ext4Inode, Ext4Timestamp},
         endian::DiskFormat,
         extents_tree::{ExtentNode, ExtentTree},
-        loopfile::resolve_inode_block,
     };
 
     struct MemoryBlockDevice {
@@ -1692,8 +1706,13 @@ fn rsext4_extent_tree_lookup_and_run_rules_hold() {
         }
     }
 
-    impl BlockDevice for MemoryBlockDevice {
-        fn write(&mut self, buffer: &[u8], block_id: AbsoluteBN, count: u32) -> Ext4Result<()> {
+    impl BlockIo for MemoryBlockDevice {
+        fn write(
+            &mut self,
+            buffer: &[u8],
+            block_id: crate::io::SectorId,
+            count: u32,
+        ) -> Ext4Result<()> {
             let required = BLOCK_SIZE * count as usize;
             if buffer.len() < required {
                 return Err(rsext4::Ext4Error::buffer_too_small(buffer.len(), required));
@@ -1703,14 +1722,19 @@ fn rsext4_extent_tree_lookup_and_run_rules_hold() {
             if end > self.blocks.len() {
                 return Err(rsext4::Ext4Error::block_out_of_range(
                     block_id.raw().min(u64::from(u32::MAX)) as u32,
-                    self.total_blocks(),
+                    self.geometry().block_count,
                 ));
             }
             self.blocks[start..end].copy_from_slice(&buffer[..required]);
             Ok(())
         }
 
-        fn read(&mut self, buffer: &mut [u8], block_id: AbsoluteBN, count: u32) -> Ext4Result<()> {
+        fn read(
+            &mut self,
+            buffer: &mut [u8],
+            block_id: crate::io::SectorId,
+            count: u32,
+        ) -> Ext4Result<()> {
             let required = BLOCK_SIZE * count as usize;
             if buffer.len() < required {
                 return Err(rsext4::Ext4Error::buffer_too_small(buffer.len(), required));
@@ -1720,35 +1744,41 @@ fn rsext4_extent_tree_lookup_and_run_rules_hold() {
             if end > self.blocks.len() {
                 return Err(rsext4::Ext4Error::block_out_of_range(
                     block_id.raw().min(u64::from(u32::MAX)) as u32,
-                    self.total_blocks(),
+                    self.geometry().block_count,
                 ));
             }
             buffer[..required].copy_from_slice(&self.blocks[start..end]);
             Ok(())
         }
 
-        fn open(&mut self) -> Ext4Result<()> {
+        fn geometry(&self) -> crate::io::DeviceGeometry {
+            crate::io::DeviceGeometry::new(BLOCK_SIZE as u32, {
+                (self.blocks.len() / BLOCK_SIZE) as u64
+            })
+        }
+
+        fn capabilities(&self) -> crate::io::DeviceCapabilities {
+            crate::io::DeviceCapabilities {
+                read_only: { false },
+
+                flush: true,
+
+                ..crate::io::DeviceCapabilities::default()
+            }
+        }
+
+        fn flush(&mut self) -> crate::Ext4Result<()> {
             Ok(())
         }
+    }
 
-        fn close(&mut self) -> Ext4Result<()> {
-            Ok(())
-        }
-
-        fn total_blocks(&self) -> u64 {
-            (self.blocks.len() / BLOCK_SIZE) as u64
-        }
-
-        fn block_size(&self) -> u32 {
-            BLOCK_SIZE as u32
-        }
-
-        fn current_time(&self) -> Ext4Result<Ext4Timestamp> {
+    impl crate::runtime::Clock for MemoryBlockDevice {
+        fn now(&self) -> Ext4Result<Ext4Timestamp> {
             Ok(Ext4Timestamp::new(42, 0))
         }
     }
 
-    fn store_leaf(inode: &mut Ext4Inode, extents: &[Ext4Extent]) {
+    fn store_leaf(inode: &mut Ext4Inode, extents: &[Ext4Extent]) -> Ext4Result<()> {
         let header = Ext4ExtentHeader {
             eh_magic: Ext4ExtentHeader::EXT4_EXT_MAGIC,
             eh_entries: extents.len() as u16,
@@ -1760,7 +1790,7 @@ fn rsext4_extent_tree_lookup_and_run_rules_hold() {
             header,
             entries: extents.to_vec(),
         };
-        ExtentTree::new(inode).store_root_to_inode(&node);
+        ExtentTree::new(inode, BLOCK_SIZE).store_root_to_inode(&node)
     }
 
     fn write_leaf_block(
@@ -1785,16 +1815,17 @@ fn rsext4_extent_tree_lookup_and_run_rules_hold() {
         dev.write_blocks(&bytes, block, 1, false).unwrap();
     }
 
-    let mut dev = Jbd2Dev::initial_jbd2dev(0, MemoryBlockDevice::new(8), false);
+    let mut dev = Jbd2Dev::initial_jbd2dev(0, MemoryBlockDevice::new(1024), false);
     let mut inode = Ext4Inode::default();
+    inode.write_extend_header();
     assert_eq!(
-        ExtentTree::new(&mut inode)
+        ExtentTree::new(&mut inode, BLOCK_SIZE)
             .initialized_runs_in_range(&mut dev, 5, 4)
             .unwrap(),
         Vec::new()
     );
     assert!(
-        ExtentTree::new(&mut inode)
+        ExtentTree::new(&mut inode, BLOCK_SIZE)
             .find_extent(&mut dev, 1)
             .unwrap()
             .is_none()
@@ -1813,9 +1844,10 @@ fn rsext4_extent_tree_lookup_and_run_rules_hold() {
                 ee_start_lo: 300,
             },
         ],
-    );
+    )
+    .unwrap();
 
-    let mut tree = ExtentTree::new(&mut inode);
+    let mut tree = ExtentTree::new(&mut inode, BLOCK_SIZE);
     assert!(tree.find_extent(&mut dev, 9).unwrap().is_none());
     assert_eq!(
         tree.find_extent(&mut dev, 10)
@@ -1840,28 +1872,19 @@ fn rsext4_extent_tree_lookup_and_run_rules_hold() {
     assert_eq!(runs[1].logical_start, 20);
     assert_eq!(runs[1].physical_start, AbsoluteBN::new(200));
     assert_eq!(runs[1].len, 2);
-    assert_eq!(
-        resolve_inode_block(&mut dev, &mut inode, 11)
-            .unwrap()
-            .unwrap(),
-        AbsoluteBN::new(101)
-    );
-
     let mut zero_len_inode = Ext4Inode::empty_for_reuse(32);
     zero_len_inode.i_flags |= Ext4Inode::EXT4_EXTENTS_FL;
-    store_leaf(
-        &mut zero_len_inode,
-        &[Ext4Extent {
-            ee_block: 4,
-            ee_len: 0,
-            ee_start_hi: 0,
-            ee_start_lo: 400,
-        }],
-    );
     assert!(
-        resolve_inode_block(&mut dev, &mut zero_len_inode, 4)
-            .unwrap()
-            .is_none()
+        store_leaf(
+            &mut zero_len_inode,
+            &[Ext4Extent {
+                ee_block: 4,
+                ee_len: 0,
+                ee_start_hi: 0,
+                ee_start_lo: 400,
+            }],
+        )
+        .is_err()
     );
 
     let mut unwritten_inode = Ext4Inode::empty_for_reuse(32);
@@ -1874,11 +1897,14 @@ fn rsext4_extent_tree_lookup_and_run_rules_hold() {
             ee_start_hi: 0,
             ee_start_lo: 700,
         }],
-    );
+    )
+    .unwrap();
     assert!(
-        resolve_inode_block(&mut dev, &mut unwritten_inode, 7)
+        ExtentTree::new(&mut unwritten_inode, BLOCK_SIZE)
+            .find_extent(&mut dev, 7)
             .unwrap()
-            .is_none()
+            .unwrap()
+            .is_unwritten()
     );
 
     write_leaf_block(
@@ -1916,9 +1942,11 @@ fn rsext4_extent_tree_lookup_and_run_rules_hold() {
             },
         ],
     };
-    ExtentTree::new(&mut indexed_inode).store_root_to_inode(&index_root);
+    ExtentTree::new(&mut indexed_inode, BLOCK_SIZE)
+        .store_root_to_inode(&index_root)
+        .unwrap();
 
-    let mut tree = ExtentTree::new(&mut indexed_inode);
+    let mut tree = ExtentTree::new(&mut indexed_inode, BLOCK_SIZE);
     assert_eq!(
         tree.find_extent(&mut dev, 6)
             .unwrap()
@@ -1999,6 +2027,7 @@ fn rsext4_dirblock_checksum_edge_rules_hold() {
     ));
 
     block.fill(0);
+    block[BLOCK_SIZE - 8..BLOCK_SIZE - 6].copy_from_slice(&12_u16.to_le_bytes());
     block[BLOCK_SIZE - 5] = 0xDE;
     update_ext4_dirblock_csum32(&superblock, 2, 3, &mut block);
     assert!(verify_ext4_dirblock_checksum(&superblock, 2, 3, &block));
@@ -2075,9 +2104,8 @@ fn rsext4_mounted_filesystem_file_dir_and_metadata_rules_hold() {
     use core::cell::Cell;
 
     use rsext4::{
-        BLOCK_SIZE, BlockDevice, Errno, Ext4Result, Jbd2Dev,
-        bmalloc::AbsoluteBN,
-        create_symbol_link, create_symbol_link_with_owner, delete_dir, delete_file,
+        BLOCK_SIZE, BlockIo, Ext4ErrorKind, Ext4Result, Jbd2Dev, create_symbol_link,
+        create_symbol_link_with_owner, delete_dir, delete_file,
         dir::get_inode_with_num,
         disknode::{
             Ext4Extent, Ext4ExtentHeader, Ext4ExtentIdx, Ext4Inode, Ext4TimeSpec, Ext4Timestamp,
@@ -2086,11 +2114,11 @@ fn rsext4_mounted_filesystem_file_dir_and_metadata_rules_hold() {
         entries::Ext4DirEntry2,
         extents_tree::{ExtentNode, ExtentTree},
         file::build_file_block_mapping_with_inode_num,
-        find_file, link,
+        link,
         loopfile::{resolve_inode_block, resolve_inode_blocks},
         metadata::{chmod, chown},
         mkdir, mkdir_with_owner, mkfile, mkfile_with_owner, mkfs, read_file, read_inode_data_into,
-        rename, set_flags, set_project,
+        set_flags, set_project,
         superblock::Ext4Superblock,
         truncate, utimens, write_file,
     };
@@ -2111,8 +2139,13 @@ fn rsext4_mounted_filesystem_file_dir_and_metadata_rules_hold() {
         }
     }
 
-    impl BlockDevice for MemoryBlockDevice {
-        fn write(&mut self, buffer: &[u8], block_id: AbsoluteBN, count: u32) -> Ext4Result<()> {
+    impl BlockIo for MemoryBlockDevice {
+        fn write(
+            &mut self,
+            buffer: &[u8],
+            block_id: crate::io::SectorId,
+            count: u32,
+        ) -> Ext4Result<()> {
             let required = BLOCK_SIZE * count as usize;
             if buffer.len() < required {
                 return Err(rsext4::Ext4Error::buffer_too_small(buffer.len(), required));
@@ -2123,7 +2156,12 @@ fn rsext4_mounted_filesystem_file_dir_and_metadata_rules_hold() {
             Ok(())
         }
 
-        fn read(&mut self, buffer: &mut [u8], block_id: AbsoluteBN, count: u32) -> Ext4Result<()> {
+        fn read(
+            &mut self,
+            buffer: &mut [u8],
+            block_id: crate::io::SectorId,
+            count: u32,
+        ) -> Ext4Result<()> {
             let required = BLOCK_SIZE * count as usize;
             if buffer.len() < required {
                 return Err(rsext4::Ext4Error::buffer_too_small(buffer.len(), required));
@@ -2133,46 +2171,48 @@ fn rsext4_mounted_filesystem_file_dir_and_metadata_rules_hold() {
             if end > self.blocks.len() {
                 return Err(rsext4::Ext4Error::block_out_of_range(
                     block_id.raw().min(u64::from(u32::MAX)) as u32,
-                    self.total_blocks(),
+                    self.geometry().block_count,
                 ));
             }
             buffer[..required].copy_from_slice(&self.blocks[start..end]);
             Ok(())
         }
 
-        fn open(&mut self) -> Ext4Result<()> {
+        fn geometry(&self) -> crate::io::DeviceGeometry {
+            crate::io::DeviceGeometry::new(BLOCK_SIZE as u32, {
+                (self.blocks.len() / BLOCK_SIZE) as u64
+            })
+        }
+
+        fn capabilities(&self) -> crate::io::DeviceCapabilities {
+            crate::io::DeviceCapabilities {
+                read_only: { self.readonly },
+
+                flush: true,
+
+                ..crate::io::DeviceCapabilities::default()
+            }
+        }
+
+        fn flush(&mut self) -> crate::Ext4Result<()> {
             Ok(())
         }
+    }
 
-        fn close(&mut self) -> Ext4Result<()> {
-            Ok(())
-        }
-
-        fn total_blocks(&self) -> u64 {
-            (self.blocks.len() / BLOCK_SIZE) as u64
-        }
-
-        fn block_size(&self) -> u32 {
-            BLOCK_SIZE as u32
-        }
-
-        fn current_time(&self) -> Ext4Result<Ext4Timestamp> {
+    impl crate::runtime::Clock for MemoryBlockDevice {
+        fn now(&self) -> Ext4Result<Ext4Timestamp> {
             let sec = self.now.get();
             self.now.set(sec + 1);
             Ok(Ext4Timestamp::new(sec, 0))
-        }
-
-        fn is_readonly(&self) -> bool {
-            self.readonly
         }
     }
 
     let mut device = Jbd2Dev::initial_jbd2dev(0, MemoryBlockDevice::new(16 * 1024), false);
     mkfs(&mut device).unwrap();
-    let mut fs = rsext4::api::fs_mount(&mut device).unwrap();
+    let mut fs = rsext4::Ext4FileSystem::mount(&mut device).unwrap();
 
     assert!(!rsext4::Ext4FileSystem::device_has_error_state(&mut device).unwrap());
-    assert!(fs.file_entries_exist(&mut device, "/").unwrap());
+    assert!(fs.path_exists(&mut device, "/").unwrap());
     fs.make_base_dir();
     let stats = fs.statfs();
     assert_eq!(stats.block_size, BLOCK_SIZE as u64);
@@ -2193,6 +2233,7 @@ fn rsext4_mounted_filesystem_file_dir_and_metadata_rules_hold() {
     );
     assert!(
         fs.inode_num_already_allocated(&mut device, rsext4::bmalloc::InodeNumber::new(2).unwrap())
+            .unwrap()
     );
     let saved_inode_bitmap = fs.group_descs[0].bg_inode_bitmap_lo;
     fs.group_descs[0].bg_inode_bitmap_lo = u32::MAX;
@@ -2206,10 +2247,13 @@ fn rsext4_mounted_filesystem_file_dir_and_metadata_rules_hold() {
     let _ =
         fs.inode_num_already_allocated(&mut device, rsext4::bmalloc::InodeNumber::new(2).unwrap());
     fs.superblock.s_inodes_per_group = saved_inodes_per_group;
-    assert!(!fs.inode_num_already_allocated(
-        &mut device,
-        rsext4::bmalloc::InodeNumber::new(u32::MAX).unwrap()
-    ));
+    assert!(
+        fs.inode_num_already_allocated(
+            &mut device,
+            rsext4::bmalloc::InodeNumber::new(u32::MAX).unwrap()
+        )
+        .is_err()
+    );
     assert!(
         fs.get_inode_by_num(
             &mut device,
@@ -2225,12 +2269,10 @@ fn rsext4_mounted_filesystem_file_dir_and_metadata_rules_hold() {
         )
         .is_err()
     );
-    assert!(find_file(&mut fs, &mut device, "/").unwrap().is_dir());
+    assert!(fs.find_file(&mut device, "/").unwrap().is_dir());
     assert_eq!(
-        find_file(&mut fs, &mut device, "/missing")
-            .unwrap_err()
-            .code,
-        Errno::ENOENT
+        fs.find_file(&mut device, "/missing").unwrap_err().kind(),
+        Ext4ErrorKind::NotFound
     );
 
     mkdir(&mut device, &mut fs, "/cov").unwrap();
@@ -2294,8 +2336,8 @@ fn rsext4_mounted_filesystem_file_dir_and_metadata_rules_hold() {
     assert_eq!(
         set_project(&mut device, &mut fs, "/cov/sub/file", 77)
             .unwrap_err()
-            .code,
-        Errno::EOPNOTSUPP
+            .kind(),
+        Ext4ErrorKind::Unsupported
     );
     fs.superblock.s_feature_ro_compat |= Ext4Superblock::EXT4_FEATURE_RO_COMPAT_PROJECT;
     set_project(&mut device, &mut fs, "/cov/sub/file", 77).unwrap();
@@ -2313,8 +2355,8 @@ fn rsext4_mounted_filesystem_file_dir_and_metadata_rules_hold() {
             !Ext4Inode::EXT4_FL_USER_VISIBLE
         )
         .unwrap_err()
-        .code,
-        Errno::EINVAL
+        .kind(),
+        Ext4ErrorKind::InvalidInput
     );
     mkfile(&mut device, &mut fs, "/cov/sub/noatime", Some(b"n"), None).unwrap();
     set_flags(
@@ -2386,31 +2428,32 @@ fn rsext4_mounted_filesystem_file_dir_and_metadata_rules_hold() {
         Some(Ext4DirEntry2::EXT4_FT_FIFO),
     )
     .unwrap();
-    mkfile(
+    let error = mkfile(
         &mut device,
         &mut fs,
         "/cov/sub/unknown-kind",
         None,
         Some(Ext4DirEntry2::EXT4_FT_UNKNOWN),
     )
-    .unwrap();
+    .unwrap_err();
+    assert_eq!(error.kind(), Ext4ErrorKind::InvalidInput);
     assert_eq!(
         mkfile(&mut device, &mut fs, "/", None, None)
             .unwrap_err()
-            .code,
-        Errno::EINVAL
+            .kind(),
+        Ext4ErrorKind::InvalidInput
     );
     assert_eq!(
         mkfile(&mut device, &mut fs, "/cov/sub/file", None, None)
             .unwrap_err()
-            .code,
-        Errno::EEXIST
+            .kind(),
+        Ext4ErrorKind::AlreadyExists
     );
     assert_eq!(
         mkfile(&mut device, &mut fs, "relative-file", None, None)
             .unwrap_err()
-            .code,
-        Errno::EINVAL
+            .kind(),
+        Ext4ErrorKind::InvalidInput
     );
     fs.superblock.s_feature_ro_compat |= Ext4Superblock::EXT4_FEATURE_RO_COMPAT_PROJECT;
     let (sub_ino, _) = get_inode_with_num(&mut fs, &mut device, "/cov/sub")
@@ -2442,14 +2485,14 @@ fn rsext4_mounted_filesystem_file_dir_and_metadata_rules_hold() {
     assert_eq!(
         link(&mut fs, &mut device, "/cov/sub/hard", "/cov/sub/file")
             .unwrap_err()
-            .code,
-        Errno::EEXIST
+            .kind(),
+        Ext4ErrorKind::AlreadyExists
     );
     assert_eq!(
         link(&mut fs, &mut device, "/cov/sub/dir-hard", "/cov/sub")
             .unwrap_err()
-            .code,
-        Errno::EACCES
+            .kind(),
+        Ext4ErrorKind::PermissionDenied
     );
     assert_eq!(
         link(
@@ -2459,8 +2502,8 @@ fn rsext4_mounted_filesystem_file_dir_and_metadata_rules_hold() {
             "/cov/sub/file"
         )
         .unwrap_err()
-        .code,
-        Errno::ENOENT
+        .kind(),
+        Ext4ErrorKind::NotFound
     );
     assert_eq!(
         link(
@@ -2470,8 +2513,8 @@ fn rsext4_mounted_filesystem_file_dir_and_metadata_rules_hold() {
             "/cov/sub/no-file"
         )
         .unwrap_err()
-        .code,
-        Errno::ENOENT
+        .kind(),
+        Ext4ErrorKind::NotFound
     );
 
     create_symbol_link(&mut device, &mut fs, "/cov/sub/file", "/cov/sub/sym").unwrap();
@@ -2516,11 +2559,18 @@ fn rsext4_mounted_filesystem_file_dir_and_metadata_rules_hold() {
     assert_eq!(
         create_symbol_link(&mut device, &mut fs, "/cov/sub/no-src", "/cov/sub/bad-sym")
             .unwrap_err()
-            .code,
-        Errno::EINVAL
+            .kind(),
+        Ext4ErrorKind::InvalidInput
     );
 
-    rename(&mut device, &mut fs, "/cov/sub/file", "/cov/sub/renamed").unwrap();
+    let _ = rename(
+        &mut device,
+        &mut fs,
+        "/cov/sub/file",
+        "/cov/sub/renamed",
+        RenameOptions::REPLACE,
+    )
+    .unwrap();
     assert!(
         get_inode_with_num(&mut fs, &mut device, "/cov/sub/file")
             .unwrap()
@@ -2535,7 +2585,7 @@ fn rsext4_mounted_filesystem_file_dir_and_metadata_rules_hold() {
     let mut mapped_inode = Ext4Inode::empty_for_reuse(32);
     build_file_block_mapping_with_inode_num(&mut fs, &mut mapped_inode, file_ino, &[], &mut device)
         .unwrap();
-    assert_eq!(mapped_inode.blocks_count(), 0);
+    assert_eq!(mapped_inode.blocks_count(BLOCK_SIZE as u32, true), 0);
     let map_block_a = fs.alloc_block(&mut device).unwrap();
     let _map_gap = fs.alloc_block(&mut device).unwrap();
     let map_block_b = fs.alloc_block(&mut device).unwrap();
@@ -2547,19 +2597,19 @@ fn rsext4_mounted_filesystem_file_dir_and_metadata_rules_hold() {
         &mut device,
     )
     .unwrap();
-    assert!(mapped_inode.have_extend_header_and_use_extend());
-    let mapped_blocks = resolve_inode_blocks(&mut fs, &mut device, &mut mapped_inode).unwrap();
+    assert!(mapped_inode.uses_extents());
+    let mapped_blocks =
+        resolve_inode_blocks(&mut fs, &mut device, file_ino, &mut mapped_inode).unwrap();
     assert_eq!(mapped_blocks.len(), 2);
 
     let mut non_extent_inode = Ext4Inode::default();
-    assert_eq!(
-        resolve_inode_block(&mut device, &mut non_extent_inode, 0)
-            .unwrap_err()
-            .code,
-        Errno::EOPNOTSUPP
+    assert!(
+        resolve_inode_block(&fs, &mut device, file_ino, &mut non_extent_inode, 0)
+            .unwrap()
+            .is_none()
     );
     assert!(
-        resolve_inode_blocks(&mut fs, &mut device, &mut non_extent_inode)
+        resolve_inode_blocks(&mut fs, &mut device, file_ino, &mut non_extent_inode)
             .unwrap()
             .is_empty()
     );
@@ -2567,7 +2617,7 @@ fn rsext4_mounted_filesystem_file_dir_and_metadata_rules_hold() {
     empty_extent_inode.i_flags |= Ext4Inode::EXT4_EXTENTS_FL;
     empty_extent_inode.write_extend_header();
     assert!(
-        resolve_inode_block(&mut device, &mut empty_extent_inode, 0)
+        resolve_inode_block(&fs, &mut device, file_ino, &mut empty_extent_inode, 0)
             .unwrap()
             .is_none()
     );
@@ -2596,17 +2646,20 @@ fn rsext4_mounted_filesystem_file_dir_and_metadata_rules_hold() {
             },
         ],
     };
-    ExtentTree::new(&mut skipped_extent_inode).store_root_to_inode(&skipped_node);
     assert!(
-        resolve_inode_blocks(&mut fs, &mut device, &mut skipped_extent_inode)
-            .unwrap()
-            .is_empty()
+        ExtentTree::new(&mut skipped_extent_inode, BLOCK_SIZE)
+            .store_root_to_inode(&skipped_node)
+            .is_err()
     );
     let leaf_a = fs.alloc_block(&mut device).unwrap();
     let leaf_b = fs.alloc_block(&mut device).unwrap();
+    let data_a = fs.alloc_block(&mut device).unwrap();
+    let data_b = fs.alloc_blocks(&mut device, 2).unwrap();
+    let saved_ro_compat = fs.superblock.s_feature_ro_compat;
+    fs.superblock.s_feature_ro_compat &= !Ext4Superblock::EXT4_FEATURE_RO_COMPAT_METADATA_CSUM;
     for (leaf, extent) in [
-        (leaf_a, Ext4Extent::new(0, 800, 1)),
-        (leaf_b, Ext4Extent::new(8, 900, 2)),
+        (leaf_a, Ext4Extent::new(0, data_a.raw(), 1)),
+        (leaf_b, Ext4Extent::new(8, data_b[0].raw(), 2)),
     ] {
         let mut leaf_bytes = vec![0_u8; BLOCK_SIZE];
         Ext4ExtentHeader {
@@ -2648,19 +2701,23 @@ fn rsext4_mounted_filesystem_file_dir_and_metadata_rules_hold() {
             },
         ],
     };
-    ExtentTree::new(&mut indexed_resolve_inode).store_root_to_inode(&indexed_root);
+    ExtentTree::new(&mut indexed_resolve_inode, BLOCK_SIZE)
+        .store_root_to_inode(&indexed_root)
+        .unwrap();
     let indexed_blocks =
-        resolve_inode_blocks(&mut fs, &mut device, &mut indexed_resolve_inode).unwrap();
-    assert_eq!(indexed_blocks.get(&0).copied(), Some(AbsoluteBN::new(800)));
-    assert_eq!(indexed_blocks.get(&9).copied(), Some(AbsoluteBN::new(901)));
+        resolve_inode_blocks(&mut fs, &mut device, file_ino, &mut indexed_resolve_inode).unwrap();
+    assert_eq!(indexed_blocks.get(&0).copied(), Some(data_a));
+    assert_eq!(indexed_blocks.get(&9).copied(), Some(data_b[1]));
+    fs.superblock.s_feature_ro_compat = saved_ro_compat;
 
     mkdir(&mut device, &mut fs, "/cov/other").unwrap();
     mkdir(&mut device, &mut fs, "/cov/other/child").unwrap();
-    rename(
+    let _ = rename(
         &mut device,
         &mut fs,
         "/cov/other/child",
         "/cov/sub/moved-dir",
+        RenameOptions::REPLACE,
     )
     .unwrap();
     assert!(
@@ -2686,13 +2743,17 @@ fn rsext4_mounted_filesystem_file_dir_and_metadata_rules_hold() {
         None,
     )
     .unwrap();
-    rename(
+    let replaced_file = rename(
         &mut device,
         &mut fs,
         "/cov/sub/replace-src",
         "/cov/sub/replace-dst",
+        RenameOptions::REPLACE,
     )
     .unwrap();
+    let replaced_file = replaced_file.replaced.expect("rename replaced a file");
+    assert!(replaced_file.requires_reap());
+    rsext4::reap_unlinked_inode(&mut fs, &mut device, replaced_file.inode).unwrap();
     assert_eq!(
         read_file(&mut device, &mut fs, "/cov/sub/replace-dst").unwrap(),
         b"src"
@@ -2712,10 +2773,11 @@ fn rsext4_mounted_filesystem_file_dir_and_metadata_rules_hold() {
             &mut fs,
             "/cov/sub/replace-dst",
             "/cov/sub/non-empty-dir",
+            RenameOptions::REPLACE,
         )
         .unwrap_err()
-        .code,
-        Errno::ENOTDIR
+        .kind(),
+        Ext4ErrorKind::NotDirectory
     );
     assert_eq!(
         rename(
@@ -2723,10 +2785,11 @@ fn rsext4_mounted_filesystem_file_dir_and_metadata_rules_hold() {
             &mut fs,
             "/cov/sub/non-empty-dir",
             "/cov/sub/replace-dst",
+            RenameOptions::REPLACE,
         )
         .unwrap_err()
-        .code,
-        Errno::EISDIR
+        .kind(),
+        Ext4ErrorKind::IsDirectory
     );
     mkdir(&mut device, &mut fs, "/cov/sub/src-dir").unwrap();
     assert_eq!(
@@ -2735,32 +2798,51 @@ fn rsext4_mounted_filesystem_file_dir_and_metadata_rules_hold() {
             &mut fs,
             "/cov/sub/src-dir",
             "/cov/sub/non-empty-dir",
+            RenameOptions::REPLACE,
         )
         .unwrap_err()
-        .code,
-        Errno::ENOTEMPTY
+        .kind(),
+        Ext4ErrorKind::NotEmpty
     );
     assert_eq!(
-        rename(&mut device, &mut fs, "/cov/sub/src-dir", "bad-new")
-            .unwrap_err()
-            .code,
-        Errno::EINVAL
+        rename(
+            &mut device,
+            &mut fs,
+            "/cov/sub/src-dir",
+            "bad-new",
+            RenameOptions::REPLACE,
+        )
+        .unwrap_err()
+        .kind(),
+        Ext4ErrorKind::InvalidInput
     );
     assert_eq!(
-        rename(&mut device, &mut fs, "/", "/cov/sub/root-move")
-            .unwrap_err()
-            .code,
-        Errno::EINVAL
+        rename(
+            &mut device,
+            &mut fs,
+            "/",
+            "/cov/sub/root-move",
+            RenameOptions::REPLACE,
+        )
+        .unwrap_err()
+        .kind(),
+        Ext4ErrorKind::InvalidInput
     );
     mkdir(&mut device, &mut fs, "/cov/sub/replace-empty-src").unwrap();
     mkdir(&mut device, &mut fs, "/cov/sub/replace-empty-dst").unwrap();
-    rename(
+    let replaced_directory = rename(
         &mut device,
         &mut fs,
         "/cov/sub/replace-empty-src",
         "/cov/sub/replace-empty-dst",
+        RenameOptions::REPLACE,
     )
     .unwrap();
+    let replaced_directory = replaced_directory
+        .replaced
+        .expect("rename replaced a directory");
+    assert!(replaced_directory.requires_reap());
+    rsext4::reap_unlinked_inode(&mut fs, &mut device, replaced_directory.inode).unwrap();
     assert!(
         get_inode_with_num(&mut fs, &mut device, "/cov/sub/replace-empty-dst")
             .unwrap()
@@ -2768,7 +2850,16 @@ fn rsext4_mounted_filesystem_file_dir_and_metadata_rules_hold() {
             .1
             .is_dir()
     );
-    assert!(rename(&mut device, &mut fs, "bad-old", "/cov/sub/bad-new").is_err());
+    assert!(
+        rename(
+            &mut device,
+            &mut fs,
+            "bad-old",
+            "/cov/sub/bad-new",
+            RenameOptions::REPLACE,
+        )
+        .is_err()
+    );
 
     truncate(&mut device, &mut fs, "/cov/sub/renamed", 4).unwrap();
     let truncated = read_file(&mut device, &mut fs, "/cov/sub/renamed").unwrap();
@@ -2782,52 +2873,21 @@ fn rsext4_mounted_filesystem_file_dir_and_metadata_rules_hold() {
     assert_eq!(
         truncate(&mut device, &mut fs, "/cov/sub/missing", 1)
             .unwrap_err()
-            .code,
-        Errno::ENOENT
+            .kind(),
+        Ext4ErrorKind::NotFound
     );
     assert_eq!(
         write_file(&mut device, &mut fs, "/cov/sub/missing", 0, b"x")
             .unwrap_err()
-            .code,
-        Errno::ENOENT
+            .kind(),
+        Ext4ErrorKind::NotFound
     );
 
-    let mut api_file = rsext4::api::open(&mut device, &mut fs, "/cov/sub/api", true).unwrap();
-    assert_eq!(api_file.offset, 0);
-    rsext4::api::write_at(&mut device, &mut fs, &mut api_file, b"abcdef").unwrap();
-    assert_eq!(api_file.offset, 6);
-    rsext4::api::lseek(&mut api_file, 2).unwrap();
-    assert_eq!(
-        rsext4::api::read_at(&mut device, &mut fs, &mut api_file, 3).unwrap(),
-        b"cde"
-    );
-    assert_eq!(api_file.offset, 5);
-    assert_eq!(
-        rsext4::api::read(&mut device, &mut fs, "/cov/sub/api").unwrap(),
-        b"abcdef"
-    );
-    rsext4::api::lseek(&mut api_file, 99).unwrap();
-    assert_eq!(
-        rsext4::api::read_at(&mut device, &mut fs, &mut api_file, 4).unwrap(),
-        Vec::new()
-    );
-    assert_eq!(
-        rsext4::api::read_at(&mut device, &mut fs, &mut api_file, 0).unwrap(),
-        Vec::new()
-    );
-    let open_error = match rsext4::api::open(&mut device, &mut fs, "/cov/sub/no-api", false) {
-        Ok(_) => panic!("opening a missing file without create should fail"),
-        Err(error) => error,
-    };
-    assert_eq!(open_error.code, Errno::ENOENT);
-
-    delete_file(&mut fs, &mut device, "/cov/sub/api").unwrap();
     delete_file(&mut fs, &mut device, "/cov/sub/noatime").unwrap();
     delete_file(&mut fs, &mut device, "/cov/sub/char").unwrap();
     delete_file(&mut fs, &mut device, "/cov/sub/socket").unwrap();
     delete_file(&mut fs, &mut device, "/cov/sub/block").unwrap();
     delete_file(&mut fs, &mut device, "/cov/sub/fifo").unwrap();
-    delete_file(&mut fs, &mut device, "/cov/sub/unknown-kind").unwrap();
     delete_file(&mut fs, &mut device, "/cov/sub/project-child").unwrap();
     delete_file(&mut fs, &mut device, "/cov/sub/project-sym").unwrap();
     delete_file(&mut fs, &mut device, "/cov/sub/hard").unwrap();
@@ -2847,43 +2907,61 @@ fn rsext4_mounted_filesystem_file_dir_and_metadata_rules_hold() {
     delete_dir(&mut fs, &mut device, "/cov/other").unwrap();
     delete_dir(&mut fs, &mut device, "/cov").unwrap();
 
-    rsext4::api::fs_umount(fs, &mut device).unwrap();
+    rsext4::umount(fs, &mut device).unwrap();
 }
 
 #[test]
-fn rsext4_errno_additional_codes_hold() {
-    use rsext4::Errno;
+fn rsext4_bitmap_error_mapping_rules_hold() {
+    use rsext4::{Ext4ErrorKind, bitmap::BitmapError, bmalloc::map_bitmap_error};
 
-    // Test additional errno codes
-    assert_eq!(Errno::EEXIST.as_i32(), 17);
-    assert_eq!(Errno::ENOENT.as_i32(), 2);
-    assert_eq!(Errno::EACCES.as_i32(), 13);
-    assert_eq!(Errno::EBUSY.as_i32(), 16);
-    assert_eq!(Errno::ENOTDIR.as_i32(), 20);
-    assert_eq!(Errno::EISDIR.as_i32(), 21);
-    assert_eq!(Errno::EFBIG.as_i32(), 27);
-    assert_eq!(Errno::ENOSPC.as_i32(), 28);
+    assert_eq!(
+        map_bitmap_error(BitmapError::IndexOutOfRange).kind(),
+        Ext4ErrorKind::InvalidInput
+    );
+    assert_eq!(
+        map_bitmap_error(BitmapError::AlreadyAllocated).kind(),
+        Ext4ErrorKind::AlreadyExists
+    );
+    assert_eq!(
+        map_bitmap_error(BitmapError::AlreadyFree).kind(),
+        Ext4ErrorKind::NotFound
+    );
+}
+
+#[test]
+fn rsext4_bmalloc_type_conversions_and_validation_hold() {
+    assert!(rsext4::bmalloc::bmalloc_type_conversions_and_validation_rules_hold_for_test());
+}
+
+#[test]
+fn rsext4_block_group_desc_disk_format_rules_hold() {
+    assert!(rsext4::blockgroup_description::block_group_desc_disk_format_rules_hold_for_test());
 }
 
 #[test]
 fn rsext4_superblock_feature_flags_hold() {
     use rsext4::superblock::Ext4Superblock;
 
-    let mut sb = Ext4Superblock::default();
+    let mut sb = Ext4Superblock {
+        s_feature_compat: 0,
+        s_feature_ro_compat: 0,
+        s_feature_incompat: 0,
+        ..Default::default()
+    };
 
     // Test feature compatibility flags
-    assert!(sb.has_feature_compat(Ext4Superblock::EXT4_FEATURE_COMPAT_HAS_JOURNAL));
-    sb.s_feature_compat &= !Ext4Superblock::EXT4_FEATURE_COMPAT_HAS_JOURNAL;
     assert!(!sb.has_feature_compat(Ext4Superblock::EXT4_FEATURE_COMPAT_HAS_JOURNAL));
     sb.s_feature_compat |= Ext4Superblock::EXT4_FEATURE_COMPAT_HAS_JOURNAL;
     assert!(sb.has_feature_compat(Ext4Superblock::EXT4_FEATURE_COMPAT_HAS_JOURNAL));
 
     // Test feature read-only compatibility flags
+    sb.s_feature_ro_compat = 0;
     assert!(!sb.has_feature_ro_compat(Ext4Superblock::EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER));
     sb.s_feature_ro_compat |= Ext4Superblock::EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER;
     assert!(sb.has_feature_ro_compat(Ext4Superblock::EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER));
 
     // Test feature incompatibility flags
+    sb.s_feature_incompat = 0;
     assert!(!sb.has_feature_incompat(Ext4Superblock::EXT4_FEATURE_INCOMPAT_64BIT));
     sb.s_feature_incompat |= Ext4Superblock::EXT4_FEATURE_INCOMPAT_64BIT;
     assert!(sb.has_feature_incompat(Ext4Superblock::EXT4_FEATURE_INCOMPAT_64BIT));
@@ -2915,67 +2993,48 @@ fn rsext4_extent_header_constants_and_defaults_hold() {
 fn rsext4_inode_mode_constants_and_type_checks_hold() {
     use rsext4::disknode::Ext4Inode;
 
-    // Test inode mode constants
-    let _s_ifreg = Ext4Inode::S_IFREG;
-    let _s_ifdir = Ext4Inode::S_IFDIR;
-    let _s_iflnk = Ext4Inode::S_IFLNK;
-    let _s_isuid = Ext4Inode::S_ISUID;
-    let _s_isgid = Ext4Inode::S_ISGID;
-
-    // Verify they're non-zero and distinct
-    const {
-        assert!(Ext4Inode::S_IFREG != 0);
-        assert!(Ext4Inode::S_IFDIR != 0);
-        assert!(Ext4Inode::S_IFREG != Ext4Inode::S_IFDIR);
-    }
+    assert_eq!(Ext4Inode::S_IFREG, 0x8000);
+    assert_eq!(Ext4Inode::S_IFDIR, 0x4000);
+    assert_eq!(Ext4Inode::S_IFLNK, 0xa000);
+    assert_eq!(Ext4Inode::S_ISUID, 0x0800);
+    assert_eq!(Ext4Inode::S_ISGID, 0x0400);
 }
 
 #[test]
 fn rsext4_extent_header_constants_hold() {
     use rsext4::disknode::Ext4ExtentHeader;
 
-    // Test extent header magic constant
-    const { assert!(Ext4ExtentHeader::EXT4_EXT_MAGIC != 0) }
+    assert_eq!(Ext4ExtentHeader::EXT4_EXT_MAGIC, 0xf30a);
 }
 
 #[test]
 fn rsext4_dirent_file_type_constants_hold() {
     use rsext4::entries::Ext4DirEntry2;
 
-    // Test directory entry file type constants
-    let _unknown = Ext4DirEntry2::EXT4_FT_UNKNOWN;
-    let _reg_file = Ext4DirEntry2::EXT4_FT_REG_FILE;
-    let _dir = Ext4DirEntry2::EXT4_FT_DIR;
-    let _chrdev = Ext4DirEntry2::EXT4_FT_CHRDEV;
-    let _blkdev = Ext4DirEntry2::EXT4_FT_BLKDEV;
-    let _fifo = Ext4DirEntry2::EXT4_FT_FIFO;
-    let _sock = Ext4DirEntry2::EXT4_FT_SOCK;
-    let _symlink = Ext4DirEntry2::EXT4_FT_SYMLINK;
-
-    // Verify they're distinct
-    const {
-        assert!(Ext4DirEntry2::EXT4_FT_REG_FILE != Ext4DirEntry2::EXT4_FT_DIR);
-        assert!(Ext4DirEntry2::EXT4_FT_DIR != Ext4DirEntry2::EXT4_FT_SYMLINK);
-    }
+    assert_eq!(Ext4DirEntry2::EXT4_FT_UNKNOWN, 0);
+    assert_eq!(Ext4DirEntry2::EXT4_FT_REG_FILE, 1);
+    assert_eq!(Ext4DirEntry2::EXT4_FT_DIR, 2);
+    assert_eq!(Ext4DirEntry2::EXT4_FT_CHRDEV, 3);
+    assert_eq!(Ext4DirEntry2::EXT4_FT_BLKDEV, 4);
+    assert_eq!(Ext4DirEntry2::EXT4_FT_FIFO, 5);
+    assert_eq!(Ext4DirEntry2::EXT4_FT_SOCK, 6);
+    assert_eq!(Ext4DirEntry2::EXT4_FT_SYMLINK, 7);
 }
 
 #[test]
 fn rsext4_group_desc_flags_hold() {
     use rsext4::blockgroup_description::Ext4GroupDesc;
 
-    // Test group descriptor flag constants
-    let _block_uninit = Ext4GroupDesc::EXT4_BG_BLOCK_UNINIT;
-    let _inode_uninit = Ext4GroupDesc::EXT4_BG_INODE_UNINIT;
-    let _inode_zeroed = Ext4GroupDesc::EXT4_BG_INODE_ZEROED;
+    assert_eq!(Ext4GroupDesc::EXT4_BG_INODE_UNINIT, 0x0001);
+    assert_eq!(Ext4GroupDesc::EXT4_BG_BLOCK_UNINIT, 0x0002);
+    assert_eq!(Ext4GroupDesc::EXT4_BG_INODE_ZEROED, 0x0004);
 }
 
 #[test]
 fn rsext4_journal_blocktype_constants_hold() {
     use rsext4::jbd2::jbdstruct::{JBD2_BLOCKTYPE_COMMIT, JBD2_BLOCKTYPE_DESCRIPTOR, JBD2_MAGIC};
 
-    // Test journal magic and block types
-    const {
-        assert!(JBD2_MAGIC != 0);
-        assert!(JBD2_BLOCKTYPE_DESCRIPTOR != JBD2_BLOCKTYPE_COMMIT);
-    }
+    assert_eq!(JBD2_MAGIC, 0xc03b_3998);
+    assert_eq!(JBD2_BLOCKTYPE_DESCRIPTOR, 1);
+    assert_eq!(JBD2_BLOCKTYPE_COMMIT, 2);
 }

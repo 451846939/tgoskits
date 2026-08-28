@@ -6954,9 +6954,8 @@ dependencies = [
 name = "rsext4"
 version = "0.8.1"
 dependencies = [
- "ax-sync",
  "bitflags 2.13.1",
- "log",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

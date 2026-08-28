@@ -343,10 +343,13 @@ impl BlockGroupHandle {
         if self.stopped.swap(true, Ordering::AcqRel) {
             return 0;
         }
+        // Teardown has exclusive ownership after publishing `stopped`. Move
+        // the controller out so retry waits never retain an IRQ-save guard.
+        let mut controller = self.controller.lock().take();
         for member in &self.members {
             member.inner.prepare_group_shutdown();
         }
-        if let Some(controller) = self.controller.lock().as_deref_mut() {
+        if let Some(controller) = controller.as_deref_mut() {
             let _ = drive_group_transition(
                 controller,
                 GroupControllerEvent::QuiesceIrqs,
@@ -360,7 +363,7 @@ impl BlockGroupHandle {
         for member in &self.members {
             member.shutdown();
         }
-        if let Some(mut controller) = self.controller.lock().take()
+        if let Some(mut controller) = controller
             && let Err(error) = drive_group_transition(
                 &mut *controller,
                 GroupControllerEvent::Shutdown,
@@ -651,6 +654,28 @@ impl BlockDeviceHandle {
         self.inner.published_device_info()
     }
 
+    #[cfg(feature = "ext4")]
+    pub(crate) fn supports_flush(&self) -> bool {
+        let queues = self.inner.hctxs.lock();
+        !queues.is_empty()
+            && queues
+                .iter()
+                .all(|queue| queue.info().limits.supports_flush)
+    }
+
+    #[cfg(feature = "ext4")]
+    pub(crate) fn supports_fua(&self) -> bool {
+        let queues = self.inner.hctxs.lock();
+        !queues.is_empty()
+            && queues.iter().all(|queue| {
+                queue
+                    .info()
+                    .limits
+                    .supported_flags
+                    .contains(RequestFlags::FUA)
+            })
+    }
+
     /// Enqueues one DMA-owning request on the current CPU software channel.
     ///
     /// `NOWAIT` affects only bounded channel admission and is removed before
@@ -787,6 +812,14 @@ impl BlockDeviceHandle {
     #[cfg(any(feature = "ext4", feature = "fat"))]
     pub(crate) fn write_blocks(&self, block_id: u64, buf: &[u8]) -> BlockResult {
         io::write_blocks(self, block_id, buf)
+    }
+
+    #[cfg(feature = "ext4")]
+    pub(crate) fn write_blocks_fua(&self, block_id: u64, buf: &[u8]) -> BlockResult {
+        if !self.supports_fua() {
+            return Err(BlockError::Unsupported);
+        }
+        io::write_blocks_fua(self, block_id, buf)
     }
 
     #[cfg(any(feature = "ext4", feature = "fat"))]
