@@ -1106,30 +1106,6 @@ fn aarch64_nvme_smoke_fail_regex_ignores_interleaved_kernel_logs() {
 }
 
 #[test]
-fn poll_idle_latency_case_requires_the_axvm_runtime_observation_marker() {
-    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let qemu_path = workspace_root.join(
-        "test-suit/axvisor/normal/qemu-rt-latency-bench-poll/poll-idle-periodic-wake/qemu-aarch64.\
-         toml",
-    );
-    let qemu = load_qemu_config(&qemu_path);
-
-    assert_eq!(
-        qemu.success_regex,
-        ["AXVISOR_RT_POLL_IDLE_RUNTIME_PASSED"],
-        "the QEMU case must require AxVM's observed poll-and-fallback verdict rather than the \
-         guest benchmark exit marker"
-    );
-    let success = regex::Regex::new(&qemu.success_regex[0]).unwrap();
-    assert!(
-        success.is_match(
-            "AXVISOR_RT_POLL_IDLE_RUNTIME_PASSED poll_bypass_count=2 poll_fallback_count=1"
-        )
-    );
-    assert!(!success.is_match("AXVISOR_RT_POLL_IDLE_BENCH_COMPLETED"));
-}
-
-#[test]
 fn ignores_qemu_only_build_groups_when_discovering_board_tests() {
     let root = tempdir().unwrap();
     write_qemu_build_config(

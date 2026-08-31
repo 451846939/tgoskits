@@ -173,9 +173,9 @@ Assigned physical SPI 使用经过所有权校验的 HW-backed LR：
 
 本轮实现比较三种可用边界：保留 shared wait 没有新增 CPU 成本，作为 control build；Linux 风格的自适应 polling 需要可靠读取 runnable host task 与 scheduler 状态，当前 AxVisor 接口尚未提供该判定；因此 profile 选择“固定短预算 + 专属 pCPU + 预算/抢占立即回退”。后续若引入可验证的 host runnable-state 能力，才可在不改变 guest ABI 的前提下替换为自适应预算；在此之前不支持共享 pCPU 或多个 polling vCPU 共置。
 
-启用条件是以 `rt-poll-idle` feature 重建并重启，同时满足上述 CPU placement 校验。每个 vCPU 首次同时观察到普通-idle bypass 与因 budget/preemption 返回 shared wait 时，输出 `AXVISOR_RT_POLL_IDLE_RUNTIME_PASSED poll_bypass_count=… poll_fallback_count=…`；QEMU 回归要求这个标记，两个计数任一为零都会使该回归失败。部署前应保存该标记和 control build 的同配置日志；若 placement 被拒绝、运行验证未同时观察到两种决策，或目标负载出现不能接受的 deadline miss，则移除该 feature、重新构建并重启回 shared-wait profile。该 profile 没有运行时热切换或状态迁移，回滚不改变 guest ABI、持久状态或 timer ownership。
+启用条件是以 `rt-poll-idle` feature 重建并重启，同时满足上述 CPU placement 校验。每个 vCPU 首次同时观察到普通-idle bypass 与因 budget/preemption 返回 shared wait 时，输出 `AXVISOR_RT_POLL_IDLE_RUNTIME_PASSED poll_bypass_count=… poll_fallback_count=…`；部署前应保存该标记和 control build 的同配置日志。CI 的 timer-wake QEMU 回归验证启用该 feature 后客户机能从 idle 经 timer IRQ 恢复执行；预算回退由 AxVM 的确定性 unit test 验证。若 placement 被拒绝、目标负载出现不能接受的 deadline miss，或部署验证未观察到预期的轮询/回退决策，则移除该 feature、重新构建并重启回 shared-wait profile。该 profile 没有运行时热切换或状态迁移，回滚不改变 guest ABI、持久状态或 timer ownership。
 
-`shared-wait-periodic-wake` 与 `poll-idle-periodic-wake` 是同一个 AArch64 Linux guest、两个 vCPU（分别绑定 host pCPU1、pCPU2）和同一个 1 ms absolute-deadline workload 的独立 QEMU build。每轮 2,000 次、共三轮；guest 输出 wake latency 与 period jitter 的 p50/p95/p99/max、deadline miss、每个 guest CPU 的 `/proc/stat` tick 增量及 guest context-switch 总数。测试专用的 Axvisor observer 同时固定在 pCPU1，输出相同窗口内的 pCPU1/pCPU2 non-idle tick、context-switch 增量及 pCPU1 worker 的最大 sleep 延迟。busy tick 是原始调度 tick 计数，必须结合目标平台 tick frequency 换算占用率。这些 QEMU 结果只能用于同环境 A/B 路径比较；硬件实时结论仍须保留目标板卡的原始日志与环境信息，不能由嵌套仿真替代。
+`shared-wait-periodic-wake` 与 `poll-idle-periodic-wake` 是同一个 AArch64 Linux guest、两个 vCPU（分别绑定 host pCPU1、pCPU2）和同一个 1 ms absolute-deadline workload 的独立 QEMU 数据采集入口。每轮 2,000 次、共三轮；guest 输出 wake latency 与 period jitter 的 p50/p95/p99/max、deadline miss、每个 guest CPU 的 `/proc/stat` tick 增量及 guest context-switch 总数。测试专用的 Axvisor observer 同时固定在 pCPU1，输出相同窗口内的 pCPU1/pCPU2 non-idle tick、context-switch 增量及 pCPU1 worker 的最大 sleep 延迟。该采集入口不作为 CI 的通过条件：QEMU/TCG 的 deadline miss 数据必须与同一平台上的 control build 比较，硬件实时结论仍须保留目标板卡的原始日志与环境信息，不能由嵌套仿真替代。
 
 每个已调度 callback 携带：
 
