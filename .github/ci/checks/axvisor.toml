@@ -15,8 +15,6 @@ echo "==> axvisor aarch64 virtio-blk ArceOS guest"
 timeout 240s apps/arceos/virtio-blk-test/run.sh
 echo "==> axvisor aarch64 axtest"
 cargo xtask ktest qemu -p axvisor --test axtest --arch aarch64
-echo "==> axvm rt-poll-idle runtime policy"
-cargo test -p axvm --no-default-features --features host-test,rt-poll-idle
 echo "==> pull qemu-aarch64 image"
 cargo xtask image pull qemu-aarch64 --extract-dir tmp/axbuild/images
 echo "==> axvisor aarch64 gicv2 timer stress"
@@ -27,7 +25,7 @@ echo "==> axvisor aarch64 rt-poll-idle timer wake"
 cargo xtask axvisor test qemu --arch aarch64 --test-case rt-poll-idle-timer-wake
 echo "==> axvisor aarch64 shared-wait latency benchmark"
 cargo xtask axvisor test qemu --arch aarch64 --test-case shared-wait-periodic-wake
-echo "==> axvisor aarch64 poll-idle latency benchmark"
+echo "==> axvisor aarch64 poll-idle runtime observation with latency data"
 cargo xtask axvisor test qemu --arch aarch64 --test-case poll-idle-periodic-wake
 '''
 

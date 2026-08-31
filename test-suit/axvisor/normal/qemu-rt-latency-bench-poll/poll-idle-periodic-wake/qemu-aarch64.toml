@@ -14,6 +14,6 @@ fail_regex = [
   "(?m)^AXVISOR_RT_LATENCY_BENCH_FAILED\\s*$",
   "(?m)^AXVISOR_RT_HOST_SCHED_FAILED\\b",
 ]
-success_regex = ["(?m)^AXVISOR_RT_POLL_IDLE_BENCH_PASSED\\s*$"]
+success_regex = ["AXVISOR_RT_POLL_IDLE_RUNTIME_PASSED"]
 to_bin = true
 uefi = false

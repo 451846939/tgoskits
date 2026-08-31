@@ -137,7 +137,7 @@ case "$cmdline" in
     exec /bin/busybox sh -i
     ;;
   *axvisor.timer_case=rt-latency-bench-poll*)
-    if ! /bin/rt_latency_bench; then echo AXVISOR_RT_LATENCY_BENCH_FAILED; else echo AXVISOR_RT_POLL_IDLE_BENCH_PASSED; fi
+    if ! /bin/rt_latency_bench; then echo AXVISOR_RT_LATENCY_BENCH_FAILED; else echo AXVISOR_RT_POLL_IDLE_BENCH_COMPLETED; fi
     exec /bin/busybox sh -i
     ;;
   *axvisor.timer_case=rt-poll-idle-gicv2*) success_marker=AXVISOR_RT_POLL_IDLE_TIMER_WAKE_PASSED; require_its=0 ;;
@@ -700,6 +700,15 @@ mod tests {
         assert!(
             init.windows(b"AXVISOR_RT_POLL_IDLE_TIMER_WAKE_PASSED".len())
                 .any(|window| window == b"AXVISOR_RT_POLL_IDLE_TIMER_WAKE_PASSED")
+        );
+        assert!(
+            init.windows(b"AXVISOR_RT_POLL_IDLE_BENCH_COMPLETED".len())
+                .any(|window| window == b"AXVISOR_RT_POLL_IDLE_BENCH_COMPLETED")
+        );
+        assert!(
+            !init
+                .windows(b"AXVISOR_RT_POLL_IDLE_BENCH_PASSED".len())
+                .any(|window| window == b"AXVISOR_RT_POLL_IDLE_BENCH_PASSED")
         );
         assert!(
             init.windows(b"AXVISOR_X86_DIRECT_ACPI_PASSED".len())

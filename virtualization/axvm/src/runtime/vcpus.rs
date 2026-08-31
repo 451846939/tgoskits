@@ -26,6 +26,9 @@ use crate::{
 const KERNEL_STACK_SIZE: usize = 0x40000; // 256 KiB
 
 #[cfg(all(feature = "rt-poll-idle", any(target_arch = "aarch64", test)))]
+// Five percent of the 1 ms periodic control workload used by the AxVisor
+// A/B regression. This bounds one contiguous busy-wait without presenting
+// the static profile as an adaptive scheduler policy.
 const IDLE_POLL_BUDGET_NS: u64 = 50_000;
 
 /// Per-vCPU runtime policy for the opt-in idle polling profile.
@@ -37,6 +40,31 @@ const IDLE_POLL_BUDGET_NS: u64 = 50_000;
 #[derive(Default)]
 struct IdlePollPolicy {
     deadline_ns: Option<u64>,
+    poll_bypass_count: u64,
+    poll_fallback_count: u64,
+    reported_runtime_observation: bool,
+}
+
+/// Result of one ordinary-idle wait decision in the bounded polling profile.
+#[cfg(all(feature = "rt-poll-idle", any(target_arch = "aarch64", test)))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IdlePollWaitDecision {
+    /// Keep the vCPU runnable inside its bounded polling interval.
+    BypassSharedWait,
+    /// Return to the ordinary shared wait queue for the stated reason.
+    SharedWait(IdlePollFallback),
+}
+
+/// Why an ordinary-idle vCPU left its bounded polling interval.
+#[cfg(all(feature = "rt-poll-idle", any(target_arch = "aarch64", test)))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IdlePollFallback {
+    /// The guest requested a blocking lifecycle wait rather than ordinary idle.
+    GuestRequestedBlock,
+    /// The local host scheduler has requested preemption.
+    PreemptionPending,
+    /// The bounded polling interval elapsed.
+    BudgetExpired,
 }
 
 #[cfg(all(feature = "rt-poll-idle", any(target_arch = "aarch64", test)))]
@@ -48,35 +76,68 @@ impl IdlePollPolicy {
         now_ns: u64,
         preemption_pending: bool,
         wait_for_event: impl FnOnce(),
-    ) {
-        if self.requires_shared_wait(event_wait, now_ns, preemption_pending) {
+    ) -> IdlePollWaitDecision {
+        let decision = self.decide_wait(event_wait, now_ns, preemption_pending);
+        if matches!(decision, IdlePollWaitDecision::SharedWait(_)) {
             wait_for_event();
         }
+        self.record_decision(decision);
+        decision
     }
 
-    /// Returns whether this exit must enter the shared event wait queue.
-    fn requires_shared_wait(
+    /// Selects the host wait action for one vCPU exit.
+    fn decide_wait(
         &mut self,
         event_wait: crate::architecture::VcpuEventWait,
         now_ns: u64,
         preemption_pending: bool,
-    ) -> bool {
+    ) -> IdlePollWaitDecision {
         use crate::architecture::VcpuEventWait;
 
         match event_wait {
             VcpuEventWait::None => {
                 self.deadline_ns = None;
-                false
+                IdlePollWaitDecision::BypassSharedWait
             }
             VcpuEventWait::Block => {
                 self.deadline_ns = None;
-                true
+                IdlePollWaitDecision::SharedWait(IdlePollFallback::GuestRequestedBlock)
             }
             VcpuEventWait::Poll if preemption_pending => {
                 self.deadline_ns = None;
-                true
+                IdlePollWaitDecision::SharedWait(IdlePollFallback::PreemptionPending)
             }
-            VcpuEventWait::Poll => self.poll_budget_expired(now_ns),
+            VcpuEventWait::Poll if self.poll_budget_expired(now_ns) => {
+                IdlePollWaitDecision::SharedWait(IdlePollFallback::BudgetExpired)
+            }
+            VcpuEventWait::Poll => IdlePollWaitDecision::BypassSharedWait,
+        }
+    }
+
+    /// Records observable ordinary-idle profile decisions.
+    fn record_decision(&mut self, decision: IdlePollWaitDecision) {
+        match decision {
+            IdlePollWaitDecision::BypassSharedWait if self.deadline_ns.is_some() => {
+                self.poll_bypass_count = self.poll_bypass_count.saturating_add(1);
+            }
+            IdlePollWaitDecision::SharedWait(
+                IdlePollFallback::PreemptionPending | IdlePollFallback::BudgetExpired,
+            ) => {
+                self.poll_fallback_count = self.poll_fallback_count.saturating_add(1);
+            }
+            IdlePollWaitDecision::BypassSharedWait
+            | IdlePollWaitDecision::SharedWait(IdlePollFallback::GuestRequestedBlock) => {}
+        }
+
+        if !self.reported_runtime_observation
+            && self.poll_bypass_count != 0
+            && self.poll_fallback_count != 0
+        {
+            info!(
+                "AXVISOR_RT_POLL_IDLE_RUNTIME_PASSED poll_bypass_count={} poll_fallback_count={}",
+                self.poll_bypass_count, self.poll_fallback_count
+            );
+            self.reported_runtime_observation = true;
         }
     }
 
@@ -787,15 +848,19 @@ mod tests {
         let mut policy = IdlePollPolicy::default();
         let shared_wait_count = std::cell::Cell::new(0);
 
-        policy.wait_for_event_if_required(VcpuEventWait::Poll, 10, false, || {
-            shared_wait_count.set(shared_wait_count.get() + 1);
-        });
-        policy.wait_for_event_if_required(VcpuEventWait::Poll, 10, false, || {
-            shared_wait_count.set(shared_wait_count.get() + 1);
-        });
+        let first_decision =
+            policy.wait_for_event_if_required(VcpuEventWait::Poll, 10, false, || {
+                shared_wait_count.set(shared_wait_count.get() + 1);
+            });
+        let second_decision =
+            policy.wait_for_event_if_required(VcpuEventWait::Poll, 10, false, || {
+                shared_wait_count.set(shared_wait_count.get() + 1);
+            });
+        assert_eq!(first_decision, IdlePollWaitDecision::BypassSharedWait);
+        assert_eq!(second_decision, IdlePollWaitDecision::BypassSharedWait);
         assert_eq!(shared_wait_count.get(), 0);
 
-        policy.wait_for_event_if_required(
+        let budget_decision = policy.wait_for_event_if_required(
             VcpuEventWait::Poll,
             10 + IDLE_POLL_BUDGET_NS,
             false,
@@ -803,6 +868,12 @@ mod tests {
                 shared_wait_count.set(shared_wait_count.get() + 1);
             },
         );
+        assert_eq!(
+            budget_decision,
+            IdlePollWaitDecision::SharedWait(IdlePollFallback::BudgetExpired)
+        );
+        assert_eq!(policy.poll_bypass_count, 2);
+        assert_eq!(policy.poll_fallback_count, 1);
         policy.wait_for_event_if_required(VcpuEventWait::Block, 20, false, || {
             shared_wait_count.set(shared_wait_count.get() + 1);
         });

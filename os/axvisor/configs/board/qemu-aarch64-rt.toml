@@ -1,6 +1,7 @@
 # AArch64 build-wide bounded polling profile. Ordinary WFI/standby may poll
 # only within the configured runtime budget, then return to the shared wait
-# queue. This build flag does not establish pCPU exclusivity.
+# queue. Poll-capable vCPUs must be pinned to distinct non-CPU0 host CPUs;
+# AxVisor rejects invalid placements before registering a guest VM.
 features = ["rt-poll-idle"]
 log = "Info"
 target = "aarch64-unknown-none-softfloat"
