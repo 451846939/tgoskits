@@ -132,6 +132,7 @@ exclude = [
 ]
 
 [workspace.dependencies]
+ax-sched = { path = "components/axsched", version = "0.5.10" }
 # Local workspace crates
 # Keep local dependency requirements at major.minor precision so release-plz does not
 # propagate patch-only releases to dependent workspace crates.

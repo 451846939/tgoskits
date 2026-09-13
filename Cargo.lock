@@ -1273,6 +1273,7 @@ dependencies = [
 name = "ax-task"
 version = "0.8.2"
 dependencies = [
+ "ax-sched",
  "axpanic",
  "cfg-if",
  "lock_api",
