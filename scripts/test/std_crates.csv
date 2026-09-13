@@ -17,6 +17,7 @@ ax-percpu
 mmio-api
 page-table-generic
 ranges-ext
+rdrive
 rdif-base
 rdif-def
 rdif-eth

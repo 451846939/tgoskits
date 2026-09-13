@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Device borrows are released only by guard destruction; remove PID-based
+  revocation and generation tokens from the proposed exit-reclaim interface.
+- Replace `Device::downcast` with consuming `DeviceGuard::downcast`; projected
+  guards retain the outer borrow and require `Send` targets for thread transfer.
+
+### Fixed
+
+- Invoke OSAL callbacks after releasing the registration lock.
+- Check immutable type metadata without aliasing a mutably borrowed driver.
+
 ## [0.24.3](https://github.com/rcore-os/tgoskits/compare/rdrive-v0.24.2...rdrive-v0.24.3) - 2026-09-11
 
 ### Fixed

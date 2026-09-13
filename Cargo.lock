@@ -6642,6 +6642,7 @@ name = "rdrive"
 version = "0.24.3"
 dependencies = [
  "acpi",
+ "ax-crate-interface",
  "ax-lazyinit",
  "ax-sync",
  "fdt-edit",
@@ -7896,6 +7897,7 @@ dependencies = [
  "sg200x-jpu",
  "slab",
  "some-serial",
+ "somehal",
  "starry-signal",
  "starry-vm",
  "static-keys",
