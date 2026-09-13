@@ -701,6 +701,10 @@ impl Pollable for PerfEvent {
 }
 
 impl FileLike for PerfEvent {
+    fn validate_write_access(&self) -> StarryResult {
+        Err(StarryError::Unsupported)
+    }
+
     fn read(&self, dst: &mut crate::file::IoDst) -> StarryResult<usize> {
         let _transaction = self.transaction.lock();
         if self.group_error.load(Ordering::Acquire) {
