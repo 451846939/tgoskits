@@ -132,6 +132,10 @@ Starry perf 使用 `ax_cpu::pmu::Pmu` 的有作用域会话；Linux event/cache 
 - LoongArch 的 someboot 和运行期通过 `ax_cpu::boot::tlb_refill_entry()` 引用唯一填充入口，不能从普通异常向量表加固定偏移推导 refill 地址。入口地址通过 PC-relative 方式取得，平台按自身映射转换为 TLBRENTRY 要求的物理地址。遇到零中间目录项立即停止并写入两个零 `TLBRELO`，使原始装载、存储或取指错误进入虚拟内存处理器。不得从物理地址零继续 `lddir` 或 `ldpte`，也不得把含错误虚拟页号的 `TLBREHI` 当作 EntryLo。以延迟 `mmap` 后第一次存储回归和分配器测试验证。
 - `ExitBootServices` 之后不得调用启动服务。退出前重试必须使用正确内存映射键序列。
 
+## CPU 启动容量
+
+容量发现与归一化由 someboot 的 `fdt::CpuCapacities` 完成，按启动层选中集合的硬件 ID 匹配节点，不以设备树顺序重建逻辑编号。容量与元数据填充必须复用同一个 `CpuIdIter` 的来源选择；仅 FDT 拓扑允许读取 FDT 容量，ACPI 拓扑在没有自身容量实现时统一使用 1024，不能因两个固件表中的数字 ID 相同而混用。完整容量随 `PerCpuMeta` 在最终高地址初始化并通过已有 Release/Acquire 发布；运行期经 `CpuTopologyIf::cpu_capacity()` 读取，不解析固件、不新建惰性容量表。参照 [CPU 启动容量设计](../../../docs/design/cpu-capacity-topology.md) 中固定 Linux 版本的整组缺失回退、等频假设和零容量语义。没有可信容量来源时全部为 1024，禁止按 A55/A76 型号猜权重；整数归一化可能为零，消费者须处理后才能除法。
+
 ## 对称多处理启动规则
 
 1. 从固件发现已启用处理器，固件标识与逻辑处理器标识分离。
