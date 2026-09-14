@@ -259,16 +259,10 @@ static int check_inherited_lost(void) {
         CPU_ZERO(&cpus);
         CPU_SET(0, &cpus);
         if (sched_setaffinity(0, sizeof(cpus), &cpus)) _exit(1);
-        struct timespec start, now;
-        if (clock_gettime(CLOCK_MONOTONIC, &start)) _exit(1);
-        while (__atomic_load_n(&meta->data_head, __ATOMIC_ACQUIRE) <
-               meta->data_size - 64) {
-            burn(10000);
-            if (clock_gettime(CLOCK_MONOTONIC, &now) ||
-                now.tv_sec - start.tv_sec >= 10) _exit(1);
-        }
-        /* More overflows after a full ring must be charged to the parent. */
-        burn(100000);
+        /* A nearly full ring is not proof of loss. Publish readiness only
+         * after the inherited event has charged an actual failed reservation
+         * to the parent's PERF_FORMAT_LOST count. */
+        if (produce_until(fd, meta, 0, 1)) _exit(1);
         char token = 0;
         if (write(ready[1], &token, 1) != 1 || read(go[0], &token, 1) != 1)
             _exit(1);
