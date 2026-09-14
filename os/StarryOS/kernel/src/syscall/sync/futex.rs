@@ -267,7 +267,7 @@ fn complete_futex_wake(count: usize) -> crate::StarryResult<isize> {
 }
 
 pub fn sys_futex(
-    current: &UserTaskRef,
+    context: &FutexContext<'_>,
     uaddr: *const u32,
     futex_op: u32,
     value: u32,
@@ -275,6 +275,7 @@ pub fn sys_futex(
     uaddr2: *mut u32,
     value3: u32,
 ) -> StarryResult<isize> {
+    let current = context.task();
     debug!(
         "sys_futex <= uaddr: {uaddr:?}, futex_op: {futex_op}, value: {value}, uaddr2: {uaddr2:?}, \
          value3: {value3}",
@@ -296,13 +297,21 @@ pub fn sys_futex(
         FutexCommand::Wait | FutexCommand::WaitBitset => {
             let deadline = futex_wait_timeout(current, &op, timeout)?;
 
+            // A private-key mismatch can finish at this nofault read without
+            // acquiring MM ownership or publishing a waiter. Possible sleepers
+            // still recheck under the bucket lock before entering the wait queue.
+            if matches!(op.key_mode, FutexKeyMode::Private)
+                && let Ok(observed) = futex_read_user_nofault(uaddr)
+                && observed != value
+            {
+                return Err(StarryError::WouldBlock);
+            }
+
             let bitset = if op.command == FutexCommand::WaitBitset {
                 value3
             } else {
                 u32::MAX
             };
-            let context = FutexContext::new(current);
-
             loop {
                 let futex = context.resolve(uaddr.addr(), op.key_mode);
                 match futex.wait_nofault_until(context.task(), bitset, deadline, || {
@@ -332,7 +341,7 @@ pub fn sys_futex(
             // particular, -1 is a very large limit, not EINVAL.
             let wake_count = value as usize;
 
-            let futex = FutexContext::new(current).resolve(uaddr.addr(), op.key_mode);
+            let futex = context.resolve(uaddr.addr(), op.key_mode);
             let bitset = if op.command == FutexCommand::WakeBitset {
                 value3
             } else {
@@ -348,8 +357,6 @@ pub fn sys_futex(
                 validate_futex_word(current, uaddr)?;
             }
             validate_futex_word(current, uaddr2)?;
-            let context = FutexContext::new(current);
-
             let count = loop {
                 let (source_futex, target_futex) =
                     context.resolve_pair(uaddr.addr(), uaddr2.addr(), op.key_mode);
@@ -395,7 +402,6 @@ pub fn sys_futex(
                 apply_wake_op_without_waiters(current, uaddr2, wake_operation)?;
                 0
             } else {
-                let context = FutexContext::new(current);
                 loop {
                     // Shared keys depend on the current VMA backing and must be
                     // recomputed after fault-in, matching Linux futex retry.
