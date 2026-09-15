@@ -1,5 +1,6 @@
 use std::{
     fmt, fs,
+    future::Future,
     io::{Read, Write},
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
@@ -22,6 +23,9 @@ const DOWNLOAD_RETRY_BASE_DELAY: Duration = Duration::from_millis(1);
 
 pub(crate) fn http_client() -> anyhow::Result<reqwest::Client> {
     reqwest::Client::builder()
+        // Retrying on a pooled HTTP/2 connection can repeatedly hit REFUSED_STREAM.
+        // Keep download attempts on fresh connections without changing protocols.
+        .pool_max_idle_per_host(0)
         .connect_timeout(Duration::from_secs(30))
         .timeout(Duration::from_secs(60 * 30))
         .build()
@@ -29,21 +33,24 @@ pub(crate) fn http_client() -> anyhow::Result<reqwest::Client> {
 }
 
 pub(crate) async fn fetch_text(client: &reqwest::Client, url: &str) -> anyhow::Result<String> {
-    #[cfg(test)]
-    if let Some(response) = test_support::fetch_text(url) {
-        return response;
-    }
+    with_download_retries(url, || async {
+        #[cfg(test)]
+        if let Some(response) = test_support::fetch_text(url) {
+            return response;
+        }
 
-    client
-        .get(url)
-        .send()
-        .await
-        .with_context(|| format!("failed to request {url}"))?
-        .error_for_status()
-        .with_context(|| format!("failed to fetch {url}"))?
-        .text()
-        .await
-        .with_context(|| format!("failed to read response body from {url}"))
+        client
+            .get(url)
+            .send()
+            .await
+            .with_context(|| format!("failed to request {url}"))?
+            .error_for_status()
+            .with_context(|| format!("failed to fetch {url}"))?
+            .text()
+            .await
+            .with_context(|| format!("failed to read response body from {url}"))
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -53,7 +60,7 @@ pub(crate) async fn download_file(
     path: &Path,
 ) -> anyhow::Result<()> {
     let _lock = acquire_path_lock(path).await?;
-    download_file_with_retries(client, url, path).await
+    with_download_retries(url, || download_file_inner(client, url, path, true)).await
 }
 
 pub(crate) async fn download_file_verified_sha256(
@@ -81,7 +88,7 @@ pub(crate) async fn download_file_verified_sha256(
             .with_context(|| format!("failed to remove {}", path.display()))?;
     }
 
-    download_file_with_retries(client, url, path).await?;
+    with_download_retries(url, || download_file_inner(client, url, path, true)).await?;
     let actual_sha256 = file_sha256(path)?;
     if actual_sha256 != expected_sha256 {
         let _ = tokio_fs::remove_file(path).await;
@@ -100,19 +107,19 @@ pub(crate) enum DownloadOutcome {
     Downloaded,
 }
 
-async fn download_file_with_retries(
-    client: &reqwest::Client,
-    url: &str,
-    path: &Path,
-) -> anyhow::Result<()> {
+async fn with_download_retries<T, F, Fut>(url: &str, mut download: F) -> anyhow::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = anyhow::Result<T>>,
+{
     for attempt in 1..=DOWNLOAD_MAX_ATTEMPTS {
-        match download_file_inner(client, url, path, true).await {
-            Ok(()) => return Ok(()),
+        match download().await {
+            Ok(result) => return Ok(result),
             Err(err) if attempt < DOWNLOAD_MAX_ATTEMPTS && retryable_download_error(&err) => {
                 let delay = download_retry_delay(attempt);
                 eprintln!(
-                    "download attempt {attempt}/{DOWNLOAD_MAX_ATTEMPTS} for {url} failed: {err}; \
-                     retrying in {:.1}s",
+                    "download attempt {attempt}/{DOWNLOAD_MAX_ATTEMPTS} for {url} failed: \
+                     {err:#}; retrying in {:.1}s",
                     delay.as_secs_f32()
                 );
                 tokio::time::sleep(delay).await;
@@ -576,16 +583,14 @@ pub(crate) mod test_support {
     }
 
     pub(super) fn fetch_text(url: &str) -> Option<anyhow::Result<String>> {
-        if !is_mock_url(url) {
-            return None;
-        }
-
-        Some(route(url).and_then(|route| {
-            route.requests.fetch_add(1, Ordering::SeqCst);
-            *route.last_range_header.lock().unwrap() = None;
-            String::from_utf8(route.body.clone())
+        download_response(url, 0).map(|response| {
+            let response = response?;
+            if !response.status.is_success() {
+                return Err(super::download_status_error(url, response.status));
+            }
+            String::from_utf8(response.body)
                 .map_err(|err| anyhow::anyhow!("mock response for {url} is not UTF-8: {err}"))
-        }))
+        })
     }
 
     pub(super) fn download_response(
