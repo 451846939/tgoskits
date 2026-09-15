@@ -37,6 +37,18 @@ class ReleasePrerequisiteTests(unittest.TestCase):
 
 
 class RunnerTrustTests(unittest.TestCase):
+    def test_public_job_images_do_not_require_registry_login(self) -> None:
+        workflow = REUSABLE_CHECK_MATRIX.read_text(encoding="utf-8")
+        job = mapping_block(workflow, "run", 2)
+        container = mapping_block(job, "container", 4)
+        credentials = mapping_block(container, "credentials", 6)
+
+        # A nonempty username prevents the runner's implicit GITHUB_TOKEN
+        # fallback; an omitted password makes ContainerRegistryLogin skip login.
+        self.assertIn("        username: anonymous", credentials.splitlines())
+        # Actions rejects an explicitly empty password before any job starts.
+        self.assertNotRegex(credentials, r"(?m)^\s*password:")
+
     def test_cleanup_reuses_planning_runner(self) -> None:
         self.assertFalse(
             PR_CLEANUP_WORKFLOW.exists(),
