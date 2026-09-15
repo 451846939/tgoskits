@@ -7,7 +7,9 @@ use core::{
 
 use ax_fs_ng::vfs::{FS_CONTEXT, FileBackend, MountNamespace, OpenOptions, OpenResult};
 use ax_memory_addr::PAGE_SIZE_4K;
-use axfs_ng_vfs::{DirEntry, FileNode, Location, NodeType, Reference, VfsError};
+use axfs_ng_vfs::{
+    DirEntry, FileNode, Location, MutationCredentials, NodeType, Reference, VfsError,
+};
 use bitflags::bitflags;
 use linux_raw_sys::general::*;
 
@@ -518,6 +520,14 @@ pub fn sys_openat(
     }
 
     let cred = thread.cred();
+    let mutation_cred = MutationCredentials {
+        fsuid: cred.fsuid,
+        fsgid: cred.fsgid,
+        supplementary_gids: &cred.groups,
+        cap_dac_override: cred.has_cap_dac_override(),
+        cap_dac_read_search: cred.has_cap_dac_read_search(),
+        cap_fowner: cred.has_cap_fowner(),
+    };
     let options = flags_to_options(flags, mode, (cred.fsuid, cred.fsgid));
     let should_notify_create = uflags & O_CREAT != 0
         && uflags & O_PATH == 0
@@ -528,7 +538,7 @@ pub fn sys_openat(
         })?;
 
     // Open first, then install the file so filesystem errors propagate unchanged.
-    let result = with_fs(dirfd, |fs| Ok(options.open(fs, path)?))?;
+    let result = with_fs(dirfd, |fs| Ok(options.open_with_credentials(fs, path, &mutation_cred)?))?;
     let mount_table_namespace = mount_table_namespace(current, &result);
     let fd = add_to_fd(current, result, flags as _, mount_table_namespace)?;
     if should_notify_create {
@@ -557,6 +567,13 @@ pub fn sys_openat2(
     openat2_check_extra_bytes(current, how, size)?;
 
     if how_value.flags & !OPENAT2_VALID_FLAGS != 0 {
+        return Err(StarryError::InvalidInput);
+    }
+    // Unlike openat, openat2 rejects flags incompatible with O_PATH instead
+    // of silently discarding them, including when resolve is zero.
+    if how_value.flags & O_PATH as u64 != 0
+        && how_value.flags & !((O_PATH | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW) as u64) != 0
+    {
         return Err(StarryError::InvalidInput);
     }
     if how_value.mode & !0o7777 != 0 {
@@ -606,18 +623,61 @@ pub fn sys_openat2(
     let thread = curr.as_thread();
     let mode = mode & !thread.proc_data.umask();
     let cred = thread.cred();
+    let mutation_cred = MutationCredentials {
+        fsuid: cred.fsuid,
+        fsgid: cred.fsgid,
+        supplementary_gids: &cred.groups,
+        cap_dac_override: cred.has_cap_dac_override(),
+        cap_dac_read_search: cred.has_cap_dac_read_search(),
+        cap_fowner: cred.has_cap_fowner(),
+    };
     let mut options = flags_to_options(flags, mode, (cred.fsuid, cred.fsgid));
     let result = with_fs(dirfd, |fs| {
-        let (parent, name) = fs.resolve_parent_beneath_no_symlinks(path.as_ref())?;
+        let path_ref = axfs_ng_vfs::path::Path::new(&path);
+        let must_be_dir = path_ref.has_trailing_slash();
+        let dot_only = path_ref
+            .components()
+            .all(|component| matches!(component, axfs_ng_vfs::path::Component::CurDir));
+
+        // A path made only of `.` components names the already-open dirfd.
+        // Resolving it directly avoids manufacturing a lookup through the
+        // dirfd's parent, which may be intentionally inaccessible. Preserve
+        // O_CREAT|O_EXCL's EEXIST precedence for this existing final entry.
+        if dot_only {
+            if uflags & (O_CREAT | O_EXCL) == (O_CREAT | O_EXCL) {
+                return Err(StarryError::AlreadyExists);
+            }
+            let (location, _) = fs.resolve_with_search_checked(axfs_ng_vfs::path::Path::new(&path), |directory| {
+                fs.check_search_path(directory, fs.permission_boundary(), &mutation_cred)
+            })?;
+            options.no_follow(true);
+            return Ok(options.open_loc(location)?);
+        }
+        let (parent, name) = fs.resolve_parent_beneath_no_symlinks_checked(
+            path.as_ref(),
+            |directory| fs.check_search_path(directory, fs.permission_boundary(), &mutation_cred),
+        )?;
         match parent.lookup_no_follow(name.as_ref()) {
             Ok(location) if location.node_type() == NodeType::Symlink => {
                 return Err(StarryError::FilesystemLoop);
             }
-            Err(VfsError::NotFound) | Ok(_) => {}
+            Ok(location) => {
+                if must_be_dir && !location.is_dir() {
+                    return Err(StarryError::NotADirectory);
+                }
+            }
+            Err(VfsError::NotFound) => {
+                // A trailing slash requires a directory and must not create a
+                // regular file while preparing the final lookup.
+                if must_be_dir {
+                    options.create(false).create_new(false);
+                }
+            }
             Err(error) => return Err(error.into()),
         }
+        let fs = fs.with_current_dir(parent)?;
         options.no_follow(true);
-        Ok(options.open(&fs.with_current_dir(parent)?, name.as_ref())?)
+        Ok(options.open_with_credentials(&fs, name.as_ref(), &mutation_cred)?)
     })?;
     let mount_table_namespace = mount_table_namespace(current, &result);
     add_to_fd(current, result, flags as u32, mount_table_namespace).map(|fd| fd as isize)
