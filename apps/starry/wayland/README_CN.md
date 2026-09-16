@@ -268,6 +268,11 @@ provision，之后复用已经 provision 好的镜像：
 STARRY_VNC=9 ./apps/starry/wayland/run-hvf.sh --no-build --vnc-only
 ```
 
+[`prebuild.sh`](prebuild.sh) 通过 HTTPS 预取包及签名索引；安装前使用基础 rootfs 的
+`/etc/apk/keys` 验证全部索引和 APK，再从签名离线仓库安装，认证失败即停止。
+旧脚本已 provision 的镜像不会自动重新认证，升级后需使用
+`--reprovision --provision-only` 从可信基础镜像重建。
+
 使用 `--reprovision` 可以丢弃并重新创建
 `tmp/axbuild/rootfs/rootfs-aarch64-wayland.img`。如果默认 4096 MiB 的手动镜像
 不合适，可以设置 `STARRY_WAYLAND_ROOTFS_MB`。辅助脚本需要宿主机提供 `debugfs`、
