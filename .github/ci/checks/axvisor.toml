@@ -4,9 +4,9 @@ group = "AxVisor"
 default_runner = "qcs"
 
 [[check]]
-id = "test-axvisor-aarch64-qemu-smoke-axtest-timer-stress"
+id = "test-axvisor-aarch64-qemu-smoke-axtest"
 impact_targets = ["axvisor:aarch64"]
-name = "QEMU aarch64 · Smoke + virtio-blk guest + axtest + timer stress"
+name = "QEMU aarch64 · Smoke + virtio-blk guest + axtest"
 timeout_minutes = 30
 command = '''
 echo "==> axvisor aarch64 smoke"
@@ -15,18 +15,12 @@ echo "==> axvisor aarch64 virtio-blk ArceOS guest"
 timeout 240s apps/arceos/virtio-blk-test/run.sh
 echo "==> axvisor aarch64 axtest"
 cargo xtask ktest qemu -p axvisor --test axtest --arch aarch64
-echo "==> pull qemu-aarch64 image"
-cargo xtask image pull qemu-aarch64 --extract-dir tmp/axbuild/images
-echo "==> axvisor aarch64 gicv2 timer stress"
-cargo xtask axvisor test qemu --arch aarch64 --test-case gicv2-timer-stress
-echo "==> axvisor aarch64 gicv3 timer stress"
-cargo xtask axvisor test qemu --arch aarch64 --test-case gicv3-timer-stress
 '''
 
 [[check.suite]]
 kind = "axvisor-qemu"
 arch = "aarch64"
-cases = ["smoke", "gicv2-timer-stress", "gicv3-timer-stress"]
+cases = ["smoke"]
 
 [[check]]
 id = "test-axvisor-aarch64-qemu-panic-http-control-plane-ivc"
@@ -222,47 +216,28 @@ arch = "x86_64"
 cases = ["pci-block-rw-svm", "pci-block-ro-svm"]
 
 [[check]]
-id = "test-axvisor-self-hosted-board-orangepi-5-plus-linux-starry-ivc-benchmark"
+id = "test-axvisor-self-hosted-board-orangepi-5-plus-linux-starry"
 impact_targets = ["axvisor:aarch64", "starry:aarch64"]
-name = "Board OrangePi 5 Plus · Linux + StarryOS + AXIVC Zephyr-Starry benchmark"
+name = "Board OrangePi 5 Plus · Linux + StarryOS"
 runner = "board"
 timeout_minutes = 90
 command = '''
 echo "==> axvisor OrangePi 5 Plus Linux guest"
-cargo xtask axvisor test board --board orangepi-5-plus-linux
+cargo xtask axvisor test board --board orangepi-5-plus-linux --test-case smoke
 echo "==> build the StarryOS guest from this checkout"
 cargo xtask starry build --config test-suit/starryos/board-orangepi-5-plus/build-aarch64-unknown-none-softfloat.toml --smp 1
 echo "==> axvisor OrangePi 5 Plus StarryOS guest"
 cargo xtask axvisor test board --board orangepi-5-plus-starry
-echo "==> axvisor OrangePi 5 Plus AXIVC Zephyr-Starry benchmark"
-cargo xtask axvisor test board --board orangepi-5-plus-ivc-benchmark
 '''
-
-[[check.suite]]
-kind = "axvisor-board"
-board = "orangepi-5-plus-ivc-benchmark"
 
 [[check.suite]]
 kind = "axvisor-board"
 board = "orangepi-5-plus-linux"
+cases = ["smoke"]
 
 [[check.suite]]
 kind = "axvisor-board"
 board = "orangepi-5-plus-starry"
-
-[[check]]
-id = "test-axvisor-self-hosted-board-orangepi-5-plus-vcpu-perf"
-impact_targets = ["axvisor:aarch64"]
-name = "Board OrangePi 5 Plus · Single ArceOS guest performance"
-runner = "board"
-timeout_minutes = 15
-command = '''
-cargo xtask axvisor test board --board orangepi-5-plus-vcpu-perf
-'''
-
-[[check.suite]]
-kind = "axvisor-board"
-board = "orangepi-5-plus-vcpu-perf"
 
 [[check]]
 id = "test-axvisor-self-hosted-board-roc-rk3568-pc-linux"
@@ -339,3 +314,76 @@ cargo xtask axvisor test board --board orangepi-5-plus-robot-linux
 [[check.suite]]
 kind = "axvisor-board"
 board = "orangepi-5-plus-robot-linux"
+
+# Nightly-only checks.
+
+[[check]]
+id = "test-axvisor-aarch64-qemu-timer-stress"
+impact_targets = ["axvisor:aarch64"]
+name = "QEMU aarch64 · GICv2 + GICv3 timer stress"
+nightly_only = true
+timeout_minutes = 30
+command = '''
+echo "==> pull qemu-aarch64 image"
+cargo xtask image pull qemu-aarch64 --extract-dir tmp/axbuild/images
+echo "==> axvisor aarch64 gicv2 timer stress"
+cargo xtask axvisor test qemu --arch aarch64 --test-case gicv2-timer-stress
+echo "==> axvisor aarch64 gicv3 timer stress"
+cargo xtask axvisor test qemu --arch aarch64 --test-case gicv3-timer-stress
+'''
+
+[[check.suite]]
+kind = "axvisor-qemu"
+arch = "aarch64"
+cases = ["gicv2-timer-stress", "gicv3-timer-stress"]
+
+[[check]]
+id = "test-axvisor-self-hosted-board-orangepi-5-plus-linux-ping"
+impact_targets = ["axvisor:aarch64"]
+name = "Board OrangePi 5 Plus · Linux PCI network ping"
+nightly_only = true
+runner = "board"
+timeout_minutes = 90
+command = '''
+cargo xtask axvisor test board --board orangepi-5-plus-linux --test-case ping
+'''
+
+[[check.suite]]
+kind = "axvisor-board"
+board = "orangepi-5-plus-linux"
+cases = ["ping"]
+
+[[check]]
+id = "test-axvisor-self-hosted-board-orangepi-5-plus-ivc-benchmark"
+impact_targets = ["axvisor:aarch64", "starry:aarch64"]
+name = "Board OrangePi 5 Plus · AXIVC Zephyr-Starry benchmark"
+nightly_only = true
+performance_report = true
+runner = "board"
+timeout_minutes = 90
+command = '''
+echo "==> build the StarryOS guest from this checkout"
+cargo xtask starry build --config test-suit/starryos/board-orangepi-5-plus/build-aarch64-unknown-none-softfloat.toml --smp 1
+echo "==> axvisor OrangePi 5 Plus AXIVC Zephyr-Starry benchmark"
+cargo xtask axvisor test board --board orangepi-5-plus-ivc-benchmark
+'''
+
+[[check.suite]]
+kind = "axvisor-board"
+board = "orangepi-5-plus-ivc-benchmark"
+
+[[check]]
+id = "test-axvisor-self-hosted-board-orangepi-5-plus-vcpu-perf"
+impact_targets = ["axvisor:aarch64"]
+name = "Board OrangePi 5 Plus · Single ArceOS guest performance"
+nightly_only = true
+performance_report = true
+runner = "board"
+timeout_minutes = 15
+command = '''
+cargo xtask axvisor test board --board orangepi-5-plus-vcpu-perf
+'''
+
+[[check.suite]]
+kind = "axvisor-board"
+board = "orangepi-5-plus-vcpu-perf"

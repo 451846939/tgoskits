@@ -65,6 +65,8 @@ TOP_LEVEL_FIELDS = {
     "check",
 }
 CHECK_FIELDS = {
+    "nightly_only",
+    "performance_report",
     "id",
     "name",
     "runner",
@@ -88,6 +90,8 @@ CHECK_FIELDS = {
 }
 REQUIRED_CHECK_FIELDS = {"id", "name", "command"}
 BOOLEAN_CHECK_FIELDS = {
+    "nightly_only",
+    "performance_report",
     "upload_xtask_bin_artifact",
     "download_xtask_bin_artifact",
     "wifi_secrets",
@@ -106,6 +110,7 @@ class PlanContext:
     base_ref: str = ""
     enabled_boolean_inputs: frozenset[str] = frozenset()
     impact: CiImpact | None = None
+    include_nightly: bool = False
 
 
 def load_catalog(manifests: Iterable[Path]) -> list[dict[str, Any]]:
@@ -169,7 +174,10 @@ def _build_main_plan(
         if suite_only
         else _plan_phase(checks, "test", context) + _plan_suite_rows(checks, context)
     )
-    if not test_rows:
+    if suite_only and not test_rows:
+        # A PR changing only nightly scenarios still receives static checks.
+        static_rows = _plan_phase(checks, "static", context)
+    if not test_rows and not suite_only:
         raise PlanError("main CI must resolve to a non-empty test matrix")
     if not suite_only and not static_rows:
         raise PlanError("main CI must resolve to a non-empty static matrix")
@@ -209,6 +217,31 @@ def build_starry_apps_plan(
     if not rows:
         raise PlanError("Starry Apps must resolve to a non-empty matrix")
     return {"starry_apps_matrix": {"include": rows}}
+
+
+def build_axvisor_nightly_plan(context: PlanContext) -> dict[str, Any]:
+    if context.event_name not in {"schedule", "workflow_dispatch"}:
+        raise PlanError("AxVisor nightly requires schedule or workflow_dispatch")
+    context = replace(context, include_nightly=True)
+    checks = load_catalog(MAIN_MANIFESTS)
+    producer = next(check for check in checks if check.get("upload_xtask_bin_artifact"))
+    prepare = _normalize_check(producer, context)
+    prepare.update(
+        id="axvisor-nightly-build-xtask",
+        name="Build tg-xtask",
+        command="cargo build -p tg-xtask",
+    )
+    rows = [
+        _normalize_check(check, context)
+        for check in checks
+        if check["group"] == "AxVisor" and _is_enabled(check, context)
+    ]
+    if not rows:
+        raise PlanError("AxVisor nightly must resolve to a non-empty matrix")
+    return {
+        "prepare_matrix": {"include": [prepare]},
+        "axvisor_matrix": {"include": rows},
+    }
 
 
 def write_github_outputs(outputs: dict[str, Any], output_file: Path) -> None:
@@ -525,6 +558,8 @@ def _plan_suite_rows(
     rows = []
     for selection in selections:
         template = checks_by_id[selection.template_id]
+        if template.get("nightly_only", False) and not context.include_nightly:
+            continue
         if not _is_enabled(template, context):
             raise PlanError(
                 f"test suite path `{selection.source_path}` requires unavailable "
@@ -554,6 +589,8 @@ def _normalize_suite_selection(
 
 
 def _is_enabled(check: dict[str, Any], context: PlanContext) -> bool:
+    if check.get("nightly_only", False) and not context.include_nightly:
+        return False
     required_owner = check.get("required_owner")
     if required_owner and context.repository_owner != required_owner:
         return False
@@ -663,6 +700,7 @@ def _normalize_check(check: dict[str, Any], context: PlanContext) -> dict[str, A
         "fetch_depth": fetch_depth,
         "timeout_minutes": check.get("timeout_minutes", 360),
         "require_kvm": check.get("require_kvm", False),
+        "performance_report": check.get("performance_report", False),
         "upload_xtask_bin_artifact": check.get("upload_xtask_bin_artifact", False),
         "download_xtask_bin_artifact": download_xtask,
         "xtask_bin_artifact_name": check.get("xtask_bin_artifact_name", "tg-xtask-bin"),
@@ -692,7 +730,7 @@ def _matrix_rows(outputs: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Plan TGOSKits CI matrices")
-    parser.add_argument("--mode", choices=("main", "starry-apps"), required=True)
+    parser.add_argument("--mode", choices=("main", "starry-apps", "axvisor-nightly"), required=True)
     parser.add_argument("--repository", required=True)
     parser.add_argument("--repository-owner", required=True)
     parser.add_argument("--event-name", required=True)
@@ -737,6 +775,8 @@ def main() -> int:
             context = _resolve_input_fallbacks(checks, context)
             impact = context.impact
             outputs = _build_main_plan(checks, context)
+        elif args.mode == "axvisor-nightly":
+            outputs = build_axvisor_nightly_plan(context)
         else:
             outputs = build_starry_apps_plan(context)
     except (OSError, PlanError, tomllib.TOMLDecodeError) as error:
