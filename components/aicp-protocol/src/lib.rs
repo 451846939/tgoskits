@@ -90,6 +90,25 @@ pub fn validate_control_payload(payload: ControlPayload) -> Result<(), ProtocolE
     Ok(())
 }
 
+/// Validates the status payload values accepted from an AICP v1 peer.
+///
+/// Status values are measurements and therefore have no control-range
+/// restriction, but every floating-point field must be finite before a
+/// caller can use it in control or display logic. `mode` shares the v1
+/// control-mode domain.
+pub fn validate_status_payload(payload: StatusPayload) -> Result<(), ProtocolError> {
+    let scalar_values = [
+        payload.setpoint,
+        payload.measured,
+        payload.control_output,
+        payload.error,
+    ];
+    if scalar_values.iter().any(|value| !value.is_finite()) || payload.mode > 1 {
+        return Err(ProtocolError::InvalidStatusPayload);
+    }
+    Ok(())
+}
+
 pub fn encode_control_payload(
     payload: ControlPayload,
 ) -> Result<[u8; CONTROL_PAYLOAD_LEN], ProtocolError> {
@@ -119,7 +138,10 @@ pub fn decode_control_payload(
     Ok(payload)
 }
 
-pub fn encode_status_payload(payload: StatusPayload) -> [u8; STATUS_PAYLOAD_LEN] {
+pub fn encode_status_payload(
+    payload: StatusPayload,
+) -> Result<[u8; STATUS_PAYLOAD_LEN], ProtocolError> {
+    validate_status_payload(payload)?;
     let mut output = [0u8; STATUS_PAYLOAD_LEN];
     output[0..4].copy_from_slice(&payload.setpoint.to_bits().to_be_bytes());
     output[4..8].copy_from_slice(&payload.measured.to_bits().to_be_bytes());
@@ -127,18 +149,22 @@ pub fn encode_status_payload(payload: StatusPayload) -> [u8; STATUS_PAYLOAD_LEN]
     output[12..16].copy_from_slice(&payload.error.to_bits().to_be_bytes());
     output[16..20].copy_from_slice(&payload.mode.to_be_bytes());
     output[20..24].copy_from_slice(&payload.applied_seq.to_be_bytes());
-    output
+    Ok(output)
 }
 
-pub fn decode_status_payload(input: &[u8; STATUS_PAYLOAD_LEN]) -> StatusPayload {
-    StatusPayload {
+pub fn decode_status_payload(
+    input: &[u8; STATUS_PAYLOAD_LEN],
+) -> Result<StatusPayload, ProtocolError> {
+    let payload = StatusPayload {
         setpoint: f32::from_bits(u32::from_be_bytes(input[0..4].try_into().unwrap())),
         measured: f32::from_bits(u32::from_be_bytes(input[4..8].try_into().unwrap())),
         control_output: f32::from_bits(u32::from_be_bytes(input[8..12].try_into().unwrap())),
         error: f32::from_bits(u32::from_be_bytes(input[12..16].try_into().unwrap())),
         mode: u32::from_be_bytes(input[16..20].try_into().unwrap()),
         applied_seq: u32::from_be_bytes(input[20..24].try_into().unwrap()),
-    }
+    };
+    validate_status_payload(payload)?;
+    Ok(payload)
 }
 
 impl Header {
@@ -173,6 +199,7 @@ pub enum ProtocolError {
     BadHeaderLength,
     UnsupportedOptions,
     InvalidControlPayload,
+    InvalidStatusPayload,
     PayloadTooLarge,
     PayloadLengthMismatch,
     OutputTooSmall,
@@ -187,6 +214,7 @@ impl core::fmt::Display for ProtocolError {
             Self::BadHeaderLength => "bad AICP header length",
             Self::UnsupportedOptions => "unsupported AICP header options",
             Self::InvalidControlPayload => "invalid AICP control payload",
+            Self::InvalidStatusPayload => "invalid AICP status payload",
             Self::PayloadTooLarge => "AICP payload too large",
             Self::PayloadLengthMismatch => "AICP payload length mismatch",
             Self::OutputTooSmall => "AICP output buffer too small",
@@ -472,6 +500,43 @@ mod tests {
         assert_eq!(
             decode_control_payload(&nan_wire),
             Err(ProtocolError::InvalidControlPayload)
+        );
+    }
+
+    #[test]
+    fn rejects_non_finite_status_payloads() {
+        let valid = StatusPayload {
+            setpoint: 0.25,
+            measured: 0.5,
+            control_output: 0.75,
+            error: -0.25,
+            mode: 1,
+            applied_seq: 7,
+        };
+        let invalid = StatusPayload {
+            measured: f32::NAN,
+            ..valid
+        };
+        let nan_wire = [
+            0x3e, 0x80, 0x00, 0x00, 0x7f, 0xc0, 0x00, 0x00, 0x3f, 0x40, 0x00, 0x00, 0xbe, 0x80,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x07,
+        ];
+
+        assert_eq!(
+            validate_status_payload(invalid),
+            Err(ProtocolError::InvalidStatusPayload)
+        );
+        assert_eq!(
+            encode_status_payload(invalid),
+            Err(ProtocolError::InvalidStatusPayload)
+        );
+        assert_eq!(
+            decode_status_payload(&nan_wire),
+            Err(ProtocolError::InvalidStatusPayload)
+        );
+        assert_eq!(
+            encode_status_payload(valid).unwrap().len(),
+            STATUS_PAYLOAD_LEN
         );
     }
 

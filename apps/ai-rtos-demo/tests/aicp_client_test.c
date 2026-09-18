@@ -6,6 +6,7 @@
 #include "aicp_posix_stream.h"
 
 #include <pthread.h>
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -15,6 +16,7 @@ struct server_case {
     int socket;
     int corrupt_response_seq;
     int corrupt_response_version;
+    int corrupt_response_status;
     int result;
 };
 
@@ -133,7 +135,7 @@ static void *serve_client(void *argument) {
         return NULL;
     }
 
-    const struct aicp_status_payload status = {
+    struct aicp_status_payload status = {
         .setpoint = 0.25f,
         .measured = 0.5f,
         .control_output = 0.75f,
@@ -141,6 +143,9 @@ static void *serve_client(void *argument) {
         .mode = 1,
         .applied_seq = request.seq,
     };
+    if (test->corrupt_response_status) {
+        status.measured = NAN;
+    }
     const uint32_t response_seq =
         test->corrupt_response_seq ? request.seq + 1u : request.seq;
     struct aicp_header response = aicp_make_header(
@@ -205,7 +210,10 @@ static void *serve_replayed_control_response(void *argument) {
     return NULL;
 }
 
-static int run_case(int corrupt_response_seq, int corrupt_response_version) {
+static int run_case(
+    int corrupt_response_seq,
+    int corrupt_response_version,
+    int corrupt_response_status) {
     int sockets[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) {
         return -1;
@@ -215,6 +223,7 @@ static int run_case(int corrupt_response_seq, int corrupt_response_version) {
         .socket = sockets[1],
         .corrupt_response_seq = corrupt_response_seq,
         .corrupt_response_version = corrupt_response_version,
+        .corrupt_response_status = corrupt_response_status,
         .result = 0,
     };
     pthread_t thread;
@@ -266,7 +275,7 @@ static int run_case(int corrupt_response_seq, int corrupt_response_version) {
     close(sockets[1]);
 
     const int expect_protocol_error =
-        corrupt_response_seq || corrupt_response_version;
+        corrupt_response_seq || corrupt_response_version || corrupt_response_status;
     const int expected = expect_protocol_error ? -EPROTO : 0;
     const uint32_t expected_seq = expect_protocol_error ? 2 : 3;
     if (result != expected || server.result != 0 || seq != expected_seq ||
@@ -355,17 +364,22 @@ int main(void) {
     unsigned passed = 0;
     unsigned failed = 0;
 
-    if (run_case(0, 0) == 0) {
+    if (run_case(0, 0, 0) == 0) {
         passed++;
     } else {
         failed++;
     }
-    if (run_case(1, 0) == 0) {
+    if (run_case(1, 0, 0) == 0) {
         passed++;
     } else {
         failed++;
     }
-    if (run_case(0, 1) == 0) {
+    if (run_case(0, 1, 0) == 0) {
+        passed++;
+    } else {
+        failed++;
+    }
+    if (run_case(0, 0, 1) == 0) {
         passed++;
     } else {
         failed++;

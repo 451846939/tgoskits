@@ -71,7 +71,12 @@ static int receive_status_response(
         return -EPROTO;
     }
 
-    aicp_status_payload_decode(payload, status);
+    struct aicp_status_payload decoded;
+    aicp_status_payload_decode(payload, &decoded);
+    if (!aicp_status_payload_is_valid(&decoded)) {
+        return -EPROTO;
+    }
+    *status = decoded;
     return 0;
 }
 

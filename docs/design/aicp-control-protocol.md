@@ -99,8 +99,8 @@ evicting replay state.
 ## Trust, operations, and rollback
 
 AICP assumes the configured Guest network is trusted. It validates frame shape,
-CRC, version, sequence, finite numeric values, control ranges, and bounded
-resource usage; it does not turn source addresses into authentication. Network
+CRC, version, sequence, finite numeric control and status values, control
+ranges, and bounded resource usage; it does not turn source addresses into authentication. Network
 access control and Guest isolation remain AxVisor/network configuration duties.
 
 Protocol health is observable through `HELLO`, `CONTROL`, duplicate/stale, and

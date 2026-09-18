@@ -84,6 +84,11 @@ static inline int aicp_control_payload_is_valid(const struct aicp_control_payloa
            payload->mode <= 1;
 }
 
+static inline int aicp_status_payload_is_valid(const struct aicp_status_payload *payload) {
+    return payload != NULL && isfinite(payload->setpoint) && isfinite(payload->measured) &&
+           isfinite(payload->control_output) && isfinite(payload->error) && payload->mode <= 1;
+}
+
 static inline int aicp_header_options_are_supported(const struct aicp_header *header) {
     return header != NULL && header->flags == 0 && header->reserved == 0;
 }
