@@ -95,7 +95,10 @@ static void log_service_event(
     }
 }
 
-static void serve_client(int fd, struct aicp_service_stats *stats) {
+static void serve_client(
+    int fd,
+    struct aicp_service *service,
+    struct aicp_service_stats *stats) {
     struct aicp_service_session session;
     struct client_context client;
     const struct aicp_service_ops ops = {
@@ -108,7 +111,7 @@ static void serve_client(int fd, struct aicp_service_stats *stats) {
     aicp_posix_stream_init(&client.stream, fd);
     aicp_posix_stream_set_deadline_after_ms(
         &client.stream, AICP_REFERENCE_FRAME_DEADLINE_MS);
-    (void)aicp_service_serve(&client.stream.stream, &session, stats, &ops);
+    (void)aicp_service_serve(&client.stream.stream, service, &session, stats, &ops);
     close(fd);
 }
 
@@ -128,7 +131,9 @@ int main(int argc, char **argv) {
     printf("AICP RTOS reference server listening on 0.0.0.0:%u\n", port);
 
     struct aicp_service_stats stats;
+    struct aicp_service service;
     aicp_service_stats_init(&stats);
+    aicp_service_init(&service);
 
     for (;;) {
         int fd = accept(listen_fd, NULL, NULL);
@@ -136,6 +141,6 @@ int main(int argc, char **argv) {
             perror("accept");
             continue;
         }
-        serve_client(fd, &stats);
+        serve_client(fd, &service, &stats);
     }
 }

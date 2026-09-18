@@ -69,7 +69,31 @@ pub struct StatusPayload {
     pub applied_seq: u32,
 }
 
-pub fn encode_control_payload(payload: ControlPayload) -> [u8; CONTROL_PAYLOAD_LEN] {
+pub fn validate_control_payload(payload: ControlPayload) -> Result<(), ProtocolError> {
+    let scalar_values = [
+        payload.target,
+        payload.kp,
+        payload.ki,
+        payload.kd,
+        payload.feed_forward,
+    ];
+    if scalar_values.iter().any(|value| !value.is_finite())
+        || !(-1.0..=1.0).contains(&payload.target)
+        || !(0.0..=10.0).contains(&payload.kp)
+        || !(0.0..=10.0).contains(&payload.ki)
+        || !(0.0..=10.0).contains(&payload.kd)
+        || !(-1.0..=1.0).contains(&payload.feed_forward)
+        || payload.mode > 1
+    {
+        return Err(ProtocolError::InvalidControlPayload);
+    }
+    Ok(())
+}
+
+pub fn encode_control_payload(
+    payload: ControlPayload,
+) -> Result<[u8; CONTROL_PAYLOAD_LEN], ProtocolError> {
+    validate_control_payload(payload)?;
     let mut output = [0u8; CONTROL_PAYLOAD_LEN];
     output[0..4].copy_from_slice(&payload.target.to_bits().to_be_bytes());
     output[4..8].copy_from_slice(&payload.kp.to_bits().to_be_bytes());
@@ -77,18 +101,22 @@ pub fn encode_control_payload(payload: ControlPayload) -> [u8; CONTROL_PAYLOAD_L
     output[12..16].copy_from_slice(&payload.kd.to_bits().to_be_bytes());
     output[16..20].copy_from_slice(&payload.feed_forward.to_bits().to_be_bytes());
     output[20..24].copy_from_slice(&payload.mode.to_be_bytes());
-    output
+    Ok(output)
 }
 
-pub fn decode_control_payload(input: &[u8; CONTROL_PAYLOAD_LEN]) -> ControlPayload {
-    ControlPayload {
+pub fn decode_control_payload(
+    input: &[u8; CONTROL_PAYLOAD_LEN],
+) -> Result<ControlPayload, ProtocolError> {
+    let payload = ControlPayload {
         target: f32::from_bits(u32::from_be_bytes(input[0..4].try_into().unwrap())),
         kp: f32::from_bits(u32::from_be_bytes(input[4..8].try_into().unwrap())),
         ki: f32::from_bits(u32::from_be_bytes(input[8..12].try_into().unwrap())),
         kd: f32::from_bits(u32::from_be_bytes(input[12..16].try_into().unwrap())),
         feed_forward: f32::from_bits(u32::from_be_bytes(input[16..20].try_into().unwrap())),
         mode: u32::from_be_bytes(input[20..24].try_into().unwrap()),
-    }
+    };
+    validate_control_payload(payload)?;
+    Ok(payload)
 }
 
 pub fn encode_status_payload(payload: StatusPayload) -> [u8; STATUS_PAYLOAD_LEN] {
@@ -144,6 +172,7 @@ pub enum ProtocolError {
     UnsupportedVersion,
     BadHeaderLength,
     UnsupportedOptions,
+    InvalidControlPayload,
     PayloadTooLarge,
     PayloadLengthMismatch,
     OutputTooSmall,
@@ -157,6 +186,7 @@ impl core::fmt::Display for ProtocolError {
             Self::UnsupportedVersion => "unsupported AICP version",
             Self::BadHeaderLength => "bad AICP header length",
             Self::UnsupportedOptions => "unsupported AICP header options",
+            Self::InvalidControlPayload => "invalid AICP control payload",
             Self::PayloadTooLarge => "AICP payload too large",
             Self::PayloadLengthMismatch => "AICP payload length mismatch",
             Self::OutputTooSmall => "AICP output buffer too small",
@@ -394,8 +424,55 @@ mod tests {
             0xd7, 0x0a, 0x3e, 0x4c, 0xcc, 0xcd, 0x00, 0x00, 0x00, 0x01,
         ];
 
-        assert_eq!(encode_control_payload(payload), expected);
-        assert_eq!(decode_control_payload(&expected), payload);
+        assert_eq!(encode_control_payload(payload), Ok(expected));
+        assert_eq!(decode_control_payload(&expected), Ok(payload));
+    }
+
+    #[test]
+    fn rejects_non_finite_and_out_of_range_control_payloads() {
+        let valid = ControlPayload {
+            target: 0.25,
+            kp: 0.5,
+            ki: 0.1,
+            kd: 0.01,
+            feed_forward: 0.2,
+            mode: 1,
+        };
+        let invalid_payloads = [
+            ControlPayload {
+                target: f32::NAN,
+                ..valid
+            },
+            ControlPayload {
+                kp: f32::INFINITY,
+                ..valid
+            },
+            ControlPayload {
+                target: 1.01,
+                ..valid
+            },
+            ControlPayload { mode: 2, ..valid },
+        ];
+
+        for payload in invalid_payloads {
+            assert_eq!(
+                validate_control_payload(payload),
+                Err(ProtocolError::InvalidControlPayload)
+            );
+            assert_eq!(
+                encode_control_payload(payload),
+                Err(ProtocolError::InvalidControlPayload)
+            );
+        }
+
+        let nan_wire = [
+            0x7f, 0xc0, 0x00, 0x00, 0x3f, 0x00, 0x00, 0x00, 0x3d, 0xcc, 0xcc, 0xcd, 0x3c, 0x23,
+            0xd7, 0x0a, 0x3e, 0x4c, 0xcc, 0xcd, 0x00, 0x00, 0x00, 0x01,
+        ];
+        assert_eq!(
+            decode_control_payload(&nan_wire),
+            Err(ProtocolError::InvalidControlPayload)
+        );
     }
 
     #[test]

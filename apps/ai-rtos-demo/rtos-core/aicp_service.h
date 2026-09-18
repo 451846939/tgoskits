@@ -37,8 +37,12 @@ struct aicp_sequence_state {
 
 struct aicp_service_session {
     uint8_t payload[AICP_MAX_PAYLOAD];
-    struct control_state control;
     struct aicp_sequence_state sequence;
+};
+
+/* Shared service state outlives individual stream connections. */
+struct aicp_service {
+    struct control_state control;
 };
 
 struct aicp_service_stats {
@@ -64,10 +68,12 @@ struct aicp_service_ops {
 };
 
 void aicp_service_session_init(struct aicp_service_session *session);
+void aicp_service_init(struct aicp_service *service);
 void aicp_service_stats_init(struct aicp_service_stats *stats);
 
 int aicp_service_serve(
     struct aicp_stream *stream,
+    struct aicp_service *service,
     struct aicp_service_session *session,
     struct aicp_service_stats *stats,
     const struct aicp_service_ops *ops);

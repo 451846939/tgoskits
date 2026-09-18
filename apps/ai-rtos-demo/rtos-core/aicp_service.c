@@ -86,13 +86,14 @@ static bool sequence_is_newer(uint32_t current, uint32_t previous) {
 
 static int replay_last_reply(
     struct aicp_stream *stream,
+    const struct aicp_service *service,
     const struct aicp_service_session *session,
     const struct aicp_service_ops *ops,
     const struct aicp_header *request) {
     switch (session->sequence.reply) {
     case AICP_CACHED_REPLY_STATUS:
         return send_status(
-            stream, &session->control, session->sequence.last_seq, ops, request);
+            stream, &service->control, session->sequence.last_seq, ops, request);
     case AICP_CACHED_REPLY_ERROR:
         return send_error(
             stream,
@@ -108,7 +109,11 @@ static int replay_last_reply(
 
 void aicp_service_session_init(struct aicp_service_session *session) {
     memset(session, 0, sizeof(*session));
-    control_state_init(&session->control);
+}
+
+void aicp_service_init(struct aicp_service *service) {
+    memset(service, 0, sizeof(*service));
+    control_state_init(&service->control);
 }
 
 void aicp_service_stats_init(struct aicp_service_stats *stats) {
@@ -117,6 +122,7 @@ void aicp_service_stats_init(struct aicp_service_stats *stats) {
 
 int aicp_service_serve(
     struct aicp_stream *stream,
+    struct aicp_service *service,
     struct aicp_service_session *session,
     struct aicp_service_stats *stats,
     const struct aicp_service_ops *ops) {
@@ -125,6 +131,14 @@ int aicp_service_serve(
         int result =
             aicp_stream_recv_frame(
                 stream, &header, session->payload, sizeof(session->payload));
+        if (result == -EBADMSG) {
+            stats->protocol_errors++;
+            result = send_error(stream, header.seq, AICP_ERR_CRC, ops, &header);
+            if (result != 0) {
+                return result;
+            }
+            continue;
+        }
         if (result != 0) {
             emit_event(ops, AICP_SERVICE_DISCONNECTED, NULL, NULL, result, AICP_OK);
             return result;
@@ -132,7 +146,7 @@ int aicp_service_serve(
 
         stats->received_frames++;
         emit_event(
-            ops, AICP_SERVICE_FRAME_RECEIVED, &header, &session->control, 0, AICP_OK);
+            ops, AICP_SERVICE_FRAME_RECEIVED, &header, &service->control, 0, AICP_OK);
 
         if (header.version != AICP_VERSION) {
             stats->protocol_errors++;
@@ -147,8 +161,8 @@ int aicp_service_serve(
         if (session->sequence.valid && header.seq == session->sequence.last_seq) {
             stats->duplicate_requests++;
             emit_event(
-                ops, AICP_SERVICE_DUPLICATE, &header, &session->control, 0, AICP_OK);
-            result = replay_last_reply(stream, session, ops, &header);
+                ops, AICP_SERVICE_DUPLICATE, &header, &service->control, 0, AICP_OK);
+            result = replay_last_reply(stream, service, session, ops, &header);
             if (result != 0) {
                 return result;
             }
@@ -163,7 +177,7 @@ int aicp_service_serve(
                 ops,
                 AICP_SERVICE_STALE,
                 &header,
-                &session->control,
+                &service->control,
                 0,
                 AICP_ERR_SEQUENCE);
             result = send_error(
@@ -181,16 +195,16 @@ int aicp_service_serve(
 
         switch (header.msg_type) {
         case AICP_MSG_HELLO:
-            emit_event(ops, AICP_SERVICE_HELLO, &header, &session->control, 0, AICP_OK);
+            emit_event(ops, AICP_SERVICE_HELLO, &header, &service->control, 0, AICP_OK);
             session->sequence.reply = AICP_CACHED_REPLY_STATUS;
-            result = send_status(stream, &session->control, header.seq, ops, &header);
+            result = send_status(stream, &service->control, header.seq, ops, &header);
             if (result != 0) {
                 return result;
             }
             break;
         case AICP_MSG_HEARTBEAT:
             session->sequence.reply = AICP_CACHED_REPLY_STATUS;
-            result = send_status(stream, &session->control, header.seq, ops, &header);
+            result = send_status(stream, &service->control, header.seq, ops, &header);
             if (result != 0) {
                 return result;
             }
@@ -221,17 +235,17 @@ int aicp_service_serve(
                 }
                 break;
             }
-            control_step(&session->control, &control, header.seq);
+            control_step(&service->control, &control, header.seq);
             stats->control_requests++;
             emit_event(
                 ops,
                 AICP_SERVICE_CONTROL_APPLIED,
                 &header,
-                &session->control,
+                &service->control,
                 0,
                 AICP_OK);
             session->sequence.reply = AICP_CACHED_REPLY_STATUS;
-            result = send_status(stream, &session->control, header.seq, ops, &header);
+            result = send_status(stream, &service->control, header.seq, ops, &header);
             if (result != 0) {
                 return result;
             }

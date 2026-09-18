@@ -21,6 +21,7 @@ struct server_context {
     int result;
     uint64_t clock_ns;
     unsigned events[EVENT_COUNT];
+    struct aicp_service *service;
     struct aicp_service_session session;
     struct aicp_service_stats stats;
     struct aicp_service_ops ops;
@@ -45,13 +46,32 @@ static void *serve(void *opaque) {
 
     aicp_posix_stream_init(&stream, context->socket);
     context->result = aicp_service_serve(
-        &stream.stream, &context->session, &context->stats, &context->ops);
+        &stream.stream,
+        context->service,
+        &context->session,
+        &context->stats,
+        &context->ops);
     return NULL;
 }
 
 static int write_raw_frame(int socket, struct aicp_header header, const void *payload) {
     uint8_t wire[AICP_HEADER_LEN];
     header.crc16 = aicp_frame_crc(header, payload);
+    aicp_header_encode(&header, wire);
+
+    int result = aicp_posix_write_full(socket, wire, sizeof(wire));
+    if (result != 0 || header.payload_len == 0) {
+        return result;
+    }
+    return aicp_posix_write_full(socket, payload, header.payload_len);
+}
+
+static int write_frame_with_bad_crc(
+    int socket,
+    struct aicp_header header,
+    const void *payload) {
+    uint8_t wire[AICP_HEADER_LEN];
+    header.crc16 = (uint16_t)(aicp_frame_crc(header, payload) ^ 1u);
     aicp_header_encode(&header, wire);
 
     int result = aicp_posix_write_full(socket, wire, sizeof(wire));
@@ -130,10 +150,13 @@ static int run_service_sequence_test(void) {
         return 1;
     }
 
+    struct aicp_service service;
+    aicp_service_init(&service);
     struct server_context context = {
         .socket = sockets[1],
         .result = 0,
         .clock_ns = 1000000,
+        .service = &service,
     };
     aicp_service_session_init(&context.session);
     aicp_service_stats_init(&context.stats);
@@ -254,6 +277,20 @@ static int run_service_sequence_test(void) {
     failed |= write_raw_frame(sockets[0], bad_version, NULL) != 0;
     failed |= expect_reply(sockets[0], AICP_MSG_ERROR, 10, AICP_ERR_VERSION, NULL);
 
+    struct aicp_header bad_crc =
+        aicp_make_header(AICP_MSG_HEARTBEAT, 0, 0, 11, 8000, AICP_OK);
+    failed |= write_frame_with_bad_crc(sockets[0], bad_crc, NULL) != 0;
+    failed |= expect_reply(sockets[0], AICP_MSG_ERROR, 11, AICP_ERR_CRC, NULL);
+
+    struct aicp_status_payload crc_recovery_status;
+    failed |= send_control(sockets[0], 12, 0.55f) != 0;
+    failed |= expect_reply(sockets[0], AICP_MSG_STATUS, 12, AICP_OK, &crc_recovery_status);
+    if (crc_recovery_status.applied_seq != 12 ||
+        fabsf(crc_recovery_status.setpoint - 0.55f) > 0.0001f) {
+        fprintf(stderr, "CRC error prevented the next valid request\n");
+        failed = 1;
+    }
+
     close(sockets[0]);
     if (pthread_join(thread, NULL) != 0) {
         perror("pthread_join");
@@ -261,8 +298,8 @@ static int run_service_sequence_test(void) {
     }
     close(sockets[1]);
 
-    if (context.result != -ECONNRESET || context.stats.received_frames != 15 ||
-        context.stats.control_requests != 2 || context.stats.protocol_errors != 8 ||
+    if (context.result != -ECONNRESET || context.stats.received_frames != 16 ||
+        context.stats.control_requests != 3 || context.stats.protocol_errors != 9 ||
         context.stats.duplicate_requests != 4 || context.stats.stale_requests != 1) {
         fprintf(
             stderr,
@@ -277,9 +314,9 @@ static int run_service_sequence_test(void) {
         failed = 1;
     }
     if (context.events[AICP_SERVICE_HELLO] != 1 ||
-        context.events[AICP_SERVICE_CONTROL_APPLIED] != 2 ||
-        context.events[AICP_SERVICE_STATUS_SENT] != 4 ||
-        context.events[AICP_SERVICE_ERROR_SENT] != 11 ||
+        context.events[AICP_SERVICE_CONTROL_APPLIED] != 3 ||
+        context.events[AICP_SERVICE_STATUS_SENT] != 5 ||
+        context.events[AICP_SERVICE_ERROR_SENT] != 12 ||
         context.events[AICP_SERVICE_DUPLICATE] != 4 ||
         context.events[AICP_SERVICE_STALE] != 1 ||
         context.events[AICP_SERVICE_DISCONNECTED] != 1) {
@@ -290,8 +327,92 @@ static int run_service_sequence_test(void) {
     return failed;
 }
 
+static int run_service_reconnect_test(void) {
+    int first_sockets[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, first_sockets) != 0) {
+        perror("socketpair");
+        return 1;
+    }
+
+    struct aicp_service service;
+    aicp_service_init(&service);
+    struct server_context first_context = {
+        .socket = first_sockets[1],
+        .clock_ns = 2000000,
+        .service = &service,
+    };
+    aicp_service_session_init(&first_context.session);
+    aicp_service_stats_init(&first_context.stats);
+    first_context.ops.monotonic_ns = test_monotonic_ns;
+    first_context.ops.context = &first_context;
+
+    pthread_t first_thread;
+    if (pthread_create(&first_thread, NULL, serve, &first_context) != 0) {
+        perror("pthread_create");
+        close(first_sockets[0]);
+        close(first_sockets[1]);
+        return 1;
+    }
+
+    int failed = 0;
+    struct aicp_status_payload first_status;
+    failed |= send_control(first_sockets[0], 1, 0.75f) != 0;
+    failed |= expect_reply(first_sockets[0], AICP_MSG_STATUS, 1, AICP_OK, &first_status);
+    close(first_sockets[0]);
+    if (pthread_join(first_thread, NULL) != 0) {
+        perror("pthread_join");
+        failed = 1;
+    }
+    close(first_sockets[1]);
+
+    int second_sockets[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, second_sockets) != 0) {
+        perror("socketpair");
+        return 1;
+    }
+
+    struct server_context second_context = {
+        .socket = second_sockets[1],
+        .clock_ns = 3000000,
+        .service = &service,
+    };
+    aicp_service_session_init(&second_context.session);
+    aicp_service_stats_init(&second_context.stats);
+    second_context.ops.monotonic_ns = test_monotonic_ns;
+    second_context.ops.context = &second_context;
+
+    pthread_t second_thread;
+    if (pthread_create(&second_thread, NULL, serve, &second_context) != 0) {
+        perror("pthread_create");
+        close(second_sockets[0]);
+        close(second_sockets[1]);
+        return 1;
+    }
+
+    struct aicp_header hello =
+        aicp_make_header(AICP_MSG_HELLO, 0, 0, 1, 2000, AICP_OK);
+    struct aicp_status_payload reconnect_status;
+    failed |= aicp_posix_send_frame(second_sockets[0], hello, NULL) != 0;
+    failed |= expect_reply(
+        second_sockets[0], AICP_MSG_STATUS, 1, AICP_OK, &reconnect_status);
+    if (first_status.applied_seq != 1 || reconnect_status.applied_seq != 1 ||
+        fabsf(reconnect_status.setpoint - 0.75f) > 0.0001f) {
+        fprintf(stderr, "reconnect reset the shared control state\n");
+        failed = 1;
+    }
+
+    close(second_sockets[0]);
+    if (pthread_join(second_thread, NULL) != 0) {
+        perror("pthread_join");
+        failed = 1;
+    }
+    close(second_sockets[1]);
+    return failed;
+}
+
 int main(void) {
     int failed = run_service_sequence_test();
+    failed |= run_service_reconnect_test();
     printf("AICP_SERVICE_SUMMARY passed=%d failed=%d\n", failed == 0, failed != 0);
     return failed == 0 ? 0 : 1;
 }
